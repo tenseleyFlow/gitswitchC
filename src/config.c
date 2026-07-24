@@ -14,6 +14,7 @@
 #include <dirent.h>
 #include <errno.h>
 #include <ctype.h>
+#include <stdarg.h>
 #if defined(__linux__)
 #include <sys/syscall.h>
 #endif
@@ -131,6 +132,49 @@ enum {
     ((void)(stage), (void)(fd), (void)(name), 0)
 #endif
 
+#ifdef GITSWITCH_TESTING
+typedef enum {
+    SWITCH_GUARD_INSTALL_AFTER_STAGE_SYNC = 0,
+    SWITCH_GUARD_CLEAR_AFTER_UNLINK
+} switch_guard_test_stage_t;
+typedef int (*switch_guard_test_hook_fn)(
+    switch_guard_test_stage_t stage, int directory_fd);
+switch_guard_test_hook_fn gitswitch_test_set_switch_guard_hook(
+    switch_guard_test_hook_fn hook);
+static switch_guard_test_hook_fn g_switch_guard_test_hook;
+
+switch_guard_test_hook_fn gitswitch_test_set_switch_guard_hook(
+    switch_guard_test_hook_fn hook) {
+    switch_guard_test_hook_fn previous =
+        g_switch_guard_test_hook;
+    g_switch_guard_test_hook = hook;
+    return previous;
+}
+
+static int config_switch_guard_test_checkpoint(
+    switch_guard_test_stage_t stage, int directory_fd) {
+    if (!g_switch_guard_test_hook) return 0;
+    if (g_switch_guard_test_hook(stage, directory_fd) == 0) {
+        return 0;
+    }
+    if (errno == 0) errno = EIO;
+    set_system_error(
+        ERR_FILE_IO,
+        "Injected switch guard lifecycle failure");
+    return -1;
+}
+
+#define SWITCH_GUARD_TEST_CHECKPOINT(stage, fd) \
+    config_switch_guard_test_checkpoint((stage), (fd))
+#else
+enum {
+    SWITCH_GUARD_INSTALL_AFTER_STAGE_SYNC = 0,
+    SWITCH_GUARD_CLEAR_AFTER_UNLINK
+};
+#define SWITCH_GUARD_TEST_CHECKPOINT(stage, fd) \
+    ((void)(stage), (void)(fd), 0)
+#endif
+
 /* Default configuration template with security-focused defaults */
 const char *default_config_template = 
 "# gitswitch-c Configuration File\n"
@@ -245,10 +289,12 @@ static bool config_metadata_snapshot_same(const struct stat *a,
                                           const struct stat *b);
 static bool config_is_namespace_change_errno(int error);
 static int config_require_loaded_source_generation(
-    const gitswitch_ctx_t *ctx, const char *config_path);
+    const gitswitch_ctx_t *ctx, const char *config_path,
+    struct stat *accepted_generation);
 static int config_reprove_loaded_source(
     const char *config_path, const struct stat *expected,
-    const unsigned char *expected_data, size_t expected_length);
+    const unsigned char *expected_data, size_t expected_length,
+    struct stat *accepted_generation);
 static int config_admit_full_save_generation(const gitswitch_ctx_t *ctx,
                                              const char *config_path);
 static int config_require_full_save_generation_snapshot(
@@ -1383,8 +1429,10 @@ static bool config_metadata_snapshot_same(const struct stat *a,
  * same strict source snapshot (and the same caller path spelling) so an
  * intervening valid accounts.toml generation is preserved as a conflict. */
 static int config_require_loaded_source_generation(
-    const gitswitch_ctx_t *ctx, const char *config_path) {
+    const gitswitch_ctx_t *ctx, const char *config_path,
+    struct stat *accepted_generation) {
     struct stat current;
+    struct stat reproved;
     int lookup_errno;
 
     if (!ctx || !config_path || !ctx->config.source_generation_valid ||
@@ -1423,7 +1471,11 @@ static int config_require_loaded_source_generation(
             if (config_reprove_loaded_source(
                     config_path, &ctx->config.source_generation,
                     ctx->config.source_witness,
-                    ctx->config.source_witness_length) == 0) {
+                    ctx->config.source_witness_length,
+                    &reproved) == 0) {
+                if (accepted_generation) {
+                    *accepted_generation = reproved;
+                }
                 return 0;
             }
             lookup_errno = errno ? errno : ESTALE;
@@ -1436,6 +1488,9 @@ static int config_require_loaded_source_generation(
             "Configuration changed since it was loaded; refusing active-state publication: %s",
             config_path);
         return -1;
+    }
+    if (accepted_generation) {
+        *accepted_generation = current;
     }
     return 0;
 }
@@ -1486,7 +1541,8 @@ static int config_require_full_save_generation_snapshot(
                 if (config_reprove_loaded_source(
                         config_path, &ctx->config.source_generation,
                         ctx->config.source_witness,
-                        ctx->config.source_witness_length) == 0) {
+                        ctx->config.source_witness_length,
+                        NULL) == 0) {
                     return 0;
                 }
                 proof_errno = errno ? errno : ESTALE;
@@ -1778,7 +1834,8 @@ proof_fail:
  * parent directory. Callers must carry the exact bounded document witness. */
 static int config_reprove_loaded_source(
     const char *config_path, const struct stat *expected,
-    const unsigned char *expected_data, size_t expected_length) {
+    const unsigned char *expected_data, size_t expected_length,
+    struct stat *accepted_generation) {
     char dir_path[MAX_PATH_LEN];
     const char *slash;
     const char *target_name;
@@ -1846,6 +1903,9 @@ static int config_reprove_loaded_source(
         dir_fd = -1;
         errno = errno ? errno : EIO;
         return -1;
+    }
+    if (accepted_generation) {
+        *accepted_generation = current_generation;
     }
     return 0;
 
@@ -3697,6 +3757,2950 @@ void config_retirement_guard_abandon(
     config_retirement_guard_free(*guard);
     *guard = NULL;
 }
+
+#define CONFIG_SWITCH_GUARD_NAME ".switch-incomplete"
+#define CONFIG_SWITCH_STAGE_NAME ".switch-transition"
+#define CONFIG_SWITCH_LOCK_NAME ".switch.lock"
+#define CONFIG_SWITCH_GUARD_HEADER "gitswitch-switch-incomplete-v2"
+#define CONFIG_SWITCH_GUARD_MAX_BYTES (64U * 1024U)
+
+typedef struct {
+    char token[ACCOUNT_INCARNATION_LEN];
+    publication_identity_t source_generation;
+    account_t target;
+    git_scope_t effective_scope;
+    publication_record_t destinations[CONFIG_SWITCH_DESTINATION_MAX];
+    size_t destination_count;
+} config_switch_guard_model_t;
+
+typedef struct {
+    unsigned char *data;
+    size_t length;
+    size_t capacity;
+} config_switch_guard_writer_t;
+
+typedef struct {
+    bool stage_present;
+    bool marker_absent;
+    struct stat stage_identity;
+    struct stat marker_identity;
+    unsigned char *marker_data;
+    size_t marker_length;
+    config_switch_guard_model_t marker_model;
+} config_switch_guard_snapshot_t;
+
+typedef enum {
+    CONFIG_SWITCH_PREINTENT_NONE = 0,
+    CONFIG_SWITCH_PREINTENT_STAGE_ONLY,
+    CONFIG_SWITCH_PREINTENT_EXACT_PAIR
+} config_switch_preintent_kind_t;
+
+typedef struct {
+    config_switch_preintent_kind_t kind;
+    struct stat stage_identity;
+    struct stat marker_identity;
+} config_switch_preintent_snapshot_t;
+
+struct config_switch_guard {
+    int directory_fd;
+    int lock_fd;
+    char directory[MAX_PATH_LEN];
+    char config_name[MAX_PATH_LEN];
+    struct stat directory_identity;
+    struct stat marker_identity;
+    unsigned char *marker_data;
+    size_t marker_length;
+    config_switch_guard_model_t model;
+    char token[ACCOUNT_INCARNATION_LEN];
+    bool created;
+    bool marker_unlinked;
+};
+
+static pid_t g_switch_guard_owner_pid;
+
+static bool config_switch_string_terminated(const char *value, size_t size) {
+    return value && memchr(value, '\0', size) != NULL;
+}
+
+static bool config_switch_identity_is_zero(
+    const publication_identity_t *identity) {
+    return identity && !identity->present && identity->device == 0U &&
+           identity->inode == 0U && identity->mode == 0U &&
+           identity->uid == 0U && identity->gid == 0U &&
+           identity->link_count == 0U && identity->size == 0U &&
+           identity->mtime_seconds == 0 &&
+           identity->mtime_nanoseconds == 0U &&
+           identity->ctime_seconds == 0 &&
+           identity->ctime_nanoseconds == 0U;
+}
+
+static bool config_switch_identity_is_type(
+    const publication_identity_t *identity, bool directory) {
+    mode_t mode;
+
+    if (!identity || !identity->present || identity->link_count == 0U) {
+        return false;
+    }
+    mode = (mode_t)identity->mode;
+    if ((uintmax_t)mode != identity->mode ||
+        identity->mtime_nanoseconds > UINT32_C(999999999) ||
+        identity->ctime_nanoseconds > UINT32_C(999999999)) {
+        return false;
+    }
+    return directory ? S_ISDIR(mode) : S_ISREG(mode);
+}
+
+/* Directory size, link count, and timestamps legitimately change when Git
+ * atomically replaces its config or updates repository metadata. Recovery
+ * authority is the same named directory object under the same ownership/mode
+ * policy, not an impossible byte-generation comparison of mutable directory
+ * bookkeeping. */
+static bool config_switch_same_directory_authority(
+    const publication_identity_t *recorded,
+    const publication_identity_t *observed) {
+    return config_switch_identity_is_type(recorded, true) &&
+           config_switch_identity_is_type(observed, true) &&
+           recorded->device == observed->device &&
+           recorded->inode == observed->inode &&
+           recorded->mode == observed->mode &&
+           recorded->uid == observed->uid &&
+           recorded->gid == observed->gid;
+}
+
+static const char *config_switch_git_scope_name(git_scope_t scope) {
+    switch (scope) {
+        case GIT_SCOPE_LOCAL:
+            return "local";
+        case GIT_SCOPE_GLOBAL:
+            return "global";
+        case GIT_SCOPE_SYSTEM:
+        default:
+            return NULL;
+    }
+}
+
+static const char *config_switch_publication_scope_name(
+    publication_scope_t scope) {
+    switch (scope) {
+        case PUBLICATION_SCOPE_LOCAL:
+            return "local";
+        case PUBLICATION_SCOPE_GLOBAL:
+            return "global";
+        case PUBLICATION_SCOPE_WORKTREE:
+            return "worktree";
+        default:
+            return NULL;
+    }
+}
+
+static bool config_switch_target_live_fields_equal(
+    const account_t *left, const account_t *right) {
+    return left && right && left->id == right->id &&
+           strcmp(left->incarnation, right->incarnation) == 0 &&
+           strcmp(left->name, right->name) == 0 &&
+           strcmp(left->email, right->email) == 0 &&
+           left->preferred_scope == right->preferred_scope &&
+           left->ssh_enabled == right->ssh_enabled &&
+           strcmp(left->ssh_key_path, right->ssh_key_path) == 0 &&
+           strcmp(left->ssh_host_alias, right->ssh_host_alias) == 0 &&
+           strcmp(left->ssh_hostname, right->ssh_hostname) == 0 &&
+           left->gpg_enabled == right->gpg_enabled &&
+           left->gpg_signing_enabled == right->gpg_signing_enabled &&
+           strcmp(left->gpg_key_id, right->gpg_key_id) == 0;
+}
+
+static bool config_switch_destination_record_valid(
+    const publication_record_t *destination) {
+    bool repository_present;
+
+    if (!destination ||
+        !config_switch_publication_scope_name(destination->scope) ||
+        !config_switch_string_terminated(
+            destination->config_path, sizeof(destination->config_path)) ||
+        !config_switch_string_terminated(
+            destination->repository_path,
+            sizeof(destination->repository_path)) ||
+        destination->config_path[0] != '/' ||
+        !config_switch_identity_is_type(
+            &destination->config_parent, true)) {
+        return false;
+    }
+    repository_present = destination->repository_path[0] != '\0';
+    if (repository_present != destination->repository.present ||
+        (repository_present &&
+         (destination->repository_path[0] != '/' ||
+          !config_switch_identity_is_type(
+              &destination->repository, true))) ||
+        (!repository_present &&
+         !config_switch_identity_is_zero(&destination->repository))) {
+        return false;
+    }
+    if (destination->scope == PUBLICATION_SCOPE_GLOBAL) {
+        return !repository_present;
+    }
+    return repository_present;
+}
+
+static bool config_switch_destinations_valid(
+    git_scope_t effective_scope,
+    const publication_record_t *destinations, size_t destination_count) {
+    publication_scope_t expected[CONFIG_SWITCH_DESTINATION_MAX];
+    size_t expected_count = 0U;
+
+    if (!destinations || destination_count == 0U ||
+        destination_count > CONFIG_SWITCH_DESTINATION_MAX ||
+        !config_scope_is_persistable(effective_scope)) {
+        return false;
+    }
+    expected[expected_count++] =
+        effective_scope == GIT_SCOPE_GLOBAL
+            ? PUBLICATION_SCOPE_GLOBAL
+            : PUBLICATION_SCOPE_LOCAL;
+    for (size_t i = 1U; i < destination_count; i++) {
+        publication_scope_t scope = destinations[i].scope;
+
+        if (scope == PUBLICATION_SCOPE_LOCAL &&
+            effective_scope == GIT_SCOPE_GLOBAL &&
+            expected_count == 1U) {
+            expected[expected_count++] = scope;
+        } else if (scope == PUBLICATION_SCOPE_WORKTREE &&
+                   expected_count == i &&
+                   expected[expected_count - 1U] !=
+                       PUBLICATION_SCOPE_WORKTREE) {
+            expected[expected_count++] = scope;
+        } else {
+            return false;
+        }
+    }
+    if (expected_count != destination_count) return false;
+    for (size_t i = 0U; i < destination_count; i++) {
+        if (destinations[i].scope != expected[i] ||
+            !config_switch_destination_record_valid(
+                &destinations[i])) {
+            return false;
+        }
+    }
+    return true;
+}
+
+static bool config_switch_same_destination_authority(
+    const publication_record_t *recorded,
+    const publication_record_t *observed) {
+    return recorded && observed &&
+           recorded->scope == observed->scope &&
+           strcmp(
+               recorded->config_path,
+               observed->config_path) == 0 &&
+           strcmp(
+               recorded->repository_path,
+               observed->repository_path) == 0 &&
+           config_switch_same_directory_authority(
+               &recorded->config_parent,
+               &observed->config_parent) &&
+           ((recorded->repository_path[0] == '\0' &&
+             config_switch_identity_is_zero(
+                 &recorded->repository) &&
+             config_switch_identity_is_zero(
+                 &observed->repository)) ||
+            (recorded->repository_path[0] != '\0' &&
+             config_switch_same_directory_authority(
+                 &recorded->repository,
+                 &observed->repository)));
+}
+
+static bool config_switch_same_destinations_authority(
+    const publication_record_t *recorded, size_t recorded_count,
+    const publication_record_t *observed, size_t observed_count) {
+    if (!recorded || !observed || recorded_count != observed_count ||
+        recorded_count == 0U ||
+        recorded_count > CONFIG_SWITCH_DESTINATION_MAX) {
+        return false;
+    }
+    for (size_t i = 0U; i < recorded_count; i++) {
+        if (!config_switch_same_destination_authority(
+                &recorded[i], &observed[i])) {
+            return false;
+        }
+    }
+    return true;
+}
+
+static int config_switch_directory_authority_live(
+    const char *path, const publication_identity_t *recorded,
+    const char *diagnostic) {
+    struct stat before;
+    struct stat opened;
+    struct stat after;
+    publication_identity_t observed;
+    int fd = -1;
+    int saved_errno = ESTALE;
+
+    if (!path || path[0] == '\0' || !recorded) {
+        errno = EINVAL;
+        return -1;
+    }
+    if (lstat(path, &before) != 0 || !S_ISDIR(before.st_mode)) {
+        saved_errno = errno ? errno : ESTALE;
+        goto authority_fail;
+    }
+    fd = open(
+        path, O_RDONLY | O_CLOEXEC | O_DIRECTORY | O_NOFOLLOW);
+    if (fd < 0 || fstat(fd, &opened) != 0 ||
+        !S_ISDIR(opened.st_mode) ||
+        !config_metadata_snapshot_same(&before, &opened)) {
+        saved_errno = errno ? errno : ESTALE;
+        goto authority_fail;
+    }
+    if (close(fd) != 0) {
+        fd = -1;
+        saved_errno = errno ? errno : EIO;
+        goto authority_fail;
+    }
+    fd = -1;
+    if (lstat(path, &after) != 0 || !S_ISDIR(after.st_mode) ||
+        !config_metadata_snapshot_same(&opened, &after)) {
+        saved_errno = errno ? errno : ESTALE;
+        goto authority_fail;
+    }
+    publication_identity_from_stat(&observed, &after);
+    if (!config_switch_same_directory_authority(
+            recorded, &observed)) {
+        saved_errno = ESTALE;
+        goto authority_fail;
+    }
+    return 0;
+
+authority_fail:
+    if (fd >= 0) close(fd);
+    errno = saved_errno;
+    set_system_error(
+        ERR_FILE_IO, "Switch recovery %s is no longer current",
+        diagnostic ? diagnostic : "directory authority");
+    return -1;
+}
+
+static int config_switch_destination_live(
+    const publication_record_t *recorded) {
+    char parent[MAX_PATH_LEN];
+
+    if (!recorded ||
+        config_directory_for_path(
+            recorded->config_path, parent, sizeof(parent)) != 0 ||
+        config_switch_directory_authority_live(
+            parent, &recorded->config_parent,
+            "Git config parent") != 0) {
+        return -1;
+    }
+    if (recorded->repository_path[0] == '\0') return 0;
+    return config_switch_directory_authority_live(
+        recorded->repository_path, &recorded->repository,
+        "repository");
+}
+
+static int config_switch_destinations_live(
+    const publication_record_t *destinations, size_t destination_count) {
+    if (!destinations || destination_count == 0U ||
+        destination_count > CONFIG_SWITCH_DESTINATION_MAX) {
+        errno = EINVAL;
+        set_error(ERR_INVALID_ARGS,
+                  "Invalid switch recovery destination set");
+        return -1;
+    }
+    for (size_t i = 0U; i < destination_count; i++) {
+        if (config_switch_destination_live(&destinations[i]) != 0) {
+            return -1;
+        }
+    }
+    return 0;
+}
+
+static bool config_switch_guard_model_valid(
+    const config_switch_guard_model_t *model) {
+    const account_t *target;
+    mode_t source_mode;
+
+    if (!model || !account_incarnation_is_valid(model->token) ||
+        !config_switch_identity_is_type(
+            &model->source_generation, false)) {
+        return false;
+    }
+    source_mode = (mode_t)model->source_generation.mode;
+    if (model->source_generation.uid != (uintmax_t)getuid() ||
+        model->source_generation.link_count != 1U ||
+        (source_mode & 0777) != PERM_USER_RW) {
+        return false;
+    }
+    target = &model->target;
+    if (!config_account_id_is_valid(target->id) ||
+        !account_incarnation_is_valid(target->incarnation) ||
+        !target->incarnation_persisted ||
+        !config_scope_is_persistable(target->preferred_scope) ||
+        !config_switch_string_terminated(target->name,
+                                         sizeof(target->name)) ||
+        !config_switch_string_terminated(target->email,
+                                         sizeof(target->email)) ||
+        !config_switch_string_terminated(target->ssh_key_path,
+                                         sizeof(target->ssh_key_path)) ||
+        !config_switch_string_terminated(
+            target->ssh_host_alias, sizeof(target->ssh_host_alias)) ||
+        !config_switch_string_terminated(
+            target->ssh_hostname, sizeof(target->ssh_hostname)) ||
+        !config_switch_string_terminated(target->gpg_key_id,
+                                         sizeof(target->gpg_key_id)) ||
+        !config_scope_is_persistable(model->effective_scope)) {
+        return false;
+    }
+    return config_switch_destinations_valid(
+        model->effective_scope, model->destinations,
+        model->destination_count);
+}
+
+static int config_switch_writer_append(
+    config_switch_guard_writer_t *writer, const void *data, size_t length) {
+    if (!writer || !writer->data || writer->length > writer->capacity ||
+        length > writer->capacity - writer->length ||
+        (length != 0U && !data)) {
+        errno = EOVERFLOW;
+        set_error(ERR_CONFIG_INVALID,
+                  "Switch guard marker exceeds its byte limit");
+        return -1;
+    }
+    if (length != 0U) {
+        memcpy(writer->data + writer->length, data, length);
+        writer->length += length;
+    }
+    return 0;
+}
+
+static int config_switch_writer_printf(
+    config_switch_guard_writer_t *writer, const char *format, ...)
+    GS_PRINTF_FMT(2, 3);
+
+static int config_switch_writer_printf(
+    config_switch_guard_writer_t *writer, const char *format, ...) {
+    va_list args;
+    size_t remaining;
+    int written;
+
+    if (!writer || !writer->data || !format ||
+        writer->length > writer->capacity) {
+        errno = EINVAL;
+        return -1;
+    }
+    remaining = writer->capacity - writer->length;
+    va_start(args, format);
+    /* All callers below use fixed format strings and bounded values. */
+    // flawfinder: ignore
+    written = vsnprintf(
+        (char *)writer->data + writer->length, remaining, format, args);
+    va_end(args);
+    if (written < 0 || (size_t)written >= remaining) {
+        errno = EOVERFLOW;
+        set_error(ERR_CONFIG_INVALID,
+                  "Switch guard marker exceeds its byte limit");
+        return -1;
+    }
+    writer->length += (size_t)written;
+    return 0;
+}
+
+static int config_switch_writer_hex(
+    config_switch_guard_writer_t *writer, const char *value) {
+    static const char digits[] = "0123456789ABCDEF";
+
+    if (!value || value[0] == '\0') {
+        return config_switch_writer_append(writer, "-", 1U);
+    }
+    for (const unsigned char *cursor = (const unsigned char *)value;
+         *cursor; cursor++) {
+        char encoded[2] = {
+            digits[*cursor >> 4U], digits[*cursor & 0x0fU]
+        };
+        if (config_switch_writer_append(
+                writer, encoded, sizeof(encoded)) != 0) {
+            return -1;
+        }
+    }
+    return 0;
+}
+
+static int config_switch_writer_named_hex(
+    config_switch_guard_writer_t *writer, const char *name,
+    const char *value) {
+    return config_switch_writer_printf(writer, "%s=", name) == 0 &&
+                   config_switch_writer_hex(writer, value) == 0 &&
+                   config_switch_writer_append(writer, "\n", 1U) == 0
+               ? 0
+               : -1;
+}
+
+static int config_switch_writer_identity(
+    config_switch_guard_writer_t *writer,
+    const publication_identity_t *identity) {
+    if (!identity || !identity->present) {
+        return config_switch_writer_append(writer, "-", 1U);
+    }
+    return config_switch_writer_printf(
+        writer,
+        "%" PRIuMAX ":%" PRIuMAX ":%" PRIuMAX ":%" PRIuMAX ":%" PRIuMAX
+        ":%" PRIuMAX ":%" PRIuMAX ":%" PRId64 ":%" PRIu32
+        ":%" PRId64 ":%" PRIu32,
+        identity->device, identity->inode, identity->mode, identity->uid,
+        identity->gid, identity->link_count, identity->size,
+        identity->mtime_seconds, identity->mtime_nanoseconds,
+        identity->ctime_seconds, identity->ctime_nanoseconds);
+}
+
+static int config_switch_writer_named_identity(
+    config_switch_guard_writer_t *writer, const char *name,
+    const publication_identity_t *identity) {
+    return config_switch_writer_printf(writer, "%s=", name) == 0 &&
+                   config_switch_writer_identity(writer, identity) == 0 &&
+                   config_switch_writer_append(writer, "\n", 1U) == 0
+               ? 0
+               : -1;
+}
+
+static int config_switch_guard_serialize(
+    const config_switch_guard_model_t *model, unsigned char **serialized,
+    size_t *serialized_length) {
+    config_switch_guard_writer_t writer;
+    unsigned char *data;
+    const char *preferred_scope;
+    const char *effective_scope;
+
+    if (!serialized || !serialized_length ||
+        !config_switch_guard_model_valid(model)) {
+        errno = EINVAL;
+        set_error(ERR_INVALID_ARGS,
+                  "Invalid switch guard serialization arguments");
+        return -1;
+    }
+    *serialized = NULL;
+    *serialized_length = 0U;
+    preferred_scope =
+        config_switch_git_scope_name(model->target.preferred_scope);
+    effective_scope =
+        config_switch_git_scope_name(model->effective_scope);
+    if (!preferred_scope || !effective_scope) {
+        errno = EINVAL;
+        set_error(ERR_INVALID_ARGS,
+                  "Switch guard contains an unsupported scope");
+        return -1;
+    }
+    data = calloc(1U, CONFIG_SWITCH_GUARD_MAX_BYTES);
+    if (!data) {
+        set_error(ERR_MEMORY_ALLOCATION,
+                  "Cannot allocate switch guard marker");
+        return -1;
+    }
+    writer.data = data;
+    writer.length = 0U;
+    writer.capacity = CONFIG_SWITCH_GUARD_MAX_BYTES;
+
+    if (config_switch_writer_printf(
+            &writer, "%s\n", CONFIG_SWITCH_GUARD_HEADER) != 0 ||
+        config_switch_writer_printf(
+            &writer, "token=%s\n", model->token) != 0 ||
+        config_switch_writer_named_identity(
+            &writer, "source_generation",
+            &model->source_generation) != 0 ||
+        config_switch_writer_printf(
+            &writer, "target_id=%" PRIu32 "\n",
+            model->target.id) != 0 ||
+        config_switch_writer_printf(
+            &writer, "target_incarnation=%s\n",
+            model->target.incarnation) != 0 ||
+        config_switch_writer_named_hex(
+            &writer, "target_name", model->target.name) != 0 ||
+        config_switch_writer_named_hex(
+            &writer, "target_email", model->target.email) != 0 ||
+        config_switch_writer_printf(
+            &writer, "target_preferred_scope=%s\n",
+            preferred_scope) != 0 ||
+        config_switch_writer_printf(
+            &writer, "target_ssh_enabled=%u\n",
+            model->target.ssh_enabled ? 1U : 0U) != 0 ||
+        config_switch_writer_named_hex(
+            &writer, "target_ssh_key_path",
+            model->target.ssh_key_path) != 0 ||
+        config_switch_writer_named_hex(
+            &writer, "target_ssh_host_alias",
+            model->target.ssh_host_alias) != 0 ||
+        config_switch_writer_named_hex(
+            &writer, "target_ssh_hostname",
+            model->target.ssh_hostname) != 0 ||
+        config_switch_writer_printf(
+            &writer, "target_gpg_enabled=%u\n",
+            model->target.gpg_enabled ? 1U : 0U) != 0 ||
+        config_switch_writer_printf(
+            &writer, "target_gpg_signing_enabled=%u\n",
+            model->target.gpg_signing_enabled ? 1U : 0U) != 0 ||
+        config_switch_writer_named_hex(
+            &writer, "target_gpg_key_id",
+            model->target.gpg_key_id) != 0 ||
+        config_switch_writer_printf(
+            &writer, "effective_scope=%s\n",
+            effective_scope) != 0 ||
+        config_switch_writer_printf(
+            &writer, "destination_count=%zu\n",
+            model->destination_count) != 0) {
+        secure_zero_memory(data, CONFIG_SWITCH_GUARD_MAX_BYTES);
+        free(data);
+        return -1;
+    }
+    for (size_t i = 0U; i < model->destination_count; i++) {
+        const publication_record_t *destination =
+            &model->destinations[i];
+        const char *destination_scope =
+            config_switch_publication_scope_name(destination->scope);
+        char field[64];
+
+        if (!destination_scope ||
+            (size_t)snprintf(
+                field, sizeof(field), "destination_%zu_scope", i) >=
+                sizeof(field) ||
+            config_switch_writer_printf(
+                &writer, "%s=%s\n", field,
+                destination_scope) != 0 ||
+            (size_t)snprintf(
+                field, sizeof(field),
+                "destination_%zu_config_path", i) >= sizeof(field) ||
+            config_switch_writer_named_hex(
+                &writer, field, destination->config_path) != 0 ||
+            (size_t)snprintf(
+                field, sizeof(field),
+                "destination_%zu_config_parent", i) >= sizeof(field) ||
+            config_switch_writer_named_identity(
+                &writer, field, &destination->config_parent) != 0 ||
+            (size_t)snprintf(
+                field, sizeof(field),
+                "destination_%zu_repository_path", i) >= sizeof(field) ||
+            config_switch_writer_named_hex(
+                &writer, field, destination->repository_path) != 0 ||
+            (size_t)snprintf(
+                field, sizeof(field),
+                "destination_%zu_repository", i) >= sizeof(field) ||
+            config_switch_writer_named_identity(
+                &writer, field, &destination->repository) != 0) {
+            secure_zero_memory(data, CONFIG_SWITCH_GUARD_MAX_BYTES);
+            free(data);
+            return -1;
+        }
+    }
+    *serialized = data;
+    *serialized_length = writer.length;
+    return 0;
+}
+
+static int config_switch_guard_malformed(const char *detail) {
+    errno = EINVAL;
+    set_error(ERR_CONFIG_INVALID,
+              "Switch-incomplete marker is malformed%s%s",
+              detail && detail[0] ? ": " : "",
+              detail && detail[0] ? detail : "");
+    return -1;
+}
+
+static int config_switch_read_field(
+    const unsigned char **cursor, const unsigned char *end,
+    const char *name, const unsigned char **value,
+    size_t *value_length) {
+    const unsigned char *line;
+    size_t line_length;
+    size_t name_length;
+
+    if (!cursor || !*cursor || !end || !name || !value ||
+        !value_length ||
+        !config_retirement_next_line(
+            cursor, end, &line, &line_length)) {
+        return config_switch_guard_malformed(
+            "missing canonical field");
+    }
+    name_length = strlen(name);
+    if (line_length <= name_length ||
+        memcmp(line, name, name_length) != 0 ||
+        line[name_length] != '=') {
+        return config_switch_guard_malformed(
+            "unexpected canonical field");
+    }
+    *value = line + name_length + 1U;
+    *value_length = line_length - name_length - 1U;
+    return 0;
+}
+
+static int config_switch_copy_token(
+    const unsigned char *value, size_t length, char *out,
+    size_t out_size) {
+    if (!value || !out || out_size == 0U || length >= out_size ||
+        memchr(value, '\0', length) != NULL) {
+        return config_switch_guard_malformed("invalid token");
+    }
+    memcpy(out, value, length);
+    out[length] = '\0';
+    return 0;
+}
+
+static int config_switch_parse_uintmax(
+    const unsigned char *value, size_t length, uintmax_t maximum,
+    uintmax_t *out) {
+    char token[64];
+    char canonical[64];
+    char *end = NULL;
+    uintmax_t parsed;
+    int written;
+
+    if (!out ||
+        config_switch_copy_token(
+            value, length, token, sizeof(token)) != 0 ||
+        token[0] == '\0') {
+        return config_switch_guard_malformed("invalid unsigned integer");
+    }
+    errno = 0;
+    parsed = strtoumax(token, &end, 10);
+    if (errno != 0 || end == token || *end != '\0' ||
+        parsed > maximum) {
+        return config_switch_guard_malformed("invalid unsigned integer");
+    }
+    written = snprintf(
+        canonical, sizeof(canonical), "%" PRIuMAX, parsed);
+    if (written < 0 || (size_t)written != length ||
+        memcmp(canonical, value, length) != 0) {
+        return config_switch_guard_malformed(
+            "noncanonical unsigned integer");
+    }
+    *out = parsed;
+    return 0;
+}
+
+static int config_switch_parse_int64(
+    const unsigned char *value, size_t length, int64_t *out) {
+    char token[64];
+    char canonical[64];
+    char *end = NULL;
+    intmax_t parsed;
+    int written;
+
+    if (!out ||
+        config_switch_copy_token(
+            value, length, token, sizeof(token)) != 0 ||
+        token[0] == '\0') {
+        return config_switch_guard_malformed("invalid signed integer");
+    }
+    errno = 0;
+    parsed = strtoimax(token, &end, 10);
+    if (errno != 0 || end == token || *end != '\0' ||
+        parsed < INT64_MIN || parsed > INT64_MAX) {
+        return config_switch_guard_malformed("invalid signed integer");
+    }
+    written = snprintf(
+        canonical, sizeof(canonical), "%" PRId64, (int64_t)parsed);
+    if (written < 0 || (size_t)written != length ||
+        memcmp(canonical, value, length) != 0) {
+        return config_switch_guard_malformed(
+            "noncanonical signed integer");
+    }
+    *out = (int64_t)parsed;
+    return 0;
+}
+
+static int config_switch_parse_identity(
+    const unsigned char *value, size_t length,
+    publication_identity_t *identity) {
+    const unsigned char *fields[11];
+    size_t field_lengths[11];
+    const unsigned char *cursor;
+    const unsigned char *end;
+    uintmax_t device;
+    uintmax_t inode;
+    uintmax_t mode;
+    uintmax_t uid;
+    uintmax_t gid;
+    uintmax_t link_count;
+    uintmax_t size;
+    uintmax_t mtime_nanoseconds;
+    uintmax_t ctime_nanoseconds;
+    int64_t mtime_seconds;
+    int64_t ctime_seconds;
+
+    if (!value || !identity) {
+        return config_switch_guard_malformed("invalid identity");
+    }
+    memset(identity, 0, sizeof(*identity));
+    if (length == 1U && value[0] == '-') return 0;
+    cursor = value;
+    end = value + length;
+    for (size_t i = 0U; i < 11U; i++) {
+        const unsigned char *separator =
+            memchr(cursor, ':', (size_t)(end - cursor));
+
+        if (i < 10U) {
+            if (!separator || separator == cursor) {
+                return config_switch_guard_malformed(
+                    "invalid identity field count");
+            }
+            fields[i] = cursor;
+            field_lengths[i] = (size_t)(separator - cursor);
+            cursor = separator + 1U;
+        } else {
+            if (separator || cursor == end) {
+                return config_switch_guard_malformed(
+                    "invalid identity field count");
+            }
+            fields[i] = cursor;
+            field_lengths[i] = (size_t)(end - cursor);
+        }
+    }
+    if (config_switch_parse_uintmax(
+            fields[0], field_lengths[0], UINTMAX_MAX, &device) != 0 ||
+        config_switch_parse_uintmax(
+            fields[1], field_lengths[1], UINTMAX_MAX, &inode) != 0 ||
+        config_switch_parse_uintmax(
+            fields[2], field_lengths[2], UINTMAX_MAX, &mode) != 0 ||
+        config_switch_parse_uintmax(
+            fields[3], field_lengths[3], UINTMAX_MAX, &uid) != 0 ||
+        config_switch_parse_uintmax(
+            fields[4], field_lengths[4], UINTMAX_MAX, &gid) != 0 ||
+        config_switch_parse_uintmax(
+            fields[5], field_lengths[5], UINTMAX_MAX,
+            &link_count) != 0 ||
+        config_switch_parse_uintmax(
+            fields[6], field_lengths[6], UINTMAX_MAX, &size) != 0 ||
+        config_switch_parse_int64(
+            fields[7], field_lengths[7], &mtime_seconds) != 0 ||
+        config_switch_parse_uintmax(
+            fields[8], field_lengths[8], UINTMAX_C(999999999),
+            &mtime_nanoseconds) != 0 ||
+        config_switch_parse_int64(
+            fields[9], field_lengths[9], &ctime_seconds) != 0 ||
+        config_switch_parse_uintmax(
+            fields[10], field_lengths[10], UINTMAX_C(999999999),
+            &ctime_nanoseconds) != 0) {
+        return -1;
+    }
+    identity->present = true;
+    identity->device = device;
+    identity->inode = inode;
+    identity->mode = mode;
+    identity->uid = uid;
+    identity->gid = gid;
+    identity->link_count = link_count;
+    identity->size = size;
+    identity->mtime_seconds = mtime_seconds;
+    identity->mtime_nanoseconds = (uint32_t)mtime_nanoseconds;
+    identity->ctime_seconds = ctime_seconds;
+    identity->ctime_nanoseconds = (uint32_t)ctime_nanoseconds;
+    return 0;
+}
+
+static int config_switch_decode_hex(
+    const unsigned char *value, size_t length, char *out,
+    size_t out_size) {
+    size_t decoded;
+
+    if (!out || out_size == 0U) {
+        return config_switch_guard_malformed("invalid hex output");
+    }
+    out[0] = '\0';
+    if (length == 1U && value[0] == '-') return 0;
+    if (!value || length == 0U || (length & 1U) != 0U) {
+        return config_switch_guard_malformed("invalid hex length");
+    }
+    decoded = length / 2U;
+    if (decoded >= out_size) {
+        return config_switch_guard_malformed(
+            "hex field exceeds its bound");
+    }
+    for (size_t i = 0U; i < decoded; i++) {
+        unsigned char high = value[i * 2U];
+        unsigned char low = value[i * 2U + 1U];
+        unsigned int hi;
+        unsigned int lo;
+
+        if (high >= '0' && high <= '9') {
+            hi = (unsigned int)(high - '0');
+        } else if (high >= 'A' && high <= 'F') {
+            hi = (unsigned int)(high - 'A') + 10U;
+        } else {
+            return config_switch_guard_malformed(
+                "hex field is not uppercase");
+        }
+        if (low >= '0' && low <= '9') {
+            lo = (unsigned int)(low - '0');
+        } else if (low >= 'A' && low <= 'F') {
+            lo = (unsigned int)(low - 'A') + 10U;
+        } else {
+            return config_switch_guard_malformed(
+                "hex field is not uppercase");
+        }
+        out[i] = (char)((hi << 4U) | lo);
+        if (out[i] == '\0') {
+            secure_zero_memory(out, out_size);
+            return config_switch_guard_malformed(
+                "hex field contains NUL");
+        }
+    }
+    out[decoded] = '\0';
+    return 0;
+}
+
+static int config_switch_parse_scope(
+    const unsigned char *value, size_t length, git_scope_t *scope) {
+    if (!scope) return config_switch_guard_malformed("missing Git scope");
+    if (config_retirement_line_equals(value, length, "local")) {
+        *scope = GIT_SCOPE_LOCAL;
+        return 0;
+    }
+    if (config_retirement_line_equals(value, length, "global")) {
+        *scope = GIT_SCOPE_GLOBAL;
+        return 0;
+    }
+    return config_switch_guard_malformed("unsupported Git scope");
+}
+
+static int config_switch_parse_publication_scope(
+    const unsigned char *value, size_t length,
+    publication_scope_t *scope) {
+    if (!scope) {
+        return config_switch_guard_malformed(
+            "missing destination scope");
+    }
+    if (config_retirement_line_equals(value, length, "local")) {
+        *scope = PUBLICATION_SCOPE_LOCAL;
+        return 0;
+    }
+    if (config_retirement_line_equals(value, length, "global")) {
+        *scope = PUBLICATION_SCOPE_GLOBAL;
+        return 0;
+    }
+    if (config_retirement_line_equals(value, length, "worktree")) {
+        *scope = PUBLICATION_SCOPE_WORKTREE;
+        return 0;
+    }
+    return config_switch_guard_malformed(
+        "unsupported destination scope");
+}
+
+static int config_switch_parse_bool(
+    const unsigned char *value, size_t length, bool *parsed) {
+    if (!parsed || length != 1U ||
+        (value[0] != '0' && value[0] != '1')) {
+        return config_switch_guard_malformed("invalid boolean");
+    }
+    *parsed = value[0] == '1';
+    return 0;
+}
+
+static int config_switch_guard_parse(
+    const unsigned char *data, size_t length,
+    config_switch_guard_model_t *model) {
+    const unsigned char *cursor = data;
+    const unsigned char *end;
+    const unsigned char *line;
+    const unsigned char *value;
+    size_t line_length;
+    size_t value_length;
+    uintmax_t account_id;
+    uintmax_t destination_count;
+    unsigned char *canonical = NULL;
+    size_t canonical_length = 0U;
+
+    if (!data || length == 0U ||
+        length > CONFIG_SWITCH_GUARD_MAX_BYTES || !model) {
+        return config_switch_guard_malformed("invalid marker size");
+    }
+    memset(model, 0, sizeof(*model));
+    end = data + length;
+    if (!config_retirement_next_line(
+            &cursor, end, &line, &line_length) ||
+        !config_retirement_line_equals(
+            line, line_length, CONFIG_SWITCH_GUARD_HEADER) ||
+        config_switch_read_field(
+            &cursor, end, "token", &value, &value_length) != 0 ||
+        config_switch_copy_token(
+            value, value_length, model->token,
+            sizeof(model->token)) != 0 ||
+        !account_incarnation_is_valid(model->token) ||
+        config_switch_read_field(
+            &cursor, end, "source_generation",
+            &value, &value_length) != 0 ||
+        config_switch_parse_identity(
+            value, value_length, &model->source_generation) != 0 ||
+        config_switch_read_field(
+            &cursor, end, "target_id", &value, &value_length) != 0 ||
+        config_switch_parse_uintmax(
+            value, value_length, UINT32_MAX, &account_id) != 0 ||
+        account_id == 0U ||
+        config_switch_read_field(
+            &cursor, end, "target_incarnation",
+            &value, &value_length) != 0 ||
+        config_switch_copy_token(
+            value, value_length, model->target.incarnation,
+            sizeof(model->target.incarnation)) != 0 ||
+        !account_incarnation_is_valid(model->target.incarnation) ||
+        config_switch_read_field(
+            &cursor, end, "target_name",
+            &value, &value_length) != 0 ||
+        config_switch_decode_hex(
+            value, value_length, model->target.name,
+            sizeof(model->target.name)) != 0 ||
+        config_switch_read_field(
+            &cursor, end, "target_email",
+            &value, &value_length) != 0 ||
+        config_switch_decode_hex(
+            value, value_length, model->target.email,
+            sizeof(model->target.email)) != 0 ||
+        config_switch_read_field(
+            &cursor, end, "target_preferred_scope",
+            &value, &value_length) != 0 ||
+        config_switch_parse_scope(
+            value, value_length,
+            &model->target.preferred_scope) != 0 ||
+        config_switch_read_field(
+            &cursor, end, "target_ssh_enabled",
+            &value, &value_length) != 0 ||
+        config_switch_parse_bool(
+            value, value_length,
+            &model->target.ssh_enabled) != 0 ||
+        config_switch_read_field(
+            &cursor, end, "target_ssh_key_path",
+            &value, &value_length) != 0 ||
+        config_switch_decode_hex(
+            value, value_length, model->target.ssh_key_path,
+            sizeof(model->target.ssh_key_path)) != 0 ||
+        config_switch_read_field(
+            &cursor, end, "target_ssh_host_alias",
+            &value, &value_length) != 0 ||
+        config_switch_decode_hex(
+            value, value_length, model->target.ssh_host_alias,
+            sizeof(model->target.ssh_host_alias)) != 0 ||
+        config_switch_read_field(
+            &cursor, end, "target_ssh_hostname",
+            &value, &value_length) != 0 ||
+        config_switch_decode_hex(
+            value, value_length, model->target.ssh_hostname,
+            sizeof(model->target.ssh_hostname)) != 0 ||
+        config_switch_read_field(
+            &cursor, end, "target_gpg_enabled",
+            &value, &value_length) != 0 ||
+        config_switch_parse_bool(
+            value, value_length,
+            &model->target.gpg_enabled) != 0 ||
+        config_switch_read_field(
+            &cursor, end, "target_gpg_signing_enabled",
+            &value, &value_length) != 0 ||
+        config_switch_parse_bool(
+            value, value_length,
+            &model->target.gpg_signing_enabled) != 0 ||
+        config_switch_read_field(
+            &cursor, end, "target_gpg_key_id",
+            &value, &value_length) != 0 ||
+        config_switch_decode_hex(
+            value, value_length, model->target.gpg_key_id,
+            sizeof(model->target.gpg_key_id)) != 0 ||
+        config_switch_read_field(
+            &cursor, end, "effective_scope",
+            &value, &value_length) != 0 ||
+        config_switch_parse_scope(
+            value, value_length, &model->effective_scope) != 0 ||
+        config_switch_read_field(
+            &cursor, end, "destination_count",
+            &value, &value_length) != 0 ||
+        config_switch_parse_uintmax(
+            value, value_length, CONFIG_SWITCH_DESTINATION_MAX,
+            &destination_count) != 0 ||
+        destination_count == 0U) {
+        secure_zero_memory(model, sizeof(*model));
+        config_switch_guard_malformed(
+            "noncanonical or incomplete fields");
+        return -1;
+    }
+    model->destination_count = (size_t)destination_count;
+    for (size_t i = 0U; i < model->destination_count; i++) {
+        publication_record_t *destination = &model->destinations[i];
+        char field[64];
+
+        publication_record_init(destination);
+        if ((size_t)snprintf(
+                field, sizeof(field), "destination_%zu_scope", i) >=
+                sizeof(field) ||
+            config_switch_read_field(
+                &cursor, end, field, &value, &value_length) != 0 ||
+            config_switch_parse_publication_scope(
+                value, value_length, &destination->scope) != 0 ||
+            (size_t)snprintf(
+                field, sizeof(field),
+                "destination_%zu_config_path", i) >= sizeof(field) ||
+            config_switch_read_field(
+                &cursor, end, field, &value, &value_length) != 0 ||
+            config_switch_decode_hex(
+                value, value_length, destination->config_path,
+                sizeof(destination->config_path)) != 0 ||
+            (size_t)snprintf(
+                field, sizeof(field),
+                "destination_%zu_config_parent", i) >= sizeof(field) ||
+            config_switch_read_field(
+                &cursor, end, field, &value, &value_length) != 0 ||
+            config_switch_parse_identity(
+                value, value_length,
+                &destination->config_parent) != 0 ||
+            (size_t)snprintf(
+                field, sizeof(field),
+                "destination_%zu_repository_path", i) >= sizeof(field) ||
+            config_switch_read_field(
+                &cursor, end, field, &value, &value_length) != 0 ||
+            config_switch_decode_hex(
+                value, value_length, destination->repository_path,
+                sizeof(destination->repository_path)) != 0 ||
+            (size_t)snprintf(
+                field, sizeof(field),
+                "destination_%zu_repository", i) >= sizeof(field) ||
+            config_switch_read_field(
+                &cursor, end, field, &value, &value_length) != 0 ||
+            config_switch_parse_identity(
+                value, value_length,
+                &destination->repository) != 0) {
+            secure_zero_memory(model, sizeof(*model));
+            return config_switch_guard_malformed(
+                "noncanonical or incomplete destination fields");
+        }
+    }
+    if (cursor != end) {
+        secure_zero_memory(model, sizeof(*model));
+        return config_switch_guard_malformed(
+            "noncanonical or trailing fields");
+    }
+    model->target.id = (uint32_t)account_id;
+    model->target.incarnation_persisted = true;
+    if (!config_switch_guard_model_valid(model) ||
+        config_switch_guard_serialize(
+            model, &canonical, &canonical_length) != 0 ||
+        canonical_length != length ||
+        memcmp(canonical, data, length) != 0) {
+        if (canonical) {
+            secure_zero_memory(canonical, canonical_length);
+            free(canonical);
+        }
+        secure_zero_memory(model, sizeof(*model));
+        return config_switch_guard_malformed(
+            "noncanonical field value");
+    }
+    secure_zero_memory(canonical, canonical_length);
+    free(canonical);
+    return 0;
+}
+
+static int config_switch_guard_open_directory(
+    const char *config_path, bool allow_absent,
+    char directory[MAX_PATH_LEN], struct stat *directory_identity,
+    int *directory_fd) {
+    struct stat opened;
+    int fd;
+
+    if (!config_path || !directory || !directory_identity ||
+        !directory_fd) {
+        errno = EINVAL;
+        set_error(ERR_INVALID_ARGS,
+                  "Invalid switch guard directory arguments");
+        return -1;
+    }
+    *directory_fd = -1;
+    if (config_directory_for_path(
+            config_path, directory, MAX_PATH_LEN) != 0) {
+        return -1;
+    }
+    errno = 0;
+    if (lstat(directory, directory_identity) != 0) {
+        if (allow_absent && errno == ENOENT) return 1;
+        set_system_error(
+            ERR_FILE_IO,
+            "Cannot inspect switch guard directory: %s", directory);
+        return -1;
+    }
+    if (!config_metadata_dir_is_safe(directory_identity)) {
+        errno = EACCES;
+        set_error(
+            ERR_PERMISSION_DENIED,
+            "Switch guard directory is not private and self-owned: %s",
+            directory);
+        return -1;
+    }
+    fd = open(
+        directory, O_RDONLY | O_CLOEXEC | O_DIRECTORY | O_NOFOLLOW);
+    if (fd < 0 || fstat(fd, &opened) != 0 ||
+        !config_metadata_dir_is_safe(&opened) ||
+        !config_metadata_same_file(directory_identity, &opened) ||
+        !config_named_directory_matches(
+            directory, directory_identity)) {
+        int saved_errno = errno ? errno : ESTALE;
+
+        if (fd >= 0) close(fd);
+        errno = saved_errno;
+        set_system_error(
+            ERR_FILE_IO,
+            "Cannot pin switch guard directory: %s", directory);
+        return -1;
+    }
+    *directory_fd = fd;
+    return 0;
+}
+
+static int config_switch_guard_config_name(
+    const char *config_path, const char **config_name) {
+    const char *slash;
+
+    if (!config_path || !config_path[0] || !config_name) {
+        errno = EINVAL;
+        return -1;
+    }
+    slash = strrchr(config_path, '/');
+    *config_name = slash ? slash + 1U : config_path;
+    if ((*config_name)[0] == '\0' || strchr(*config_name, '/')) {
+        errno = EINVAL;
+        set_error(ERR_INVALID_PATH,
+                  "Cannot derive the switch guard config filename");
+        return -1;
+    }
+    return 0;
+}
+
+static int config_switch_guard_source_matches_at(
+    int directory_fd, const char *config_name,
+    const publication_identity_t *expected) {
+    struct stat named_before;
+    struct stat opened;
+    struct stat descriptor_after;
+    struct stat named_after;
+    struct stat named_final;
+    publication_identity_t observed;
+    int fd = -1;
+    int saved_errno = ESTALE;
+
+    if (directory_fd < 0 || !config_name || !expected ||
+        !expected->present) {
+        errno = EINVAL;
+        return -1;
+    }
+    if (fstatat(
+            directory_fd, config_name, &named_before,
+            AT_SYMLINK_NOFOLLOW) != 0) {
+        saved_errno = config_is_namespace_change_errno(errno)
+                          ? ESTALE
+                          : (errno ? errno : EIO);
+        goto source_fail;
+    }
+    fd = openat(
+        directory_fd, config_name,
+        O_RDONLY | O_CLOEXEC | O_NOFOLLOW | O_NONBLOCK);
+    if (fd < 0 || fstat(fd, &opened) != 0) {
+        saved_errno = config_is_namespace_change_errno(errno)
+                          ? ESTALE
+                          : (errno ? errno : EIO);
+        goto source_fail;
+    }
+    if (!config_metadata_file_is_safe(&named_before, true) ||
+        !config_metadata_file_is_safe(&opened, true) ||
+        !config_metadata_snapshot_same(&named_before, &opened) ||
+        fstat(fd, &descriptor_after) != 0 ||
+        fstatat(
+            directory_fd, config_name, &named_after,
+            AT_SYMLINK_NOFOLLOW) != 0 ||
+        !config_metadata_file_is_safe(&descriptor_after, true) ||
+        !config_metadata_file_is_safe(&named_after, true) ||
+        !config_metadata_snapshot_same(&opened, &descriptor_after) ||
+        !config_metadata_snapshot_same(&opened, &named_after)) {
+        saved_errno = errno ? errno : ESTALE;
+        goto source_fail;
+    }
+    if (close(fd) != 0) {
+        fd = -1;
+        saved_errno = errno ? errno : EIO;
+        goto source_fail;
+    }
+    fd = -1;
+    if (fstatat(
+            directory_fd, config_name, &named_final,
+            AT_SYMLINK_NOFOLLOW) != 0 ||
+        !config_metadata_file_is_safe(&named_final, true) ||
+        !config_metadata_snapshot_same(&named_after, &named_final)) {
+        saved_errno = errno ? errno : ESTALE;
+        goto source_fail;
+    }
+    publication_identity_from_stat(&observed, &named_final);
+    if (!publication_identity_equal(expected, &observed)) {
+        saved_errno = ESTALE;
+        goto source_fail;
+    }
+    return 0;
+
+source_fail:
+    if (fd >= 0) close(fd);
+    errno = saved_errno;
+    set_system_error(
+        ERR_FILE_IO,
+        "Switch recovery source generation is no longer current");
+    return -1;
+}
+
+static int config_switch_guard_stage_state_at(
+    int directory_fd, bool *present, struct stat *identity) {
+    struct stat named;
+
+    if (directory_fd < 0 || !present) {
+        errno = EINVAL;
+        return -1;
+    }
+    *present = true;
+    if (identity) memset(identity, 0, sizeof(*identity));
+    errno = 0;
+    if (fstatat(
+            directory_fd, CONFIG_SWITCH_STAGE_NAME, &named,
+            AT_SYMLINK_NOFOLLOW) != 0) {
+        if (errno == ENOENT) {
+            *present = false;
+            return 0;
+        }
+        return -1;
+    }
+    if (!config_metadata_file_is_safe(&named, true) ||
+        named.st_size < 0 ||
+        (uintmax_t)named.st_size >
+            CONFIG_SWITCH_GUARD_MAX_BYTES) {
+        errno = EACCES;
+        return -1;
+    }
+    if (identity) *identity = named;
+    return 0;
+}
+
+static int config_switch_guard_optional_stat_at(
+    int directory_fd, const char *name, bool *present,
+    struct stat *identity) {
+    if (directory_fd < 0 || !name || !present || !identity) {
+        errno = EINVAL;
+        return -1;
+    }
+    *present = true;
+    memset(identity, 0, sizeof(*identity));
+    errno = 0;
+    if (fstatat(
+            directory_fd, name, identity,
+            AT_SYMLINK_NOFOLLOW) != 0) {
+        if (errno == ENOENT) {
+            *present = false;
+            return 0;
+        }
+        return -1;
+    }
+    return 0;
+}
+
+static bool config_switch_guard_file_has_link_count(
+    const struct stat *identity, nlink_t link_count) {
+    return identity && S_ISREG(identity->st_mode) &&
+           identity->st_uid == getuid() &&
+           (identity->st_mode & 0777) == PERM_USER_RW &&
+           identity->st_nlink == link_count;
+}
+
+/* A fixed stage can exist only before accounts_switch_impl() is allowed to
+ * mutate Git/SSH/GPG. The portable no-replace fallback can also be interrupted
+ * between linkat(stage, marker) and unlinkat(stage), producing two names for
+ * the same private inode. Classify only stable, exact namespace shapes here;
+ * every unsafe, changing, or distinct-name pair remains fail-closed. */
+static int config_switch_guard_preintent_snapshot_at(
+    int directory_fd, config_switch_preintent_snapshot_t *snapshot) {
+    bool stage_before_present;
+    bool marker_before_present;
+    bool stage_after_present;
+    bool marker_after_present;
+    struct stat stage_before;
+    struct stat marker_before;
+    struct stat stage_after;
+    struct stat marker_after;
+
+    if (directory_fd < 0 || !snapshot) {
+        errno = EINVAL;
+        return -1;
+    }
+    memset(snapshot, 0, sizeof(*snapshot));
+    if (config_switch_guard_optional_stat_at(
+            directory_fd, CONFIG_SWITCH_STAGE_NAME,
+            &stage_before_present, &stage_before) != 0 ||
+        config_switch_guard_optional_stat_at(
+            directory_fd, CONFIG_SWITCH_GUARD_NAME,
+            &marker_before_present, &marker_before) != 0 ||
+        config_switch_guard_optional_stat_at(
+            directory_fd, CONFIG_SWITCH_STAGE_NAME,
+            &stage_after_present, &stage_after) != 0 ||
+        config_switch_guard_optional_stat_at(
+            directory_fd, CONFIG_SWITCH_GUARD_NAME,
+            &marker_after_present, &marker_after) != 0) {
+        goto preintent_fail;
+    }
+    if (stage_before_present != stage_after_present ||
+        marker_before_present != marker_after_present ||
+        (stage_before_present &&
+         !config_metadata_snapshot_same(
+             &stage_before, &stage_after)) ||
+        (marker_before_present &&
+         !config_metadata_snapshot_same(
+             &marker_before, &marker_after))) {
+        errno = ESTALE;
+        goto preintent_fail;
+    }
+    if (!stage_before_present) {
+        snapshot->kind = CONFIG_SWITCH_PREINTENT_NONE;
+        return 0;
+    }
+    if (!marker_before_present) {
+        if (!config_switch_guard_file_has_link_count(
+                &stage_before, (nlink_t)1)) {
+            errno = EACCES;
+            goto preintent_fail;
+        }
+        snapshot->kind =
+            CONFIG_SWITCH_PREINTENT_STAGE_ONLY;
+        snapshot->stage_identity = stage_before;
+        return 0;
+    }
+    if (!config_switch_guard_file_has_link_count(
+            &stage_before, (nlink_t)2) ||
+        !config_switch_guard_file_has_link_count(
+            &marker_before, (nlink_t)2) ||
+        !config_metadata_same_file(
+            &stage_before, &marker_before)) {
+        errno = EACCES;
+        goto preintent_fail;
+    }
+    snapshot->kind = CONFIG_SWITCH_PREINTENT_EXACT_PAIR;
+    snapshot->stage_identity = stage_before;
+    snapshot->marker_identity = marker_before;
+    return 0;
+
+preintent_fail:
+    if (errno == 0) errno = ESTALE;
+    set_system_error(
+        ERR_FILE_IO,
+        "Switch transition namespace is unsafe or changed");
+    return -1;
+}
+
+static int config_switch_guard_name_stable_at(
+    int directory_fd, const char *name, bool absent,
+    const struct stat *expected) {
+    struct stat named;
+
+    errno = 0;
+    if (fstatat(
+            directory_fd, name, &named,
+            AT_SYMLINK_NOFOLLOW) != 0) {
+        if (absent && errno == ENOENT) return 0;
+        errno = config_is_namespace_change_errno(errno)
+                    ? ESTALE
+                    : (errno ? errno : EIO);
+        return -1;
+    }
+    if (absent || !expected ||
+        !config_metadata_file_is_safe(&named, true) ||
+        !config_metadata_snapshot_same(expected, &named)) {
+        errno = ESTALE;
+        return -1;
+    }
+    return 0;
+}
+
+static int config_switch_guard_read_named_at(
+    int directory_fd, bool *absent, unsigned char **data,
+    size_t *length, struct stat *identity,
+    config_switch_guard_model_t *model) {
+    struct stat named_before;
+    struct stat opened;
+    struct stat descriptor_after;
+    struct stat named_after;
+    unsigned char *buffer = NULL;
+    unsigned char trailing;
+    ssize_t trailing_count;
+    int fd = -1;
+    int failure_errno = ESTALE;
+
+    if (directory_fd < 0 || !absent || !data || !length ||
+        !identity || !model) {
+        errno = EINVAL;
+        set_error(ERR_INVALID_ARGS,
+                  "Invalid switch guard read arguments");
+        return -1;
+    }
+    *absent = false;
+    *data = NULL;
+    *length = 0U;
+    memset(identity, 0, sizeof(*identity));
+    memset(model, 0, sizeof(*model));
+
+    errno = 0;
+    if (fstatat(
+            directory_fd, CONFIG_SWITCH_GUARD_NAME, &named_before,
+            AT_SYMLINK_NOFOLLOW) != 0) {
+        if (errno == ENOENT) {
+            *absent = true;
+            return 0;
+        }
+        failure_errno = errno ? errno : EIO;
+        goto read_fail;
+    }
+    if (!config_metadata_file_is_safe(&named_before, true) ||
+        named_before.st_size <= 0 ||
+        (uintmax_t)named_before.st_size >
+            CONFIG_SWITCH_GUARD_MAX_BYTES) {
+        failure_errno = EACCES;
+        goto read_fail;
+    }
+    fd = openat(
+        directory_fd, CONFIG_SWITCH_GUARD_NAME,
+        O_RDONLY | O_CLOEXEC | O_NOFOLLOW | O_NONBLOCK);
+    if (fd < 0 || fstat(fd, &opened) != 0) {
+        failure_errno = errno ? errno : EIO;
+        goto read_fail;
+    }
+    if (!config_metadata_file_is_safe(&opened, true) ||
+        !config_metadata_snapshot_same(&named_before, &opened) ||
+        opened.st_size <= 0 ||
+        (uintmax_t)opened.st_size >
+            CONFIG_SWITCH_GUARD_MAX_BYTES) {
+        failure_errno = ESTALE;
+        goto read_fail;
+    }
+    *length = (size_t)opened.st_size;
+    buffer = malloc(*length);
+    if (!buffer) {
+        failure_errno = ENOMEM;
+        set_error(ERR_MEMORY_ALLOCATION,
+                  "Cannot allocate switch guard read buffer");
+        goto read_fail_preserve_error;
+    }
+    if (!config_pread_full(fd, buffer, *length, 0)) {
+        failure_errno = errno ? errno : EIO;
+        goto read_fail;
+    }
+    do {
+        errno = 0;
+        trailing_count = pread(fd, &trailing, 1, (off_t)*length);
+    } while (trailing_count < 0 && errno == EINTR);
+    if (trailing_count != 0 ||
+        fstat(fd, &descriptor_after) != 0 ||
+        fstatat(
+            directory_fd, CONFIG_SWITCH_GUARD_NAME, &named_after,
+            AT_SYMLINK_NOFOLLOW) != 0) {
+        failure_errno = errno ? errno : ESTALE;
+        goto read_fail;
+    }
+    if (!config_metadata_file_is_safe(&descriptor_after, true) ||
+        !config_metadata_file_is_safe(&named_after, true) ||
+        !config_metadata_snapshot_same(&opened, &descriptor_after) ||
+        !config_metadata_snapshot_same(&opened, &named_after)) {
+        failure_errno = ESTALE;
+        goto read_fail;
+    }
+    if (config_switch_guard_parse(
+            buffer, *length, model) != 0) {
+        failure_errno = errno ? errno : EINVAL;
+        goto read_fail_preserve_error;
+    }
+    if (close(fd) != 0) {
+        fd = -1;
+        failure_errno = errno ? errno : EIO;
+        goto read_fail;
+    }
+    fd = -1;
+    *identity = named_after;
+    *data = buffer;
+    return 0;
+
+read_fail:
+    errno = failure_errno;
+    set_system_error(
+        ERR_FILE_IO,
+        "Cannot read a stable private switch-incomplete marker");
+read_fail_preserve_error:
+    if (fd >= 0) close(fd);
+    if (buffer) {
+        secure_zero_memory(buffer, *length);
+        free(buffer);
+    }
+    *data = NULL;
+    *length = 0U;
+    secure_zero_memory(model, sizeof(*model));
+    errno = failure_errno;
+    return -1;
+}
+
+static void config_switch_guard_snapshot_clear(
+    config_switch_guard_snapshot_t *snapshot) {
+    if (!snapshot) return;
+    if (snapshot->marker_data) {
+        secure_zero_memory(
+            snapshot->marker_data, snapshot->marker_length);
+        free(snapshot->marker_data);
+    }
+    secure_zero_memory(snapshot, sizeof(*snapshot));
+}
+
+static int config_switch_guard_snapshot_read_at(
+    int directory_fd, config_switch_guard_snapshot_t *snapshot) {
+    struct stat stage_after;
+    bool stage_after_present = false;
+
+    if (directory_fd < 0 || !snapshot) {
+        errno = EINVAL;
+        return -1;
+    }
+    memset(snapshot, 0, sizeof(*snapshot));
+    if (config_switch_guard_stage_state_at(
+            directory_fd, &snapshot->stage_present,
+            &snapshot->stage_identity) != 0 ||
+        config_switch_guard_read_named_at(
+            directory_fd, &snapshot->marker_absent,
+            &snapshot->marker_data, &snapshot->marker_length,
+            &snapshot->marker_identity,
+            &snapshot->marker_model) != 0 ||
+        config_switch_guard_name_stable_at(
+            directory_fd, CONFIG_SWITCH_GUARD_NAME,
+            snapshot->marker_absent,
+            &snapshot->marker_identity) != 0 ||
+        config_switch_guard_stage_state_at(
+            directory_fd, &stage_after_present,
+            &stage_after) != 0) {
+        goto snapshot_fail;
+    }
+    if (snapshot->stage_present != stage_after_present ||
+        (snapshot->stage_present &&
+         !config_metadata_snapshot_same(
+             &snapshot->stage_identity, &stage_after))) {
+        errno = ESTALE;
+        goto snapshot_fail;
+    }
+    return 0;
+
+snapshot_fail:
+    config_switch_guard_snapshot_clear(snapshot);
+    return -1;
+}
+
+static int config_switch_guard_reconcile_preintent_at(
+    int directory_fd, int lock_fd, const char *directory,
+    const struct stat *directory_identity) {
+    config_switch_preintent_snapshot_t before;
+    config_switch_preintent_snapshot_t after;
+    struct stat marker_after;
+    bool marker_after_present = false;
+    int failure_errno = ESTALE;
+
+    if (directory_fd < 0 || lock_fd < 0 || !directory ||
+        !directory_identity) {
+        errno = EINVAL;
+        return -1;
+    }
+    if (config_switch_guard_preintent_snapshot_at(
+            directory_fd, &before) != 0) {
+        return -1;
+    }
+    if (before.kind == CONFIG_SWITCH_PREINTENT_NONE) return 0;
+    if (verify_private_lock_file_at(
+            lock_fd, directory_fd,
+            CONFIG_SWITCH_LOCK_NAME) != 0 ||
+        !config_named_directory_matches(
+            directory, directory_identity)) {
+        if (errno == 0) errno = ESTALE;
+        set_system_error(
+            ERR_FILE_IO,
+            "Cannot prove switch pre-intent cleanup authority");
+        return -1;
+    }
+    if (unlinkat(
+            directory_fd, CONFIG_SWITCH_STAGE_NAME, 0) != 0) {
+        failure_errno = errno ? errno : EIO;
+        goto reconcile_fail;
+    }
+    if (fsync(directory_fd) != 0 ||
+        config_switch_guard_preintent_snapshot_at(
+            directory_fd, &after) != 0 ||
+        after.kind != CONFIG_SWITCH_PREINTENT_NONE ||
+        config_switch_guard_optional_stat_at(
+            directory_fd, CONFIG_SWITCH_GUARD_NAME,
+            &marker_after_present, &marker_after) != 0 ||
+        verify_private_lock_file_at(
+            lock_fd, directory_fd,
+            CONFIG_SWITCH_LOCK_NAME) != 0 ||
+        !config_named_directory_matches(
+            directory, directory_identity)) {
+        failure_errno = errno ? errno : ESTALE;
+        goto reconcile_fail;
+    }
+    if (before.kind == CONFIG_SWITCH_PREINTENT_STAGE_ONLY) {
+        if (marker_after_present) {
+            failure_errno = ESTALE;
+            goto reconcile_fail;
+        }
+    } else {
+        if (!marker_after_present ||
+            !config_switch_guard_file_has_link_count(
+                &marker_after, (nlink_t)1) ||
+            !config_metadata_same_file(
+                &before.marker_identity, &marker_after)) {
+            failure_errno = ESTALE;
+            goto reconcile_fail;
+        }
+    }
+    return 0;
+
+reconcile_fail:
+    errno = failure_errno;
+    set_system_error(
+        ERR_FILE_IO,
+        "Cannot reconcile the exact switch pre-intent namespace");
+    return -1;
+}
+
+static bool config_switch_destination_is_probe(
+    const publication_record_t *destination) {
+    return destination && destination->account_id == 0U &&
+           destination->account_incarnation[0] == '\0' &&
+           destination->capabilities == 0U &&
+           config_switch_identity_is_zero(
+               &destination->post_config) &&
+           destination->gpg_fingerprint[0] == '\0' &&
+           destination->gpg_selector[0] == '\0' &&
+           destination->gpg_program[0] == '\0' &&
+           config_switch_identity_is_zero(
+               &destination->gpg_program_identity) &&
+           !destination->gpg_signing_enabled &&
+           destination->ssh_command[0] == '\0' &&
+           destination->ssh_program[0] == '\0' &&
+           config_switch_identity_is_zero(
+               &destination->ssh_program_identity) &&
+           destination->state == PUBLICATION_STATE_PUBLISHED;
+}
+
+static bool config_switch_destinations_are_probes(
+    const publication_record_t *destinations, size_t destination_count) {
+    if (!destinations || destination_count == 0U ||
+        destination_count > CONFIG_SWITCH_DESTINATION_MAX) {
+        return false;
+    }
+    for (size_t i = 0U; i < destination_count; i++) {
+        if (!config_switch_destination_is_probe(&destinations[i])) {
+            return false;
+        }
+    }
+    return true;
+}
+
+static int config_switch_guard_model_from_request(
+    const gitswitch_ctx_t *ctx, const account_t *target,
+    git_scope_t effective_scope,
+    const publication_record_t *destinations,
+    size_t destination_count,
+    config_switch_guard_model_t *model) {
+    const account_t *loaded_target = NULL;
+    struct stat current_source;
+    size_t matches = 0U;
+
+    if (!ctx || !target || !destinations || !model ||
+        !ctx->config.source_generation_valid ||
+        !config_switch_string_terminated(
+            ctx->config.config_path,
+            sizeof(ctx->config.config_path)) ||
+        ctx->config.config_path[0] == '\0' ||
+        ctx->account_count > MAX_ACCOUNTS ||
+        !config_switch_string_terminated(
+            target->incarnation, sizeof(target->incarnation)) ||
+        !config_switch_string_terminated(target->name,
+                                         sizeof(target->name)) ||
+        !config_switch_string_terminated(target->email,
+                                         sizeof(target->email)) ||
+        !config_switch_string_terminated(target->ssh_key_path,
+                                         sizeof(target->ssh_key_path)) ||
+        !config_switch_string_terminated(
+            target->ssh_host_alias, sizeof(target->ssh_host_alias)) ||
+        !config_switch_string_terminated(
+            target->ssh_hostname, sizeof(target->ssh_hostname)) ||
+        !config_switch_string_terminated(target->gpg_key_id,
+                                         sizeof(target->gpg_key_id)) ||
+        !target->incarnation_persisted ||
+        !config_scope_is_persistable(effective_scope) ||
+        !config_switch_destinations_valid(
+            effective_scope, destinations, destination_count) ||
+        !config_switch_destinations_are_probes(
+            destinations, destination_count) ||
+        !config_metadata_file_is_safe(
+            &ctx->config.source_generation, true)) {
+        errno = EINVAL;
+        set_error(ERR_INVALID_ARGS,
+                  "Invalid switch guard installation request");
+        return -1;
+    }
+    /* Reuse the sole established ctime-only admission path: it re-proves every
+     * retained source byte before accepting that narrow metadata step and
+     * returns the exact generation observed by that proof. Do not perform a
+     * second path lookup here: a replacement in that gap could otherwise bind
+     * an unproved source generation to the already-loaded account model. */
+    if (config_require_loaded_source_generation(
+            ctx, ctx->config.config_path, &current_source) != 0) {
+        if (errno == 0) errno = ESTALE;
+        if (get_last_error()->message[0] == '\0') {
+            set_system_error(
+                ERR_FILE_IO,
+                "Cannot bind switch recovery to the loaded accounts source");
+        }
+        return -1;
+    }
+    for (size_t i = 0U; i < ctx->account_count; i++) {
+        if (config_switch_target_live_fields_equal(
+                &ctx->accounts[i], target)) {
+            loaded_target = &ctx->accounts[i];
+            matches++;
+        }
+    }
+    if (matches != 1U || !loaded_target ||
+        !loaded_target->incarnation_persisted) {
+        errno = ESTALE;
+        set_error(
+            ERR_CONFIG_INVALID,
+            "Switch guard target is not one exact persisted account incarnation in the loaded source");
+        return -1;
+    }
+
+    memset(model, 0, sizeof(*model));
+    publication_identity_from_stat(
+        &model->source_generation, &current_source);
+    model->target.id = loaded_target->id;
+    model->target.incarnation_persisted = true;
+    model->target.preferred_scope = loaded_target->preferred_scope;
+    model->target.ssh_enabled = loaded_target->ssh_enabled;
+    model->target.gpg_enabled = loaded_target->gpg_enabled;
+    model->target.gpg_signing_enabled =
+        loaded_target->gpg_signing_enabled;
+    if (safe_strncpy(
+            model->target.incarnation, loaded_target->incarnation,
+            sizeof(model->target.incarnation)) != 0 ||
+        safe_strncpy(
+            model->target.name, loaded_target->name,
+            sizeof(model->target.name)) != 0 ||
+        safe_strncpy(
+            model->target.email, loaded_target->email,
+            sizeof(model->target.email)) != 0 ||
+        safe_strncpy(
+            model->target.ssh_key_path,
+            loaded_target->ssh_key_path,
+            sizeof(model->target.ssh_key_path)) != 0 ||
+        safe_strncpy(
+            model->target.ssh_host_alias,
+            loaded_target->ssh_host_alias,
+            sizeof(model->target.ssh_host_alias)) != 0 ||
+        safe_strncpy(
+            model->target.ssh_hostname,
+            loaded_target->ssh_hostname,
+            sizeof(model->target.ssh_hostname)) != 0 ||
+        safe_strncpy(
+            model->target.gpg_key_id, loaded_target->gpg_key_id,
+            sizeof(model->target.gpg_key_id)) != 0) {
+        secure_zero_memory(model, sizeof(*model));
+        return -1;
+    }
+    model->effective_scope = effective_scope;
+    model->destination_count = destination_count;
+    for (size_t i = 0U; i < destination_count; i++) {
+        publication_record_t *stored = &model->destinations[i];
+        const publication_record_t *destination = &destinations[i];
+
+        publication_record_init(stored);
+        stored->scope = destination->scope;
+        stored->config_parent = destination->config_parent;
+        stored->repository = destination->repository;
+        if (safe_strncpy(
+                stored->config_path, destination->config_path,
+                sizeof(stored->config_path)) != 0 ||
+            safe_strncpy(
+                stored->repository_path,
+                destination->repository_path,
+                sizeof(stored->repository_path)) != 0) {
+            secure_zero_memory(model, sizeof(*model));
+            return -1;
+        }
+    }
+    return 0;
+}
+
+static bool config_switch_guard_matches_handle(
+    const config_switch_guard_t *guard,
+    const config_switch_guard_snapshot_t *snapshot) {
+    return guard && snapshot && !snapshot->stage_present &&
+           !snapshot->marker_absent &&
+           config_metadata_snapshot_same(
+               &guard->marker_identity,
+               &snapshot->marker_identity) &&
+           guard->marker_length == snapshot->marker_length &&
+           memcmp(
+               guard->marker_data, snapshot->marker_data,
+               guard->marker_length) == 0 &&
+           strcmp(
+               guard->token,
+               snapshot->marker_model.token) == 0;
+}
+
+static void config_switch_guard_free(config_switch_guard_t *guard) {
+    if (!guard) return;
+    if (g_switch_guard_owner_pid == getpid()) {
+        g_switch_guard_owner_pid = 0;
+    }
+    if (guard->lock_fd >= 0) {
+        unlock_private_file(guard->lock_fd);
+    }
+    if (guard->directory_fd >= 0) close(guard->directory_fd);
+    if (guard->marker_data) {
+        secure_zero_memory(
+            guard->marker_data, guard->marker_length);
+        free(guard->marker_data);
+    }
+    secure_zero_memory(guard, sizeof(*guard));
+    free(guard);
+}
+
+static int config_switch_guard_make_handle(
+    int directory_fd, int lock_fd, const char *directory,
+    const char *config_name,
+    const struct stat *directory_identity,
+    const struct stat *marker_identity,
+    unsigned char *marker_data, size_t marker_length,
+    const config_switch_guard_model_t *model,
+    const char token[ACCOUNT_INCARNATION_LEN], bool created,
+    config_switch_guard_t **out) {
+    config_switch_guard_t *guard;
+
+    if (directory_fd < 0 || lock_fd < 0 || !directory || !config_name ||
+        !directory_identity || !marker_identity || !marker_data ||
+        marker_length == 0U || !model ||
+        !account_incarnation_is_valid(token) ||
+        !out || *out) {
+        errno = EINVAL;
+        return -1;
+    }
+    guard = calloc(1U, sizeof(*guard));
+    if (!guard) {
+        set_error(ERR_MEMORY_ALLOCATION,
+                  "Cannot allocate switch guard handle");
+        return -1;
+    }
+    guard->directory_fd = -1;
+    guard->lock_fd = -1;
+    if (safe_strncpy(
+            guard->directory, directory,
+            sizeof(guard->directory)) != 0 ||
+        safe_strncpy(
+            guard->config_name, config_name,
+            sizeof(guard->config_name)) != 0) {
+        free(guard);
+        return -1;
+    }
+    guard->directory_fd = directory_fd;
+    guard->lock_fd = lock_fd;
+    guard->directory_identity = *directory_identity;
+    guard->marker_identity = *marker_identity;
+    guard->marker_data = marker_data;
+    guard->marker_length = marker_length;
+    guard->model = *model;
+    memcpy(guard->token, token, sizeof(guard->token));
+    guard->created = created;
+    g_switch_guard_owner_pid = getpid();
+    *out = guard;
+    return 0;
+}
+
+static int config_switch_guard_stage_write_at(
+    int directory_fd, const unsigned char *data, size_t length,
+    struct stat *stage_identity, bool *stage_created) {
+    struct stat opened;
+    struct stat after_write;
+    struct stat named;
+    size_t total = 0U;
+    int fd = -1;
+    int saved_errno;
+
+    if (directory_fd < 0 || !data || length == 0U ||
+        length > CONFIG_SWITCH_GUARD_MAX_BYTES || !stage_identity ||
+        !stage_created) {
+        errno = EINVAL;
+        return -1;
+    }
+    memset(stage_identity, 0, sizeof(*stage_identity));
+    *stage_created = false;
+    fd = openat(
+        directory_fd, CONFIG_SWITCH_STAGE_NAME,
+        O_WRONLY | O_CREAT | O_EXCL | O_CLOEXEC | O_NOFOLLOW,
+        PERM_USER_RW);
+    if (fd < 0) {
+        saved_errno = errno ? errno : EIO;
+        errno = saved_errno;
+        set_system_error(
+            ERR_FILE_IO,
+            "Cannot create private switch transition stage");
+        return -1;
+    }
+    if (fstat(fd, &opened) != 0) {
+        saved_errno = errno ? errno : EIO;
+        (void)unlinkat(
+            directory_fd, CONFIG_SWITCH_STAGE_NAME, 0);
+        (void)fsync(directory_fd);
+        close(fd);
+        errno = saved_errno;
+        set_system_error(
+            ERR_FILE_IO,
+            "Cannot identify private switch transition stage");
+        return -1;
+    }
+    *stage_identity = opened;
+    *stage_created = true;
+    if (fchmod(fd, PERM_USER_RW) != 0 ||
+        fstat(fd, &opened) != 0 ||
+        !config_metadata_file_is_safe(&opened, true)) {
+        saved_errno = errno ? errno : EIO;
+        close(fd);
+        errno = saved_errno;
+        set_system_error(
+            ERR_FILE_IO,
+            "Cannot create private switch transition stage");
+        return -1;
+    }
+    while (total < length) {
+        ssize_t count = write(fd, data + total, length - total);
+
+        if (count > 0) {
+            total += (size_t)count;
+        } else if (count < 0 && errno == EINTR) {
+            continue;
+        } else {
+            saved_errno = errno ? errno : EIO;
+            close(fd);
+            errno = saved_errno;
+            set_system_error(
+                ERR_FILE_IO,
+                "Cannot write switch transition stage");
+            return -1;
+        }
+    }
+    if (fsync(fd) != 0 || fstat(fd, &after_write) != 0 ||
+        !config_metadata_file_is_safe(&after_write, true) ||
+        after_write.st_size < 0 ||
+        (uintmax_t)after_write.st_size != length) {
+        saved_errno = errno ? errno : EIO;
+        close(fd);
+        errno = saved_errno;
+        set_system_error(
+            ERR_FILE_IO,
+            "Cannot synchronize switch transition stage");
+        return -1;
+    }
+    if (close(fd) != 0) {
+        saved_errno = errno ? errno : EIO;
+        errno = saved_errno;
+        set_system_error(
+            ERR_FILE_IO,
+            "Cannot close switch transition stage");
+        return -1;
+    }
+    if (fstatat(
+            directory_fd, CONFIG_SWITCH_STAGE_NAME, &named,
+            AT_SYMLINK_NOFOLLOW) != 0 ||
+        !config_metadata_file_is_safe(&named, true) ||
+        (!config_metadata_snapshot_same(&after_write, &named) &&
+         !config_metadata_ctime_only_change(
+             &after_write, &named))) {
+        errno = errno ? errno : ESTALE;
+        set_system_error(
+            ERR_FILE_IO,
+            "Switch transition stage changed before publication");
+        return -1;
+    }
+    *stage_identity = named;
+    return 0;
+}
+
+/* A switch stage is strictly pre-mutation: the caller cannot receive a live
+ * guard handle until the stage has been renamed to the canonical marker and
+ * durably re-proved. On an installation error, remove only the exact inode
+ * created by this call while its lifecycle lock and parent directory are
+ * still pinned. A successful rename may already have moved the inode to the
+ * canonical marker; in that case there is no uncallable stage to clean and
+ * the marker remains available for explicit recovery. */
+static int config_switch_guard_cleanup_owned_stage_at(
+    int directory_fd, int lock_fd, const char *directory,
+    const struct stat *directory_identity,
+    const struct stat *stage_identity, bool *stage_created) {
+    struct stat named;
+    int failure_errno = ESTALE;
+
+    if (directory_fd < 0 || lock_fd < 0 || !directory ||
+        !directory_identity || !stage_identity || !stage_created) {
+        errno = EINVAL;
+        return -1;
+    }
+    if (!*stage_created) return 0;
+    if (verify_private_lock_file_at(
+            lock_fd, directory_fd,
+            CONFIG_SWITCH_LOCK_NAME) != 0 ||
+        !config_named_directory_matches(
+            directory, directory_identity)) {
+        if (errno == 0) errno = ESTALE;
+        set_system_error(
+            ERR_FILE_IO,
+            "Cannot prove switch stage cleanup authority");
+        return -1;
+    }
+
+    errno = 0;
+    if (fstatat(
+            directory_fd, CONFIG_SWITCH_STAGE_NAME, &named,
+            AT_SYMLINK_NOFOLLOW) != 0) {
+        if (errno == ENOENT) {
+            *stage_created = false;
+            return 0;
+        }
+        failure_errno = errno ? errno : EIO;
+        goto cleanup_fail;
+    }
+    if (!config_metadata_file_is_safe(&named, true) ||
+        !config_metadata_same_file(stage_identity, &named)) {
+        failure_errno = ESTALE;
+        goto cleanup_fail;
+    }
+    if (unlinkat(
+            directory_fd, CONFIG_SWITCH_STAGE_NAME, 0) != 0) {
+        failure_errno = errno ? errno : EIO;
+        goto cleanup_fail;
+    }
+    *stage_created = false;
+    if (fsync(directory_fd) != 0 ||
+        config_switch_guard_name_stable_at(
+            directory_fd, CONFIG_SWITCH_STAGE_NAME,
+            true, NULL) != 0 ||
+        verify_private_lock_file_at(
+            lock_fd, directory_fd,
+            CONFIG_SWITCH_LOCK_NAME) != 0 ||
+        !config_named_directory_matches(
+            directory, directory_identity)) {
+        failure_errno = errno ? errno : ESTALE;
+        goto cleanup_fail;
+    }
+    return 0;
+
+cleanup_fail:
+    errno = failure_errno;
+    set_system_error(
+        ERR_FILE_IO,
+        "Cannot remove the exact fresh switch transition stage");
+    return -1;
+}
+
+static int config_switch_guard_publish_stage_at(
+    int directory_fd, const struct stat *stage_identity,
+    struct stat *published_identity) {
+    struct stat named;
+
+    if (directory_fd < 0 || !stage_identity ||
+        !published_identity) {
+        errno = EINVAL;
+        return -1;
+    }
+    if (config_publish_noreplace_at(
+            directory_fd, CONFIG_SWITCH_STAGE_NAME,
+            CONFIG_SWITCH_GUARD_NAME) != 0 ||
+        fstatat(
+            directory_fd, CONFIG_SWITCH_GUARD_NAME, &named,
+            AT_SYMLINK_NOFOLLOW) != 0 ||
+        !config_metadata_file_is_safe(&named, true) ||
+        !config_metadata_same_file(stage_identity, &named)) {
+        errno = errno ? errno : ESTALE;
+        return -1;
+    }
+    *published_identity = named;
+    return 0;
+}
+
+int config_switch_guard_install_or_adopt(
+    const gitswitch_ctx_t *ctx, const account_t *target,
+    git_scope_t effective_scope,
+    const publication_record_t *destinations,
+    size_t destination_count,
+    config_switch_guard_t **guard) {
+    static const char hexadecimal[] = "0123456789ABCDEF";
+    config_switch_guard_model_t *expected = NULL;
+    config_switch_guard_snapshot_t *snapshot = NULL;
+    config_switch_guard_snapshot_t *revalidated = NULL;
+    char directory[MAX_PATH_LEN];
+    const char *config_name = NULL;
+    struct stat directory_identity;
+    struct stat stage_identity;
+    struct stat published_identity;
+    unsigned char *expected_data = NULL;
+    size_t expected_length = 0U;
+    int directory_fd = -1;
+    int lock_fd = -1;
+    int result = -1;
+    int saved_errno = EIO;
+    bool stage_created = false;
+
+    if (!guard || *guard) {
+        errno = EINVAL;
+        set_error(ERR_INVALID_ARGS,
+                  "Invalid switch guard output handle");
+        return -1;
+    }
+    if (g_switch_guard_owner_pid != 0) {
+        errno = EBUSY;
+        set_error(
+            ERR_CONFIG_INVALID,
+            "This process already owns a switch recovery transaction");
+        return -1;
+    }
+    expected = calloc(1U, sizeof(*expected));
+    snapshot = calloc(1U, sizeof(*snapshot));
+    revalidated = calloc(1U, sizeof(*revalidated));
+    if (!expected || !snapshot || !revalidated) {
+        set_error(ERR_MEMORY_ALLOCATION,
+                  "Cannot allocate switch guard revalidation state");
+        goto install_done;
+    }
+    if (config_switch_guard_model_from_request(
+            ctx, target, effective_scope, destinations,
+            destination_count,
+            expected) != 0 ||
+        config_switch_guard_config_name(
+            ctx->config.config_path, &config_name) != 0) {
+        goto install_done;
+    }
+    result = config_switch_guard_open_directory(
+        ctx->config.config_path, false, directory,
+        &directory_identity, &directory_fd);
+    if (result != 0) goto install_done;
+    result = -1;
+    lock_fd = try_lock_private_file_at(
+        directory_fd, CONFIG_SWITCH_LOCK_NAME);
+    if (lock_fd < 0) {
+        set_system_error(
+            ERR_FILE_IO,
+            "Cannot acquire the switch lifecycle lock");
+        goto install_done;
+    }
+    if (verify_private_lock_file_at(
+            lock_fd, directory_fd,
+            CONFIG_SWITCH_LOCK_NAME) != 0 ||
+        config_switch_guard_reconcile_preintent_at(
+            directory_fd, lock_fd, directory,
+            &directory_identity) != 0 ||
+        config_switch_guard_source_matches_at(
+            directory_fd, config_name,
+            &expected->source_generation) != 0 ||
+        config_switch_destinations_live(
+            expected->destinations,
+            expected->destination_count) != 0 ||
+        config_switch_guard_snapshot_read_at(
+            directory_fd, snapshot) != 0 ||
+        !config_named_directory_matches(
+            directory, &directory_identity)) {
+        if (errno == 0) errno = ESTALE;
+        goto install_done;
+    }
+    if (snapshot->stage_present) {
+        errno = EBUSY;
+        set_error(
+            ERR_CONFIG_INVALID,
+            "A retained switch transition stage blocks recovery");
+        goto install_done;
+    }
+
+    if (!snapshot->marker_absent) {
+        if (!config_switch_same_destinations_authority(
+                snapshot->marker_model.destinations,
+                snapshot->marker_model.destination_count,
+                expected->destinations,
+                expected->destination_count)) {
+            errno = EBUSY;
+            set_error(
+                ERR_CONFIG_INVALID,
+                "Switch recovery destinations no longer name the recorded Git namespaces");
+            goto install_done;
+        }
+        /* The current probe proves stable destination authority. Preserve the
+         * pre-mutation directory witnesses stored in the marker so mutable
+         * directory timestamps cannot defeat canonical adoption equality. */
+        for (size_t i = 0U;
+             i < expected->destination_count; i++) {
+            expected->destinations[i].config_parent =
+                snapshot->marker_model.destinations[i].config_parent;
+            expected->destinations[i].repository =
+                snapshot->marker_model.destinations[i].repository;
+        }
+        memcpy(
+            expected->token, snapshot->marker_model.token,
+            sizeof(expected->token));
+        if (config_switch_guard_serialize(
+                expected, &expected_data,
+                &expected_length) != 0 ||
+            expected_length != snapshot->marker_length ||
+            memcmp(
+                expected_data, snapshot->marker_data,
+                expected_length) != 0) {
+            errno = EBUSY;
+            set_error(
+                ERR_CONFIG_INVALID,
+                "A different switch-incomplete operation already blocks configuration mutation");
+            goto install_done;
+        }
+        if (fsync(directory_fd) != 0 ||
+            config_switch_guard_snapshot_read_at(
+                directory_fd, revalidated) != 0 ||
+            revalidated->stage_present ||
+            revalidated->marker_absent ||
+            !config_metadata_snapshot_same(
+                &snapshot->marker_identity,
+                &revalidated->marker_identity) ||
+            revalidated->marker_length != expected_length ||
+            memcmp(
+                revalidated->marker_data, expected_data,
+                expected_length) != 0 ||
+            config_switch_guard_source_matches_at(
+                directory_fd, config_name,
+                &expected->source_generation) != 0 ||
+            config_switch_destinations_live(
+                expected->destinations,
+                expected->destination_count) != 0 ||
+            verify_private_lock_file_at(
+                lock_fd, directory_fd,
+                CONFIG_SWITCH_LOCK_NAME) != 0 ||
+            !config_named_directory_matches(
+                directory, &directory_identity)) {
+            if (errno == 0) errno = ESTALE;
+            set_system_error(
+                ERR_FILE_IO,
+                "Retained switch guard changed during adoption");
+            goto install_done;
+        }
+        if (config_switch_guard_make_handle(
+                directory_fd, lock_fd, directory, config_name,
+                &directory_identity,
+                &revalidated->marker_identity,
+                revalidated->marker_data,
+                revalidated->marker_length, expected,
+                expected->token, false,
+                guard) != 0) {
+            goto install_done;
+        }
+        revalidated->marker_data = NULL;
+        revalidated->marker_length = 0U;
+        directory_fd = -1;
+        lock_fd = -1;
+        result = 0;
+        goto install_done;
+    }
+
+    if (generate_random_string(
+            expected->token, sizeof(expected->token),
+            hexadecimal) != 0 ||
+        !account_incarnation_is_valid(expected->token) ||
+        config_switch_guard_serialize(
+            expected, &expected_data,
+            &expected_length) != 0 ||
+        config_switch_guard_stage_write_at(
+            directory_fd, expected_data, expected_length,
+            &stage_identity, &stage_created) != 0 ||
+        SWITCH_GUARD_TEST_CHECKPOINT(
+            SWITCH_GUARD_INSTALL_AFTER_STAGE_SYNC,
+            directory_fd) != 0 ||
+        config_switch_guard_source_matches_at(
+            directory_fd, config_name,
+            &expected->source_generation) != 0 ||
+        config_switch_destinations_live(
+            expected->destinations,
+            expected->destination_count) != 0 ||
+        verify_private_lock_file_at(
+            lock_fd, directory_fd,
+            CONFIG_SWITCH_LOCK_NAME) != 0 ||
+        !config_named_directory_matches(
+            directory, &directory_identity)) {
+        if (errno == 0) errno = ESTALE;
+        goto install_done;
+    }
+    if (config_switch_guard_publish_stage_at(
+            directory_fd, &stage_identity,
+            &published_identity) != 0) {
+        set_system_error(
+            ERR_FILE_IO,
+            "Cannot publish the fresh switch guard generation");
+        goto install_done;
+    }
+    stage_created = false;
+    if (fsync(directory_fd) != 0 ||
+        config_reprove_published_file_at(
+            directory_fd, CONFIG_SWITCH_GUARD_NAME,
+            &published_identity, expected_data, expected_length,
+            &published_identity) != 0 ||
+        config_switch_guard_snapshot_read_at(
+            directory_fd, revalidated) != 0 ||
+        revalidated->stage_present ||
+        revalidated->marker_absent ||
+        revalidated->marker_length != expected_length ||
+        memcmp(
+            revalidated->marker_data, expected_data,
+            expected_length) != 0 ||
+        config_switch_guard_source_matches_at(
+            directory_fd, config_name,
+            &expected->source_generation) != 0 ||
+        config_switch_destinations_live(
+            expected->destinations,
+            expected->destination_count) != 0 ||
+        verify_private_lock_file_at(
+            lock_fd, directory_fd,
+            CONFIG_SWITCH_LOCK_NAME) != 0 ||
+        !config_named_directory_matches(
+            directory, &directory_identity)) {
+        if (errno == 0) errno = ESTALE;
+        set_system_error(
+            ERR_FILE_IO,
+            "Fresh switch guard is not one durable stable generation");
+        goto install_done;
+    }
+    if (config_switch_guard_make_handle(
+            directory_fd, lock_fd, directory, config_name,
+            &directory_identity, &revalidated->marker_identity,
+            revalidated->marker_data, revalidated->marker_length,
+            expected, expected->token, true, guard) != 0) {
+        goto install_done;
+    }
+    revalidated->marker_data = NULL;
+    revalidated->marker_length = 0U;
+    directory_fd = -1;
+    lock_fd = -1;
+    result = 0;
+
+install_done:
+    if (result != 0) {
+        error_accumulator_t failures;
+        error_context_t primary_error = *get_last_error();
+
+        saved_errno = errno ? errno : EIO;
+        if (primary_error.code == ERR_SUCCESS) {
+            errno = saved_errno;
+            set_system_error(
+                ERR_FILE_IO,
+                "Switch recovery guard installation failed");
+            primary_error = *get_last_error();
+            saved_errno = errno ? errno : saved_errno;
+        }
+        error_accumulator_init(&failures);
+        errno = saved_errno;
+        (void)error_accumulator_add(
+            &failures, "switch guard installation",
+            &primary_error);
+        if (stage_created && directory_fd >= 0 && lock_fd >= 0 &&
+            config_switch_guard_cleanup_owned_stage_at(
+                directory_fd, lock_fd, directory,
+                &directory_identity, &stage_identity,
+                &stage_created) != 0) {
+            (void)error_accumulator_add_last(
+                &failures, "switch stage cleanup");
+        }
+        (void)error_accumulator_publish(&failures);
+        saved_errno = errno ? errno : saved_errno;
+    }
+    if (lock_fd >= 0) unlock_private_file(lock_fd);
+    if (directory_fd >= 0) close(directory_fd);
+    if (snapshot) {
+        config_switch_guard_snapshot_clear(snapshot);
+        free(snapshot);
+    }
+    if (revalidated) {
+        config_switch_guard_snapshot_clear(revalidated);
+        free(revalidated);
+    }
+    if (expected_data) {
+        secure_zero_memory(expected_data, expected_length);
+        free(expected_data);
+    }
+    if (expected) {
+        secure_zero_memory(expected, sizeof(*expected));
+        free(expected);
+    }
+    if (result != 0) {
+        errno = saved_errno;
+    }
+    return result;
+}
+
+bool config_switch_guard_was_created(
+    const config_switch_guard_t *guard) {
+    return guard && guard->created;
+}
+
+int config_switch_guard_reconcile_preintent(
+    const char *config_path) {
+    config_switch_preintent_snapshot_t snapshot;
+    char directory[MAX_PATH_LEN];
+    struct stat directory_identity;
+    int directory_fd = -1;
+    int lock_fd = -1;
+    int result;
+    int saved_errno = EIO;
+
+    if (!config_path || config_path[0] == '\0') {
+        errno = EINVAL;
+        set_error(
+            ERR_INVALID_ARGS,
+            "Invalid switch pre-intent reconciliation path");
+        return -1;
+    }
+    if (g_switch_guard_owner_pid != 0) {
+        errno = EBUSY;
+        set_error(
+            ERR_CONFIG_INVALID,
+            "This process already owns a switch recovery transaction");
+        return -1;
+    }
+    result = config_switch_guard_open_directory(
+        config_path, true, directory, &directory_identity,
+        &directory_fd);
+    if (result == 1) return 0;
+    if (result != 0) return -1;
+    result = -1;
+    if (config_switch_guard_preintent_snapshot_at(
+            directory_fd, &snapshot) != 0) {
+        goto reconcile_done;
+    }
+    if (snapshot.kind == CONFIG_SWITCH_PREINTENT_NONE) {
+        close(directory_fd);
+        return 0;
+    }
+    lock_fd = try_lock_private_file_at(
+        directory_fd, CONFIG_SWITCH_LOCK_NAME);
+    if (lock_fd < 0) {
+        set_system_error(
+            ERR_FILE_IO,
+            "Cannot acquire the switch lifecycle lock for pre-intent reconciliation");
+        goto reconcile_done;
+    }
+    if (config_switch_guard_reconcile_preintent_at(
+            directory_fd, lock_fd, directory,
+            &directory_identity) != 0) {
+        goto reconcile_done;
+    }
+    result = 0;
+
+reconcile_done:
+    if (result != 0) saved_errno = errno ? errno : EIO;
+    if (lock_fd >= 0) unlock_private_file(lock_fd);
+    close(directory_fd);
+    if (result != 0) errno = saved_errno;
+    return result;
+}
+
+int config_switch_guard_probe(
+    const char *config_path, bool *blocked,
+    config_switch_guard_recovery_t *recovery) {
+    config_switch_guard_snapshot_t snapshot;
+    config_switch_preintent_snapshot_t preintent;
+    char directory[MAX_PATH_LEN];
+    const char *config_name = NULL;
+    struct stat directory_identity;
+    int directory_fd = -1;
+    int result;
+
+    if (!config_path || !blocked || !recovery) {
+        errno = EINVAL;
+        set_error(ERR_INVALID_ARGS,
+                  "Invalid switch guard probe arguments");
+        return -1;
+    }
+    *blocked = true;
+    memset(recovery, 0, sizeof(*recovery));
+    memset(&snapshot, 0, sizeof(snapshot));
+    if (config_switch_guard_config_name(
+            config_path, &config_name) != 0) {
+        return -1;
+    }
+    result = config_switch_guard_open_directory(
+        config_path, true, directory, &directory_identity,
+        &directory_fd);
+    if (result == 1) {
+        *blocked = false;
+        return 0;
+    }
+    if (result != 0) return -1;
+    if (config_switch_guard_preintent_snapshot_at(
+            directory_fd, &preintent) != 0) {
+        result = -1;
+        goto probe_done;
+    }
+    if (preintent.kind != CONFIG_SWITCH_PREINTENT_NONE) {
+        /* A recognized stage-only or exact portable hard-link pair exists
+         * strictly before live mutation. Let a real mutating entry acquire
+         * `.config.lock`, reconcile it under `.switch.lock`, and probe again.
+         * The stage itself never authorizes resume. */
+        *blocked = false;
+        result = 0;
+        goto probe_done;
+    }
+    if (config_switch_guard_snapshot_read_at(
+            directory_fd, &snapshot) != 0 ||
+        !config_named_directory_matches(
+            directory, &directory_identity)) {
+        if (errno == 0) errno = ESTALE;
+        result = -1;
+        goto probe_done;
+    }
+    if (snapshot.stage_present) {
+        result = 0;
+        goto probe_done;
+    }
+    if (snapshot.marker_absent) {
+        *blocked = false;
+        result = 0;
+        goto probe_done;
+    }
+    if (config_switch_guard_source_matches_at(
+            directory_fd, config_name,
+            &snapshot.marker_model.source_generation) != 0 ||
+        config_switch_destinations_live(
+            snapshot.marker_model.destinations,
+            snapshot.marker_model.destination_count) != 0 ||
+        config_switch_guard_name_stable_at(
+            directory_fd, CONFIG_SWITCH_GUARD_NAME, false,
+            &snapshot.marker_identity) != 0 ||
+        !config_named_directory_matches(
+            directory, &directory_identity)) {
+        if (errno == 0) errno = ESTALE;
+        result = -1;
+        goto probe_done;
+    }
+    recovery->source_generation =
+        snapshot.marker_model.source_generation;
+    recovery->target = snapshot.marker_model.target;
+    recovery->effective_scope =
+        snapshot.marker_model.effective_scope;
+    recovery->destination_count =
+        snapshot.marker_model.destination_count;
+    memcpy(
+        recovery->destinations,
+        snapshot.marker_model.destinations,
+        sizeof(recovery->destinations));
+    recovery->valid = true;
+    result = 0;
+
+probe_done:
+    config_switch_guard_snapshot_clear(&snapshot);
+    close(directory_fd);
+    return result;
+}
+
+int config_switch_guard_clear(config_switch_guard_t **guard_ptr) {
+    config_switch_guard_t *guard;
+    config_switch_guard_snapshot_t *snapshot = NULL;
+    config_switch_guard_snapshot_t *after = NULL;
+    int saved_errno;
+
+    if (!guard_ptr || !*guard_ptr) {
+        errno = EINVAL;
+        set_error(ERR_INVALID_ARGS,
+                  "Invalid switch guard clear handle");
+        return -1;
+    }
+    guard = *guard_ptr;
+    clear_error();
+    errno = 0;
+    snapshot = calloc(1U, sizeof(*snapshot));
+    after = calloc(1U, sizeof(*after));
+    if (!snapshot || !after) {
+        free(snapshot);
+        free(after);
+        set_error(
+            ERR_MEMORY_ALLOCATION,
+            "Cannot allocate switch guard clear verification state");
+        return -1;
+    }
+    if (g_switch_guard_owner_pid != getpid() ||
+        !config_named_directory_matches(
+            guard->directory, &guard->directory_identity) ||
+        verify_private_lock_file_at(
+            guard->lock_fd, guard->directory_fd,
+            CONFIG_SWITCH_LOCK_NAME) != 0 ||
+        config_switch_guard_snapshot_read_at(
+            guard->directory_fd, snapshot) != 0 ||
+        config_switch_guard_source_matches_at(
+            guard->directory_fd, guard->config_name,
+            &guard->model.source_generation) != 0 ||
+        config_switch_destinations_live(
+            guard->model.destinations,
+            guard->model.destination_count) != 0 ||
+        (guard->marker_unlinked
+             ? (snapshot->stage_present ||
+                !snapshot->marker_absent)
+             : !config_switch_guard_matches_handle(
+                   guard, snapshot))) {
+        if (errno == 0) errno = ESTALE;
+        set_system_error(
+            ERR_FILE_IO,
+            "Switch guard generation changed before clear");
+        goto clear_fail;
+    }
+    if (!guard->marker_unlinked) {
+        if (unlinkat(
+                guard->directory_fd,
+                CONFIG_SWITCH_GUARD_NAME, 0) != 0) {
+            set_system_error(
+                ERR_FILE_IO,
+                "Cannot remove the owned switch guard generation");
+            goto clear_fail;
+        }
+        /* From here onward the callable handle represents a pending
+         * durability proof for an already-unlinked exact marker. A failed
+         * directory sync must be retryable without requiring the absent name
+         * to match its old inode again. */
+        guard->marker_unlinked = true;
+    }
+    if (SWITCH_GUARD_TEST_CHECKPOINT(
+            SWITCH_GUARD_CLEAR_AFTER_UNLINK,
+            guard->directory_fd) != 0 ||
+        fsync(guard->directory_fd) != 0) {
+        saved_errno = errno ? errno : EIO;
+        errno = saved_errno;
+        set_system_error(
+            ERR_FILE_IO,
+            "Cannot synchronize switch guard removal");
+        goto clear_fail;
+    }
+    if (config_switch_guard_snapshot_read_at(
+            guard->directory_fd, after) != 0 ||
+        after->stage_present || !after->marker_absent ||
+        verify_private_lock_file_at(
+            guard->lock_fd, guard->directory_fd,
+            CONFIG_SWITCH_LOCK_NAME) != 0 ||
+        !config_named_directory_matches(
+            guard->directory, &guard->directory_identity)) {
+        if (errno == 0) errno = ESTALE;
+        set_system_error(
+            ERR_FILE_IO,
+            "Switch guard removal is not a stable absent generation");
+        goto clear_fail;
+    }
+    config_switch_guard_snapshot_clear(snapshot);
+    config_switch_guard_snapshot_clear(after);
+    free(snapshot);
+    free(after);
+    config_switch_guard_free(guard);
+    *guard_ptr = NULL;
+    clear_error();
+    errno = 0;
+    return 0;
+
+clear_fail:
+    config_switch_guard_snapshot_clear(snapshot);
+    config_switch_guard_snapshot_clear(after);
+    free(snapshot);
+    free(after);
+    return -1;
+}
+
+int config_switch_guard_retain(
+    config_switch_guard_t **guard_ptr) {
+    config_switch_guard_t *guard;
+    config_switch_guard_snapshot_t *snapshot = NULL;
+    config_switch_guard_snapshot_t *after = NULL;
+    struct stat stage_identity;
+    struct stat published_identity;
+    error_accumulator_t failures;
+    error_context_t primary_error;
+    int primary_errno = 0;
+    bool stage_created = false;
+    bool primary_failure = false;
+
+    if (!guard_ptr || !*guard_ptr) {
+        errno = EINVAL;
+        set_error(ERR_INVALID_ARGS,
+                  "Invalid switch guard retain handle");
+        return -1;
+    }
+    guard = *guard_ptr;
+    clear_error();
+    errno = 0;
+    snapshot = calloc(1U, sizeof(*snapshot));
+    after = calloc(1U, sizeof(*after));
+    if (!snapshot || !after) {
+        free(snapshot);
+        free(after);
+        set_error(
+            ERR_MEMORY_ALLOCATION,
+            "Cannot allocate switch guard retain verification state");
+        return -1;
+    }
+    memset(&stage_identity, 0, sizeof(stage_identity));
+    memset(&published_identity, 0, sizeof(published_identity));
+    error_accumulator_init(&failures);
+
+    if (g_switch_guard_owner_pid != getpid() ||
+        !config_named_directory_matches(
+            guard->directory, &guard->directory_identity) ||
+        verify_private_lock_file_at(
+            guard->lock_fd, guard->directory_fd,
+            CONFIG_SWITCH_LOCK_NAME) != 0 ||
+        config_switch_guard_source_matches_at(
+            guard->directory_fd, guard->config_name,
+            &guard->model.source_generation) != 0 ||
+        config_switch_destinations_live(
+            guard->model.destinations,
+            guard->model.destination_count) != 0 ||
+        config_switch_guard_snapshot_read_at(
+            guard->directory_fd, snapshot) != 0) {
+        if (errno == 0) errno = ESTALE;
+        set_system_error(
+            ERR_FILE_IO,
+            "Cannot prove switch guard authority before retaining recovery");
+        goto retain_fail;
+    }
+
+    if (guard->marker_unlinked) {
+        if (snapshot->stage_present || !snapshot->marker_absent) {
+            errno = ESTALE;
+            set_error(
+                ERR_CONFIG_INVALID,
+                "Cannot republish switch recovery over a changed guard namespace");
+            goto retain_fail;
+        }
+        if (config_switch_guard_stage_write_at(
+                guard->directory_fd, guard->marker_data,
+                guard->marker_length, &stage_identity,
+                &stage_created) != 0 ||
+            config_switch_guard_publish_stage_at(
+                guard->directory_fd, &stage_identity,
+                &published_identity) != 0) {
+            primary_failure = true;
+            primary_error = *get_last_error();
+            primary_errno = errno ? errno : EIO;
+            goto retain_recheck;
+        }
+        stage_created = false;
+        guard->marker_identity = published_identity;
+        guard->marker_unlinked = false;
+    } else if (!config_switch_guard_matches_handle(
+                   guard, snapshot)) {
+        errno = ESTALE;
+        set_error(
+            ERR_CONFIG_INVALID,
+            "Owned switch recovery marker changed before retention");
+        goto retain_fail;
+    }
+
+retain_recheck:
+    config_switch_guard_snapshot_clear(after);
+    if (config_switch_guard_snapshot_read_at(
+            guard->directory_fd, after) != 0) {
+        goto retain_fail;
+    }
+    /* A no-replace publication can install the exact canonical name and then
+     * report an uncertain post-install check. Adopt only the byte-identical
+     * marker generation; a foreign or malformed name remains untouched. */
+    if (guard->marker_unlinked && !after->stage_present &&
+        !after->marker_absent &&
+        after->marker_length == guard->marker_length &&
+        memcmp(
+            after->marker_data, guard->marker_data,
+            guard->marker_length) == 0 &&
+        strcmp(
+            after->marker_model.token, guard->token) == 0) {
+        guard->marker_identity = after->marker_identity;
+        guard->marker_unlinked = false;
+        stage_created = false;
+    }
+    if (guard->marker_unlinked || after->stage_present ||
+        !config_switch_guard_matches_handle(guard, after) ||
+        fsync(guard->directory_fd) != 0) {
+        if (errno == 0) errno = ESTALE;
+        if (get_last_error()->code == ERR_SUCCESS) {
+            set_system_error(
+                ERR_FILE_IO,
+                "Cannot prove the retained switch recovery marker");
+        }
+        goto retain_fail;
+    }
+    config_switch_guard_snapshot_clear(snapshot);
+    if (config_switch_guard_snapshot_read_at(
+            guard->directory_fd, snapshot) != 0 ||
+        snapshot->stage_present ||
+        !config_switch_guard_matches_handle(guard, snapshot) ||
+        verify_private_lock_file_at(
+            guard->lock_fd, guard->directory_fd,
+            CONFIG_SWITCH_LOCK_NAME) != 0 ||
+        !config_named_directory_matches(
+            guard->directory, &guard->directory_identity) ||
+        config_switch_guard_source_matches_at(
+            guard->directory_fd, guard->config_name,
+            &guard->model.source_generation) != 0 ||
+        config_switch_destinations_live(
+            guard->model.destinations,
+            guard->model.destination_count) != 0) {
+        if (errno == 0) errno = ESTALE;
+        set_system_error(
+            ERR_FILE_IO,
+            "Retained switch recovery marker is not one durable stable generation");
+        goto retain_fail;
+    }
+
+    config_switch_guard_snapshot_clear(snapshot);
+    config_switch_guard_snapshot_clear(after);
+    free(snapshot);
+    free(after);
+    config_switch_guard_free(guard);
+    *guard_ptr = NULL;
+    if (primary_failure) {
+        g_last_error = primary_error;
+        errno = primary_errno;
+    } else {
+        clear_error();
+        errno = 0;
+    }
+    return 0;
+
+retain_fail:
+    if (!primary_failure) {
+        primary_error = *get_last_error();
+        primary_errno = errno ? errno : EIO;
+    }
+    errno = primary_errno;
+    (void)error_accumulator_add(
+        &failures, "switch recovery retention",
+        &primary_error);
+    if (stage_created &&
+        config_switch_guard_cleanup_owned_stage_at(
+            guard->directory_fd, guard->lock_fd,
+            guard->directory, &guard->directory_identity,
+            &stage_identity, &stage_created) != 0) {
+        (void)error_accumulator_add_last(
+            &failures, "switch recovery stage cleanup");
+    }
+    (void)error_accumulator_publish(&failures);
+    primary_errno = errno ? errno : primary_errno;
+    config_switch_guard_snapshot_clear(snapshot);
+    config_switch_guard_snapshot_clear(after);
+    free(snapshot);
+    free(after);
+    errno = primary_errno;
+    return -1;
+}
+
+void config_switch_guard_abandon(
+    config_switch_guard_t **guard) {
+    if (!guard || !*guard) return;
+    config_switch_guard_free(*guard);
+    *guard = NULL;
+}
+
 static int config_write_lock_directory(const char *dir) {
     char lockpath[MAX_PATH_LEN];
     struct stat dir_identity;
@@ -3808,15 +6812,36 @@ int config_resume_hint_path(char *buf, size_t size) {
 
 int config_resume_hint_probe(char *needs, size_t size) {
     config_active_state_t state;
+    config_switch_guard_recovery_t switch_recovery;
     char config_path[MAX_PATH_LEN];
     const char *normalized;
+    bool switch_blocked = true;
 
     if (!needs || size == 0) {
         set_error(ERR_INVALID_ARGS, "Invalid resume-hint probe output");
         return -1;
     }
     needs[0] = '\0';
+    memset(&switch_recovery, 0, sizeof(switch_recovery));
     if (config_get_path(config_path, sizeof(config_path)) != 0 ||
+        config_switch_guard_probe(
+            config_path, &switch_blocked, &switch_recovery) != 0) {
+        return -1;
+    }
+    if (switch_blocked) {
+        if (!switch_recovery.valid) {
+            errno = ESTALE;
+            set_error(
+                ERR_CONFIG_INVALID,
+                "An incomplete switch transition blocks shell recovery");
+            return -1;
+        }
+        /* The unresolved generation may own either runtime manager. The shell
+         * must invoke full resume reconciliation rather than trust the stale
+         * active-state needs token. */
+        return safe_strncpy(needs, "ssh gpg", size);
+    }
+    if (
         config_read_active_state(config_path, &state, true, NULL, NULL) != 0) {
         return -1;
     }
@@ -4397,6 +7422,285 @@ int config_resume_hint_snapshot_restore(
     return result;
 }
 
+/* Re-prove a complete before/post image through one descriptor, then sync both
+ * that inode and its pinned parent before reporting a durable settlement
+ * direction.  This is deliberately content-aware: an equivalent replacement
+ * inode is safe to reconcile forward or backward, while a third byte image
+ * remains unowned and unresolved. */
+static int config_resume_hint_snapshot_classify_at(
+    const char *config_path,
+    const config_resume_hint_snapshot_t *snapshot,
+    config_active_rollback_state_t *state) {
+    unsigned char buffer[512];
+    char directory[MAX_PATH_LEN];
+    char hint[MAX_PATH_LEN];
+    struct stat directory_identity;
+    struct stat directory_opened;
+    struct stat named_before;
+    struct stat opened;
+    struct stat opened_after;
+    struct stat named_after;
+    struct stat directory_named_after;
+    const char *hint_name;
+    size_t offset = 0U;
+    bool before_matches;
+    bool post_matches;
+    int directory_fd = -1;
+    int fd = -1;
+
+    if (state) *state = CONFIG_ACTIVE_ROLLBACK_UNRESOLVED;
+    if (!config_path || !snapshot || !snapshot->valid || !state ||
+        strcmp(snapshot->config_path, config_path) != 0 ||
+        snapshot->length > CONFIG_RESUME_HINT_SNAPSHOT_MAX ||
+        snapshot->post_image_length > CONFIG_RESUME_HINT_SNAPSHOT_MAX ||
+        (snapshot->length != 0U && !snapshot->data) ||
+        (snapshot->post_image_length != 0U &&
+         !snapshot->post_image_data)) {
+        errno = EINVAL;
+        set_error(ERR_INVALID_ARGS,
+                  "Invalid active-state settlement snapshot");
+        return -1;
+    }
+    if (config_state_path_for_config(config_path, hint, sizeof(hint)) != 0 ||
+        safe_strncpy(directory, hint, sizeof(directory)) != 0) {
+        return -1;
+    }
+    {
+        char *slash = strrchr(directory, '/');
+
+        if (!slash) {
+            if (safe_strncpy(directory, ".", sizeof(directory)) != 0) {
+                return -1;
+            }
+        } else if (slash == directory) {
+            slash[1] = '\0';
+        } else {
+            *slash = '\0';
+        }
+    }
+    hint_name = strrchr(hint, '/');
+    hint_name = hint_name ? hint_name + 1 : hint;
+    if (hint_name[0] == '\0' || strchr(hint_name, '/')) {
+        errno = EINVAL;
+        set_error(ERR_INVALID_PATH,
+                  "Cannot derive the active-state settlement filename");
+        return -1;
+    }
+    if (lstat(directory, &directory_identity) != 0 ||
+        !config_metadata_dir_is_safe(&directory_identity)) {
+        set_error(ERR_PERMISSION_DENIED,
+                  "Cannot classify active-state settlement: config directory is unsafe");
+        return -1;
+    }
+    directory_fd = open(directory,
+                        O_RDONLY | O_CLOEXEC | O_DIRECTORY | O_NOFOLLOW);
+    if (directory_fd < 0 ||
+        fstat(directory_fd, &directory_opened) != 0 ||
+        !config_metadata_dir_is_safe(&directory_opened) ||
+        !config_metadata_same_file(&directory_identity,
+                                   &directory_opened)) {
+        int saved_errno = errno;
+        if (directory_fd >= 0) close(directory_fd);
+        errno = saved_errno;
+        set_system_error(
+            ERR_FILE_IO,
+            "Cannot pin config directory while classifying active-state settlement");
+        return -1;
+    }
+
+    if (fstatat(directory_fd, hint_name, &named_before,
+                AT_SYMLINK_NOFOLLOW) != 0) {
+        if (errno == ENOENT && !snapshot->existed) {
+            if (fsync(directory_fd) == 0) {
+                errno = 0;
+                if (fstatat(directory_fd, hint_name, &named_after,
+                            AT_SYMLINK_NOFOLLOW) != 0 &&
+                    errno == ENOENT &&
+                    lstat(directory, &directory_named_after) == 0 &&
+                    config_metadata_dir_is_safe(&directory_named_after) &&
+                    config_metadata_same_file(
+                        &directory_identity, &directory_named_after)) {
+                    close(directory_fd);
+                    *state = CONFIG_ACTIVE_ROLLBACK_BEFORE_DURABLE;
+                    clear_error();
+                    errno = 0;
+                    return 0;
+                }
+            }
+        }
+        {
+            int saved_errno = errno ? errno : ESTALE;
+            close(directory_fd);
+            errno = saved_errno;
+            set_system_error(
+                ERR_FILE_IO,
+                "Active-state settlement cannot prove the current namespace entry: %s",
+                hint);
+            return -1;
+        }
+    }
+    if (!config_metadata_file_is_safe(&named_before, false) ||
+        named_before.st_size < 0 ||
+        (uintmax_t)named_before.st_size >
+            CONFIG_RESUME_HINT_SNAPSHOT_MAX) {
+        close(directory_fd);
+        errno = ESTALE;
+        set_error(
+            ERR_PERMISSION_DENIED,
+            "Active-state settlement found an unsafe or oversized state file: %s",
+            hint);
+        return -1;
+    }
+
+    before_matches =
+        snapshot->existed &&
+        (size_t)named_before.st_size == snapshot->length &&
+        (named_before.st_mode & 0777) == (mode_t)snapshot->mode;
+    post_matches =
+        snapshot->post_image_bound &&
+        snapshot->post_image_installed &&
+        snapshot->post_image_valid &&
+        (size_t)named_before.st_size == snapshot->post_image_length &&
+        (named_before.st_mode & 0777) ==
+            (snapshot->post_image.st_mode & 0777);
+    if (!before_matches && !post_matches) {
+        close(directory_fd);
+        errno = ESTALE;
+        set_error(
+            ERR_FILE_IO,
+            "Active-state settlement found neither the before-image nor the post-image: %s",
+            hint);
+        return -1;
+    }
+
+    fd = openat(directory_fd, hint_name,
+                O_RDONLY | O_CLOEXEC | O_NOFOLLOW | O_NONBLOCK);
+    if (fd < 0 || fstat(fd, &opened) != 0 ||
+        !config_metadata_file_is_safe(&opened, false) ||
+        !config_metadata_snapshot_same(&named_before, &opened)) {
+        int saved_errno = errno ? errno : ESTALE;
+        if (fd >= 0) close(fd);
+        close(directory_fd);
+        errno = saved_errno;
+        set_system_error(
+            ERR_FILE_IO,
+            "Cannot open a stable active-state settlement image: %s", hint);
+        return -1;
+    }
+    while (offset < (size_t)opened.st_size) {
+        size_t wanted = (size_t)opened.st_size - offset;
+        ssize_t count;
+
+        if (wanted > sizeof(buffer)) wanted = sizeof(buffer);
+        do {
+            count = pread(fd, buffer, wanted, (off_t)offset);
+        } while (count < 0 && errno == EINTR);
+        if (count != (ssize_t)wanted) {
+            before_matches = false;
+            post_matches = false;
+            break;
+        }
+        if (before_matches &&
+            memcmp(buffer, snapshot->data + offset, wanted) != 0) {
+            before_matches = false;
+        }
+        if (post_matches &&
+            memcmp(buffer, snapshot->post_image_data + offset, wanted) != 0) {
+            post_matches = false;
+        }
+        if (!before_matches && !post_matches) break;
+        offset += wanted;
+    }
+    secure_zero_memory(buffer, sizeof(buffer));
+    if (!before_matches && !post_matches) {
+        close(fd);
+        close(directory_fd);
+        errno = ESTALE;
+        set_error(
+            ERR_FILE_IO,
+            "Active-state settlement bytes match neither owned image: %s",
+            hint);
+        return -1;
+    }
+    if (fsync(fd) != 0 || fsync(directory_fd) != 0 ||
+        fstat(fd, &opened_after) != 0 ||
+        fstatat(directory_fd, hint_name, &named_after,
+                AT_SYMLINK_NOFOLLOW) != 0 ||
+        lstat(directory, &directory_named_after) != 0 ||
+        !config_metadata_file_is_safe(&opened_after, false) ||
+        !config_metadata_file_is_safe(&named_after, false) ||
+        !config_metadata_dir_is_safe(&directory_named_after) ||
+        (!config_metadata_snapshot_same(&opened, &opened_after) &&
+         !config_metadata_ctime_only_change(&opened, &opened_after)) ||
+        (!config_metadata_snapshot_same(&opened, &named_after) &&
+         !config_metadata_ctime_only_change(&opened, &named_after)) ||
+        !config_metadata_same_file(
+            &directory_identity, &directory_named_after)) {
+        int saved_errno = errno ? errno : ESTALE;
+        close(fd);
+        close(directory_fd);
+        errno = saved_errno;
+        set_system_error(
+            ERR_FILE_IO,
+            "Active-state settlement changed while being synchronized: %s",
+            hint);
+        return -1;
+    }
+    close(fd);
+    close(directory_fd);
+
+    /* Identical images are a no-op rollback. Prefer the before side so the
+     * caller releases its prepared account transaction through abort. */
+    *state = before_matches ? CONFIG_ACTIVE_ROLLBACK_BEFORE_DURABLE
+                            : CONFIG_ACTIVE_ROLLBACK_POST_DURABLE;
+    clear_error();
+    errno = 0;
+    return 0;
+}
+
+int config_resume_hint_snapshot_settle(
+    const config_resume_hint_snapshot_t *snapshot,
+    config_active_rollback_state_t *state) {
+    char config_path[MAX_PATH_LEN];
+    int write_lock_fd;
+    int restore_result;
+    int classify_result;
+
+    if (state) *state = CONFIG_ACTIVE_ROLLBACK_UNRESOLVED;
+    if (!snapshot || !state) {
+        errno = EINVAL;
+        set_error(ERR_INVALID_ARGS,
+                  "Active-state settlement requires a snapshot and result");
+        return -1;
+    }
+    if (config_get_path(config_path, sizeof(config_path)) != 0) {
+        return -1;
+    }
+    write_lock_fd = config_write_lock_path(config_path);
+    if (write_lock_fd < 0) {
+        return -1;
+    }
+
+    restore_result = snapshot->post_image_bound
+        ? config_resume_hint_snapshot_restore_at(config_path, snapshot)
+        : 0;
+    classify_result = config_resume_hint_snapshot_classify_at(
+        config_path, snapshot, state);
+    config_write_unlock(write_lock_fd);
+
+    if (classify_result == 0 &&
+        *state != CONFIG_ACTIVE_ROLLBACK_UNRESOLVED) {
+        /* The classifier re-proved and synchronized a complete owned image.
+         * A preceding restore diagnostic is no longer an unresolved state. */
+        (void)restore_result;
+        clear_error();
+        errno = 0;
+        return 0;
+    }
+    *state = CONFIG_ACTIVE_ROLLBACK_UNRESOLVED;
+    return -1;
+}
+
 static bool config_retirement_refresh_owns_record(
     const config_retirement_refresh_request_t *request,
     const publication_record_t *record) {
@@ -4551,7 +7855,8 @@ static int config_update_resume_hint(const gitswitch_ctx_t *ctx,
         return -1;
     }
     if (generation_requirement == CONFIG_SOURCE_GENERATION_REQUIRE_LOADED) {
-        if (config_require_loaded_source_generation(ctx, config_path) != 0) {
+        if (config_require_loaded_source_generation(
+                ctx, config_path, NULL) != 0) {
             return -1;
         }
     } else if (generation_requirement ==
@@ -4898,7 +8203,8 @@ static int config_update_resume_hint(const gitswitch_ctx_t *ctx,
         goto hint_fail;
     }
     if (generation_requirement == CONFIG_SOURCE_GENERATION_REQUIRE_LOADED) {
-        if (config_require_loaded_source_generation(ctx, config_path) != 0) {
+        if (config_require_loaded_source_generation(
+                ctx, config_path, NULL) != 0) {
             goto hint_fail;
         }
     } else if (generation_requirement ==

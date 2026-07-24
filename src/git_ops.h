@@ -361,6 +361,16 @@ int git_config_export_sealed_publication(publication_record_t *out,
 int git_config_snapshot_export_destination(publication_record_t *out);
 
 /**
+ * Export the complete canonical destination set owned by the active snapshot:
+ * primary first, followed by any local and worktree secondary scopes that the
+ * transaction will mutate. Valid from git_config_snapshot() on; no sealed
+ * post-image is required. On insufficient capacity, `count` receives the
+ * required element count and the function fails without partially exporting.
+ */
+int git_config_snapshot_export_destinations(
+    publication_record_t *out, size_t capacity, size_t *count);
+
+/**
  * Restore the most recent git_config_snapshot(), rebuilding every key with its
  * exact ordered values only while the current vector still matches the sealed
  * transaction-owned state and the repository, config namespace, and sealed

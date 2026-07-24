@@ -1396,13 +1396,14 @@ TEST(partial_load_blocks_add_but_switch_persists_active) {
     remove_tree(rt);
 }
 
-/* ---------- AR-03 M9: save failure must surface in the exit code ---------- */
+/* ---------- AR-14 H1: recovery-fence admission must fail closed ---------- */
 
-/* Deny the config directory write permission after load: the switch itself
- * succeeds (git config is written), the save cannot create its temp file, and
- * the command must exit nonzero — pre-fix it warned and exited 0, so scripted
- * callers could not detect that active_account went stale. */
-TEST(switch_save_failure_exits_nonzero) {
+/* Deny config-directory write permission before switch admission. A switch
+ * now installs its durable recovery owner before the first live mutation, so
+ * it must stop at that boundary, report the lifecycle-lock failure, and return
+ * a genuine command failure. Persistence-fault rollback after successful
+ * admission remains covered by the embedded-main lifecycle suites. */
+TEST(switch_recovery_guard_admission_failure_exits_nonzero) {
     char home[256], rt[256], cmd[16384], dir[512], lock[640], err_path[512];
     char buf[8192];
     int rc;
@@ -1424,8 +1425,8 @@ TEST(switch_save_failure_exits_nonzero) {
         "email = \"s@example.com\"\n"
         "preferred_scope = \"global\"\n"), 0);
 
-    /* Pre-create the lock file (the locked open needs no dir write), then
-     * make the config dir read-only so the save's temp create fails. */
+    /* Pre-create the ordinary config lock so the denial is specifically at
+     * the new switch-lifecycle namespace rather than generic config locking. */
     snprintf(dir, sizeof(dir), "%s/.config/gitswitch", home);
     snprintf(lock, sizeof(lock), "%s/.config.lock", dir);
     FILE *f = fopen(lock, "w");
@@ -1439,9 +1440,9 @@ TEST(switch_save_failure_exits_nonzero) {
              "HOME='%s' XDG_RUNTIME_DIR='%s' '%s' -y solo </dev/null >'%s' 2>&1",
              home, rt, g_bin, err_path);
     rc = run_shell(cmd);
-    CHECK(rc > 0 && rc < 126);                                 /* pre-fix: 0 */
+    CHECK(rc > 0 && rc < 126);
     slurp(err_path, buf, sizeof(buf));
-    CHECK(strstr(buf, "Failed to save configuration changes") != NULL);
+    CHECK(strstr(buf, "Cannot acquire the switch lifecycle lock") != NULL);
 
     chmod(dir, 0700); /* so remove_tree can clean up */
     remove_tree(home);
@@ -1622,7 +1623,7 @@ TEST_MAIN_BEGIN()
     RUN_TEST(add_reprompts_email_at_exact_length_bound);
     RUN_TEST(switch_writes_resume_hint_and_reset_clears_it);
     RUN_TEST(partial_load_blocks_add_but_switch_persists_active);
-    RUN_TEST(switch_save_failure_exits_nonzero);
+    RUN_TEST(switch_recovery_guard_admission_failure_exits_nonzero);
     RUN_TEST(configuration_and_command_failures_keep_distinct_exit_codes);
     RUN_TEST(readonly_cli_forms_never_create_or_rewrite_configuration_state);
 TEST_MAIN_END()

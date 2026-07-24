@@ -29,6 +29,7 @@
 #include "utils.h"
 #include "git_ops.h"
 #define GITSWITCH_INTERNAL_API
+#include "git_ops_internal.h"
 #include "git_status_internal.h"
 #include "ssh_manager_internal.h"
 #undef GITSWITCH_INTERNAL_API
@@ -83,6 +84,8 @@ typedef struct {
     bool gpg_ok;
     bool publication_valid;
     publication_record_t publication;
+    config_switch_guard_t *guard;
+    bool guard_created;
 } pending_switch_t;
 
 static pending_switch_t g_pending_switch = {0};
@@ -974,7 +977,8 @@ static bool abort_switch_failure(pending_switch_t *prepared,
                                  prepared->token,
                                  ACCOUNTS_TRANSACTION_ABORT_ONLY);
 
-    (void)accounts_switch_abort_accumulated(prepared->ctx, false, &failures);
+    (void)accounts_switch_abort_accumulated(
+        prepared->ctx, false, &failures);
     if (!g_pending_switch.active || g_pending_switch.ctx != prepared->ctx) {
         return false;
     }
@@ -1027,7 +1031,7 @@ static void finish_switch_success(gitswitch_ctx_t *ctx, account_t *account,
      * are diagnostic and run regardless. */
     if (full_success && !ctx->config.dry_run && account->ssh_enabled &&
         strlen(account->ssh_key_path) > 0 && ssh_ok &&
-        !ctx->config.resuming &&
+        !ctx->config.resuming && !ctx->config.recovering_switch &&
         !g_session.ssh_config.reused_existing_agent && !signals_pending()) {
         if (strlen(account->ssh_host_alias) > 0) {
             if (run_informational_ssh_probe(
@@ -1213,13 +1217,13 @@ static int accounts_switch_impl(gitswitch_ctx_t *ctx, const char *identifier,
      * exact name, so resolve it literally (AR-06 F22) — the id-first fuzzy
      * matcher could otherwise re-resolve a legacy all-digit name to a different
      * account whose id matches. Interactive switches keep the fuzzy matcher. */
-    account = ctx->config.resuming
+    account = (ctx->config.resuming || ctx->config.recovering_switch)
         ? config_find_account_exact(ctx, identifier)
         : config_find_account(ctx, identifier);
     if (!account) {
         /* The fuzzy resolver already owns useful ambiguity/candidate detail.
          * Only the exact-name resume path returns NULL without setting it. */
-        if (ctx->config.resuming) {
+        if (ctx->config.resuming || ctx->config.recovering_switch) {
             set_error(ERR_ACCOUNT_NOT_FOUND, "Account not found: %s", identifier);
         }
         return -1;
@@ -1444,29 +1448,53 @@ static int accounts_switch_impl(gitswitch_ctx_t *ctx, const char *identifier,
          * for the persistence destination they own. */
         if (write_git && defer_commit &&
             ctx->config.defer_signal_cleanup) {
-            /* AR-12 H2: the snapshot above pinned the exact destination this
-             * switch will publish to. A destination that already has a
-             * ledger record is an in-place replacement, which an at-capacity
-             * ledger must still admit. Probe-export or allocation failure
-             * falls back to the conservative append-capacity check. */
-            publication_record_t *destination_probe =
-                calloc(1U, sizeof(*destination_probe));
-            const publication_record_t *probe = NULL;
-            int preflight_result;
+            /* AR-12 H2 / AR-14 H1: the snapshot above pinned the exact
+             * destination this switch will publish to. A destination that
+             * already has a ledger record is an in-place replacement, which
+             * an at-capacity ledger must still admit. The same exact
+             * destination generation is now part of the durable incomplete-
+             * switch fence, so a CLI transaction may no longer fall back to
+             * a destination-less conservative capacity probe. */
+            publication_record_t *destination_probes = calloc(
+                CONFIG_SWITCH_DESTINATION_MAX,
+                sizeof(*destination_probes));
+            size_t destination_count = 0U;
+            int preflight_result = -1;
 
-            if (destination_probe &&
-                git_config_snapshot_export_destination(
-                    destination_probe) == 0) {
-                probe = destination_probe;
+            if (!destination_probes) {
+                errno = ENOMEM;
+                set_error(
+                    ERR_MEMORY_ALLOCATION,
+                    "Cannot allocate the exact Git destinations for switch recovery");
+            } else if (git_config_snapshot_export_destinations(
+                           destination_probes,
+                           CONFIG_SWITCH_DESTINATION_MAX,
+                           &destination_count) != 0) {
+                /* Keep the exact export diagnostic: without every generation
+                 * neither publication capacity nor recovery ownership can be
+                 * bound safely. */
+            } else if (config_publication_preflight_destination(
+                           ctx->config.config_path,
+                           &destination_probes[0]) != 0) {
+                /* The preflight owns the useful capacity/model diagnostic. */
+            } else if (config_switch_guard_install_or_adopt(
+                           ctx, &prepared_owner.frozen_target, scope,
+                           destination_probes, destination_count,
+                           &prepared_owner.guard) != 0) {
+                /* A malformed/mismatched existing fence remains blocking and
+                 * no live state has been touched. */
             } else {
-                clear_error();
+                prepared_owner.guard_created =
+                    config_switch_guard_was_created(
+                        prepared_owner.guard);
+                preflight_result = 0;
             }
-            preflight_result = config_publication_preflight_destination(
-                ctx->config.config_path, probe);
-            if (destination_probe) {
-                secure_zero_memory(destination_probe,
-                                   sizeof(*destination_probe));
-                free(destination_probe);
+            if (destination_probes) {
+                secure_zero_memory(
+                    destination_probes,
+                    CONFIG_SWITCH_DESTINATION_MAX *
+                        sizeof(*destination_probes));
+                free(destination_probes);
             }
             if (preflight_result != 0) {
                 error_context_t preflight_error = *get_last_error();
@@ -1480,11 +1508,13 @@ static int accounts_switch_impl(gitswitch_ctx_t *ctx, const char *identifier,
             }
         }
 
-        /* Nothing durable has been touched yet, so a signal up to here could
-         * simply kill us. From this point on, mutations begin: guard. On
-         * success the guard stays armed all the way through main()'s
-         * config_save (M3) — only the failure paths (abort_failed_switch)
-         * drop it here in accounts.c.
+        /* The recovery marker installed immediately above is intentionally
+         * the only durable change so far: a signal could kill us and leave a
+         * fail-closed witness without changing any live identity. From this
+         * point on, live Git/SSH/GPG mutations begin under the signal guard.
+         * The recovery fence stays owned all the way through main()'s
+         * config_save (M3); checked abort/commit settlement either removes
+         * the exact marker or deliberately abandons it as a durable blocker.
          *
          * The config-save temp file is NOT registered here: this function's
          * success path still clears the scratch registry, so a registration
@@ -1527,9 +1557,18 @@ static int accounts_switch_impl(gitswitch_ctx_t *ctx, const char *identifier,
             int rollback_errno = errno;
 
             if (write_git) git_config_commit();
-            runtime_state_lock_release(runtime_lock_fd);
-            (void)finish_signal_guard_checked(
-                "Switch rollback ownership setup failed");
+            if (defer_commit) {
+                if (abort_switch_failure(
+                        &prepared_owner, prev_account, prev_gpg_home,
+                        prev_gpg_present, false, false, false,
+                        runtime_lock_fd, defer_signal_dispatch)) {
+                    return -1;
+                }
+            } else {
+                runtime_state_lock_release(runtime_lock_fd);
+                (void)finish_signal_guard_checked(
+                    "Switch rollback ownership setup failed");
+            }
             g_last_error = rollback_error;
             errno = rollback_errno;
             return -1;
@@ -2218,12 +2257,20 @@ static bool account_fields_equal_exact(const account_t *left,
 int accounts_switch_commit_result(gitswitch_ctx_t *ctx,
                                   accounts_switch_commit_state_t *state) {
     account_t *target = NULL;
+    git_config_finalization_t *git_finalization = NULL;
     ssh_config_publication_state_t alias_publication =
         SSH_CONFIG_PUBLICATION_PREINSTALL_FAILED;
     accounts_switch_commit_state_t final_state =
         ACCOUNTS_SWITCH_COMMIT_COMPLETE;
+    error_context_t alias_error = {0};
+    int alias_error_errno = 0;
     char alias_publication_detail[sizeof(g_last_error.message)] = "";
     int alias_publication_system_errno = 0;
+    error_context_t settlement_error = {0};
+    int settlement_error_errno = 0;
+    bool settlement_error_captured = false;
+    bool fence_retained = false;
+    accounts_transaction_token_t token;
 
     if (state) {
         *state = ACCOUNTS_SWITCH_COMMIT_NOT_COMMITTED;
@@ -2273,6 +2320,34 @@ int accounts_switch_commit_result(gitswitch_ctx_t *ctx,
         return -1;
     }
 
+    /* AR-14 H1: the seal used by active-state publication is only a snapshot
+     * until final commit. Acquire every distinct canonical Git `<config>.lock`
+     * and re-prove the exact sealed generations/vectors while those leases
+     * exclude supported Git writers. The durable switch fence remains owned
+     * until alias settlement and fence clearing both finish under this lease.
+     *
+     * Once active metadata is durable, a finalization mismatch cannot safely
+     * authorize reverse abort: it may describe a concurrent Git writer.
+     * Production CLI switches therefore transfer to exact forward recovery,
+     * discard stale reverse images, and retain the durable marker. Direct
+     * embedders without that marker retain the historic abortable boundary. */
+    if (g_pending_switch.git_written &&
+        git_config_finalization_begin(&git_finalization) != 0) {
+        settlement_error = *get_last_error();
+        settlement_error_errno = errno;
+        settlement_error_captured = true;
+        if (!g_pending_switch.guard) {
+            g_transaction_owner.phase = ACCOUNTS_TRANSACTION_PREPARED;
+            return -1;
+        }
+        config_switch_guard_abandon(&g_pending_switch.guard);
+        fence_retained = true;
+        git_config_commit();
+        final_state =
+            ACCOUNTS_SWITCH_COMMIT_FORWARD_RECOVERY_REQUIRED;
+        goto switch_commit_irreversible;
+    }
+
     /* This is the prepared switch's final required user-file commit. It runs
      * only after active_account and the resume hint are durable, but before
      * pending rollback ownership or the runtime lock is released. Failure
@@ -2281,31 +2356,144 @@ int accounts_switch_commit_result(gitswitch_ctx_t *ctx,
         target->ssh_host_alias[0] != '\0' &&
         ssh_configure_host_alias_result(&g_pending_switch.switch_target,
                                         &alias_publication) != 0) {
+        alias_error = *get_last_error();
+        alias_error_errno = errno;
         alias_publication_system_errno = get_last_error()->system_errno;
         safe_strncpy(alias_publication_detail, get_last_error()->message,
                      sizeof(alias_publication_detail));
         if (!ssh_alias_publication_is_installed(alias_publication)) {
+            if (git_config_finalization_end(
+                    &git_finalization) != 0) {
+                settlement_error = *get_last_error();
+                settlement_error_errno = errno;
+                settlement_error_captured = true;
+                if (g_pending_switch.guard) {
+                    config_switch_guard_abandon(
+                        &g_pending_switch.guard);
+                    fence_retained = true;
+                    if (g_pending_switch.git_written) {
+                        git_config_commit();
+                    }
+                    final_state =
+                        ACCOUNTS_SWITCH_COMMIT_FORWARD_RECOVERY_REQUIRED;
+                    goto switch_commit_irreversible;
+                }
+            } else {
+                g_last_error = alias_error;
+                errno = alias_error_errno;
+            }
             g_transaction_owner.phase = ACCOUNTS_TRANSACTION_PREPARED;
             return -1;
         }
         final_state = accounts_commit_state_for_alias(alias_publication);
     }
 
+    /* AR-14 H1: the durable recovery fence outlives every forward mutation.
+     * Remove it only after the caller's active-state save, the alias
+     * publication, Git, and runtime all describe the same target while the
+     * Git finalization lease is still held. An alias generation that is
+     * public but unverified/durability-uncertain is intentionally retained,
+     * but not a proven coherent endpoint: release the process-local handles
+     * while retaining the durable fence for exact forward recovery.
+     */
+    if (g_pending_switch.guard) {
+        if (final_state == ACCOUNTS_SWITCH_COMMIT_ALIAS_UNVERIFIED ||
+            final_state ==
+                ACCOUNTS_SWITCH_COMMIT_ALIAS_DURABILITY_UNCERTAIN) {
+            config_switch_guard_abandon(&g_pending_switch.guard);
+            fence_retained = true;
+        } else if (config_switch_guard_clear(
+                       &g_pending_switch.guard) != 0) {
+            error_context_t first_clear_error = *get_last_error();
+            int first_clear_errno = errno ? errno : EIO;
+
+            /* clear() deliberately retains a callable handle after unlink
+             * when only the directory durability proof failed. Retry that
+             * exact owner before classifying a retained fence; abandoning it
+             * immediately would lose the only in-process proof while the
+             * canonical name may already be absent. */
+            if (config_switch_guard_clear(
+                    &g_pending_switch.guard) != 0) {
+                error_accumulator_t clear_errors;
+
+                error_accumulator_init(&clear_errors);
+                errno = first_clear_errno;
+                (void)error_accumulator_add(
+                    &clear_errors, "switch fence clear",
+                    &first_clear_error);
+                (void)error_accumulator_add_last(
+                    &clear_errors, "switch fence clear retry");
+                (void)error_accumulator_publish(&clear_errors);
+                {
+                    error_context_t clear_failure =
+                        *get_last_error();
+                    int clear_failure_errno = errno ? errno : EIO;
+
+                    /* A second clear failure is not proof that the canonical
+                     * marker remains: unlink may already have succeeded. Only
+                     * release this owner as recoverable after republishing and
+                     * durably re-proving the exact marker bytes. */
+                    if (config_switch_guard_retain(
+                            &g_pending_switch.guard) == 0) {
+                        settlement_error = clear_failure;
+                        settlement_error_errno =
+                            clear_failure_errno;
+                        settlement_error_captured = true;
+                        fence_retained = true;
+                        final_state =
+                            ACCOUNTS_SWITCH_COMMIT_RECOVERY_FENCE_RETAINED;
+                    } else {
+                        error_accumulator_t retain_errors;
+
+                        error_accumulator_init(&retain_errors);
+                        errno = clear_failure_errno;
+                        (void)error_accumulator_add(
+                            &retain_errors,
+                            "switch fence clear",
+                            &clear_failure);
+                        (void)error_accumulator_add_last(
+                            &retain_errors,
+                            "switch fence retention");
+                        (void)error_accumulator_publish(
+                            &retain_errors);
+                        settlement_error = *get_last_error();
+                        settlement_error_errno =
+                            errno ? errno : EIO;
+                        settlement_error_captured = true;
+                        config_switch_guard_abandon(
+                            &g_pending_switch.guard);
+                        final_state =
+                            ACCOUNTS_SWITCH_COMMIT_RECOVERY_FENCE_CLEANUP_FAILED;
+                    }
+                }
+            }
+        }
+    }
     if (g_pending_switch.git_written) {
         git_config_commit();
     }
+    if (git_config_finalization_end(&git_finalization) != 0) {
+        settlement_error = *get_last_error();
+        settlement_error_errno = errno;
+        settlement_error_captured = true;
+        final_state = fence_retained
+            ? ACCOUNTS_SWITCH_COMMIT_FORWARD_RECOVERY_REQUIRED
+            : ACCOUNTS_SWITCH_COMMIT_FINALIZATION_CLEANUP_FAILED;
+    }
 
-    /* AR-12 M1/L3: the installed alias publication above and this Git
-     * commit are the transaction's point of no return. Report the committed
-     * state NOW: a later ownership-release or signal-guard failure returns
-     * -1, and NOT_COMMITTED at that point would authorize the caller to
-     * restore persistence before-images around a switch that has fully
-     * committed (main keys its rollback branch off exactly this state). */
+switch_commit_irreversible:
+    /* AR-12 M1/L3: the installed alias publication, Git commit, and checked
+     * fence settlement above are past the transaction's point of no return.
+     * Report the committed state NOW: a later ownership-release or
+     * signal-guard failure returns -1, and NOT_COMMITTED at that point would
+     * authorize the caller to restore persistence before-images around a
+     * switch that has fully committed (main keys its rollback branch off
+     * exactly this state). */
     if (state) {
         *state = final_state;
     }
 
-    accounts_transaction_token_t token = g_pending_switch.token;
+    token = g_pending_switch.token;
     runtime_state_lock_release(g_pending_switch.runtime_lock_fd);
     g_pending_switch.runtime_lock_fd = -1;
     finish_switch_success(ctx, target, &g_pending_switch.switch_target,
@@ -2327,6 +2515,69 @@ int accounts_switch_commit_result(gitswitch_ctx_t *ctx,
     if (!ctx->config.defer_signal_cleanup &&
         finish_signal_guard_checked(
             "Prepared switch committed, but restoring the caller's signal dispositions failed") != 0) {
+        return -1;
+    }
+    if (final_state ==
+        ACCOUNTS_SWITCH_COMMIT_RECOVERY_FENCE_RETAINED) {
+        const char *detail =
+            settlement_error_captured && settlement_error.message[0]
+                ? settlement_error.message
+                : "unknown recovery-fence cleanup error";
+
+        set_error(
+            ERR_FILE_IO,
+            "Account switch to '%s' committed, but its durable recovery "
+            "fence remains: %s",
+            target->name, detail);
+        g_last_error.system_errno = settlement_error.system_errno;
+        errno = settlement_error_errno;
+        return -1;
+    }
+    if (final_state ==
+        ACCOUNTS_SWITCH_COMMIT_FORWARD_RECOVERY_REQUIRED) {
+        const char *detail =
+            settlement_error_captured && settlement_error.message[0]
+                ? settlement_error.message
+                : "the final Git/alias image could not be proven";
+
+        set_error(
+            ERR_GIT_CONFIG_FAILED,
+            "Account switch to '%s' requires exact forward recovery: %s",
+            target->name, detail);
+        g_last_error.system_errno = settlement_error.system_errno;
+        errno = settlement_error_errno;
+        return -1;
+    }
+    if (final_state ==
+        ACCOUNTS_SWITCH_COMMIT_RECOVERY_FENCE_CLEANUP_FAILED) {
+        const char *detail =
+            settlement_error_captured && settlement_error.message[0]
+                ? settlement_error.message
+                : "the recovery marker could not be durably retained or cleared";
+
+        set_error(
+            ERR_FILE_IO,
+            "Account switch to '%s' committed coherently, but recovery-fence "
+            "cleanup could not be proven: %s",
+            target->name, detail);
+        g_last_error.system_errno = settlement_error.system_errno;
+        errno = settlement_error_errno;
+        return -1;
+    }
+    if (final_state ==
+        ACCOUNTS_SWITCH_COMMIT_FINALIZATION_CLEANUP_FAILED) {
+        const char *detail =
+            settlement_error_captured && settlement_error.message[0]
+                ? settlement_error.message
+                : "unknown Git finalization cleanup error";
+
+        set_error(
+            ERR_GIT_CONFIG_FAILED,
+            "Account switch to '%s' committed, but Git finalization cleanup "
+            "failed: %s",
+            target->name, detail);
+        g_last_error.system_errno = settlement_error.system_errno;
+        errno = settlement_error_errno;
         return -1;
     }
     if (final_state != ACCOUNTS_SWITCH_COMMIT_COMPLETE) {
@@ -2401,7 +2652,6 @@ static int accounts_switch_abort_accumulated(
         (void)error_accumulator_add_last(errors, "account abort phase");
         return publish_abort_result(errors, -1);
     }
-
     pending = g_pending_switch;
     g_transaction_owner.phase = pending.abort_only
         ? ACCOUNTS_TRANSACTION_ABORT_ONLY
@@ -2465,6 +2715,32 @@ static int accounts_switch_abort_accumulated(
         g_transaction_owner.phase = ACCOUNTS_TRANSACTION_ABORT_ONLY;
         return publish_abort_result(errors, -1);
     }
+    /* Git/runtime are now fully back at the before-image. A normal abort may
+     * remove a fence created by this attempt only at this point. An adopted
+     * recovery fence can never be removed by reverse abort: its before-image
+     * is the unresolved state that required the marker in the first place,
+     * so abandoning its handle leaves the marker durable while process-local
+     * ownership unwinds. */
+    pending.abort_only = true;
+    pending.git_written = false;
+    pending.ssh_dirty = false;
+    pending.gpg_dirty = false;
+    pending.runtime_lock_fd = -1;
+    if (pending.guard) {
+        if (!pending.guard_created) {
+            config_switch_guard_abandon(&pending.guard);
+        } else if (config_switch_guard_clear(&pending.guard) != 0) {
+            (void)error_accumulator_add_last(
+                errors, "durable switch recovery-fence removal");
+            /* clear() retains the live handle on every failure. Publish a
+             * zero-dirty abort-only retry record instead of losing it through
+             * the final memset below. */
+            g_pending_switch = pending;
+            g_transaction_owner.phase =
+                ACCOUNTS_TRANSACTION_ABORT_ONLY;
+            return publish_abort_result(errors, -1);
+        }
+    }
     /* main() may still need to reverse its active-account file and resume
      * hint, so CLI-owned abort keeps both layers armed until common cleanup.
      * A standalone prepared-API caller has completed every rollback here:
@@ -2476,6 +2752,9 @@ static int accounts_switch_abort_accumulated(
                 ctx, ACCOUNTS_TRANSACTION_SWITCH, pending.token) != 0) {
             (void)error_accumulator_add_last(
                 errors, "transaction rollback release");
+            g_pending_switch = pending;
+            g_transaction_owner.phase =
+                ACCOUNTS_TRANSACTION_ABORT_ONLY;
             return publish_abort_result(errors, -1);
         }
         memset(&g_pending_switch, 0, sizeof(g_pending_switch));
@@ -2492,6 +2771,8 @@ static int accounts_switch_abort_accumulated(
             ctx, ACCOUNTS_TRANSACTION_SWITCH, pending.token) != 0) {
         (void)error_accumulator_add_last(errors,
                                          "transaction rollback release");
+        g_pending_switch = pending;
+        g_transaction_owner.phase = ACCOUNTS_TRANSACTION_ABORT_ONLY;
         return publish_abort_result(errors, -1);
     }
     guard_rc = finish_signal_guard_checked(
@@ -2502,11 +2783,6 @@ static int accounts_switch_abort_accumulated(
          * one failed disposition (or pending dispatch step). Keep an
          * abort-only zero-dirty record so the caller has a checked API that
          * can retry that final process-global cleanup. */
-        pending.abort_only = true;
-        pending.git_written = false;
-        pending.ssh_dirty = false;
-        pending.gpg_dirty = false;
-        pending.runtime_lock_fd = -1;
         g_pending_switch = pending;
         g_transaction_owner.phase = ACCOUNTS_TRANSACTION_ABORT_ONLY;
         (void)error_accumulator_add_last(errors, "signal guard release");

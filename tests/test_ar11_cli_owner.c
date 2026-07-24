@@ -12,7 +12,9 @@
 #include "accounts.h"
 #include "config.h"
 #include "error.h"
+#include "git_ops.h"
 #include "signals.h"
+#include "ssh_manager.h"
 #include "utils.h"
 
 #include <getopt.h>
@@ -33,6 +35,14 @@ gitswitch_test_set_switch_prepare_failure_hook(
 switch_rollback_publish_test_hook_fn
 gitswitch_test_set_switch_rollback_publish_hook(
     switch_rollback_publish_test_hook_fn hook);
+typedef enum {
+    SWITCH_GUARD_INSTALL_AFTER_STAGE_SYNC = 0,
+    SWITCH_GUARD_CLEAR_AFTER_UNLINK
+} switch_guard_test_stage_t;
+typedef int (*switch_guard_test_hook_fn)(
+    switch_guard_test_stage_t stage, int directory_fd);
+switch_guard_test_hook_fn gitswitch_test_set_switch_guard_hook(
+    switch_guard_test_hook_fn hook);
 int gitswitch_test_context_allocations(void);
 int gitswitch_test_context_allocation_total(void);
 
@@ -43,6 +53,8 @@ typedef struct {
     char config_dir[PATH_MAX];
     char config[PATH_MAX];
     char hint[PATH_MAX];
+    char switch_fence[PATH_MAX];
+    char switch_stage[PATH_MAX];
     char gitconfig[PATH_MAX];
     char ssh_config[PATH_MAX];
     char output[PATH_MAX];
@@ -67,6 +79,14 @@ static char g_hook_commit_error[512];
 static cli_owner_fixture_t g_persistence_fault_fixture;
 static bool g_persistence_fault_armed;
 static int g_persistence_fault_mutation_rc;
+static cli_owner_fixture_t g_h1_fault_fixture;
+static bool g_h1_fault_armed;
+static int g_h1_fault_calls;
+static int g_h1_fault_mutation_rc;
+static bool g_switch_guard_fail_stage;
+static bool g_switch_guard_fail_clear;
+static int g_switch_guard_clear_failures_remaining;
+static int g_switch_guard_hook_calls;
 static volatile sig_atomic_t g_returning_signal_calls;
 
 typedef enum {
@@ -97,6 +117,55 @@ static const char concurrent_gitconfig[] =
     "\tgpgsign = false\n"
     "[gpg]\n"
     "\tformat = openpgp\n";
+static const char h1_accounts_config[] =
+    "[settings]\n"
+    "default_scope = \"global\"\n"
+    "\n"
+    "[accounts.1]\n"
+    "incarnation = \"1111111111111111111111111111111111111111111111111111111111111111\"\n"
+    "name = \"old\"\n"
+    "email = \"old@example.test\"\n"
+    "description = \"H1 prior identity\"\n"
+    "preferred_scope = \"global\"\n"
+    "\n"
+    "[accounts.2]\n"
+    "incarnation = \"2222222222222222222222222222222222222222222222222222222222222222\"\n"
+    "name = \"work\"\n"
+    "email = \"work@example.test\"\n"
+    "description = \"H1 switch identity\"\n"
+    "preferred_scope = \"global\"\n";
+static const char h1_numeric_name_accounts_config[] =
+    "[settings]\n"
+    "default_scope = \"global\"\n"
+    "\n"
+    "[accounts.1]\n"
+    "incarnation = \"1111111111111111111111111111111111111111111111111111111111111111\"\n"
+    "name = \"old\"\n"
+    "email = \"old@example.test\"\n"
+    "description = \"H1 prior identity\"\n"
+    "preferred_scope = \"global\"\n"
+    "\n"
+    "[accounts.7]\n"
+    "incarnation = \"7777777777777777777777777777777777777777777777777777777777777777\"\n"
+    "name = \"id-seven\"\n"
+    "email = \"id-seven@example.test\"\n"
+    "description = \"numeric ID collision decoy\"\n"
+    "preferred_scope = \"global\"\n"
+    "\n"
+    "[accounts.8]\n"
+    "incarnation = \"8888888888888888888888888888888888888888888888888888888888888888\"\n"
+    "name = \"7\"\n"
+    "email = \"numeric-name@example.test\"\n"
+    "description = \"canonical decimal account name\"\n"
+    "preferred_scope = \"global\"\n";
+static const char h1_old_gitconfig[] =
+    "[user]\n"
+    "\tname = old\n"
+    "\temail = old@example.test\n";
+#define H1_WORK_INCARNATION \
+    "2222222222222222222222222222222222222222222222222222222222222222"
+#define H1_NUMERIC_NAME_INCARNATION \
+    "8888888888888888888888888888888888888888888888888888888888888888"
 
 static int write_private(const char *path, const char *text) {
     int fd = open(path, O_WRONLY | O_CREAT | O_TRUNC | O_CLOEXEC, 0600);
@@ -119,6 +188,81 @@ static int write_private(const char *path, const char *text) {
     return close(fd);
 }
 
+static int sync_directory(const char *path) {
+    int fd = open(
+        path, O_RDONLY | O_CLOEXEC | O_DIRECTORY | O_NOFOLLOW);
+    int result;
+    int saved_errno;
+
+    if (fd < 0) return -1;
+    result = fsync(fd);
+    saved_errno = errno;
+    if (close(fd) != 0 && result == 0) {
+        result = -1;
+        saved_errno = errno;
+    }
+    errno = saved_errno;
+    return result;
+}
+
+static int replace_private_atomically(const char *path, const char *text) {
+    char directory[PATH_MAX];
+    char temp[PATH_MAX] = "";
+    const char *slash;
+    size_t directory_length;
+    size_t length = strlen(text);
+    size_t total = 0;
+    int dir_fd = -1;
+    int output_fd = -1;
+    int result = -1;
+    int saved_errno;
+
+    slash = strrchr(path, '/');
+    if (!slash || slash == path) {
+        errno = EINVAL;
+        return -1;
+    }
+    directory_length = (size_t)(slash - path);
+    if (directory_length >= sizeof(directory) ||
+        (size_t)snprintf(temp, sizeof(temp), "%s.ar14.XXXXXX", path) >=
+            sizeof(temp)) {
+        errno = ENAMETOOLONG;
+        return -1;
+    }
+    memcpy(directory, path, directory_length);
+    directory[directory_length] = '\0';
+
+    output_fd = mkstemp(temp);
+    if (output_fd < 0 || fchmod(output_fd, 0600) != 0) goto cleanup;
+    while (total < length) {
+        ssize_t count = write(output_fd, text + total, length - total);
+
+        if (count > 0) total += (size_t)count;
+        else if (count < 0 && errno == EINTR) continue;
+        else goto cleanup;
+    }
+    if (fsync(output_fd) != 0 || close(output_fd) != 0) {
+        output_fd = -1;
+        goto cleanup;
+    }
+    output_fd = -1;
+    if (rename(temp, path) != 0) goto cleanup;
+    temp[0] = '\0';
+
+    dir_fd = open(directory,
+                  O_RDONLY | O_CLOEXEC | O_DIRECTORY | O_NOFOLLOW);
+    if (dir_fd < 0 || fsync(dir_fd) != 0) goto cleanup;
+    result = 0;
+
+cleanup:
+    saved_errno = errno;
+    if (output_fd >= 0) close(output_fd);
+    if (dir_fd >= 0) close(dir_fd);
+    if (result != 0 && temp[0] != '\0') (void)unlink(temp);
+    errno = saved_errno;
+    return result;
+}
+
 static bool diverge_persistence_rollback(config_io_boundary_t boundary) {
     int hint_rc;
     int git_rc;
@@ -134,6 +278,159 @@ static bool diverge_persistence_rollback(config_io_boundary_t boundary) {
                            concurrent_gitconfig);
     g_persistence_fault_mutation_rc = hint_rc == 0 && git_rc == 0 ? 0 : -1;
     return true;
+}
+
+static int replace_h1_hint_generation(void) {
+    unsigned char *content = NULL;
+    char temp[PATH_MAX] = "";
+    struct stat st;
+    size_t length;
+    size_t total = 0;
+    int dir_fd = -1;
+    int input_fd = -1;
+    int output_fd = -1;
+    int result = -1;
+    int saved_errno;
+
+    input_fd = open(g_h1_fault_fixture.hint,
+                    O_RDONLY | O_CLOEXEC | O_NOFOLLOW);
+    if (input_fd < 0 || fstat(input_fd, &st) != 0 ||
+        !S_ISREG(st.st_mode) || st.st_size <= 0 ||
+        (uintmax_t)st.st_size > UINTMAX_C(8) * 1024U * 1024U + 4096U) {
+        goto cleanup;
+    }
+    length = (size_t)st.st_size;
+    content = malloc(length + 1U);
+    if (!content) goto cleanup;
+    while (total < length) {
+        ssize_t count = read(input_fd, content + total, length - total);
+
+        if (count > 0) total += (size_t)count;
+        else if (count < 0 && errno == EINTR) continue;
+        else goto cleanup;
+    }
+    content[length] = '\0';
+    if (strncmp((const char *)content, "none\nactive=work\n",
+                strlen("none\nactive=work\n")) != 0 ||
+        strstr((const char *)content, "publications=v1\n") == NULL) {
+        errno = EINVAL;
+        goto cleanup;
+    }
+    if (close(input_fd) != 0) {
+        input_fd = -1;
+        goto cleanup;
+    }
+    input_fd = -1;
+
+    if ((size_t)snprintf(temp, sizeof(temp),
+                         "%s/.resume-hint.h1.XXXXXX",
+                         g_h1_fault_fixture.config_dir) >= sizeof(temp)) {
+        errno = ENAMETOOLONG;
+        goto cleanup;
+    }
+    output_fd = mkstemp(temp);
+    if (output_fd < 0 || fchmod(output_fd, 0600) != 0) goto cleanup;
+    total = 0;
+    while (total < length) {
+        ssize_t count = write(output_fd, content + total, length - total);
+
+        if (count > 0) total += (size_t)count;
+        else if (count < 0 && errno == EINTR) continue;
+        else goto cleanup;
+    }
+    if (fsync(output_fd) != 0 || close(output_fd) != 0) {
+        output_fd = -1;
+        goto cleanup;
+    }
+    output_fd = -1;
+    if (rename(temp, g_h1_fault_fixture.hint) != 0) goto cleanup;
+    temp[0] = '\0';
+
+    dir_fd = open(g_h1_fault_fixture.config_dir,
+                  O_RDONLY | O_CLOEXEC | O_DIRECTORY | O_NOFOLLOW);
+    if (dir_fd < 0 || fsync(dir_fd) != 0) goto cleanup;
+    result = 0;
+
+cleanup:
+    saved_errno = errno;
+    if (input_fd >= 0) close(input_fd);
+    if (output_fd >= 0) close(output_fd);
+    if (dir_fd >= 0) close(dir_fd);
+    if (result != 0 && temp[0] != '\0') (void)unlink(temp);
+    if (content) {
+        secure_zero_memory(content, length + 1U);
+        free(content);
+    }
+    errno = saved_errno;
+    return result;
+}
+
+static bool replace_h1_postimage_and_fail_sync(
+    config_io_boundary_t boundary) {
+    if (!g_h1_fault_armed ||
+        boundary != CONFIG_IO_STATE_BEFORE_DIR_SYNC) {
+        return false;
+    }
+    g_h1_fault_armed = false;
+    g_h1_fault_calls++;
+    g_h1_fault_mutation_rc = replace_h1_hint_generation();
+    return true;
+}
+
+static bool replace_h1_with_third_image_and_fail_sync(
+    config_io_boundary_t boundary) {
+    int hint_rc;
+    int git_rc;
+
+    if (!g_h1_fault_armed ||
+        boundary != CONFIG_IO_STATE_BEFORE_DIR_SYNC) {
+        return false;
+    }
+    g_h1_fault_armed = false;
+    g_h1_fault_calls++;
+    hint_rc = replace_private_atomically(
+        g_h1_fault_fixture.hint, "none\nactive=later\n");
+    git_rc = replace_private_atomically(
+        g_h1_fault_fixture.gitconfig, concurrent_gitconfig);
+    g_h1_fault_mutation_rc = hint_rc == 0 && git_rc == 0 ? 0 : -1;
+    return true;
+}
+
+static bool replace_h1_git_during_state_commit_and_allow_sync(
+    config_io_boundary_t boundary) {
+    if (!g_h1_fault_armed ||
+        boundary != CONFIG_IO_STATE_BEFORE_DIR_SYNC) {
+        return false;
+    }
+    g_h1_fault_armed = false;
+    g_h1_fault_calls++;
+    g_h1_fault_mutation_rc = replace_private_atomically(
+        g_h1_fault_fixture.gitconfig, concurrent_gitconfig);
+
+    /* The replacement is the race under test, not an injected durability
+     * failure. Let the target active-state save finish successfully so final
+     * switch validation must detect the now-divergent Git destination. */
+    return false;
+}
+
+static int fail_switch_guard_lifecycle(
+    switch_guard_test_stage_t stage, int directory_fd) {
+    (void)directory_fd;
+    if ((stage == SWITCH_GUARD_INSTALL_AFTER_STAGE_SYNC &&
+         g_switch_guard_fail_stage) ||
+        (stage == SWITCH_GUARD_CLEAR_AFTER_UNLINK &&
+         (g_switch_guard_fail_clear ||
+          g_switch_guard_clear_failures_remaining > 0))) {
+        g_switch_guard_fail_stage = false;
+        g_switch_guard_fail_clear = false;
+        if (g_switch_guard_clear_failures_remaining > 0) {
+            g_switch_guard_clear_failures_remaining--;
+        }
+        g_switch_guard_hook_calls++;
+        errno = EIO;
+        return -1;
+    }
+    return 0;
 }
 
 static size_t read_text(const char *path, char *text, size_t size) {
@@ -154,6 +451,77 @@ static size_t read_text(const char *path, char *text, size_t size) {
     close(fd);
     text[total] = '\0';
     return total;
+}
+
+static size_t h1_read_bounded_file(
+    const char *path, unsigned char *data, size_t capacity,
+    struct stat *state) {
+    struct stat before;
+    struct stat after;
+    size_t total = 0U;
+    int fd;
+
+    if (!path || !data || capacity == 0U ||
+        lstat(path, &before) != 0 || !S_ISREG(before.st_mode) ||
+        before.st_size <= 0 ||
+        (uintmax_t)before.st_size > (uintmax_t)capacity) {
+        return 0U;
+    }
+    fd = open(path, O_RDONLY | O_CLOEXEC | O_NOFOLLOW);
+    if (fd < 0 || fstat(fd, &after) != 0 ||
+        !ts_same_identity(&before, &after) ||
+        after.st_size != before.st_size) {
+        if (fd >= 0) close(fd);
+        return 0U;
+    }
+    while (total < (size_t)before.st_size) {
+        ssize_t count = read(
+            fd, data + total, (size_t)before.st_size - total);
+
+        if (count > 0) {
+            total += (size_t)count;
+        } else if (count < 0 && errno == EINTR) {
+            continue;
+        } else {
+            total = 0U;
+            break;
+        }
+    }
+    if (fstat(fd, &after) != 0 ||
+        !ts_same_identity(&before, &after) ||
+        after.st_size != before.st_size) {
+        close(fd);
+        return 0U;
+    }
+    if (close(fd) != 0) {
+        return 0U;
+    }
+    if (state) *state = after;
+    return total;
+}
+
+static bool h1_same_file_state(
+    const struct stat *left, const struct stat *right) {
+    if (!left || !right ||
+        !ts_same_identity(left, right) ||
+        left->st_mode != right->st_mode ||
+        left->st_uid != right->st_uid ||
+        left->st_gid != right->st_gid ||
+        left->st_nlink != right->st_nlink ||
+        left->st_size != right->st_size) {
+        return false;
+    }
+#if defined(__APPLE__)
+    return left->st_mtimespec.tv_sec == right->st_mtimespec.tv_sec &&
+           left->st_mtimespec.tv_nsec == right->st_mtimespec.tv_nsec &&
+           left->st_ctimespec.tv_sec == right->st_ctimespec.tv_sec &&
+           left->st_ctimespec.tv_nsec == right->st_ctimespec.tv_nsec;
+#else
+    return left->st_mtim.tv_sec == right->st_mtim.tv_sec &&
+           left->st_mtim.tv_nsec == right->st_mtim.tv_nsec &&
+           left->st_ctim.tv_sec == right->st_ctim.tv_sec &&
+           left->st_ctim.tv_nsec == right->st_ctim.tv_nsec;
+#endif
 }
 
 static int fixture_setup(cli_owner_fixture_t *fixture) {
@@ -189,6 +557,14 @@ static int fixture_setup(cli_owner_fixture_t *fixture) {
         (size_t)snprintf(fixture->hint, sizeof(fixture->hint),
                          "%s/.resume-hint", fixture->config_dir) >=
             sizeof(fixture->hint) ||
+        (size_t)snprintf(fixture->switch_fence,
+                         sizeof(fixture->switch_fence),
+                         "%s/.switch-incomplete", fixture->config_dir) >=
+            sizeof(fixture->switch_fence) ||
+        (size_t)snprintf(fixture->switch_stage,
+                         sizeof(fixture->switch_stage),
+                         "%s/.switch-transition", fixture->config_dir) >=
+            sizeof(fixture->switch_stage) ||
         (size_t)snprintf(fixture->gitconfig, sizeof(fixture->gitconfig),
                          "%s/.gitconfig", fixture->home) >=
             sizeof(fixture->gitconfig) ||
@@ -209,6 +585,78 @@ static int fixture_setup(cli_owner_fixture_t *fixture) {
                : -1;
 }
 
+static int h1_fixture_setup(cli_owner_fixture_t *fixture) {
+    if (fixture_setup(fixture) != 0) return -1;
+    return write_private(fixture->config, h1_accounts_config) == 0 &&
+                   write_private(fixture->hint,
+                                 "none\nactive=old\n") == 0 &&
+                   write_private(fixture->gitconfig,
+                                 h1_old_gitconfig) == 0
+               ? 0
+               : -1;
+}
+
+static int h1_numeric_name_fixture_setup(
+    cli_owner_fixture_t *fixture) {
+    if (fixture_setup(fixture) != 0) return -1;
+    return write_private(
+               fixture->config, h1_numeric_name_accounts_config) == 0 &&
+                   write_private(fixture->hint,
+                                 "none\nactive=old\n") == 0 &&
+                   write_private(fixture->gitconfig,
+                                 h1_old_gitconfig) == 0
+               ? 0
+               : -1;
+}
+
+static int h1_ssh_fixture_setup(
+    cli_owner_fixture_t *fixture, char *key_path,
+    size_t key_path_size) {
+    char config_body[PATH_MAX + 2048];
+    const char *keygen_argv[] = {
+        "ssh-keygen", "-q", "-t", "ed25519", "-N", "",
+        "-f", key_path, NULL
+    };
+    run_opts_t opts;
+    run_result_t result;
+    int written;
+
+    if (!fixture || !key_path || key_path_size == 0U ||
+        h1_fixture_setup(fixture) != 0 ||
+        (size_t)snprintf(
+            key_path, key_path_size, "%s/work-key",
+            fixture->root) >= key_path_size) {
+        return -1;
+    }
+    memset(&opts, 0, sizeof(opts));
+    memset(&result, 0, sizeof(result));
+    opts.stderr_to_devnull = true;
+    if (run_argv(keygen_argv, &opts, &result) != 0) return -1;
+
+    written = snprintf(
+        config_body, sizeof(config_body),
+        "[settings]\n"
+        "default_scope = \"global\"\n"
+        "\n"
+        "[accounts.1]\n"
+        "incarnation = \"1111111111111111111111111111111111111111111111111111111111111111\"\n"
+        "name = \"old\"\n"
+        "email = \"old@example.test\"\n"
+        "description = \"H1 prior identity\"\n"
+        "preferred_scope = \"global\"\n"
+        "\n"
+        "[accounts.2]\n"
+        "incarnation = \"2222222222222222222222222222222222222222222222222222222222222222\"\n"
+        "name = \"work\"\n"
+        "email = \"work@example.test\"\n"
+        "description = \"H1 SSH recovery identity\"\n"
+        "preferred_scope = \"global\"\n"
+        "ssh_key = \"%s\"\n",
+        key_path);
+    if (written < 0 || (size_t)written >= sizeof(config_body)) return -1;
+    return write_private(fixture->config, config_body);
+}
+
 static int redirect_output(const char *path) {
     int fd = open(path, O_WRONLY | O_CREAT | O_TRUNC | O_CLOEXEC, 0600);
 
@@ -222,6 +670,159 @@ static int redirect_output(const char *path) {
     }
     if (fd > STDERR_FILENO) close(fd);
     return 0;
+}
+
+static int run_h1_git_at(
+    const cli_owner_fixture_t *fixture, const char *repository,
+    const char *const argv[]) {
+    static const char *const unset_env[] = {
+        "GIT_CONFIG_COUNT", "GIT_CONFIG_KEY_0", "GIT_CONFIG_VALUE_0",
+        "GIT_DIR", "GIT_WORK_TREE", NULL
+    };
+    char home_env[PATH_MAX + sizeof("HOME=")];
+    char global_env[PATH_MAX + sizeof("GIT_CONFIG_GLOBAL=")];
+    const char *extra_env[4];
+    run_opts_t opts;
+    run_result_t result;
+    int cwd_fd;
+    int rc;
+
+    if (!fixture || !repository || !argv ||
+        (size_t)snprintf(
+            home_env, sizeof(home_env), "HOME=%s",
+            fixture->home) >= sizeof(home_env) ||
+        (size_t)snprintf(
+            global_env, sizeof(global_env), "GIT_CONFIG_GLOBAL=%s",
+            fixture->gitconfig) >= sizeof(global_env)) {
+        errno = EINVAL;
+        return -1;
+    }
+    cwd_fd = open(
+        repository,
+        O_RDONLY | O_CLOEXEC | O_DIRECTORY | O_NOFOLLOW);
+    if (cwd_fd < 0) return -1;
+    extra_env[0] = home_env;
+    extra_env[1] = global_env;
+    extra_env[2] = "GIT_CONFIG_NOSYSTEM=1";
+    extra_env[3] = NULL;
+    memset(&opts, 0, sizeof(opts));
+    memset(&result, 0, sizeof(result));
+    opts.cwd_fd = cwd_fd;
+    opts.use_cwd_fd = true;
+    opts.stderr_to_devnull = true;
+    opts.extra_env = extra_env;
+    opts.unset_env = unset_env;
+    rc = run_argv(argv, &opts, &result);
+    close(cwd_fd);
+    return rc;
+}
+
+static int h1_repo_setup(
+    const cli_owner_fixture_t *fixture, const char *repository,
+    const char *label) {
+    char local_name[128];
+    char local_email[128];
+    char worktree_name[128];
+    char worktree_email[128];
+    const char *init_argv[] = {
+        "git", "init", "--quiet", NULL
+    };
+    const char *extension_argv[] = {
+        "git", "config", "--local",
+        "extensions.worktreeConfig", "true", NULL
+    };
+    const char *local_name_argv[] = {
+        "git", "config", "--local", "user.name",
+        local_name, NULL
+    };
+    const char *local_email_argv[] = {
+        "git", "config", "--local", "user.email",
+        local_email, NULL
+    };
+    const char *worktree_name_argv[] = {
+        "git", "config", "--worktree", "user.name",
+        worktree_name, NULL
+    };
+    const char *worktree_email_argv[] = {
+        "git", "config", "--worktree", "user.email",
+        worktree_email, NULL
+    };
+
+    if (!fixture || !repository || !label ||
+        mkdir(repository, 0700) != 0 ||
+        (size_t)snprintf(
+            local_name, sizeof(local_name), "%s local", label) >=
+            sizeof(local_name) ||
+        (size_t)snprintf(
+            local_email, sizeof(local_email), "%s-local@example.test",
+            label) >= sizeof(local_email) ||
+        (size_t)snprintf(
+            worktree_name, sizeof(worktree_name), "%s worktree",
+            label) >= sizeof(worktree_name) ||
+        (size_t)snprintf(
+            worktree_email, sizeof(worktree_email),
+            "%s-worktree@example.test", label) >=
+            sizeof(worktree_email)) {
+        return -1;
+    }
+    return run_h1_git_at(fixture, repository, init_argv) == 0 &&
+                   run_h1_git_at(
+                       fixture, repository, extension_argv) == 0 &&
+                   run_h1_git_at(
+                       fixture, repository, local_name_argv) == 0 &&
+                   run_h1_git_at(
+                       fixture, repository, local_email_argv) == 0 &&
+                   run_h1_git_at(
+                       fixture, repository, worktree_name_argv) == 0 &&
+                   run_h1_git_at(
+                       fixture, repository, worktree_email_argv) == 0
+               ? 0
+               : -1;
+}
+
+static int h1_git_set(
+    const cli_owner_fixture_t *fixture, const char *repository,
+    const char *scope, const char *key, const char *value) {
+    const char *argv[] = {
+        "git", "config", scope, key, value, NULL
+    };
+
+    return run_h1_git_at(fixture, repository, argv);
+}
+
+static bool h1_git_identity_matches(
+    const char *path, const char *name, const char *email) {
+    char expected_name[256];
+    char expected_email[256];
+    char contents[4096];
+
+    return path && name && email &&
+           (size_t)snprintf(
+               expected_name, sizeof(expected_name),
+               "name = %s\n", name) < sizeof(expected_name) &&
+           (size_t)snprintf(
+               expected_email, sizeof(expected_email),
+               "email = %s\n", email) < sizeof(expected_email) &&
+           read_text(path, contents, sizeof(contents)) > 0 &&
+           strstr(contents, expected_name) != NULL &&
+           strstr(contents, expected_email) != NULL;
+}
+
+static bool h1_git_identity_is_absent(const char *path) {
+    char contents[4096];
+    struct stat state;
+
+    if (!path) return false;
+    if (lstat(path, &state) != 0) return errno == ENOENT;
+    if (!S_ISREG(state.st_mode) || state.st_size < 0 ||
+        (uintmax_t)state.st_size >= sizeof(contents)) {
+        return false;
+    }
+    if (state.st_size == 0) return true;
+    return read_text(path, contents, sizeof(contents)) ==
+               (size_t)state.st_size &&
+           strstr(contents, "name = ") == NULL &&
+           strstr(contents, "email = ") == NULL;
 }
 
 static int start_runtime_holder(runtime_holder_t *holder) {
@@ -559,15 +1160,18 @@ static int run_cli_aggregate_case(const cli_owner_fixture_t *fixture) {
 
     if (child < 0) return -1;
     if (child == 0) {
+        char gitconfig[256];
+        char hint[128];
         char program[] = "gitswitch";
         char no_color[] = "-C";
         char force_global[] = "-g";
         char account[] = "work";
+        char version[] = "--version";
         char *switch_argv[] = {
             program, no_color, force_global, account, NULL
         };
-        const char *resume_entry;
-        const char *abort_entry;
+        char *version_argv[] = { program, version, NULL };
+        const char *settlement_entry;
         int first_rc;
 
         if (setenv("HOME", fixture->home, 1) != 0 ||
@@ -603,11 +1207,11 @@ static int run_cli_aggregate_case(const cli_owner_fixture_t *fixture) {
             g_publish_error.function[0] == '\0') {
             _exit(121);
         }
-        resume_entry = strstr(g_publish_error.details,
-                              "[resume-hint rollback]");
-        abort_entry = strstr(g_publish_error.details,
-                             "[account switch abort]");
-        if (!resume_entry || !abort_entry || resume_entry >= abort_entry) {
+        settlement_entry = strstr(g_publish_error.details,
+                                  "[active-state settlement]");
+        if (!settlement_entry ||
+            strstr(g_publish_error.details,
+                   "[account switch abort]") != NULL) {
             _exit(122);
         }
         if (gitswitch_test_context_allocations() != 1 ||
@@ -615,6 +1219,18 @@ static int run_cli_aggregate_case(const cli_owner_fixture_t *fixture) {
             !signals_guard_active() || !signals_rollback_active() ||
             !config_lock_available()) {
             _exit(123);
+        }
+
+        /* An informational second entry must not blindly abort an unresolved
+         * retained switch and overwrite either concurrent artifact. */
+        optind = 1;
+        (void)gitswitch_cli_main(2, version_argv);
+        if (read_text(fixture->hint, hint, sizeof(hint)) == 0 ||
+            strcmp(hint, "none\nactive=later\n") != 0 ||
+            read_text(fixture->gitconfig, gitconfig,
+                      sizeof(gitconfig)) == 0 ||
+            strcmp(gitconfig, concurrent_gitconfig) != 0) {
+            _exit(125);
         }
         if (fflush(NULL) != 0) _exit(124);
         _exit(0);
@@ -629,6 +1245,691 @@ static int run_cli_aggregate_case(const cli_owner_fixture_t *fixture) {
         } while (waited < 0 && errno == EINTR);
         return waited == child ? status : -1;
     }
+}
+
+static int run_h1_switch_case_at(
+    const cli_owner_fixture_t *fixture, const char *working_directory,
+    const char *selector, config_io_fault_fn fault,
+    bool expect_context_released) {
+    pid_t child = fork();
+
+    if (child < 0) return -1;
+    if (child == 0) {
+        char program[] = "gitswitch";
+        char no_color[] = "-C";
+        char force_global[] = "-g";
+        char account[MAX_EMAIL_LEN];
+        char *switch_argv[] = {
+            program, no_color, force_global, account, NULL
+        };
+        int switch_rc;
+
+        if (safe_strncpy(account, selector, sizeof(account)) != 0 ||
+            setenv("HOME", fixture->home, 1) != 0 ||
+            setenv("XDG_RUNTIME_DIR", fixture->runtime, 1) != 0 ||
+            setenv("GIT_CONFIG_GLOBAL", fixture->gitconfig, 1) != 0 ||
+            setenv("GIT_CONFIG_NOSYSTEM", "1", 1) != 0 ||
+            setenv("GITSWITCH_ALLOW_TMP_GPG", "1", 1) != 0 ||
+            unsetenv("XDG_CONFIG_HOME") != 0 ||
+            unsetenv("GNUPGHOME") != 0 ||
+            (working_directory &&
+             chdir(working_directory) != 0) ||
+            redirect_output(fixture->output) != 0) {
+            _exit(160);
+        }
+
+        g_h1_fault_fixture = *fixture;
+        g_h1_fault_armed = true;
+        g_h1_fault_calls = 0;
+        g_h1_fault_mutation_rc = -1;
+        g_publish_called = 0;
+        g_publish_errno = 0;
+        memset(&g_publish_error, 0, sizeof(g_publish_error));
+        (void)config_set_io_fault_fn(fault);
+        (void)gitswitch_test_set_switch_rollback_publish_hook(
+            capture_published_rollback);
+
+        optind = 1;
+        switch_rc = gitswitch_cli_main(4, switch_argv);
+        (void)config_set_io_fault_fn(NULL);
+        (void)gitswitch_test_set_switch_rollback_publish_hook(NULL);
+        if (switch_rc != EXIT_FAILURE ||
+            g_h1_fault_calls != 1 ||
+            g_h1_fault_mutation_rc != 0 ||
+            (expect_context_released &&
+             gitswitch_test_context_allocations() != 0)) {
+            _exit(161);
+        }
+        if (fflush(NULL) != 0) _exit(162);
+        _exit(0);
+    }
+
+    {
+        int status = 0;
+        pid_t waited;
+
+        do {
+            waited = waitpid(child, &status, 0);
+        } while (waited < 0 && errno == EINTR);
+        return waited == child ? status : -1;
+    }
+}
+
+static int run_h1_switch_case(
+    const cli_owner_fixture_t *fixture, const char *selector,
+    config_io_fault_fn fault, bool expect_context_released) {
+    return run_h1_switch_case_at(
+        fixture, NULL, selector, fault, expect_context_released);
+}
+
+static int run_h1_resume_case_at(
+    const cli_owner_fixture_t *fixture,
+    const char *working_directory, const char *output_name) {
+    pid_t child = fork();
+
+    if (child < 0) return -1;
+    if (child == 0) {
+        char output[PATH_MAX];
+        char program[] = "gitswitch";
+        char no_color[] = "-C";
+        char resume[] = "resume";
+        char *resume_argv[] = { program, no_color, resume, NULL };
+        int resume_rc;
+
+        if (!output_name || output_name[0] == '\0' ||
+            (size_t)snprintf(output, sizeof(output), "%s/%s",
+                             fixture->root, output_name) >=
+                sizeof(output) ||
+            setenv("HOME", fixture->home, 1) != 0 ||
+            setenv("XDG_RUNTIME_DIR", fixture->runtime, 1) != 0 ||
+            setenv("GIT_CONFIG_GLOBAL", fixture->gitconfig, 1) != 0 ||
+            setenv("GIT_CONFIG_NOSYSTEM", "1", 1) != 0 ||
+            setenv("GITSWITCH_ALLOW_TMP_GPG", "1", 1) != 0 ||
+            unsetenv("XDG_CONFIG_HOME") != 0 ||
+            unsetenv("GNUPGHOME") != 0 ||
+            (working_directory &&
+             chdir(working_directory) != 0) ||
+            redirect_output(output) != 0) {
+            _exit(170);
+        }
+
+        optind = 1;
+        resume_rc = gitswitch_cli_main(3, resume_argv);
+        if (resume_rc != EXIT_SUCCESS) _exit(171);
+        if (fflush(NULL) != 0) _exit(172);
+        _exit(0);
+    }
+
+    {
+        int status = 0;
+        pid_t waited;
+
+        do {
+            waited = waitpid(child, &status, 0);
+        } while (waited < 0 && errno == EINTR);
+        return waited == child ? status : -1;
+    }
+}
+
+static int run_h1_resume_case(const cli_owner_fixture_t *fixture) {
+    return run_h1_resume_case_at(
+        fixture, NULL, "resume-output");
+}
+
+static int run_h1_blocked_resume_case_at(
+    const cli_owner_fixture_t *fixture,
+    const char *working_directory, const char *output_name) {
+    pid_t child = fork();
+
+    if (child < 0) return -1;
+    if (child == 0) {
+        char output[PATH_MAX];
+        char program[] = "gitswitch";
+        char no_color[] = "-C";
+        char resume[] = "resume";
+        char *resume_argv[] = { program, no_color, resume, NULL };
+        int resume_rc;
+
+        if (!output_name || output_name[0] == '\0' ||
+            (size_t)snprintf(output, sizeof(output),
+                             "%s/%s", fixture->root,
+                             output_name) >= sizeof(output) ||
+            setenv("HOME", fixture->home, 1) != 0 ||
+            setenv("XDG_RUNTIME_DIR", fixture->runtime, 1) != 0 ||
+            setenv("GIT_CONFIG_GLOBAL", fixture->gitconfig, 1) != 0 ||
+            setenv("GIT_CONFIG_NOSYSTEM", "1", 1) != 0 ||
+            setenv("GITSWITCH_ALLOW_TMP_GPG", "1", 1) != 0 ||
+            unsetenv("XDG_CONFIG_HOME") != 0 ||
+            unsetenv("GNUPGHOME") != 0 ||
+            (working_directory &&
+             chdir(working_directory) != 0) ||
+            redirect_output(output) != 0) {
+            _exit(175);
+        }
+        optind = 1;
+        resume_rc = gitswitch_cli_main(3, resume_argv);
+        if (resume_rc != EXIT_FAILURE ||
+            gitswitch_test_context_allocations() != 0) {
+            _exit(176);
+        }
+        if (fflush(NULL) != 0) _exit(177);
+        _exit(0);
+    }
+
+    {
+        int status = 0;
+        pid_t waited;
+
+        do {
+            waited = waitpid(child, &status, 0);
+        } while (waited < 0 && errno == EINTR);
+        return waited == child ? status : -1;
+    }
+}
+
+static int run_h1_blocked_resume_case(
+    const cli_owner_fixture_t *fixture) {
+    return run_h1_blocked_resume_case_at(
+        fixture, NULL, "resume-output");
+}
+
+static int run_h1_ssh_runtime_case(
+    const cli_owner_fixture_t *fixture, const char *key_path,
+    bool reset_first, bool expected_live) {
+    pid_t child = fork();
+
+    if (child < 0) return -1;
+    if (child == 0) {
+        account_t account;
+        bool live = !expected_live;
+
+        memset(&account, 0, sizeof(account));
+        if (!fixture || !key_path ||
+            setenv("HOME", fixture->home, 1) != 0 ||
+            setenv("XDG_RUNTIME_DIR", fixture->runtime, 1) != 0 ||
+            safe_strncpy(
+                account.name, "work", sizeof(account.name)) != 0 ||
+            safe_strncpy(
+                account.email, "work@example.test",
+                sizeof(account.email)) != 0 ||
+            safe_strncpy(
+                account.ssh_key_path, key_path,
+                sizeof(account.ssh_key_path)) != 0) {
+            _exit(230);
+        }
+        account.id = UINT32_C(2);
+        account.ssh_enabled = true;
+        if (reset_first && ssh_manager_reset("work") != 0) {
+            _exit(231);
+        }
+        if (ssh_manager_current_is_live_for_account(
+                &account, &live) != 0 ||
+            live != expected_live) {
+            _exit(232);
+        }
+        _exit(0);
+    }
+
+    {
+        int status = 0;
+        pid_t waited;
+
+        do {
+            waited = waitpid(child, &status, 0);
+        } while (waited < 0 && errno == EINTR);
+        return waited == child ? status : -1;
+    }
+}
+
+static int run_h1_stage_install_failure_case(
+    const cli_owner_fixture_t *fixture) {
+    pid_t child = fork();
+
+    if (child < 0) return -1;
+    if (child == 0) {
+        char program[] = "gitswitch";
+        char no_color[] = "-C";
+        char force_global[] = "-g";
+        char account[] = "work";
+        char *switch_argv[] = {
+            program, no_color, force_global, account, NULL
+        };
+        int switch_rc;
+
+        if (setenv("HOME", fixture->home, 1) != 0 ||
+            setenv("XDG_RUNTIME_DIR", fixture->runtime, 1) != 0 ||
+            setenv("GIT_CONFIG_GLOBAL", fixture->gitconfig, 1) != 0 ||
+            setenv("GIT_CONFIG_NOSYSTEM", "1", 1) != 0 ||
+            setenv("GITSWITCH_ALLOW_TMP_GPG", "1", 1) != 0 ||
+            unsetenv("XDG_CONFIG_HOME") != 0 ||
+            unsetenv("GNUPGHOME") != 0 ||
+            redirect_output(fixture->output) != 0) {
+            _exit(180);
+        }
+
+        g_switch_guard_fail_stage = true;
+        g_switch_guard_fail_clear = false;
+        g_switch_guard_clear_failures_remaining = 0;
+        g_switch_guard_hook_calls = 0;
+        (void)gitswitch_test_set_switch_guard_hook(
+            fail_switch_guard_lifecycle);
+        optind = 1;
+        switch_rc = gitswitch_cli_main(4, switch_argv);
+        (void)gitswitch_test_set_switch_guard_hook(NULL);
+        if (switch_rc != EXIT_FAILURE ||
+            g_switch_guard_hook_calls != 1 ||
+            gitswitch_test_context_allocations() != 0) {
+            _exit(181);
+        }
+        if (fflush(NULL) != 0) _exit(182);
+        _exit(0);
+    }
+
+    {
+        int status = 0;
+        pid_t waited;
+
+        do {
+            waited = waitpid(child, &status, 0);
+        } while (waited < 0 && errno == EINTR);
+        return waited == child ? status : -1;
+    }
+}
+
+static int run_h1_persistent_clear_failure_case(
+    const cli_owner_fixture_t *fixture) {
+    pid_t child = fork();
+
+    if (child < 0) return -1;
+    if (child == 0) {
+        char program[] = "gitswitch";
+        char no_color[] = "-C";
+        char force_global[] = "-g";
+        char account[] = "work";
+        char *switch_argv[] = {
+            program, no_color, force_global, account, NULL
+        };
+        int switch_rc;
+
+        if (setenv("HOME", fixture->home, 1) != 0 ||
+            setenv("XDG_RUNTIME_DIR", fixture->runtime, 1) != 0 ||
+            setenv("GIT_CONFIG_GLOBAL", fixture->gitconfig, 1) != 0 ||
+            setenv("GIT_CONFIG_NOSYSTEM", "1", 1) != 0 ||
+            setenv("GITSWITCH_ALLOW_TMP_GPG", "1", 1) != 0 ||
+            unsetenv("XDG_CONFIG_HOME") != 0 ||
+            unsetenv("GNUPGHOME") != 0 ||
+            redirect_output(fixture->output) != 0) {
+            _exit(185);
+        }
+
+        g_switch_guard_fail_stage = false;
+        g_switch_guard_fail_clear = false;
+        g_switch_guard_clear_failures_remaining = 2;
+        g_switch_guard_hook_calls = 0;
+        (void)gitswitch_test_set_switch_guard_hook(
+            fail_switch_guard_lifecycle);
+        optind = 1;
+        switch_rc = gitswitch_cli_main(4, switch_argv);
+        (void)gitswitch_test_set_switch_guard_hook(NULL);
+        if (switch_rc != EXIT_FAILURE ||
+            g_switch_guard_hook_calls != 2 ||
+            g_switch_guard_clear_failures_remaining != 0 ||
+            gitswitch_test_context_allocations() != 0) {
+            _exit(186);
+        }
+        if (fflush(NULL) != 0) _exit(187);
+        _exit(0);
+    }
+
+    {
+        int status = 0;
+        pid_t waited;
+
+        do {
+            waited = waitpid(child, &status, 0);
+        } while (waited < 0 && errno == EINTR);
+        return waited == child ? status : -1;
+    }
+}
+
+static int run_h1_guard_clear_retry_case(
+    const cli_owner_fixture_t *fixture) {
+    pid_t child = fork();
+
+    if (child < 0) return -1;
+    if (child == 0) {
+        static const char foreign_marker[] =
+            "foreign-switch-marker\n";
+        gitswitch_ctx_t *ctx = NULL;
+        account_t *target;
+        publication_record_t *destinations = NULL;
+        size_t destination_count = 0U;
+        config_switch_guard_t *guard = NULL;
+        char observed[64];
+        struct stat st;
+        int directory_fd = -1;
+        int result = 190;
+
+        if (setenv("HOME", fixture->home, 1) != 0 ||
+            setenv("XDG_RUNTIME_DIR", fixture->runtime, 1) != 0 ||
+            setenv("GIT_CONFIG_GLOBAL", fixture->gitconfig, 1) != 0 ||
+            setenv("GIT_CONFIG_NOSYSTEM", "1", 1) != 0 ||
+            unsetenv("XDG_CONFIG_HOME") != 0 ||
+            unsetenv("GNUPGHOME") != 0) {
+            _exit(result);
+        }
+        ctx = calloc(1U, sizeof(*ctx));
+        destinations = calloc(
+            CONFIG_SWITCH_DESTINATION_MAX,
+            sizeof(*destinations));
+        if (!ctx || !destinations || config_init(ctx) != 0) goto done;
+        target = config_find_account_exact(ctx, "work");
+        if (!target ||
+            git_config_snapshot(GIT_SCOPE_GLOBAL) != 0 ||
+            git_config_snapshot_export_destinations(
+                destinations, CONFIG_SWITCH_DESTINATION_MAX,
+                &destination_count) != 0 ||
+            config_switch_guard_install_or_adopt(
+                ctx, target, GIT_SCOPE_GLOBAL,
+                destinations, destination_count, &guard) != 0) {
+            goto done;
+        }
+
+        g_switch_guard_fail_stage = false;
+        g_switch_guard_fail_clear = true;
+        g_switch_guard_clear_failures_remaining = 0;
+        g_switch_guard_hook_calls = 0;
+        (void)gitswitch_test_set_switch_guard_hook(
+            fail_switch_guard_lifecycle);
+        if (config_switch_guard_clear(&guard) == 0 ||
+            !guard || g_switch_guard_hook_calls != 1 ||
+            (lstat(fixture->switch_fence, &st) == 0 ||
+             errno != ENOENT)) {
+            result = 191;
+            goto done;
+        }
+
+        /* A same-UID foreign replacement cannot inherit the unlinked
+         * generation's retry authority. The retry must reject and preserve
+         * it byte-for-byte. */
+        if (write_private(
+                fixture->switch_fence, foreign_marker) != 0 ||
+            config_switch_guard_clear(&guard) == 0 ||
+            !guard ||
+            read_text(fixture->switch_fence, observed,
+                      sizeof(observed)) == 0 ||
+            strcmp(observed, foreign_marker) != 0) {
+            result = 192;
+            goto done;
+        }
+        if (unlink(fixture->switch_fence) != 0) {
+            result = 193;
+            goto done;
+        }
+        directory_fd = open(
+            fixture->config_dir,
+            O_RDONLY | O_CLOEXEC | O_DIRECTORY | O_NOFOLLOW);
+        if (directory_fd < 0 || fsync(directory_fd) != 0 ||
+            close(directory_fd) != 0) {
+            directory_fd = -1;
+            result = 194;
+            goto done;
+        }
+        directory_fd = -1;
+        if (config_switch_guard_clear(&guard) != 0 || guard) {
+            result = 195;
+            goto done;
+        }
+
+        /* A second complete ownership cycle proves both the process owner and
+         * lifecycle lock were released by the successful retry. */
+        if (config_switch_guard_install_or_adopt(
+                ctx, target, GIT_SCOPE_GLOBAL,
+                destinations, destination_count, &guard) != 0 ||
+            config_switch_guard_clear(&guard) != 0 || guard) {
+            result = 196;
+            goto done;
+        }
+        result = 0;
+
+done:
+        (void)gitswitch_test_set_switch_guard_hook(NULL);
+        if (guard) config_switch_guard_abandon(&guard);
+        if (directory_fd >= 0) close(directory_fd);
+        git_config_commit();
+        if (destinations) {
+            secure_zero_memory(
+                destinations,
+                CONFIG_SWITCH_DESTINATION_MAX *
+                    sizeof(*destinations));
+            free(destinations);
+        }
+        if (ctx) {
+            secure_zero_memory(ctx, sizeof(*ctx));
+            free(ctx);
+        }
+        _exit(result);
+    }
+
+    {
+        int status = 0;
+        pid_t waited;
+
+        do {
+            waited = waitpid(child, &status, 0);
+        } while (waited < 0 && errno == EINTR);
+        return waited == child ? status : -1;
+    }
+}
+
+static int run_h1_create_guard_marker_at(
+    const cli_owner_fixture_t *fixture, const char *working_directory) {
+    pid_t child = fork();
+
+    if (child < 0) return -1;
+    if (child == 0) {
+        gitswitch_ctx_t *ctx = NULL;
+        account_t *target;
+        publication_record_t *destinations = NULL;
+        size_t destination_count = 0U;
+        config_switch_guard_t *guard = NULL;
+        int result = 200;
+
+        if (setenv("HOME", fixture->home, 1) != 0 ||
+            setenv("XDG_RUNTIME_DIR", fixture->runtime, 1) != 0 ||
+            setenv("GIT_CONFIG_GLOBAL", fixture->gitconfig, 1) != 0 ||
+            setenv("GIT_CONFIG_NOSYSTEM", "1", 1) != 0 ||
+            unsetenv("XDG_CONFIG_HOME") != 0 ||
+            unsetenv("GNUPGHOME") != 0 ||
+            (working_directory &&
+             chdir(working_directory) != 0)) {
+            _exit(result);
+        }
+        ctx = calloc(1U, sizeof(*ctx));
+        destinations = calloc(
+            CONFIG_SWITCH_DESTINATION_MAX,
+            sizeof(*destinations));
+        if (!ctx || !destinations || config_init(ctx) != 0) goto done;
+        target = config_find_account_exact(ctx, "work");
+        if (!target ||
+            git_config_snapshot(GIT_SCOPE_GLOBAL) != 0 ||
+            git_config_snapshot_export_destinations(
+                destinations, CONFIG_SWITCH_DESTINATION_MAX,
+                &destination_count) != 0 ||
+            config_switch_guard_install_or_adopt(
+                ctx, target, GIT_SCOPE_GLOBAL,
+                destinations, destination_count, &guard) != 0) {
+            goto done;
+        }
+        config_switch_guard_abandon(&guard);
+        result = 0;
+
+done:
+        if (guard) config_switch_guard_abandon(&guard);
+        git_config_commit();
+        if (destinations) {
+            secure_zero_memory(
+                destinations,
+                CONFIG_SWITCH_DESTINATION_MAX *
+                    sizeof(*destinations));
+            free(destinations);
+        }
+        if (ctx) {
+            secure_zero_memory(ctx, sizeof(*ctx));
+            free(ctx);
+        }
+        _exit(result);
+    }
+
+    {
+        int status = 0;
+        pid_t waited;
+
+        do {
+            waited = waitpid(child, &status, 0);
+        } while (waited < 0 && errno == EINTR);
+        return waited == child ? status : -1;
+    }
+}
+
+static int run_h1_create_guard_marker(
+    const cli_owner_fixture_t *fixture) {
+    return run_h1_create_guard_marker_at(fixture, NULL);
+}
+
+static int run_h1_plain_switch_case(
+    const cli_owner_fixture_t *fixture) {
+    pid_t child = fork();
+
+    if (child < 0) return -1;
+    if (child == 0) {
+        char program[] = "gitswitch";
+        char no_color[] = "-C";
+        char force_global[] = "-g";
+        char account[] = "work";
+        char *switch_argv[] = {
+            program, no_color, force_global, account, NULL
+        };
+        int switch_rc;
+
+        if (setenv("HOME", fixture->home, 1) != 0 ||
+            setenv("XDG_RUNTIME_DIR", fixture->runtime, 1) != 0 ||
+            setenv("GIT_CONFIG_GLOBAL", fixture->gitconfig, 1) != 0 ||
+            setenv("GIT_CONFIG_NOSYSTEM", "1", 1) != 0 ||
+            setenv("GITSWITCH_ALLOW_TMP_GPG", "1", 1) != 0 ||
+            unsetenv("XDG_CONFIG_HOME") != 0 ||
+            unsetenv("GNUPGHOME") != 0 ||
+            redirect_output(fixture->output) != 0) {
+            _exit(210);
+        }
+        optind = 1;
+        switch_rc = gitswitch_cli_main(4, switch_argv);
+        if (switch_rc != EXIT_SUCCESS ||
+            gitswitch_test_context_allocations() != 0) {
+            _exit(211);
+        }
+        if (fflush(NULL) != 0) _exit(212);
+        _exit(0);
+    }
+
+    {
+        int status = 0;
+        pid_t waited;
+
+        do {
+            waited = waitpid(child, &status, 0);
+        } while (waited < 0 && errno == EINTR);
+        return waited == child ? status : -1;
+    }
+}
+
+static bool h1_work_publication_is_live(
+    const cli_owner_fixture_t *fixture) {
+    const publication_record_t *record = NULL;
+    const publication_record_t *live_generation = NULL;
+    const publication_record_t *generations[
+        PUBLICATION_LEDGER_MAX_RECORDS];
+    publication_ledger_t ledger;
+    publication_lookup_status_t lookup;
+    bool live = false;
+
+    publication_ledger_init(&ledger);
+    if (config_load_publication_ledger(fixture->config, &ledger) != 0 ||
+        ledger.count == 0 ||
+        ledger.count > PUBLICATION_LEDGER_MAX_RECORDS) {
+        goto cleanup;
+    }
+    for (size_t i = 0; i < ledger.count; i++) {
+        generations[i] = &ledger.records[i];
+    }
+    lookup = publication_ledger_find(
+        &ledger, UINT32_C(2), H1_WORK_INCARNATION,
+        PUBLICATION_SCOPE_GLOBAL, fixture->gitconfig, "", &record);
+    live = lookup == PUBLICATION_LOOKUP_FOUND && record &&
+           record->state == PUBLICATION_STATE_PUBLISHED &&
+           publication_record_verify_live_destination(
+               record, generations, ledger.count, &live_generation) == 0 &&
+           live_generation != NULL;
+
+cleanup:
+    publication_ledger_clear(&ledger);
+    return live;
+}
+
+static bool h1_numeric_name_publication_is_live(
+    const cli_owner_fixture_t *fixture) {
+    const publication_record_t *record = NULL;
+    const publication_record_t *live_generation = NULL;
+    const publication_record_t *generations[
+        PUBLICATION_LEDGER_MAX_RECORDS];
+    publication_ledger_t ledger;
+    publication_lookup_status_t lookup;
+    bool live = false;
+
+    publication_ledger_init(&ledger);
+    if (config_load_publication_ledger(fixture->config, &ledger) != 0 ||
+        ledger.count == 0 ||
+        ledger.count > PUBLICATION_LEDGER_MAX_RECORDS) {
+        goto cleanup;
+    }
+    for (size_t i = 0; i < ledger.count; i++) {
+        generations[i] = &ledger.records[i];
+    }
+    lookup = publication_ledger_find(
+        &ledger, UINT32_C(8), H1_NUMERIC_NAME_INCARNATION,
+        PUBLICATION_SCOPE_GLOBAL, fixture->gitconfig, "", &record);
+    live = lookup == PUBLICATION_LOOKUP_FOUND && record &&
+           record->state == PUBLICATION_STATE_PUBLISHED &&
+           publication_record_verify_live_destination(
+               record, generations, ledger.count, &live_generation) == 0 &&
+           live_generation != NULL;
+
+cleanup:
+    publication_ledger_clear(&ledger);
+    return live;
+}
+
+static bool h1_has_published_work_record(
+    const cli_owner_fixture_t *fixture) {
+    publication_ledger_t ledger;
+    bool found = false;
+
+    publication_ledger_init(&ledger);
+    if (config_load_publication_ledger(fixture->config, &ledger) != 0) {
+        publication_ledger_clear(&ledger);
+        return true;
+    }
+    for (size_t i = 0; i < ledger.count; i++) {
+        if (ledger.records[i].account_id == UINT32_C(2) &&
+            strcmp(ledger.records[i].account_incarnation,
+                   H1_WORK_INCARNATION) == 0 &&
+            ledger.records[i].state == PUBLICATION_STATE_PUBLISHED) {
+            found = true;
+            break;
+        }
+    }
+    publication_ledger_clear(&ledger);
+    return found;
 }
 
 static int run_signal_marker_case(const cli_owner_fixture_t *fixture,
@@ -821,8 +2122,8 @@ static void check_aggregate_artifacts(const cli_owner_fixture_t *fixture) {
                 output);
     }
     CHECK(strstr(output, "Cannot durably commit resume hint") != NULL);
-    CHECK(strstr(output, "[resume-hint rollback]") != NULL);
-    CHECK(strstr(output, "[account switch abort]") != NULL);
+    CHECK(strstr(output, "[active-state settlement]") != NULL);
+    CHECK(strstr(output, "[account switch abort]") == NULL);
     CHECK(strstr(output, "application context was retained") != NULL);
     CHECK(strstr(output, "Switched to:") == NULL);
 }
@@ -846,6 +2147,777 @@ TEST(persistence_and_abort_failures_keep_first_context_and_causal_order) {
 
     CHECK_EQ_INT(fixture_setup(&fixture), 0);
     check_aggregate_artifacts(&fixture);
+}
+
+TEST(restart_resume_converges_after_active_state_restore_conflict) {
+    cli_owner_fixture_t fixture;
+    char gitconfig[4096];
+    char hint[256];
+    char output[16384];
+    bool old_coherent;
+    bool work_coherent;
+    int status;
+
+    CHECK_EQ_INT(h1_fixture_setup(&fixture), 0);
+
+    status = run_h1_switch_case(
+        &fixture, "work", replace_h1_postimage_and_fail_sync, true);
+    CHECK(status >= 0);
+    if (status >= 0) {
+        CHECK(WIFEXITED(status));
+        if (WIFEXITED(status)) CHECK_EQ_INT(WEXITSTATUS(status), 0);
+    }
+    CHECK(read_text(fixture.output, output, sizeof(output)) > 0);
+    CHECK(strstr(output, "Account switch committed") != NULL);
+    CHECK(strstr(output, "Switched to:") == NULL);
+
+    /* Fork from the pristine test parent after the switch child has exited.
+     * No process-global pending-switch or retained-CLI context can cross this
+     * boundary, so this models the recovery information available after a
+     * real process restart. */
+    status = run_h1_resume_case(&fixture);
+    CHECK(status >= 0);
+    if (status >= 0) {
+        CHECK(WIFEXITED(status));
+        if (WIFEXITED(status)) CHECK_EQ_INT(WEXITSTATUS(status), 0);
+    }
+
+    CHECK(read_text(fixture.hint, hint, sizeof(hint)) > 0);
+    CHECK(read_text(fixture.gitconfig, gitconfig, sizeof(gitconfig)) > 0);
+    old_coherent =
+        strncmp(hint, "none\nactive=old\n",
+                strlen("none\nactive=old\n")) == 0 &&
+        strstr(gitconfig, "name = old\n") != NULL &&
+        strstr(gitconfig, "email = old@example.test\n") != NULL &&
+        strstr(gitconfig, "work@example.test") == NULL;
+    work_coherent =
+        strncmp(hint, "none\nactive=work\n",
+                strlen("none\nactive=work\n")) == 0 &&
+        strstr(gitconfig, "name = work\n") != NULL &&
+        strstr(gitconfig, "email = work@example.test\n") != NULL &&
+        strstr(gitconfig, "old@example.test") == NULL;
+    if (!old_coherent && !work_coherent) {
+        fprintf(stderr,
+                "AR-14 H1 restart left mixed identity:\n"
+                "active-state prefix:\n%.128s\n"
+                "global Git config:\n%.512s\n",
+                hint, gitconfig);
+    }
+    CHECK(old_coherent || work_coherent);
+    if (old_coherent) {
+        CHECK(!h1_has_published_work_record(&fixture));
+    }
+    if (work_coherent) {
+        CHECK(h1_work_publication_is_live(&fixture));
+    }
+    CHECK(!config_dir_has_temporary(fixture.config_dir));
+}
+
+TEST(unresolved_switch_fence_survives_restart_and_resume_reconciles_forward) {
+    cli_owner_fixture_t fixture;
+    char gitconfig[4096];
+    char hint[256];
+    char output[16384];
+    char resume_output[PATH_MAX];
+    struct stat fence;
+    int fence_rc;
+    int status;
+
+    CHECK_EQ_INT(h1_fixture_setup(&fixture), 0);
+
+    status = run_h1_switch_case(
+        &fixture, "work", replace_h1_with_third_image_and_fail_sync,
+        false);
+    CHECK(status >= 0);
+    if (status >= 0) {
+        CHECK(WIFEXITED(status));
+        if (WIFEXITED(status)) CHECK_EQ_INT(WEXITSTATUS(status), 0);
+    }
+
+    CHECK(read_text(fixture.output, output, sizeof(output)) > 0);
+    CHECK(strstr(output, "Switched to:") == NULL);
+    CHECK(read_text(fixture.hint, hint, sizeof(hint)) > 0);
+    CHECK_STR_EQ(hint, "none\nactive=later\n");
+    CHECK(read_text(fixture.gitconfig, gitconfig, sizeof(gitconfig)) > 0);
+    CHECK_STR_EQ(gitconfig, concurrent_gitconfig);
+
+    memset(&fence, 0, sizeof(fence));
+    fence_rc = lstat(fixture.switch_fence, &fence);
+    CHECK_EQ_INT(fence_rc, 0);
+    if (fence_rc == 0) {
+        CHECK(S_ISREG(fence.st_mode));
+        CHECK_EQ_INT(fence.st_mode & 0777, 0600);
+        CHECK_EQ_INT(fence.st_uid, geteuid());
+        CHECK(fence.st_size > 0);
+    }
+
+    /* The switch process is gone: only the durable fence can carry exact
+     * recovery ownership into this fresh explicit resume process. */
+    status = run_h1_resume_case(&fixture);
+    CHECK(status >= 0);
+    if (status >= 0) {
+        CHECK(WIFEXITED(status));
+        if (WIFEXITED(status)) CHECK_EQ_INT(WEXITSTATUS(status), 0);
+    }
+    if ((size_t)snprintf(resume_output, sizeof(resume_output),
+                         "%s/resume-output", fixture.root) <
+            sizeof(resume_output) &&
+        read_text(resume_output, output, sizeof(output)) > 0 &&
+        (status < 0 || !WIFEXITED(status) ||
+         WEXITSTATUS(status) != 0)) {
+        fprintf(stderr, "AR-14 H1 fenced resume output:\n%s\n", output);
+    }
+
+    CHECK(read_text(fixture.hint, hint, sizeof(hint)) > 0);
+    CHECK(strncmp(hint, "none\nactive=work\n",
+                  strlen("none\nactive=work\n")) == 0);
+    CHECK(read_text(fixture.gitconfig, gitconfig, sizeof(gitconfig)) > 0);
+    CHECK(strstr(gitconfig, "name = work\n") != NULL);
+    CHECK(strstr(gitconfig, "email = work@example.test\n") != NULL);
+    CHECK(strstr(gitconfig, "old@example.test") == NULL);
+    CHECK(strstr(gitconfig, "Concurrent Name") == NULL);
+    CHECK(h1_work_publication_is_live(&fixture));
+    errno = 0;
+    CHECK(lstat(fixture.switch_fence, &fence) != 0 && errno == ENOENT);
+    CHECK(!config_dir_has_temporary(fixture.config_dir));
+}
+
+TEST(restart_resume_reconstructs_enabled_ssh_identity) {
+    cli_owner_fixture_t fixture;
+    char key_path[PATH_MAX] = "";
+    char gitconfig[4096];
+    char hint[256];
+    char output[16384];
+    char resume_output[PATH_MAX];
+    struct stat fence;
+    int status;
+
+    if (!command_exists("ssh-agent") ||
+        !command_exists("ssh-add") ||
+        !command_exists("ssh-keygen")) {
+        TS_SKIP("openssh", "OpenSSH agent tools are unavailable");
+    }
+    CHECK_EQ_INT(
+        h1_ssh_fixture_setup(
+            &fixture, key_path, sizeof(key_path)),
+        0);
+
+    status = run_h1_switch_case_at(
+        &fixture, fixture.root, "work",
+        replace_h1_with_third_image_and_fail_sync, false);
+    CHECK(status >= 0);
+    if (status >= 0) {
+        CHECK(WIFEXITED(status));
+        if (WIFEXITED(status)) CHECK_EQ_INT(WEXITSTATUS(status), 0);
+    }
+    CHECK_EQ_INT(lstat(fixture.switch_fence, &fence), 0);
+
+    /* Simulate boot-volatile SSH runtime loss after the interrupted switch.
+     * The fresh resume process must reconstruct the exact target key from the
+     * durable switch owner; a Git-only replay would fail this witness. */
+    status = run_h1_ssh_runtime_case(
+        &fixture, key_path, true, false);
+    CHECK(status >= 0);
+    if (status >= 0) {
+        CHECK(WIFEXITED(status));
+        if (WIFEXITED(status)) CHECK_EQ_INT(WEXITSTATUS(status), 0);
+    }
+
+    status = run_h1_resume_case_at(
+        &fixture, fixture.root, "resume-ssh-output");
+    CHECK(status >= 0);
+    if (status >= 0) {
+        CHECK(WIFEXITED(status));
+        if (WIFEXITED(status)) CHECK_EQ_INT(WEXITSTATUS(status), 0);
+    }
+    if ((size_t)snprintf(
+            resume_output, sizeof(resume_output),
+            "%s/resume-ssh-output", fixture.root) <
+            sizeof(resume_output) &&
+        read_text(resume_output, output, sizeof(output)) > 0 &&
+        (status < 0 || !WIFEXITED(status) ||
+         WEXITSTATUS(status) != 0)) {
+        fprintf(stderr,
+                "AR-14 H1 SSH fenced resume output:\n%s\n",
+                output);
+    }
+
+    CHECK(read_text(fixture.hint, hint, sizeof(hint)) > 0);
+    CHECK(strncmp(hint, "ssh\nactive=work\n",
+                  strlen("ssh\nactive=work\n")) == 0);
+    CHECK(read_text(
+              fixture.gitconfig, gitconfig,
+              sizeof(gitconfig)) > 0);
+    CHECK(strstr(gitconfig, "name = work\n") != NULL);
+    CHECK(strstr(
+              gitconfig,
+              "email = work@example.test\n") != NULL);
+    CHECK(h1_work_publication_is_live(&fixture));
+    errno = 0;
+    CHECK(lstat(fixture.switch_fence, &fence) != 0 &&
+          errno == ENOENT);
+
+    status = run_h1_ssh_runtime_case(
+        &fixture, key_path, false, true);
+    CHECK(status >= 0);
+    if (status >= 0) {
+        CHECK(WIFEXITED(status));
+        if (WIFEXITED(status)) CHECK_EQ_INT(WEXITSTATUS(status), 0);
+    }
+
+    /* Do not leak the real test agent into the developer or CI host. */
+    status = run_h1_ssh_runtime_case(
+        &fixture, key_path, true, false);
+    CHECK(status >= 0);
+    if (status >= 0) {
+        CHECK(WIFEXITED(status));
+        if (WIFEXITED(status)) CHECK_EQ_INT(WEXITSTATUS(status), 0);
+    }
+}
+
+TEST(finalization_git_replacement_retains_fence_until_fresh_resume) {
+    cli_owner_fixture_t fixture;
+    char gitconfig[4096];
+    char hint[256];
+    char output[16384];
+    char resume_output[PATH_MAX];
+    struct stat fence;
+    int fence_rc;
+    int status;
+
+    CHECK_EQ_INT(h1_fixture_setup(&fixture), 0);
+
+    status = run_h1_switch_case(
+        &fixture, "work",
+        replace_h1_git_during_state_commit_and_allow_sync, false);
+    CHECK(status >= 0);
+    if (status >= 0) {
+        CHECK(WIFEXITED(status));
+        if (WIFEXITED(status)) CHECK_EQ_INT(WEXITSTATUS(status), 0);
+    }
+
+    CHECK(read_text(fixture.output, output, sizeof(output)) > 0);
+    CHECK(strstr(output, "Switched to:") == NULL);
+
+    /* The active-state commit itself succeeded, while the independently
+     * replaced Git destination no longer publishes the target identity. */
+    CHECK(read_text(fixture.hint, hint, sizeof(hint)) > 0);
+    CHECK(strncmp(hint, "none\nactive=work\n",
+                  strlen("none\nactive=work\n")) == 0);
+    CHECK(read_text(fixture.gitconfig, gitconfig, sizeof(gitconfig)) > 0);
+    CHECK_STR_EQ(gitconfig, concurrent_gitconfig);
+
+    memset(&fence, 0, sizeof(fence));
+    fence_rc = lstat(fixture.switch_fence, &fence);
+    CHECK_EQ_INT(fence_rc, 0);
+    if (fence_rc == 0) {
+        CHECK(S_ISREG(fence.st_mode));
+        CHECK_EQ_INT(fence.st_mode & 0777, 0600);
+        CHECK_EQ_INT(fence.st_uid, geteuid());
+        CHECK(fence.st_size > 0);
+    }
+
+    /* This process has no in-memory switch owner. Recovery must therefore
+     * adopt the durable fence and converge every identity surface forward. */
+    status = run_h1_resume_case(&fixture);
+    CHECK(status >= 0);
+    if (status >= 0) {
+        CHECK(WIFEXITED(status));
+        if (WIFEXITED(status)) CHECK_EQ_INT(WEXITSTATUS(status), 0);
+    }
+    if ((size_t)snprintf(resume_output, sizeof(resume_output),
+                         "%s/resume-output", fixture.root) <
+            sizeof(resume_output) &&
+        read_text(resume_output, output, sizeof(output)) > 0 &&
+        (status < 0 || !WIFEXITED(status) ||
+         WEXITSTATUS(status) != 0)) {
+        fprintf(stderr,
+                "AR-14 H1 finalization-race resume output:\n%s\n",
+                output);
+    }
+
+    CHECK(read_text(fixture.hint, hint, sizeof(hint)) > 0);
+    CHECK(strncmp(hint, "none\nactive=work\n",
+                  strlen("none\nactive=work\n")) == 0);
+    CHECK(read_text(fixture.gitconfig, gitconfig, sizeof(gitconfig)) > 0);
+    CHECK(strstr(gitconfig, "name = work\n") != NULL);
+    CHECK(strstr(gitconfig, "email = work@example.test\n") != NULL);
+    CHECK(strstr(gitconfig, "old@example.test") == NULL);
+    CHECK(strstr(gitconfig, "Concurrent Name") == NULL);
+    CHECK(h1_work_publication_is_live(&fixture));
+    errno = 0;
+    CHECK(lstat(fixture.switch_fence, &fence) != 0 &&
+          errno == ENOENT);
+    CHECK(!config_dir_has_temporary(fixture.config_dir));
+}
+
+TEST(fresh_switch_stage_failure_cleans_exact_preintent_before_mutation) {
+    cli_owner_fixture_t fixture;
+    char gitconfig[4096];
+    char hint[256];
+    char output[8192];
+    struct stat st;
+    int status;
+
+    CHECK_EQ_INT(h1_fixture_setup(&fixture), 0);
+    status = run_h1_stage_install_failure_case(&fixture);
+    CHECK(status >= 0);
+    if (status >= 0) {
+        CHECK(WIFEXITED(status));
+        if (WIFEXITED(status)) CHECK_EQ_INT(WEXITSTATUS(status), 0);
+    }
+    CHECK(read_text(fixture.hint, hint, sizeof(hint)) > 0);
+    CHECK_STR_EQ(hint, "none\nactive=old\n");
+    CHECK(read_text(fixture.gitconfig, gitconfig, sizeof(gitconfig)) > 0);
+    CHECK_STR_EQ(gitconfig, h1_old_gitconfig);
+    errno = 0;
+    CHECK(lstat(fixture.switch_stage, &st) != 0 && errno == ENOENT);
+    errno = 0;
+    CHECK(lstat(fixture.switch_fence, &st) != 0 && errno == ENOENT);
+    CHECK(read_text(fixture.output, output, sizeof(output)) > 0);
+    CHECK(strstr(output, "Injected switch guard lifecycle failure") != NULL);
+    CHECK(strstr(output, "Switched to:") == NULL);
+}
+
+TEST(switch_guard_clear_retries_after_unlink_and_preserves_foreign_name) {
+    cli_owner_fixture_t fixture;
+    int status;
+
+    CHECK_EQ_INT(h1_fixture_setup(&fixture), 0);
+    status = run_h1_guard_clear_retry_case(&fixture);
+    CHECK(status >= 0);
+    if (status >= 0) {
+        CHECK(WIFEXITED(status));
+        if (WIFEXITED(status)) CHECK_EQ_INT(WEXITSTATUS(status), 0);
+    }
+}
+
+TEST(persistent_clear_failure_republishes_restart_callable_fence) {
+    cli_owner_fixture_t fixture;
+    char gitconfig[4096];
+    char hint[256];
+    char output[16384];
+    struct stat marker;
+    int status;
+
+    CHECK_EQ_INT(h1_fixture_setup(&fixture), 0);
+    status = run_h1_persistent_clear_failure_case(&fixture);
+    CHECK(status >= 0);
+    if (status >= 0) {
+        CHECK(WIFEXITED(status));
+        if (WIFEXITED(status)) CHECK_EQ_INT(WEXITSTATUS(status), 0);
+    }
+    CHECK(read_text(fixture.output, output, sizeof(output)) > 0);
+    CHECK(strstr(output, "Switched to:") == NULL);
+    CHECK(strstr(output, "recovery fencing remains") != NULL);
+    CHECK(read_text(fixture.hint, hint, sizeof(hint)) > 0);
+    CHECK(strncmp(hint, "none\nactive=work\n",
+                  strlen("none\nactive=work\n")) == 0);
+    CHECK(read_text(fixture.gitconfig, gitconfig, sizeof(gitconfig)) > 0);
+    CHECK(strstr(gitconfig, "name = work\n") != NULL);
+    CHECK(strstr(gitconfig, "email = work@example.test\n") != NULL);
+    CHECK(h1_work_publication_is_live(&fixture));
+    CHECK_EQ_INT(lstat(fixture.switch_fence, &marker), 0);
+    CHECK(S_ISREG(marker.st_mode));
+    CHECK_EQ_INT(marker.st_mode & 0777, 0600);
+
+    /* The originating process released every handle. Only the republished,
+     * directory-synchronized marker can authorize this fresh recovery. */
+    status = run_h1_resume_case(&fixture);
+    CHECK(status >= 0);
+    if (status >= 0) {
+        CHECK(WIFEXITED(status));
+        if (WIFEXITED(status)) CHECK_EQ_INT(WEXITSTATUS(status), 0);
+    }
+    errno = 0;
+    CHECK(lstat(fixture.switch_fence, &marker) != 0 && errno == ENOENT);
+    CHECK(read_text(fixture.hint, hint, sizeof(hint)) > 0);
+    CHECK(strncmp(hint, "none\nactive=work\n",
+                  strlen("none\nactive=work\n")) == 0);
+    CHECK(read_text(fixture.gitconfig, gitconfig, sizeof(gitconfig)) > 0);
+    CHECK(strstr(gitconfig, "name = work\n") != NULL);
+    CHECK(strstr(gitconfig, "email = work@example.test\n") != NULL);
+    CHECK(h1_work_publication_is_live(&fixture));
+}
+
+TEST(restart_guard_binds_complete_repository_destination_set) {
+    enum { MARKER_CAPACITY = 64 * 1024 };
+    cli_owner_fixture_t fixture;
+    char repo_a[PATH_MAX] = "";
+    char repo_b[PATH_MAX] = "";
+    char repo_a_local[PATH_MAX] = "";
+    char repo_a_worktree[PATH_MAX] = "";
+    char repo_b_local[PATH_MAX] = "";
+    char repo_b_worktree[PATH_MAX] = "";
+    unsigned char *marker_before = NULL;
+    unsigned char *marker_after = NULL;
+    struct stat state_before;
+    struct stat state_after;
+    size_t marker_before_length = 0U;
+    size_t marker_after_length = 0U;
+    int status;
+
+    memset(&state_before, 0, sizeof(state_before));
+    memset(&state_after, 0, sizeof(state_after));
+    CHECK_EQ_INT(h1_fixture_setup(&fixture), 0);
+    CHECK((size_t)snprintf(
+              repo_a, sizeof(repo_a), "%s/repo-a", fixture.root) <
+          sizeof(repo_a));
+    CHECK((size_t)snprintf(
+              repo_b, sizeof(repo_b), "%s/repo-b", fixture.root) <
+          sizeof(repo_b));
+    CHECK((size_t)snprintf(
+              repo_a_local, sizeof(repo_a_local),
+              "%s/.git/config", repo_a) < sizeof(repo_a_local));
+    CHECK((size_t)snprintf(
+              repo_a_worktree, sizeof(repo_a_worktree),
+              "%s/.git/config.worktree", repo_a) <
+          sizeof(repo_a_worktree));
+    CHECK((size_t)snprintf(
+              repo_b_local, sizeof(repo_b_local),
+              "%s/.git/config", repo_b) < sizeof(repo_b_local));
+    CHECK((size_t)snprintf(
+              repo_b_worktree, sizeof(repo_b_worktree),
+              "%s/.git/config.worktree", repo_b) <
+          sizeof(repo_b_worktree));
+    CHECK_EQ_INT(h1_repo_setup(&fixture, repo_a, "repo-a"), 0);
+    CHECK_EQ_INT(h1_repo_setup(&fixture, repo_b, "repo-b"), 0);
+
+    status = run_h1_create_guard_marker_at(&fixture, repo_a);
+    CHECK(status >= 0);
+    if (status >= 0) {
+        CHECK(WIFEXITED(status));
+        if (WIFEXITED(status)) CHECK_EQ_INT(WEXITSTATUS(status), 0);
+    }
+
+    /* Model an abrupt exit after global and local publication but before the
+     * worktree destination was rewritten. The durable owner must remember all
+     * three destinations, not merely whichever repository the retry sees. */
+    CHECK_EQ_INT(h1_git_set(
+                     &fixture, repo_a, "--global",
+                     "user.name", "work"),
+                 0);
+    CHECK_EQ_INT(h1_git_set(
+                     &fixture, repo_a, "--global",
+                     "user.email", "work@example.test"),
+                 0);
+    CHECK_EQ_INT(h1_git_set(
+                     &fixture, repo_a, "--local",
+                     "user.name", "work"),
+                 0);
+    CHECK_EQ_INT(h1_git_set(
+                     &fixture, repo_a, "--local",
+                     "user.email", "work@example.test"),
+                 0);
+    CHECK(h1_git_identity_matches(
+        fixture.gitconfig, "work", "work@example.test"));
+    CHECK(h1_git_identity_matches(
+        repo_a_local, "work", "work@example.test"));
+    CHECK(h1_git_identity_matches(
+        repo_a_worktree, "repo-a worktree",
+        "repo-a-worktree@example.test"));
+    CHECK(h1_git_identity_matches(
+        repo_b_local, "repo-b local",
+        "repo-b-local@example.test"));
+    CHECK(h1_git_identity_matches(
+        repo_b_worktree, "repo-b worktree",
+        "repo-b-worktree@example.test"));
+
+    marker_before = calloc(1U, MARKER_CAPACITY);
+    marker_after = calloc(1U, MARKER_CAPACITY);
+    CHECK(marker_before != NULL);
+    CHECK(marker_after != NULL);
+    if (marker_before && marker_after) {
+        marker_before_length = h1_read_bounded_file(
+            fixture.switch_fence, marker_before,
+            MARKER_CAPACITY, &state_before);
+        CHECK(marker_before_length > 0U);
+    }
+
+    /* A different repository has a distinct local/worktree topology. It may
+     * not adopt, rewrite, or normalize repo A's exact recovery owner. */
+    status = run_h1_blocked_resume_case_at(
+        &fixture, repo_b, "resume-wrong-repo-output");
+    CHECK(status >= 0);
+    if (status >= 0) {
+        CHECK(WIFEXITED(status));
+        if (WIFEXITED(status)) CHECK_EQ_INT(WEXITSTATUS(status), 0);
+    }
+    if (marker_before && marker_after) {
+        marker_after_length = h1_read_bounded_file(
+            fixture.switch_fence, marker_after,
+            MARKER_CAPACITY, &state_after);
+        CHECK_EQ_INT(marker_after_length, marker_before_length);
+        CHECK(marker_after_length > 0U &&
+              memcmp(marker_before, marker_after,
+                     marker_before_length) == 0);
+        CHECK(h1_same_file_state(&state_before, &state_after));
+    }
+    CHECK(h1_git_identity_matches(
+        fixture.gitconfig, "work", "work@example.test"));
+    CHECK(h1_git_identity_matches(
+        repo_a_local, "work", "work@example.test"));
+    CHECK(h1_git_identity_matches(
+        repo_a_worktree, "repo-a worktree",
+        "repo-a-worktree@example.test"));
+    CHECK(h1_git_identity_matches(
+        repo_b_local, "repo-b local",
+        "repo-b-local@example.test"));
+    CHECK(h1_git_identity_matches(
+        repo_b_worktree, "repo-b worktree",
+        "repo-b-worktree@example.test"));
+
+    /* An invocation outside every repository exports only the global
+     * destination and must fail the same complete-set equality check. */
+    status = run_h1_blocked_resume_case_at(
+        &fixture, fixture.root, "resume-outside-repo-output");
+    CHECK(status >= 0);
+    if (status >= 0) {
+        CHECK(WIFEXITED(status));
+        if (WIFEXITED(status)) CHECK_EQ_INT(WEXITSTATUS(status), 0);
+    }
+    if (marker_before && marker_after) {
+        memset(marker_after, 0, MARKER_CAPACITY);
+        memset(&state_after, 0, sizeof(state_after));
+        marker_after_length = h1_read_bounded_file(
+            fixture.switch_fence, marker_after,
+            MARKER_CAPACITY, &state_after);
+        CHECK_EQ_INT(marker_after_length, marker_before_length);
+        CHECK(marker_after_length > 0U &&
+              memcmp(marker_before, marker_after,
+                     marker_before_length) == 0);
+        CHECK(h1_same_file_state(&state_before, &state_after));
+    }
+    CHECK(h1_git_identity_matches(
+        fixture.gitconfig, "work", "work@example.test"));
+    CHECK(h1_git_identity_matches(
+        repo_a_local, "work", "work@example.test"));
+    CHECK(h1_git_identity_matches(
+        repo_a_worktree, "repo-a worktree",
+        "repo-a-worktree@example.test"));
+    CHECK(h1_git_identity_matches(
+        repo_b_local, "repo-b local",
+        "repo-b-local@example.test"));
+    CHECK(h1_git_identity_matches(
+        repo_b_worktree, "repo-b worktree",
+        "repo-b-worktree@example.test"));
+
+    /* Only the exact repository topology can adopt the marker. A global
+     * switch completes by clearing both higher-precedence override scopes,
+     * leaving the target global publication effective in this worktree. */
+    status = run_h1_resume_case_at(
+        &fixture, repo_a, "resume-exact-repo-output");
+    CHECK(status >= 0);
+    if (status >= 0) {
+        CHECK(WIFEXITED(status));
+        if (WIFEXITED(status)) CHECK_EQ_INT(WEXITSTATUS(status), 0);
+    }
+    CHECK(h1_git_identity_matches(
+        fixture.gitconfig, "work", "work@example.test"));
+    CHECK(h1_git_identity_is_absent(repo_a_local));
+    CHECK(h1_git_identity_is_absent(repo_a_worktree));
+    CHECK(h1_git_identity_matches(
+        repo_b_local, "repo-b local",
+        "repo-b-local@example.test"));
+    CHECK(h1_git_identity_matches(
+        repo_b_worktree, "repo-b worktree",
+        "repo-b-worktree@example.test"));
+    CHECK(h1_work_publication_is_live(&fixture));
+    errno = 0;
+    CHECK(lstat(fixture.switch_fence, &state_after) != 0 &&
+          errno == ENOENT);
+
+    if (marker_before) {
+        secure_zero_memory(marker_before, MARKER_CAPACITY);
+        free(marker_before);
+    }
+    if (marker_after) {
+        secure_zero_memory(marker_after, MARKER_CAPACITY);
+        free(marker_after);
+    }
+}
+
+TEST(restart_stage_only_preintent_self_heals_before_switch) {
+    cli_owner_fixture_t fixture;
+    char gitconfig[4096];
+    char hint[256];
+    struct stat st;
+    int status;
+
+    CHECK_EQ_INT(h1_fixture_setup(&fixture), 0);
+    status = run_h1_create_guard_marker(&fixture);
+    CHECK(status >= 0);
+    if (status >= 0) {
+        CHECK(WIFEXITED(status));
+        if (WIFEXITED(status)) CHECK_EQ_INT(WEXITSTATUS(status), 0);
+    }
+    CHECK_EQ_INT(rename(fixture.switch_fence, fixture.switch_stage), 0);
+    CHECK_EQ_INT(sync_directory(fixture.config_dir), 0);
+    CHECK_EQ_INT(lstat(fixture.switch_stage, &st), 0);
+    CHECK_EQ_INT(st.st_nlink, 1);
+
+    status = run_h1_plain_switch_case(&fixture);
+    CHECK(status >= 0);
+    if (status >= 0) {
+        CHECK(WIFEXITED(status));
+        if (WIFEXITED(status)) CHECK_EQ_INT(WEXITSTATUS(status), 0);
+    }
+    CHECK(read_text(fixture.hint, hint, sizeof(hint)) > 0);
+    CHECK(strncmp(hint, "none\nactive=work\n",
+                  strlen("none\nactive=work\n")) == 0);
+    CHECK(read_text(fixture.gitconfig, gitconfig, sizeof(gitconfig)) > 0);
+    CHECK(strstr(gitconfig, "name = work\n") != NULL);
+    CHECK(strstr(gitconfig, "email = work@example.test\n") != NULL);
+    CHECK(h1_work_publication_is_live(&fixture));
+    errno = 0;
+    CHECK(lstat(fixture.switch_stage, &st) != 0 && errno == ENOENT);
+    errno = 0;
+    CHECK(lstat(fixture.switch_fence, &st) != 0 && errno == ENOENT);
+}
+
+TEST(restart_exact_portable_pair_normalizes_then_resumes) {
+    cli_owner_fixture_t fixture;
+    char gitconfig[4096];
+    char hint[256];
+    struct stat marker;
+    struct stat stage;
+    int status;
+
+    CHECK_EQ_INT(h1_fixture_setup(&fixture), 0);
+    status = run_h1_create_guard_marker(&fixture);
+    CHECK(status >= 0);
+    if (status >= 0) {
+        CHECK(WIFEXITED(status));
+        if (WIFEXITED(status)) CHECK_EQ_INT(WEXITSTATUS(status), 0);
+    }
+    CHECK_EQ_INT(link(fixture.switch_fence, fixture.switch_stage), 0);
+    CHECK_EQ_INT(sync_directory(fixture.config_dir), 0);
+    CHECK_EQ_INT(lstat(fixture.switch_fence, &marker), 0);
+    CHECK_EQ_INT(lstat(fixture.switch_stage, &stage), 0);
+    CHECK(marker.st_dev == stage.st_dev && marker.st_ino == stage.st_ino);
+    CHECK_EQ_INT(marker.st_nlink, 2);
+    CHECK_EQ_INT(stage.st_nlink, 2);
+
+    status = run_h1_resume_case(&fixture);
+    CHECK(status >= 0);
+    if (status >= 0) {
+        CHECK(WIFEXITED(status));
+        if (WIFEXITED(status)) CHECK_EQ_INT(WEXITSTATUS(status), 0);
+    }
+    CHECK(read_text(fixture.hint, hint, sizeof(hint)) > 0);
+    CHECK(strncmp(hint, "none\nactive=work\n",
+                  strlen("none\nactive=work\n")) == 0);
+    CHECK(read_text(fixture.gitconfig, gitconfig, sizeof(gitconfig)) > 0);
+    CHECK(strstr(gitconfig, "name = work\n") != NULL);
+    CHECK(strstr(gitconfig, "email = work@example.test\n") != NULL);
+    CHECK(h1_work_publication_is_live(&fixture));
+    errno = 0;
+    CHECK(lstat(fixture.switch_stage, &stage) != 0 && errno == ENOENT);
+    errno = 0;
+    CHECK(lstat(fixture.switch_fence, &marker) != 0 && errno == ENOENT);
+}
+
+TEST(restart_distinct_stage_and_marker_pair_fails_closed) {
+    cli_owner_fixture_t fixture;
+    static const char foreign_stage[] = "foreign-stage\n";
+    char gitconfig[4096];
+    char hint[256];
+    char stage_text[64];
+    struct stat marker_before;
+    struct stat marker_after;
+    struct stat stage_before;
+    struct stat stage_after;
+    int status;
+
+    CHECK_EQ_INT(h1_fixture_setup(&fixture), 0);
+    status = run_h1_create_guard_marker(&fixture);
+    CHECK(status >= 0);
+    if (status >= 0) {
+        CHECK(WIFEXITED(status));
+        if (WIFEXITED(status)) CHECK_EQ_INT(WEXITSTATUS(status), 0);
+    }
+    CHECK_EQ_INT(write_private(fixture.switch_stage, foreign_stage), 0);
+    CHECK_EQ_INT(sync_directory(fixture.config_dir), 0);
+    CHECK_EQ_INT(lstat(fixture.switch_fence, &marker_before), 0);
+    CHECK_EQ_INT(lstat(fixture.switch_stage, &stage_before), 0);
+    CHECK(marker_before.st_ino != stage_before.st_ino ||
+          marker_before.st_dev != stage_before.st_dev);
+
+    status = run_h1_blocked_resume_case(&fixture);
+    CHECK(status >= 0);
+    if (status >= 0) {
+        CHECK(WIFEXITED(status));
+        if (WIFEXITED(status)) CHECK_EQ_INT(WEXITSTATUS(status), 0);
+    }
+    CHECK_EQ_INT(lstat(fixture.switch_fence, &marker_after), 0);
+    CHECK_EQ_INT(lstat(fixture.switch_stage, &stage_after), 0);
+    CHECK(marker_before.st_dev == marker_after.st_dev &&
+          marker_before.st_ino == marker_after.st_ino);
+    CHECK(stage_before.st_dev == stage_after.st_dev &&
+          stage_before.st_ino == stage_after.st_ino);
+    CHECK(read_text(fixture.switch_stage, stage_text,
+                    sizeof(stage_text)) > 0);
+    CHECK_STR_EQ(stage_text, foreign_stage);
+    CHECK(read_text(fixture.hint, hint, sizeof(hint)) > 0);
+    CHECK_STR_EQ(hint, "none\nactive=old\n");
+    CHECK(read_text(fixture.gitconfig, gitconfig, sizeof(gitconfig)) > 0);
+    CHECK_STR_EQ(gitconfig, h1_old_gitconfig);
+}
+
+TEST(fenced_resume_uses_exact_numeric_account_name_not_colliding_id) {
+    cli_owner_fixture_t fixture;
+    char gitconfig[4096];
+    char hint[256];
+    char output[16384];
+    struct stat fence;
+    int status;
+
+    CHECK_EQ_INT(h1_numeric_name_fixture_setup(&fixture), 0);
+
+    /* Select account id 8 by its unique email so the durable marker records
+     * its literal name "7", which deliberately collides with account id 7. */
+    status = run_h1_switch_case(
+        &fixture, "numeric-name@example.test",
+        replace_h1_with_third_image_and_fail_sync, false);
+    CHECK(status >= 0);
+    if (status >= 0) {
+        CHECK(WIFEXITED(status));
+        if (WIFEXITED(status)) CHECK_EQ_INT(WEXITSTATUS(status), 0);
+    }
+    CHECK_EQ_INT(lstat(fixture.switch_fence, &fence), 0);
+
+    /* This child starts from the pristine test parent. Recovery receives the
+     * marker's name "7"; id-first lookup would select the decoy account and
+     * either fail marker adoption or publish the wrong identity. */
+    status = run_h1_resume_case(&fixture);
+    CHECK(status >= 0);
+    if (status >= 0) {
+        CHECK(WIFEXITED(status));
+        if (WIFEXITED(status)) CHECK_EQ_INT(WEXITSTATUS(status), 0);
+    }
+    if (status < 0 || !WIFEXITED(status) ||
+        WEXITSTATUS(status) != 0) {
+        CHECK(read_text(fixture.output, output, sizeof(output)) > 0);
+        fprintf(stderr,
+                "AR-14 H1 numeric-name switch output:\n%s\n",
+                output);
+    }
+
+    CHECK(read_text(fixture.hint, hint, sizeof(hint)) > 0);
+    CHECK(strncmp(hint, "none\nactive=7\n",
+                  strlen("none\nactive=7\n")) == 0);
+    CHECK(read_text(fixture.gitconfig, gitconfig, sizeof(gitconfig)) > 0);
+    CHECK(strstr(gitconfig, "name = 7\n") != NULL);
+    CHECK(strstr(gitconfig,
+                 "email = numeric-name@example.test\n") != NULL);
+    CHECK(strstr(gitconfig, "name = id-seven\n") == NULL);
+    CHECK(strstr(gitconfig,
+                 "email = id-seven@example.test\n") == NULL);
+    CHECK(h1_numeric_name_publication_is_live(&fixture));
+    errno = 0;
+    CHECK(lstat(fixture.switch_fence, &fence) != 0 &&
+          errno == ENOENT);
+    CHECK(!config_dir_has_temporary(fixture.config_dir));
 }
 
 TEST(ordinary_guard_restore_failure_fences_next_cli_entry) {
@@ -880,6 +2952,18 @@ TEST_MAIN_BEGIN()
     RUN_TEST(one_shot_exact_abort_releases_cli_context);
     RUN_TEST(persistent_runtime_lock_retains_then_settles_before_next_entry);
     RUN_TEST(persistence_and_abort_failures_keep_first_context_and_causal_order);
+    RUN_TEST(restart_resume_converges_after_active_state_restore_conflict);
+    RUN_TEST(unresolved_switch_fence_survives_restart_and_resume_reconciles_forward);
+    RUN_TEST(restart_resume_reconstructs_enabled_ssh_identity);
+    RUN_TEST(finalization_git_replacement_retains_fence_until_fresh_resume);
+    RUN_TEST(fresh_switch_stage_failure_cleans_exact_preintent_before_mutation);
+    RUN_TEST(switch_guard_clear_retries_after_unlink_and_preserves_foreign_name);
+    RUN_TEST(persistent_clear_failure_republishes_restart_callable_fence);
+    RUN_TEST(restart_guard_binds_complete_repository_destination_set);
+    RUN_TEST(restart_stage_only_preintent_self_heals_before_switch);
+    RUN_TEST(restart_exact_portable_pair_normalizes_then_resumes);
+    RUN_TEST(restart_distinct_stage_and_marker_pair_fails_closed);
+    RUN_TEST(fenced_resume_uses_exact_numeric_account_name_not_colliding_id);
     RUN_TEST(ordinary_guard_restore_failure_fences_next_cli_entry);
     RUN_TEST(ordinary_dispatch_restore_failure_fences_next_cli_entry);
 TEST_MAIN_END()

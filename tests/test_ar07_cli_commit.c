@@ -390,10 +390,13 @@ typedef struct {
     struct stat accounts;
     struct stat resume_hint;
     struct stat config_lock;
+    bool switch_lock_present;
+    struct stat switch_lock;
     struct stat git_config;
     char accounts_contents[4096];
     char resume_hint_contents[4096];
     char config_lock_contents[128];
+    char switch_lock_contents[128];
     char git_config_contents[4096];
 } persisted_tree_snapshot_t;
 
@@ -436,13 +439,51 @@ static int snapshot_persisted_tree(const char *home, const char *config_dir,
                                    persisted_tree_snapshot_t *snapshot) {
     static const char *const home_entries[] = {".config", ".gitconfig"};
     static const char *const config_parent_entries[] = {"gitswitch"};
-    static const char *const config_entries[] = {
+    static const char *const config_entries_without_switch_lock[] = {
         "accounts.toml", ".resume-hint", ".config.lock"
     };
+    static const char *const config_entries_with_switch_lock[] = {
+        "accounts.toml", ".resume-hint", ".config.lock", ".switch.lock"
+    };
     char path[8192];
+    bool config_entries_match;
 
     if (!home || !config_dir || !snapshot) return -1;
     memset(snapshot, 0, sizeof(*snapshot));
+    if ((size_t)snprintf(path, sizeof(path), "%s/.switch.lock",
+                         config_dir) >= sizeof(path)) {
+        return -1;
+    }
+    errno = 0;
+    if (lstat(path, &snapshot->switch_lock) == 0) {
+        snapshot->switch_lock_present = true;
+        if (!S_ISREG(snapshot->switch_lock.st_mode) ||
+            snapshot->switch_lock.st_nlink != 1 ||
+            snapshot->switch_lock.st_uid != geteuid() ||
+            (snapshot->switch_lock.st_mode & 0777) != 0600 ||
+            snapshot->switch_lock.st_size < 0 ||
+            (uintmax_t)snapshot->switch_lock.st_size >=
+                (uintmax_t)sizeof(snapshot->switch_lock_contents)) {
+            return -1;
+        }
+        slurp(path, snapshot->switch_lock_contents,
+              sizeof(snapshot->switch_lock_contents));
+        if (strlen(snapshot->switch_lock_contents) !=
+            (size_t)snapshot->switch_lock.st_size) {
+            return -1;
+        }
+    } else if (errno != ENOENT) {
+        return -1;
+    }
+    config_entries_match = snapshot->switch_lock_present
+        ? directory_has_exact_entries(
+              config_dir, config_entries_with_switch_lock,
+              sizeof(config_entries_with_switch_lock) /
+                  sizeof(config_entries_with_switch_lock[0]))
+        : directory_has_exact_entries(
+              config_dir, config_entries_without_switch_lock,
+              sizeof(config_entries_without_switch_lock) /
+                  sizeof(config_entries_without_switch_lock[0]));
     if (!directory_has_exact_entries(
             home, home_entries,
             sizeof(home_entries) / sizeof(home_entries[0])) ||
@@ -454,9 +495,7 @@ static int snapshot_persisted_tree(const char *home, const char *config_dir,
             sizeof(config_parent_entries) /
                 sizeof(config_parent_entries[0])) ||
         lstat(path, &snapshot->config_parent) != 0 ||
-        !directory_has_exact_entries(
-            config_dir, config_entries,
-            sizeof(config_entries) / sizeof(config_entries[0])) ||
+        !config_entries_match ||
         lstat(config_dir, &snapshot->config_dir) != 0) {
         return -1;
     }
@@ -504,6 +543,12 @@ static bool persisted_tree_unchanged(
                                     &after.resume_hint) &&
            preserved_metadata_equal(&before->config_lock,
                                     &after.config_lock) &&
+           before->switch_lock_present == after.switch_lock_present &&
+           (!before->switch_lock_present ||
+            (preserved_metadata_equal(&before->switch_lock,
+                                      &after.switch_lock) &&
+             strcmp(before->switch_lock_contents,
+                    after.switch_lock_contents) == 0)) &&
            preserved_metadata_equal(&before->git_config,
                                     &after.git_config) &&
            strcmp(before->accounts_contents, after.accounts_contents) == 0 &&
@@ -537,6 +582,12 @@ static bool persisted_authority_unchanged(
                                     &after.resume_hint) &&
            preserved_file_identity_equal(&before->config_lock,
                                          &after.config_lock) &&
+           before->switch_lock_present == after.switch_lock_present &&
+           (!before->switch_lock_present ||
+            (preserved_file_identity_equal(&before->switch_lock,
+                                           &after.switch_lock) &&
+             strcmp(before->switch_lock_contents,
+                    after.switch_lock_contents) == 0)) &&
            preserved_metadata_equal(&before->git_config,
                                     &after.git_config) &&
            strcmp(before->accounts_contents, after.accounts_contents) == 0 &&
@@ -955,7 +1006,7 @@ TEST(informational_output_bytes_are_stable) {
         "  doctor, health       Run local configuration/key readiness checks\n"
         "  config               Show configuration file information\n"
         "  init <shell>         Emit shell integration (bash|zsh|fish|sh|dash|ksh)\n"
-        "  resume               Restore saved boot-volatile SSH/GPG state (never rewrites Git config)\n"
+        "  resume               Restore saved SSH/GPG state, or reconcile an incomplete switch\n"
         "  reset [account]      Kill agents and delete isolated GPG/SSH state (all, or one)\n"
         "  switch <account>     Switch to specified account\n"
         "  <account>            Switch to specified account\n"
@@ -1515,7 +1566,7 @@ TEST(destructive_prompt_output_failure_blocks_authorization) {
     }
 }
 
-TEST(switch_save_failure_restores_git_config_active_and_exact_hint) {
+TEST(unwritable_config_refuses_switch_before_identity_mutation) {
     char home[128], runtime[128], config_dir[4096];
     char output_path[128], output[16384], path[8192], contents[16384];
     const char *argv[] = {
@@ -1538,11 +1589,13 @@ TEST(switch_save_failure_restores_git_config_active_and_exact_hint) {
     rc = run_cli(home, runtime, argv, output_path, sizeof(output_path));
     slurp(output_path, output, sizeof(output));
     CHECK(rc > 0 && rc < 126);
-    CHECK(strstr(output, "Failed to save configuration changes") != NULL);
-    if (strstr(output, "previous switch state restored") == NULL) {
-        fprintf(stderr, "  switch-save rollback output:\n%s\n", output);
+    CHECK(strstr(output, "Cannot acquire the switch lifecycle lock") != NULL);
+    if (strstr(output, "Failed to switch account") == NULL) {
+        fprintf(stderr, "  unwritable-config preflight output:\n%s\n",
+                output);
     }
-    CHECK(strstr(output, "previous switch state restored") != NULL);
+    CHECK(strstr(output, "Failed to switch account") != NULL);
+    CHECK(strstr(output, "previous switch state restored") == NULL);
     CHECK(strstr(output, "Switched to:") == NULL);
 
     snprintf(path, sizeof(path), "%s/accounts.toml", config_dir);
@@ -1769,7 +1822,7 @@ TEST_MAIN_BEGIN()
     RUN_TEST(read_only_commands_never_repair_or_replace_wrong_mode_manager_lock);
     RUN_TEST(mutation_failures_never_print_final_mutation_success);
     RUN_TEST(destructive_prompt_output_failure_blocks_authorization);
-    RUN_TEST(switch_save_failure_restores_git_config_active_and_exact_hint);
+    RUN_TEST(unwritable_config_refuses_switch_before_identity_mutation);
     RUN_TEST(valid_legacy_switch_migrates_before_publication);
     RUN_TEST(production_ignores_inherited_test_fault_environment);
 TEST_MAIN_END()

@@ -38,16 +38,21 @@ typedef struct {
 } account_validation_t;
 
 /* Prepared-switch commit result. NOT_COMMITTED authorizes the caller to use
- * accounts_switch_abort(). Every other non-success state means Git/runtime,
- * active metadata, and the installed SSH alias were intentionally retained as
- * one committed transaction; the caller reports failure but must not restore
- * persistence before-images around it. */
+ * accounts_switch_abort(). Every other non-success state has crossed the
+ * forward-only boundary: the caller must retain the persisted active image
+ * and must not restore before-images. FORWARD_RECOVERY_REQUIRED deliberately
+ * permits Git/alias state to be incomplete because the exact durable switch
+ * fence remains callable by explicit resume. */
 typedef enum {
     ACCOUNTS_SWITCH_COMMIT_NOT_COMMITTED,
     ACCOUNTS_SWITCH_COMMIT_COMPLETE,
     ACCOUNTS_SWITCH_COMMIT_ALIAS_UNVERIFIED,
     ACCOUNTS_SWITCH_COMMIT_ALIAS_DURABILITY_UNCERTAIN,
-    ACCOUNTS_SWITCH_COMMIT_ALIAS_CLEANUP_FAILED
+    ACCOUNTS_SWITCH_COMMIT_ALIAS_CLEANUP_FAILED,
+    ACCOUNTS_SWITCH_COMMIT_RECOVERY_FENCE_RETAINED,
+    ACCOUNTS_SWITCH_COMMIT_FORWARD_RECOVERY_REQUIRED,
+    ACCOUNTS_SWITCH_COMMIT_RECOVERY_FENCE_CLEANUP_FAILED,
+    ACCOUNTS_SWITCH_COMMIT_FINALIZATION_CLEANUP_FAILED
 } accounts_switch_commit_state_t;
 
 /* Transactional prepare outcome. A nonzero return with CLEAN_FAILURE owns no
@@ -140,7 +145,9 @@ int accounts_switch_commit_result(gitswitch_ctx_t *ctx,
 int accounts_switch_publication(
     const gitswitch_ctx_t *ctx, const publication_record_t **publication);
 /* continue_persistence_rollback keeps the signal rollback window active so
- * the caller can restore config/hint state without an interruptible gap. */
+ * the caller can restore config/hint state without an interruptible gap. A
+ * reverse abort clears only a recovery fence freshly created by this switch;
+ * a fence adopted from an older unresolved switch remains durable. */
 int accounts_switch_abort(gitswitch_ctx_t *ctx,
                           bool continue_persistence_rollback);
 

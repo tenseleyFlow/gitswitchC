@@ -135,6 +135,11 @@ typedef struct {
     bool resuming;       /* set during boot-time `resume`: skip the blocking,
                           * purely-informational SSH connection test so the
                           * login shell prompt isn't stalled on a network RTT */
+    /* Set only while adopting an exact durable switch-recovery marker. Unlike
+     * boot resume this remains a full Git/runtime transaction, but its target
+     * is a literal marker-bound account name rather than an id-first/fuzzy
+     * user selector. Never persisted. */
+    bool recovering_switch;
     bool assume_yes;     /* --yes: skip interactive confirmation prompts */
     /* Runtime-only ownership marker. The CLI's common tail must release its
      * config lock and securely free the heap context before a deferred signal

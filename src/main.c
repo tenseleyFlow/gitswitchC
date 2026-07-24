@@ -81,7 +81,7 @@ static int print_usage(const char *prog_name) {
     printf("  init <shell>         Emit shell integration (");
     print_supported_shells(stdout, "|");
     printf(")\n");
-    printf("  resume               Restore saved boot-volatile SSH/GPG state (never rewrites Git config)\n");
+    printf("  resume               Restore saved SSH/GPG state, or reconcile an incomplete switch\n");
     printf("  reset [account]      Kill agents and delete isolated GPG/SSH state (all, or one)\n");
     printf("  switch <account>     Switch to specified account\n");
     printf("  <account>            Switch to specified account\n");
@@ -158,6 +158,7 @@ typedef struct {
     bool remove_prepared;
     bool reset_guarded;
     bool reset_retirement_prepared;
+    bool switch_persistence_unresolved;
     accounts_transaction_token_t reset_token;
     command_failure_kind_t failure_kind;
     error_accumulator_t failure_errors;
@@ -180,6 +181,7 @@ typedef command_result_t (*mutation_handler_t)(gitswitch_ctx_t *ctx,
 typedef enum {
     RETAINED_CLI_CONTEXT_NONE = 0,
     RETAINED_CLI_CONTEXT_SWITCH_ABORT,
+    RETAINED_CLI_CONTEXT_SWITCH_UNRESOLVED,
     RETAINED_CLI_CONTEXT_RESET_RELEASE,
     RETAINED_CLI_CONTEXT_SIGNAL_GUARD_RELEASE,
     RETAINED_CLI_CONTEXT_UNEXPECTED_ACCOUNT_OWNER
@@ -551,6 +553,26 @@ static int settle_retained_cli_context(void) {
     primary = g_retained_cli_context.primary_error;
     primary_errno = g_retained_cli_context.primary_errno;
 
+    /* The active-state bytes are neither the captured before-image nor the
+     * switch post-image. Normal abort would restore Git/runtime and erase a
+     * freshly installed switch fence around an unowned persistence image.
+     * Keep the exact prepared owner untouched for the lifetime of this
+     * process; after process exit, the durable `.switch-incomplete` marker is
+     * the only authority a fresh explicit `resume` may adopt. */
+    if (g_retained_cli_context.kind ==
+        RETAINED_CLI_CONTEXT_SWITCH_UNRESOLVED) {
+        fprintf(stderr,
+                "gitswitch: an unresolved switch still owns this process; "
+                "refusing another in-process CLI entry without changing Git, "
+                "runtime, or active-state bytes. Exit this process and run "
+                "`gitswitch resume` to adopt the durable recovery marker. "
+                "Original failure: %s\n",
+                primary.message[0] ? primary.message :
+                                     "unknown active-state settlement error");
+        restore_cli_error(&primary, primary_errno);
+        return -1;
+    }
+
     if (g_retained_cli_context.kind !=
             RETAINED_CLI_CONTEXT_SWITCH_ABORT &&
         g_retained_cli_context.kind !=
@@ -713,10 +735,17 @@ static int handle_resume_check_command(gitswitch_ctx_t *ctx);
 static bool command_activates_account(const char *command,
                                       bool resume_check);
 static bool command_mutates_unrelated_retirement_state(const char *command);
+static bool command_mutates_switch_guard_state(const char *command,
+                                               bool resume_check);
 static bool retirement_guard_blocks_activation(const gitswitch_ctx_t *ctx);
 static bool retirement_guard_rejects_command(
     const gitswitch_ctx_t *ctx, const char *command, bool resume_check,
     bool activation_command, bool unrelated_mutation, int *exit_code);
+static bool switch_guard_rejects_command(
+    const char *config_path, const char *command, bool resume_check,
+    bool relevant_command, bool dry_run,
+    config_switch_guard_recovery_t *recovery, bool *recovering,
+    int *exit_code);
 static command_result_t handle_reset_command(gitswitch_ctx_t *ctx,
                                              const char *account);
 static const char *detect_shell_from_env(void);
@@ -893,6 +922,9 @@ int main(int argc, char *argv[]) {
     bool read_only_command = false;
     bool activation_command = false;
     bool unrelated_retirement_mutation = false;
+    bool switch_guard_relevant = false;
+    bool switch_recovery_pending = false;
+    config_switch_guard_recovery_t *switch_recovery = NULL;
     const char *pending_signal_notice = NULL;
     int config_lock_fd = -1;
     int opt;
@@ -1164,13 +1196,25 @@ int main(int argc, char *argv[]) {
     activation_command = command_activates_account(command, resume_check);
     unrelated_retirement_mutation =
         command_mutates_unrelated_retirement_state(command);
+    switch_guard_relevant =
+        command_mutates_switch_guard_state(command, resume_check);
+    if (switch_guard_relevant) {
+        switch_recovery = calloc(1U, sizeof(*switch_recovery));
+        if (!switch_recovery) {
+            display_error("Could not allocate switch recovery state", "%s",
+                          strerror(errno));
+            exit_code = EXIT_FAILURE;
+            goto cleanup;
+        }
+    }
 
     /* Inspect before acquiring a lock or loading configuration so an existing
      * durable retirement marker blocks unrelated work without first creating,
      * repairing, or probing runtime state. A missing/unsafe configuration path
      * also fails closed for these commands. Recovery remove/reset commands and
      * genuinely read-only commands deliberately do not pass through this gate. */
-    if (activation_command || unrelated_retirement_mutation) {
+    if (activation_command || unrelated_retirement_mutation ||
+        switch_guard_relevant) {
         if (config_get_path(ctx->config.config_path,
                             sizeof(ctx->config.config_path)) != 0) {
             ctx->config.config_path[0] = '\0';
@@ -1178,6 +1222,12 @@ int main(int argc, char *argv[]) {
         if (retirement_guard_rejects_command(
                 ctx, command, resume_check, activation_command,
                 unrelated_retirement_mutation, &exit_code)) {
+            goto cleanup;
+        }
+        if (switch_guard_rejects_command(
+                ctx->config.config_path, command, resume_check,
+                switch_guard_relevant, dry_run, switch_recovery,
+                &switch_recovery_pending, &exit_code)) {
             goto cleanup;
         }
     }
@@ -1222,7 +1272,8 @@ int main(int argc, char *argv[]) {
                  * switch already owns serialization and will leave a coherent
                  * result, so this redundant restore is a successful no-op and
                  * must not delay or alarm every newly opened shell. */
-                if (contended && c && strcmp(c, "resume") == 0) {
+                if (contended && c && strcmp(c, "resume") == 0 &&
+                    !switch_recovery_pending) {
                     exit_code = EXIT_SUCCESS;
                     goto cleanup;
                 }
@@ -1251,6 +1302,22 @@ int main(int argc, char *argv[]) {
             unrelated_retirement_mutation, &exit_code)) {
         goto cleanup;
     }
+    if (config_lock_fd >= 0 && switch_guard_relevant) {
+        if (config_switch_guard_reconcile_preintent(
+                ctx->config.config_path) != 0) {
+            display_error(
+                "Cannot reconcile incomplete switch preparation",
+                "%s", get_last_error()->message);
+            exit_code = EXIT_FAILURE;
+            goto cleanup;
+        }
+        if (switch_guard_rejects_command(
+                ctx->config.config_path, command, resume_check,
+                switch_guard_relevant, dry_run, switch_recovery,
+                &switch_recovery_pending, &exit_code)) {
+            goto cleanup;
+        }
+    }
 
     /* Completion invokes `list --names` on every TAB. Give exactly that
      * grammar a names-only loader which parses the full account document but
@@ -1270,6 +1337,28 @@ int main(int argc, char *argv[]) {
     }
     
     /* Set dry run mode if requested */
+    if (switch_recovery_pending) {
+        bool scope_conflict =
+            (force_global &&
+             switch_recovery->effective_scope != GIT_SCOPE_GLOBAL) ||
+            (force_local &&
+             switch_recovery->effective_scope != GIT_SCOPE_LOCAL);
+
+        if (scope_conflict) {
+            display_error(
+                "Incomplete switch recovery has a fixed Git scope",
+                "the durable marker requires %s scope; retry `gitswitch resume` without a conflicting scope flag",
+                switch_recovery->effective_scope == GIT_SCOPE_GLOBAL
+                    ? "global" : "local");
+            exit_code = EXIT_FAILURE;
+            goto cleanup;
+        }
+        force_global =
+            switch_recovery->effective_scope == GIT_SCOPE_GLOBAL;
+        force_local =
+            switch_recovery->effective_scope == GIT_SCOPE_LOCAL;
+        ctx->config.recovering_switch = true;
+    }
     ctx->config.dry_run = dry_run;
     ctx->config.force_global = force_global;
     ctx->config.force_local = force_local;
@@ -1320,7 +1409,24 @@ int main(int argc, char *argv[]) {
     } else if (strcmp(command, "config") == 0) {
         exit_code = handle_config_command(ctx);
     } else if (strcmp(command, "resume") == 0) {
-        exit_code = handle_resume_command(ctx);
+        if (switch_recovery_pending) {
+            /* Recovery is a full transactional switch, but remains
+             * noninteractive like ordinary login-shell resume. The marker's
+             * exact local destination either matches this cwd or prepare
+             * fails before mutation; it must never fall back to a hidden
+             * global-scope consent prompt. */
+            if (!freopen("/dev/null", "r", stdin)) {
+                display_error(
+                    "Cannot detach stdin for switch recovery", "%s",
+                    strerror(errno));
+                exit_code = EXIT_FAILURE;
+            } else {
+                mutation_handler = handle_switch_command;
+                mutation_argument = switch_recovery->target.name;
+            }
+        } else {
+            exit_code = handle_resume_command(ctx);
+        }
     } else if (strcmp(command, "reset") == 0) {
         mutation_handler = handle_reset_command;
         mutation_argument = arg1;
@@ -1386,6 +1492,8 @@ int main(int argc, char *argv[]) {
         int save_rc = 0;
         bool config_installed = false;
         bool switch_commit_retained = false;
+        config_active_rollback_state_t switch_persistence_state =
+            CONFIG_ACTIVE_ROLLBACK_UNRESOLVED;
         accounts_switch_commit_state_t switch_commit_state =
             ACCOUNTS_SWITCH_COMMIT_NOT_COMMITTED;
         error_context_t save_error_context = {0};
@@ -1457,6 +1565,41 @@ int main(int argc, char *argv[]) {
                 switch_commit_retained =
                     switch_commit_state !=
                     ACCOUNTS_SWITCH_COMMIT_NOT_COMMITTED;
+            }
+        }
+
+        /* A post-install persistence error does not say which complete state
+         * image is now durable.  Prove that direction before consuming the
+         * prepared account owner.  If the post-image is current, reconcile
+         * forward; rolling Git/runtime back around that durable active image
+         * is the split-state defect this transaction boundary prevents. */
+        if (mutation.switch_prepare_state ==
+                ACCOUNTS_SWITCH_PREPARE_PREPARED &&
+            save_rc != 0 && !switch_commit_retained) {
+            if (config_resume_hint_snapshot_settle(
+                    &mutation.hint_snapshot,
+                    &switch_persistence_state) == 0 &&
+                switch_persistence_state ==
+                    CONFIG_ACTIVE_ROLLBACK_POST_DURABLE) {
+                int forward_rc =
+                    accounts_switch_commit_result(ctx,
+                                                  &switch_commit_state);
+
+                if (forward_rc == 0 ||
+                    switch_commit_state !=
+                        ACCOUNTS_SWITCH_COMMIT_NOT_COMMITTED) {
+                    switch_commit_retained = true;
+                } else {
+                    /* Alias publication can fail before the commit point. The
+                     * owner is still prepared, so make one guarded attempt to
+                     * settle the active state backward before authorizing an
+                     * account abort. */
+                    switch_persistence_state =
+                        CONFIG_ACTIVE_ROLLBACK_UNRESOLVED;
+                    (void)config_resume_hint_snapshot_settle(
+                        &mutation.hint_snapshot,
+                        &switch_persistence_state);
+                }
             }
         }
 
@@ -1583,33 +1726,37 @@ int main(int argc, char *argv[]) {
                                             &save_error_context);
             }
 
-            /* Keep the cross-HOME runtime lock owned by the prepared switch
-             * until the persistence before-images are restored. Reversing
-             * accounts first released that lock and let another HOME sharing
-             * XDG_RUNTIME_DIR interleave between runtime and active/hint
-             * rollback. The outer config lock still excludes same-HOME
-             * writers while these persisted before-images are installed. */
-            safe_strncpy(ctx->config.active_account,
-                         mutation.previous_active,
-                         sizeof(ctx->config.active_account));
-            /* Restore the exact captured bytes only while the active-state
-             * inode installed by this switch is still current. A later writer
-             * is a rollback conflict and retains ownership of its generation;
-             * the outer config/runtime locks cover cooperating writers. */
-            if (config_installed &&
-                config_resume_hint_snapshot_restore(
-                    &mutation.hint_snapshot) != 0) {
+            /* Consume the account owner only in the direction proved by the
+             * synchronized active-state image above.  UNRESOLVED deliberately
+             * leaves the prepared owner live; cleanup must retain its context
+             * instead of freeing the only in-process retry handle. */
+            if (switch_persistence_state ==
+                CONFIG_ACTIVE_ROLLBACK_UNRESOLVED) {
+                mutation.switch_persistence_unresolved = true;
                 rollback_complete = false;
                 (void)error_accumulator_add_last(
-                    &rollback_errors, "resume-hint rollback");
-            }
-            /* accounts_switch_abort is deliberately last: it restores
-             * Git/runtime and releases the retained shared-runtime lock only
-             * after every config/hint rollback attempt has finished. */
-            if (accounts_switch_abort(ctx, true) != 0) {
+                    &rollback_errors, "active-state settlement");
+            } else if (switch_persistence_state ==
+                       CONFIG_ACTIVE_ROLLBACK_BEFORE_DURABLE) {
+                safe_strncpy(ctx->config.active_account,
+                             mutation.previous_active,
+                             sizeof(ctx->config.active_account));
+                /* accounts_switch_abort is deliberately last: it restores
+                 * Git/runtime and releases the retained shared-runtime lock
+                 * only after the active before-image is durable. */
+                if (accounts_switch_abort(ctx, true) != 0) {
+                    rollback_complete = false;
+                    (void)error_accumulator_add_last(
+                        &rollback_errors, "account switch abort");
+                }
+            } else {
+                /* POST_DURABLE reaches this branch only when forward commit
+                 * failed before its point of no return and the guarded reverse
+                 * settlement could not prove the before-image. */
+                mutation.switch_persistence_unresolved = true;
                 rollback_complete = false;
                 (void)error_accumulator_add_last(
-                    &rollback_errors, "account switch abort");
+                    &rollback_errors, "forward switch settlement");
             }
             (void)error_accumulator_publish(&rollback_errors);
             rollback_error = *get_last_error();
@@ -1655,8 +1802,9 @@ int main(int argc, char *argv[]) {
                         "Account switch committed, but SSH alias publication is uncertain",
                         "%s; active metadata, Git identity, runtime state, and "
                         "the installed alias were retained together. Verify "
-                        "~/.ssh/config and its filesystem durability before "
-                        "retrying", detail);
+                        "~/.ssh/config and its filesystem durability, then "
+                        "run `gitswitch resume` to reconcile and clear the "
+                        "durable .switch-incomplete marker", detail);
                     break;
                 case ACCOUNTS_SWITCH_COMMIT_ALIAS_CLEANUP_FAILED:
                     display_error(
@@ -1665,6 +1813,42 @@ int main(int argc, char *argv[]) {
                         "%s; the switch is in effect — active metadata, Git "
                         "identity, runtime state, and the alias were retained "
                         "together", detail);
+                    break;
+                case ACCOUNTS_SWITCH_COMMIT_RECOVERY_FENCE_RETAINED:
+                    display_error(
+                        "Account switch committed, but recovery fencing remains",
+                        "%s; the new active metadata, Git identity, runtime "
+                        "state, and alias were retained together. Explicit "
+                        "`gitswitch resume` must reconcile and clear the "
+                        "durable .switch-incomplete marker",
+                        detail);
+                    break;
+                case ACCOUNTS_SWITCH_COMMIT_FORWARD_RECOVERY_REQUIRED:
+                    display_error(
+                        "Account switch requires forward recovery",
+                        "%s; the new active/runtime state was retained, but "
+                        "the final Git/alias image was not proven. Explicit "
+                        "`gitswitch resume` must reconcile the exact durable "
+                        ".switch-incomplete marker",
+                        detail);
+                    break;
+                case ACCOUNTS_SWITCH_COMMIT_RECOVERY_FENCE_CLEANUP_FAILED:
+                    display_error(
+                        "Account switch committed, but recovery-fence cleanup "
+                        "is uncertain",
+                        "%s; the coherent switch is in effect, but no durable "
+                        "resume marker is being claimed. Inspect the gitswitch "
+                        "configuration directory before another mutation",
+                        detail);
+                    break;
+                case ACCOUNTS_SWITCH_COMMIT_FINALIZATION_CLEANUP_FAILED:
+                    display_error(
+                        "Account switch committed, but Git finalization "
+                        "cleanup failed",
+                        "%s; the coherent switch is in effect, but a "
+                        "transaction lock may require cleanup before another "
+                        "Git writer can proceed",
+                        detail);
                     break;
                 case ACCOUNTS_SWITCH_COMMIT_COMPLETE:
                 case ACCOUNTS_SWITCH_COMMIT_NOT_COMMITTED:
@@ -1843,7 +2027,9 @@ cleanup:
                            ACCOUNTS_SWITCH_PREPARE_PREPARED ||
                        mutation.switch_prepare_state ==
                            ACCOUNTS_SWITCH_PREPARE_ABORT_REQUIRED) {
-                kind = RETAINED_CLI_CONTEXT_SWITCH_ABORT;
+                kind = mutation.switch_persistence_unresolved
+                    ? RETAINED_CLI_CONTEXT_SWITCH_UNRESOLVED
+                    : RETAINED_CLI_CONTEXT_SWITCH_ABORT;
             } else {
                 kind = RETAINED_CLI_CONTEXT_UNEXPECTED_ACCOUNT_OWNER;
             }
@@ -1859,6 +2045,11 @@ cleanup:
      * at exit). */
     if (config_lock_fd >= 0) {
         config_write_unlock(config_lock_fd);
+    }
+    if (switch_recovery) {
+        secure_zero_memory(switch_recovery, sizeof(*switch_recovery));
+        free(switch_recovery);
+        switch_recovery = NULL;
     }
 
     /* The context can contain key paths and identity metadata.  Zero it before
@@ -2157,9 +2348,13 @@ static command_result_t handle_switch_command(gitswitch_ctx_t *ctx,
      * not real switches and must fail without rewriting the account file. The
      * prepared switch resolves it again under the same outer config lock after
      * migration, so no pointer from this admission check is retained. */
-    if (!config_find_account(ctx, identifier)) {
+    if (!(ctx->config.recovering_switch
+              ? config_find_account_exact(ctx, identifier)
+              : config_find_account(ctx, identifier))) {
         display_error("Failed to switch account", "%s",
-                      get_last_error()->message);
+                      get_last_error()->message[0] != '\0'
+                          ? get_last_error()->message
+                          : "Recovery target account no longer exists");
         return result;
     }
 
@@ -2916,6 +3111,108 @@ static bool command_mutates_unrelated_retirement_state(const char *command) {
            (strcmp(command, "add") == 0 ||
             strcmp(command, "edit") == 0 ||
             strcmp(command, "config") == 0);
+}
+
+/* Unlike retirement, an incomplete switch is bound to the exact account
+ * document generation. Removing/resetting its target would destroy recovery
+ * authority, so every account/runtime mutation is blocked except the one
+ * explicit `resume` path that adopts the exact marker. */
+static bool command_mutates_switch_guard_state(const char *command,
+                                               bool resume_check) {
+    if (resume_check) return true;
+    if (!command) return false;
+    if (command_activates_account(command, false)) return true;
+    return strcmp(command, "add") == 0 ||
+           strcmp(command, "edit") == 0 ||
+           strcmp(command, "remove") == 0 ||
+           strcmp(command, "rm") == 0 ||
+           strcmp(command, "delete") == 0 ||
+           strcmp(command, "config") == 0 ||
+           strcmp(command, "reset") == 0;
+}
+
+/* Probe before load and again under `.config.lock`. A valid canonical marker
+ * authorizes only a non-preview explicit `resume`; malformed/unsafe/staged
+ * state blocks every mutation. For the shell readiness probe, a valid marker
+ * deliberately returns failure so the shell invokes recovery, while an
+ * invalid marker returns success to suppress an unsafe automatic retry. */
+static bool switch_guard_rejects_command(
+    const char *config_path, const char *command, bool resume_check,
+    bool relevant_command, bool dry_run,
+    config_switch_guard_recovery_t *recovery, bool *recovering,
+    int *exit_code) {
+    bool blocked = true;
+    bool explicit_resume =
+        command && strcmp(command, "resume") == 0;
+    const char *detail;
+
+    if (recovering) *recovering = false;
+    if (recovery) {
+        secure_zero_memory(recovery, sizeof(*recovery));
+    }
+    if (!relevant_command) return false;
+    if (!config_path || config_path[0] == '\0' || !recovery ||
+        !recovering) {
+        errno = EINVAL;
+        set_error(ERR_INVALID_ARGS,
+                  "Cannot inspect .switch-incomplete without a valid configuration path");
+        if (exit_code) *exit_code = resume_check ? EXIT_SUCCESS : EXIT_FAILURE;
+        return true;
+    }
+
+    clear_error();
+    errno = 0;
+    if (config_switch_guard_probe(config_path, &blocked, recovery) != 0) {
+        if (get_last_error()->message[0] == '\0') {
+            errno = errno ? errno : EIO;
+            set_system_error(
+                ERR_FILE_IO,
+                "Cannot validate .switch-incomplete; account mutation remains blocked");
+        }
+        if (exit_code) *exit_code = resume_check ? EXIT_SUCCESS : EXIT_FAILURE;
+        if (!resume_check) {
+            display_error(
+                "Cannot validate incomplete switch recovery",
+                "%s", get_last_error()->message);
+        }
+        return true;
+    }
+    if (!blocked) {
+        clear_error();
+        errno = 0;
+        return false;
+    }
+    if (recovery->valid && explicit_resume && !resume_check && !dry_run) {
+        *recovering = true;
+        clear_error();
+        errno = 0;
+        return false;
+    }
+
+    if (exit_code) {
+        *exit_code = resume_check
+            ? (recovery->valid ? EXIT_FAILURE : EXIT_SUCCESS)
+            : EXIT_FAILURE;
+    }
+    if (resume_check) return true;
+
+    detail = get_last_error()->message[0] != '\0'
+        ? get_last_error()->message
+        : (recovery->valid
+               ? "a durable .switch-incomplete marker requires exact explicit recovery"
+               : "the switch recovery marker is malformed, unsafe, or incomplete");
+    if (recovery->valid && explicit_resume && dry_run) {
+        display_error(
+            "Cannot preview incomplete switch recovery",
+            "%s; rerun `gitswitch resume` without --dry-run to reconcile the exact transaction",
+            detail);
+    } else {
+        display_error(
+            "Cannot modify account state while a switch is incomplete",
+            "%s; only `gitswitch resume` may adopt the exact durable recovery marker",
+            detail);
+    }
+    return true;
 }
 
 /* A retirement guard means durable Git credential state may no longer agree

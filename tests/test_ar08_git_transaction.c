@@ -9,6 +9,9 @@
 #include "test.h"
 #include "error.h"
 #include "git_ops.h"
+#define GITSWITCH_INTERNAL_API
+#include "git_ops_internal.h"
+#undef GITSWITCH_INTERNAL_API
 #include "gpg_manager.h"
 #include "utils.h"
 
@@ -468,6 +471,95 @@ static int read_file(const char *path, char *output, size_t output_size) {
     if (ferror(file) || fclose(file) != 0) return -1;
     output[length] = '\0';
     return 0;
+}
+
+static char g_finalization_lock_path[MAX_PATH_LEN];
+static int g_finalization_hook_calls;
+
+static bool finalization_hook_targets_global(const char *lock_leaf) {
+    return lock_leaf &&
+           strcmp(lock_leaf, "global.gitconfig.lock") == 0;
+}
+
+static bool kill_after_finalization_certificate_publish(
+    git_finalization_test_stage_t stage, int directory_fd,
+    const char *lock_leaf) {
+    (void)directory_fd;
+    if (stage == GIT_FINALIZATION_TEST_AFTER_CANONICAL_PUBLISH &&
+        finalization_hook_targets_global(lock_leaf)) {
+        _exit(86);
+    }
+    return false;
+}
+
+static bool kill_after_private_finalization_certificate_prepare(
+    git_finalization_test_stage_t stage, int directory_fd,
+    const char *lock_leaf) {
+    (void)directory_fd;
+    if (stage == GIT_FINALIZATION_TEST_AFTER_PRIVATE_PREPARE &&
+        finalization_hook_targets_global(lock_leaf)) {
+        _exit(87);
+    }
+    return false;
+}
+
+static bool fail_finalization_release_once(
+    git_finalization_test_stage_t stage, int directory_fd,
+    const char *lock_leaf) {
+    (void)directory_fd;
+    if (stage == GIT_FINALIZATION_TEST_BEFORE_RELEASE &&
+        finalization_hook_targets_global(lock_leaf) &&
+        g_finalization_hook_calls++ == 0) {
+        return true;
+    }
+    return false;
+}
+
+static bool fail_finalization_release_sync_once(
+    git_finalization_test_stage_t stage, int directory_fd,
+    const char *lock_leaf) {
+    (void)directory_fd;
+    if (stage ==
+            GIT_FINALIZATION_TEST_BEFORE_RELEASE_DIRECTORY_SYNC &&
+        finalization_hook_targets_global(lock_leaf) &&
+        g_finalization_hook_calls++ == 0) {
+        return true;
+    }
+    return false;
+}
+
+static bool replace_finalization_certificate_with_foreign_lock(
+    git_finalization_test_stage_t stage, int directory_fd,
+    const char *lock_leaf) {
+    (void)directory_fd;
+    if (stage == GIT_FINALIZATION_TEST_BEFORE_RELEASE &&
+        finalization_hook_targets_global(lock_leaf) &&
+        g_finalization_hook_calls++ == 0) {
+        if (unlink(g_finalization_lock_path) != 0 ||
+            write_text_file(g_finalization_lock_path,
+                            "foreign-git-lock\n", 0600) != 0) {
+            return true;
+        }
+    }
+    return false;
+}
+
+static size_t count_finalization_private_aliases(const char *directory_path) {
+    static const char prefix[] = ".gitswitch-finalization-";
+    DIR *directory = opendir(directory_path);
+    struct dirent *entry;
+    size_t count = 0U;
+
+    if (!directory) return SIZE_MAX;
+    errno = 0;
+    while ((entry = readdir(directory)) != NULL) {
+        if (strncmp(entry->d_name, prefix, sizeof(prefix) - 1U) == 0) {
+            count++;
+        }
+    }
+    if (errno != 0) count = SIZE_MAX;
+    (void)closedir(directory);
+    return count;
 }
 
 static int count_open_descriptors(void) {
@@ -1989,6 +2081,275 @@ TEST(postpublish_path_race_retains_the_installed_generation_for_retry) {
     fixture_cleanup(&fixture);
 }
 
+static int prepare_finalization_transaction(const char *post_name) {
+    if (git_config_snapshot(GIT_SCOPE_GLOBAL) != 0 ||
+        git_set_config_value(GIT_CONFIG_USER_NAME, post_name,
+                             GIT_SCOPE_GLOBAL) != 0 ||
+        git_config_seal() != 0) {
+        return -1;
+    }
+    return 0;
+}
+
+TEST(finalization_sigkill_leaves_complete_self_healing_certificate) {
+    static const char marker_magic[] = "gitswitch-recovery-v1 ";
+    git_fixture_t fixture;
+    struct stat marker_stat;
+    char marker[1024];
+    char actual[256];
+    pid_t child;
+    int status = 0;
+
+    if (!fixture_init(&fixture)) {
+        CHECK(false);
+        fixture_cleanup(&fixture);
+        return;
+    }
+    CHECK_EQ_INT(git_set("--global", "user.name", "before-kill"), 0);
+    CHECK((size_t)snprintf(
+              g_finalization_lock_path,
+              sizeof(g_finalization_lock_path), "%s.lock",
+              fixture.global_config) < sizeof(g_finalization_lock_path));
+
+    child = fork();
+    CHECK(child >= 0);
+    if (child == 0) {
+        git_config_finalization_t *finalization = NULL;
+
+        git_ops_test_reset_caches();
+        if (prepare_finalization_transaction("published-before-kill") != 0) {
+            _exit(80);
+        }
+        (void)git_ops_test_set_finalization_hook(
+            kill_after_finalization_certificate_publish);
+        if (git_config_finalization_begin(&finalization) != 0) {
+            _exit(81);
+        }
+        _exit(82);
+    }
+    if (child > 0) {
+        CHECK(waitpid(child, &status, 0) == child);
+        CHECK(WIFEXITED(status));
+        if (WIFEXITED(status)) CHECK_EQ_INT(WEXITSTATUS(status), 86);
+    }
+    CHECK_EQ_INT(lstat(g_finalization_lock_path, &marker_stat), 0);
+    CHECK(S_ISREG(marker_stat.st_mode));
+    CHECK(marker_stat.st_nlink == 1 || marker_stat.st_nlink == 2);
+    CHECK_EQ_INT(marker_stat.st_uid, geteuid());
+    CHECK_EQ_INT(marker_stat.st_mode & 07777, 0600);
+    CHECK(marker_stat.st_size > 0);
+    CHECK_EQ_INT(read_file(g_finalization_lock_path, marker,
+                           sizeof(marker)), 0);
+    CHECK(strncmp(marker, marker_magic, strlen(marker_magic)) == 0);
+
+    /* This process did not inherit the child's transaction or descriptors.
+     * Its first managed write must claim the strict certificate, retire any
+     * portable hard-link alias, and retry through real Git. */
+    git_ops_test_reset_caches();
+    CHECK_EQ_INT(git_set_config_value(
+                     GIT_CONFIG_USER_NAME, "after-kill-recovery",
+                     GIT_SCOPE_GLOBAL), 0);
+    CHECK_EQ_INT(git_get_all("--global", "user.name", actual,
+                             sizeof(actual)), 0);
+    CHECK_STR_EQ(actual, "after-kill-recovery\n");
+    errno = 0;
+    CHECK(lstat(g_finalization_lock_path, &marker_stat) != 0 &&
+          errno == ENOENT);
+    CHECK_EQ_INT((long)count_finalization_private_aliases(fixture.base), 0);
+
+    fixture_cleanup(&fixture);
+}
+
+TEST(private_prepublication_sigkill_is_reconciled_exactly) {
+    git_fixture_t fixture;
+    git_config_finalization_t *finalization = NULL;
+    char foreign_private[MAX_PATH_LEN];
+    char contents[256];
+    pid_t child;
+    int status = 0;
+
+    if (!fixture_init(&fixture)) {
+        CHECK(false);
+        fixture_cleanup(&fixture);
+        return;
+    }
+    CHECK_EQ_INT(git_set("--global", "user.name", "before-private-kill"), 0);
+    child = fork();
+    CHECK(child >= 0);
+    if (child == 0) {
+        git_ops_test_reset_caches();
+        if (prepare_finalization_transaction(
+                "private-before-kill") != 0) {
+            _exit(83);
+        }
+        (void)git_ops_test_set_finalization_hook(
+            kill_after_private_finalization_certificate_prepare);
+        if (git_config_finalization_begin(&finalization) != 0) {
+            _exit(84);
+        }
+        _exit(85);
+    }
+    if (child > 0) {
+        CHECK(waitpid(child, &status, 0) == child);
+        CHECK(WIFEXITED(status));
+        if (WIFEXITED(status)) CHECK_EQ_INT(WEXITSTATUS(status), 87);
+    }
+    CHECK((size_t)snprintf(
+              foreign_private, sizeof(foreign_private),
+              "%s/.gitswitch-finalization-999-1",
+              fixture.base) < sizeof(foreign_private));
+    CHECK_EQ_INT(write_text_file(
+                     foreign_private, "foreign-private-marker\n", 0600), 0);
+    CHECK_EQ_INT((long)count_finalization_private_aliases(fixture.base), 2);
+
+    git_ops_test_reset_caches();
+    CHECK_EQ_INT(prepare_finalization_transaction(
+                     "private-orphan-reconciled"), 0);
+    CHECK_EQ_INT(git_config_finalization_begin(&finalization), 0);
+    CHECK_EQ_INT((long)count_finalization_private_aliases(fixture.base), 1);
+    CHECK_EQ_INT(read_file(foreign_private, contents, sizeof(contents)), 0);
+    CHECK_STR_EQ(contents, "foreign-private-marker\n");
+    CHECK_EQ_INT(git_config_finalization_end(&finalization), 0);
+    CHECK(finalization == NULL);
+    git_config_commit();
+    CHECK_EQ_INT(unlink(foreign_private), 0);
+
+    fixture_cleanup(&fixture);
+}
+
+TEST(finalization_release_failure_consumes_handle_and_self_heals) {
+    static const char marker_magic[] = "gitswitch-recovery-v1 ";
+    git_fixture_t fixture;
+    git_config_finalization_t *finalization = NULL;
+    struct stat marker_stat;
+    char marker[1024];
+    char actual[256];
+    int descriptors_before;
+    int descriptors_after;
+
+    if (!fixture_init(&fixture)) {
+        CHECK(false);
+        fixture_cleanup(&fixture);
+        return;
+    }
+    CHECK_EQ_INT(git_set("--global", "user.name", "before-release-fail"), 0);
+    CHECK((size_t)snprintf(
+              g_finalization_lock_path,
+              sizeof(g_finalization_lock_path), "%s.lock",
+              fixture.global_config) < sizeof(g_finalization_lock_path));
+    CHECK_EQ_INT(prepare_finalization_transaction(
+                     "release-failure-postimage"), 0);
+    descriptors_before = count_open_descriptors();
+    CHECK_EQ_INT(git_config_finalization_begin(&finalization), 0);
+    CHECK(finalization != NULL);
+    g_finalization_hook_calls = 0;
+    (void)git_ops_test_set_finalization_hook(
+        fail_finalization_release_once);
+    CHECK_EQ_INT(git_config_finalization_end(&finalization), -1);
+    CHECK(finalization == NULL);
+    (void)git_ops_test_set_finalization_hook(NULL);
+    descriptors_after = count_open_descriptors();
+    if (descriptors_before >= 0 && descriptors_after >= 0) {
+        CHECK_EQ_INT(descriptors_after, descriptors_before);
+    }
+    CHECK_EQ_INT(read_file(g_finalization_lock_path, marker,
+                           sizeof(marker)), 0);
+    CHECK(strncmp(marker, marker_magic, strlen(marker_magic)) == 0);
+
+    /* Committing the sealed transaction models accounts.c's irreversible
+     * boundary. The consumed lease left no in-process fcntl claim, so the same
+     * process can immediately recover on its next managed write. */
+    git_config_commit();
+    CHECK_EQ_INT(git_set_config_value(
+                     GIT_CONFIG_USER_NAME, "same-process-recovery",
+                     GIT_SCOPE_GLOBAL), 0);
+    CHECK_EQ_INT(git_get_all("--global", "user.name", actual,
+                             sizeof(actual)), 0);
+    CHECK_STR_EQ(actual, "same-process-recovery\n");
+    errno = 0;
+    CHECK(lstat(g_finalization_lock_path, &marker_stat) != 0 &&
+          errno == ENOENT);
+    CHECK_EQ_INT((long)count_finalization_private_aliases(fixture.base), 0);
+
+    fixture_cleanup(&fixture);
+}
+
+TEST(finalization_release_preserves_foreign_replacement) {
+    git_fixture_t fixture;
+    git_config_finalization_t *finalization = NULL;
+    char contents[256];
+
+    if (!fixture_init(&fixture)) {
+        CHECK(false);
+        fixture_cleanup(&fixture);
+        return;
+    }
+    CHECK_EQ_INT(git_set("--global", "user.name",
+                         "before-foreign-release"), 0);
+    CHECK((size_t)snprintf(
+              g_finalization_lock_path,
+              sizeof(g_finalization_lock_path), "%s.lock",
+              fixture.global_config) < sizeof(g_finalization_lock_path));
+    CHECK_EQ_INT(prepare_finalization_transaction(
+                     "foreign-release-postimage"), 0);
+    CHECK_EQ_INT(git_config_finalization_begin(&finalization), 0);
+    g_finalization_hook_calls = 0;
+    (void)git_ops_test_set_finalization_hook(
+        replace_finalization_certificate_with_foreign_lock);
+    CHECK_EQ_INT(git_config_finalization_end(&finalization), -1);
+    CHECK(finalization == NULL);
+    (void)git_ops_test_set_finalization_hook(NULL);
+    CHECK_EQ_INT(read_file(g_finalization_lock_path, contents,
+                           sizeof(contents)), 0);
+    CHECK_STR_EQ(contents, "foreign-git-lock\n");
+    git_config_commit();
+    CHECK_EQ_INT(git_set_config_value(
+                     GIT_CONFIG_USER_NAME, "must-not-overwrite-lock",
+                     GIT_SCOPE_GLOBAL), -1);
+    CHECK_EQ_INT(read_file(g_finalization_lock_path, contents,
+                           sizeof(contents)), 0);
+    CHECK_STR_EQ(contents, "foreign-git-lock\n");
+    CHECK_EQ_INT(unlink(g_finalization_lock_path), 0);
+
+    fixture_cleanup(&fixture);
+}
+
+TEST(finalization_postunlink_retry_never_removes_later_foreign_lock) {
+    git_fixture_t fixture;
+    git_config_finalization_t *finalization = NULL;
+    char contents[256];
+
+    if (!fixture_init(&fixture)) {
+        CHECK(false);
+        fixture_cleanup(&fixture);
+        return;
+    }
+    CHECK_EQ_INT(git_set("--global", "user.name",
+                         "before-postunlink-fail"), 0);
+    CHECK((size_t)snprintf(
+              g_finalization_lock_path,
+              sizeof(g_finalization_lock_path), "%s.lock",
+              fixture.global_config) < sizeof(g_finalization_lock_path));
+    CHECK_EQ_INT(prepare_finalization_transaction(
+                     "postunlink-failure-postimage"), 0);
+    CHECK_EQ_INT(git_config_finalization_begin(&finalization), 0);
+    g_finalization_hook_calls = 0;
+    (void)git_ops_test_set_finalization_hook(
+        fail_finalization_release_sync_once);
+    CHECK_EQ_INT(git_config_finalization_end(&finalization), -1);
+    CHECK(finalization == NULL);
+    (void)git_ops_test_set_finalization_hook(NULL);
+    CHECK_EQ_INT(write_text_file(g_finalization_lock_path,
+                                 "foreign-after-unlink\n", 0600), 0);
+    CHECK_EQ_INT(read_file(g_finalization_lock_path, contents,
+                           sizeof(contents)), 0);
+    CHECK_STR_EQ(contents, "foreign-after-unlink\n");
+    CHECK_EQ_INT(unlink(g_finalization_lock_path), 0);
+    git_config_commit();
+
+    fixture_cleanup(&fixture);
+}
+
 TEST(snapshot_commit_releases_all_generation_descriptors) {
     git_fixture_t fixture;
     int before;
@@ -2112,6 +2473,11 @@ TEST_MAIN_BEGIN()
     RUN_TEST(replaced_config_file_with_one_conflict_is_never_partially_rebased);
     RUN_TEST(conflict_retry_never_rebases_onto_unrelated_same_path_generation);
     RUN_TEST(postpublish_path_race_retains_the_installed_generation_for_retry);
+    RUN_TEST(finalization_sigkill_leaves_complete_self_healing_certificate);
+    RUN_TEST(private_prepublication_sigkill_is_reconciled_exactly);
+    RUN_TEST(finalization_release_failure_consumes_handle_and_self_heals);
+    RUN_TEST(finalization_release_preserves_foreign_replacement);
+    RUN_TEST(finalization_postunlink_retry_never_removes_later_foreign_lock);
     RUN_TEST(snapshot_commit_releases_all_generation_descriptors);
     RUN_TEST(metadata_mismatches_use_stable_eagain_diagnostics);
 TEST_MAIN_END()

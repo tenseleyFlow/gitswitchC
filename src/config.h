@@ -291,6 +291,81 @@ int config_retirement_guard_clear(config_retirement_guard_t **guard);
  * retain the one fixed stage, and both states remain probe-blocking. */
 void config_retirement_guard_abandon(config_retirement_guard_t **guard);
 
+/* Durable recovery owner for a switch whose active-state before/post image
+ * could not be classified. The canonical private marker binds the exact
+ * accounts.toml generation, all target fields that affect Git/SSH/GPG live
+ * state, the effective Git scope, and the complete destination set captured
+ * by git_config_snapshot_export_destinations(). */
+typedef struct config_switch_guard config_switch_guard_t;
+
+#define CONFIG_SWITCH_DESTINATION_MAX 3U
+
+typedef struct {
+    bool valid;
+    publication_identity_t source_generation;
+    account_t target;
+    git_scope_t effective_scope;
+    publication_record_t destinations[CONFIG_SWITCH_DESTINATION_MAX];
+    size_t destination_count;
+} config_switch_guard_recovery_t;
+
+/* Install a fresh `.switch-incomplete` generation, or adopt an existing one
+ * only when every account/scope/path field matches and the current destination
+ * still has the recorded directory authority. Mutable directory timestamps
+ * are not identity. `target` must be the exact persisted incarnation in `ctx`;
+ * `destinations` must be the complete, canonical pre-mutation Git destination
+ * set for `effective_scope`: primary first, then any local and worktree
+ * secondary scopes in precedence order. The returned opaque handle owns
+ * `.switch.lock` until clear() or abandon(). */
+int config_switch_guard_install_or_adopt(
+    const gitswitch_ctx_t *ctx, const account_t *target,
+    git_scope_t effective_scope,
+    const publication_record_t *destinations, size_t destination_count,
+    config_switch_guard_t **guard);
+
+/* True only when this invocation durably installed the marker. Adoption of a
+ * pre-existing recovery fence returns false, so rollback cannot accidentally
+ * clear an older unresolved operation. */
+bool config_switch_guard_was_created(
+    const config_switch_guard_t *guard);
+
+/* Reconcile only the two restart-safe pre-intent namespace shapes under the
+ * private switch lifecycle lock: a lone stable private stage is removed, and
+ * an exact stage/marker hard-link pair left by the portable no-replace
+ * fallback is reduced to the canonical marker. No live identity mutation can
+ * precede either shape. Unsafe, changing, or distinct pairs fail closed.
+ * Callers that mutate account state must serialize this operation with the
+ * ordinary configuration write lock and probe again before mutation. */
+int config_switch_guard_reconcile_preintent(
+    const char *config_path);
+
+/* Read-only, fail-closed startup gate. `blocked` remains true for a canonical
+ * marker or malformed/unsafe/unstable state. A stable private stage-only
+ * generation and an exact stage/marker hard-link pair are reported unblocked
+ * only so a real mutating entry can acquire the configuration lock, call
+ * config_switch_guard_reconcile_preintent(), and probe again; neither shape
+ * authorizes resume. A stable canonical marker is decoded into `recovery`;
+ * absent state returns blocked=false and recovery.valid=false. This call never
+ * creates or repairs filesystem state. */
+int config_switch_guard_probe(
+    const char *config_path, bool *blocked,
+    config_switch_guard_recovery_t *recovery);
+
+/* Remove only the exact marker generation owned by `guard`, synchronize the
+ * pinned directory, and re-prove marker absence before releasing the lock.
+ * Failure retains the handle for checked cleanup or abandon(). */
+int config_switch_guard_clear(config_switch_guard_t **guard);
+
+/* Re-establish and durably prove the exact canonical marker owned by `guard`
+ * after a failed clear may already have unlinked it, then release and NULL the
+ * handle. This is the checked failure-settlement path: success guarantees a
+ * restart can adopt the marker; failure retains the callable handle. */
+int config_switch_guard_retain(config_switch_guard_t **guard);
+
+/* Release the lifecycle lock and free/NULL the handle without changing either
+ * fixed switch-guard namespace entry. */
+void config_switch_guard_abandon(config_switch_guard_t **guard);
+
 /* Refresh only the Git post-config generation witnesses for PUBLISHED ledger
  * records owned by `owners`. Every matching record must find exactly one
  * destination with the same Git config path; duplicate, missing, or unused
@@ -329,6 +404,16 @@ typedef struct {
     size_t post_image_length;
 } config_resume_hint_snapshot_t;
 
+/* A guarded active-state rollback can fail after either image has become the
+ * stable namespace occupant.  Callers that also own Git/runtime settlement
+ * must branch on the image that is durably current instead of treating every
+ * restore error as permission to roll those other layers back. */
+typedef enum {
+    CONFIG_ACTIVE_ROLLBACK_UNRESOLVED = 0,
+    CONFIG_ACTIVE_ROLLBACK_BEFORE_DURABLE,
+    CONFIG_ACTIVE_ROLLBACK_POST_DURABLE
+} config_active_rollback_state_t;
+
 int config_resume_hint_snapshot_capture(config_resume_hint_snapshot_t *snapshot);
 /* Restore accepts only a snapshot subsequently bound by
  * config_save_active_account_transactional_guarded (or the internal full-save
@@ -336,6 +421,13 @@ int config_resume_hint_snapshot_capture(config_resume_hint_snapshot_t *snapshot)
  * to its caller and is rejected instead of overwriting it. */
 int config_resume_hint_snapshot_restore(
     const config_resume_hint_snapshot_t *snapshot);
+/* Attempt the guarded restore, then prove and synchronize whichever complete
+ * image is currently installed.  Success means state is BEFORE_DURABLE or
+ * POST_DURABLE; UNRESOLVED is always returned with -1 and authorizes neither
+ * the matching account abort nor commit. */
+int config_resume_hint_snapshot_settle(
+    const config_resume_hint_snapshot_t *snapshot,
+    config_active_rollback_state_t *state);
 void config_resume_hint_snapshot_clear(config_resume_hint_snapshot_t *snapshot);
 
 /* Transaction-aware active-account save. config_installed is true once the

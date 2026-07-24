@@ -115,6 +115,14 @@ TEST(all_retained_public_apis_compile_and_link) {
     REQUIRE_PUBLIC_API(config_resume_hint_snapshot_capture);
     REQUIRE_PUBLIC_API(config_resume_hint_snapshot_clear);
     REQUIRE_PUBLIC_API(config_resume_hint_snapshot_restore);
+    REQUIRE_PUBLIC_API(config_resume_hint_snapshot_settle);
+    REQUIRE_PUBLIC_API(config_switch_guard_abandon);
+    REQUIRE_PUBLIC_API(config_switch_guard_clear);
+    REQUIRE_PUBLIC_API(config_switch_guard_retain);
+    REQUIRE_PUBLIC_API(config_switch_guard_install_or_adopt);
+    REQUIRE_PUBLIC_API(config_switch_guard_probe);
+    REQUIRE_PUBLIC_API(config_switch_guard_reconcile_preintent);
+    REQUIRE_PUBLIC_API(config_switch_guard_was_created);
     REQUIRE_PUBLIC_API(config_retirement_guard_abandon);
     REQUIRE_PUBLIC_API(config_retirement_guard_clear);
     REQUIRE_PUBLIC_API(config_retirement_guard_install_or_adopt);
@@ -193,6 +201,7 @@ TEST(all_retained_public_apis_compile_and_link) {
     REQUIRE_PUBLIC_API(git_config_seal);
     REQUIRE_PUBLIC_API(git_config_snapshot);
     REQUIRE_PUBLIC_API(git_config_snapshot_export_destination);
+    REQUIRE_PUBLIC_API(git_config_snapshot_export_destinations);
     REQUIRE_PUBLIC_API(git_configure_gpg);
     REQUIRE_PUBLIC_API(git_configure_openpgp_publication);
     REQUIRE_PUBLIC_API(git_configure_ssh);

@@ -24,6 +24,7 @@
 #include <errno.h>
 #include <fcntl.h>
 #include <unistd.h>
+#include <dirent.h>
 #include <sys/wait.h>
 #include <sys/stat.h>
 #if defined(__linux__)
@@ -32,6 +33,7 @@
 
 #include "git_ops.h"
 #define GITSWITCH_INTERNAL_API
+#include "git_ops_internal.h"
 #include "git_status_internal.h"
 #undef GITSWITCH_INTERNAL_API
 #include "gpg_manager.h"
@@ -194,6 +196,27 @@ typedef struct {
     bool restore_incomplete;
 } git_config_snapshot_t;
 
+typedef struct {
+    char config_leaf[NAME_MAX + 1U];
+    char lock_leaf[NAME_MAX + sizeof(".lock")];
+    char private_leaf[96];
+    int parent_fd;
+    int lock_fd;
+    struct stat parent_stat;
+    struct stat lock_stat;
+    unsigned char *marker_data;
+    size_t marker_length;
+    bool private_created;
+    bool canonical_published;
+    bool canonical_unlinked;
+    bool active;
+} git_config_finalization_lock_t;
+
+struct git_config_finalization {
+    git_config_finalization_lock_t locks[3];
+    size_t count;
+};
+
 static git_config_snapshot_t g_git_snapshot;
 static unsigned int g_git_account_write_depth;
 static void git_snapshot_clear(git_config_snapshot_t *snapshot);
@@ -238,6 +261,7 @@ typedef bool (*git_retirement_test_hook_fn)(
     git_retirement_test_stage_t stage, const char *path,
     const char *key, const char *value);
 static git_retirement_test_hook_fn g_retirement_test_hook;
+static git_finalization_test_hook_fn g_finalization_test_hook;
 
 /* Test seams for deterministic real-Git race coverage. They are deliberately
  * absent from the installed API; tests declare the prototypes locally. */
@@ -248,6 +272,8 @@ git_metadata_test_hook_fn git_ops_test_set_metadata_hook(
     git_metadata_test_hook_fn fn);
 git_retirement_test_hook_fn git_ops_test_set_retirement_hook(
     git_retirement_test_hook_fn fn);
+git_finalization_test_hook_fn git_ops_test_set_finalization_hook(
+    git_finalization_test_hook_fn fn);
 git_snapshot_value_malloc_fn git_ops_test_set_snapshot_value_malloc_fn(
     git_snapshot_value_malloc_fn fn);
 void git_ops_test_set_restore_prelock_hook(git_restore_test_hook_fn fn) {
@@ -276,6 +302,13 @@ git_retirement_test_hook_fn git_ops_test_set_retirement_hook(
     git_retirement_test_hook_fn fn) {
     git_retirement_test_hook_fn previous = g_retirement_test_hook;
     g_retirement_test_hook = fn;
+    return previous;
+}
+
+git_finalization_test_hook_fn git_ops_test_set_finalization_hook(
+    git_finalization_test_hook_fn fn) {
+    git_finalization_test_hook_fn previous = g_finalization_test_hook;
+    g_finalization_test_hook = fn;
     return previous;
 }
 
@@ -381,6 +414,7 @@ void git_ops_test_reset_caches(void) {
     g_restore_locked_hook = NULL;
     g_restore_postpublish_hook = NULL;
     g_metadata_test_hook = NULL;
+    g_finalization_test_hook = NULL;
     g_git_snapshot_value_malloc = malloc;
 }
 
@@ -2398,6 +2432,23 @@ static bool git_recovery_stage_leaf_valid(const char *leaf) {
     return *cursor == '\0';
 }
 
+static bool git_finalization_private_leaf_valid(const char *leaf) {
+    static const char prefix[] = ".gitswitch-finalization-";
+    const unsigned char *cursor;
+
+    if (!leaf || strncmp(leaf, prefix, sizeof(prefix) - 1U) != 0 ||
+        strlen(leaf) >= sizeof(((git_config_finalization_lock_t *)0)
+                                   ->private_leaf)) {
+        return false;
+    }
+    cursor = (const unsigned char *)leaf + sizeof(prefix) - 1U;
+    if (!isdigit(*cursor)) return false;
+    while (isdigit(*cursor)) cursor++;
+    if (*cursor++ != '-' || !isdigit(*cursor)) return false;
+    while (isdigit(*cursor)) cursor++;
+    return *cursor == '\0';
+}
+
 static int git_recovery_format_header(char *header, size_t header_size,
                                       const char *stage_leaf,
                                       const struct stat *stage_stat,
@@ -3093,6 +3144,119 @@ fail:
     return result;
 }
 
+/* FreeBSD lacks a native no-replace rename for regular files. Finalization
+ * therefore publishes a complete private recovery certificate with linkat()
+ * and retires the private alias immediately afterward. A crash between those
+ * two namespace operations leaves exactly two links to the same complete
+ * marker. Recognize only that narrow shape: one canonical name, one strictly
+ * named private alias, exact bytes, private ownership, and no third link. */
+static int git_recovery_remove_linked_private_alias(
+    git_scope_lock_t *lock, int marker_fd, unsigned char *marker_data,
+    size_t marker_length, struct stat *marker_stat) {
+    char alias_leaf[sizeof(
+        ((git_config_finalization_lock_t *)0)->private_leaf)] = "";
+    struct stat candidate;
+    struct stat updated;
+    struct dirent *entry;
+    DIR *directory = NULL;
+    int alias_fd = -1;
+    int directory_scan_fd = -1;
+    int saved_errno = EEXIST;
+    int matches = 0;
+    git_cleanup_result_t cleanup;
+
+    if (!lock || lock->dir_fd < 0 || marker_fd < 0 || !marker_data ||
+        !marker_stat || marker_stat->st_nlink != 2) {
+        errno = EINVAL;
+        return -1;
+    }
+    directory_scan_fd = openat(
+        lock->dir_fd, ".",
+        O_RDONLY | O_DIRECTORY | O_CLOEXEC | O_NOFOLLOW);
+    if (directory_scan_fd < 0 ||
+        (directory = fdopendir(directory_scan_fd)) == NULL) {
+        saved_errno = errno ? errno : EIO;
+        if (directory_scan_fd >= 0) (void)close(directory_scan_fd);
+        errno = saved_errno;
+        return -1;
+    }
+    directory_scan_fd = -1;
+    errno = 0;
+    while ((entry = readdir(directory)) != NULL) {
+        if (!git_finalization_private_leaf_valid(entry->d_name)) continue;
+        if (fstatat(lock->dir_fd, entry->d_name, &candidate,
+                    AT_SYMLINK_NOFOLLOW) != 0) {
+            if (errno == ENOENT) {
+                errno = 0;
+                continue;
+            }
+            saved_errno = errno ? errno : EIO;
+            goto done;
+        }
+        if (candidate.st_dev != marker_stat->st_dev ||
+            candidate.st_ino != marker_stat->st_ino) {
+            continue;
+        }
+        matches++;
+        if (matches != 1 ||
+            safe_strncpy(alias_leaf, entry->d_name,
+                         sizeof(alias_leaf)) != 0) {
+            saved_errno = EEXIST;
+            goto done;
+        }
+        errno = 0;
+    }
+    if (errno != 0) {
+        saved_errno = errno;
+        goto done;
+    }
+    if (matches != 1) {
+        saved_errno = EEXIST;
+        goto done;
+    }
+    alias_fd = openat(lock->dir_fd, alias_leaf,
+                      O_RDONLY | O_CLOEXEC | O_NOFOLLOW);
+    if (alias_fd < 0 ||
+        !git_file_at_matches_witness(
+            lock->dir_fd, lock->lock_leaf, marker_fd, marker_stat,
+            marker_data, marker_length, NULL) ||
+        !git_file_at_matches_witness(
+            lock->dir_fd, alias_leaf, alias_fd, marker_stat,
+            marker_data, marker_length, NULL)) {
+        saved_errno = errno ? errno : EAGAIN;
+        goto done;
+    }
+    cleanup = git_scope_lock_cleanup_name_once(
+        lock, alias_leaf, "linked private recovery marker", alias_fd,
+        marker_stat, marker_data, marker_length, true, false);
+    if (cleanup != GIT_CLEANUP_REMOVED) {
+        saved_errno = errno ? errno : EAGAIN;
+        goto done;
+    }
+    /* Keep the canonical certificate until private-alias retirement is
+     * durable. A crash before this sync simply recreates the recognizable
+     * two-link state and is safe to retry. */
+    if (fsync(lock->dir_fd) != 0 ||
+        fstat(marker_fd, &updated) != 0 ||
+        !S_ISREG(updated.st_mode) || updated.st_nlink != 1 ||
+        updated.st_uid != geteuid() ||
+        (updated.st_mode & 07777) != 0600 ||
+        !git_file_at_matches_witness(
+            lock->dir_fd, lock->lock_leaf, marker_fd, &updated,
+            marker_data, marker_length, NULL)) {
+        saved_errno = errno ? errno : EAGAIN;
+        goto done;
+    }
+    *marker_stat = updated;
+    saved_errno = 0;
+
+done:
+    if (alias_fd >= 0) (void)close(alias_fd);
+    if (directory) (void)closedir(directory);
+    errno = saved_errno;
+    return saved_errno == 0 ? 0 : -1;
+}
+
 static int git_scope_lock_recover_marker(git_scope_lock_t *lock) {
     git_recovery_marker_t marker;
     git_cleanup_result_t cleanup;
@@ -3115,13 +3279,21 @@ static int git_scope_lock_recover_marker(git_scope_lock_t *lock) {
         git_capture_fd_bytes_exact_bounded(
             marker_fd, &marker_data, &marker_length, &marker_stat,
             GIT_RECOVERY_MARKER_MAX_BYTES) != 0 ||
-        !S_ISREG(marker_stat.st_mode) || marker_stat.st_nlink != 1 ||
+        !S_ISREG(marker_stat.st_mode) ||
+        (marker_stat.st_nlink != 1 && marker_stat.st_nlink != 2) ||
         marker_stat.st_uid != geteuid() ||
         (marker_stat.st_mode & 07777) != 0600 ||
         !git_file_at_matches_witness(
             lock->dir_fd, lock->lock_leaf, marker_fd, &marker_stat,
             marker_data, marker_length, NULL) ||
         !git_recovery_marker_parse(marker_data, marker_length, &marker)) {
+        saved_errno = errno ? errno : EEXIST;
+        goto done;
+    }
+    if (marker_stat.st_nlink == 2 &&
+        git_recovery_remove_linked_private_alias(
+            lock, marker_fd, marker_data, marker_length,
+            &marker_stat) != 0) {
         saved_errno = errno ? errno : EEXIST;
         goto done;
     }
@@ -3246,6 +3418,62 @@ static void git_scope_lock_close(git_scope_lock_t *lock) {
     lock->published_length = 0;
     if (lock->dir_fd >= 0) close(lock->dir_fd);
     lock->dir_fd = -1;
+}
+
+/* A finalization lease deliberately occupies Git's canonical lock name with a
+ * complete recovery marker. If its owner exits before release, the next
+ * gitswitch-managed write gets one exact self-healing retry. Ordinary Git lock
+ * files, malformed lookalikes, foreign replacements, and live claimed
+ * certificates are all preserved and reported as write failures. */
+static int git_recover_scope_finalization_marker(git_scope_t scope) {
+    git_scope_lock_t recovery;
+    struct stat named;
+    int saved_errno;
+
+    memset(&recovery, 0, sizeof(recovery));
+    recovery.dir_fd = -1;
+    recovery.lock_fd = -1;
+    recovery.stage_fd = -1;
+    recovery.original_fd = -1;
+    recovery.published_fd = -1;
+    if (git_scope_lock_resolve_paths(scope, &recovery) != 0) {
+        return -1;
+    }
+    recovery.dir_fd = open(
+        recovery.parent,
+        O_RDONLY | O_DIRECTORY | O_CLOEXEC | O_NOFOLLOW);
+    if (recovery.dir_fd < 0) {
+        set_system_error(
+            ERR_GIT_CONFIG_FAILED,
+            "Cannot inspect the Git configuration lock directory");
+        return -1;
+    }
+    if (fstatat(recovery.dir_fd, recovery.lock_leaf, &named,
+                AT_SYMLINK_NOFOLLOW) != 0) {
+        saved_errno = errno;
+        git_scope_lock_close(&recovery);
+        if (saved_errno == ENOENT) {
+            errno = 0;
+            return 0;
+        }
+        errno = saved_errno;
+        set_system_error(
+            ERR_GIT_CONFIG_FAILED,
+            "Cannot inspect the Git configuration lock");
+        return -1;
+    }
+    if (git_scope_lock_recover_marker(&recovery) != 0) {
+        saved_errno = errno ? errno : EEXIST;
+        git_scope_lock_close(&recovery);
+        errno = saved_errno;
+        set_error(
+            ERR_GIT_CONFIG_FAILED,
+            "Existing Git configuration lock is not an exact recoverable "
+            "gitswitch certificate");
+        return -1;
+    }
+    git_scope_lock_close(&recovery);
+    return 1;
 }
 
 static int git_scope_lock_discard_checked(git_scope_lock_t *lock,
@@ -4507,6 +4735,58 @@ static int git_snapshot_verify_generations(
     return 0;
 }
 
+static int git_snapshot_verify_managed_postimage(
+    const git_config_snapshot_t *snapshot,
+    bool postimage_was_previously_verified) {
+    git_scope_snapshot_t observed_primary;
+    git_scope_snapshot_t observed_local;
+    git_scope_snapshot_t observed_worktree;
+    int differences;
+
+    if (!snapshot) {
+        errno = EINVAL;
+        set_error(ERR_INVALID_ARGS,
+                  "Missing Git transaction for post-image verification");
+        return -1;
+    }
+    memset(&observed_primary, 0, sizeof(observed_primary));
+    memset(&observed_local, 0, sizeof(observed_local));
+    memset(&observed_worktree, 0, sizeof(observed_worktree));
+    if (git_capture_transaction_scopes(
+            &observed_primary, &observed_local,
+            &observed_worktree) != 0 ||
+        git_snapshot_verify_generations(snapshot, true) != 0) {
+        git_scope_snapshot_clear(&observed_primary);
+        git_scope_snapshot_clear(&observed_local);
+        git_scope_snapshot_clear(&observed_worktree);
+        return -1;
+    }
+    differences = git_scope_snapshot_difference_count(
+        &snapshot->post_primary, &observed_primary);
+    if (snapshot->local_also) {
+        differences += git_scope_snapshot_difference_count(
+            &snapshot->post_local, &observed_local);
+    }
+    if (snapshot->worktree_also) {
+        differences += git_scope_snapshot_difference_count(
+            &snapshot->post_worktree, &observed_worktree);
+    }
+    git_scope_snapshot_clear(&observed_primary);
+    git_scope_snapshot_clear(&observed_local);
+    git_scope_snapshot_clear(&observed_worktree);
+    if (differences != 0) {
+        errno = ESTALE;
+        set_error(
+            ERR_GIT_CONFIG_FAILED,
+            "Cannot finalize Git transaction: %d managed vector(s) changed "
+            "outside this transaction %s post-image verification",
+            differences,
+            postimage_was_previously_verified ? "after" : "before");
+        return -1;
+    }
+    return 0;
+}
+
 static int git_snapshot_pin_post_configs(git_config_snapshot_t *snapshot) {
     git_scope_generation_t *generations[] = {
         &snapshot->primary_generation,
@@ -4550,6 +4830,720 @@ static void git_snapshot_clear_post_configs(git_config_snapshot_t *snapshot) {
         generation->post_config_identity_valid = false;
         generation->post_config_present = false;
     }
+}
+
+static bool git_finalization_has_destination(
+    const git_config_finalization_t *finalization,
+    const git_scope_generation_t *generation) {
+    if (!finalization || !generation) return false;
+    for (size_t i = 0; i < finalization->count; i++) {
+        const git_config_finalization_lock_t *lock =
+            &finalization->locks[i];
+        if (git_same_object_identity(
+                &lock->parent_stat, &generation->parent_stat) &&
+            strcmp(lock->config_leaf, generation->leaf) == 0) {
+            return true;
+        }
+    }
+    return false;
+}
+
+typedef enum {
+    GIT_FINALIZATION_PUBLISH_ERROR = -1,
+    GIT_FINALIZATION_PUBLISH_MOVED = 0,
+    GIT_FINALIZATION_PUBLISH_LINKED = 1
+} git_finalization_publish_result_t;
+
+typedef enum {
+    GIT_FINALIZATION_RELEASE_RETRY = -1,
+    GIT_FINALIZATION_RELEASE_OK = 0,
+    GIT_FINALIZATION_RELEASE_FOREIGN = 1
+} git_finalization_release_result_t;
+
+static void git_finalization_lock_dispose(
+    git_config_finalization_lock_t *lock) {
+    if (!lock) return;
+    if (lock->lock_fd >= 0) (void)close(lock->lock_fd);
+    if (lock->parent_fd >= 0) (void)close(lock->parent_fd);
+    if (lock->marker_data) {
+        secure_zero_memory(lock->marker_data, lock->marker_length);
+        free(lock->marker_data);
+    }
+    secure_zero_memory(lock, sizeof(*lock));
+    lock->parent_fd = -1;
+    lock->lock_fd = -1;
+}
+
+static git_finalization_publish_result_t
+git_finalization_publish_noreplace(
+    int directory_fd, const char *source, const char *destination) {
+#if defined(__linux__) && defined(SYS_renameat2)
+#ifndef RENAME_NOREPLACE
+#define RENAME_NOREPLACE (1U)
+#endif
+    if (syscall(SYS_renameat2, directory_fd, source, directory_fd,
+                destination, RENAME_NOREPLACE) == 0) {
+        return GIT_FINALIZATION_PUBLISH_MOVED;
+    }
+    if (errno != ENOSYS && errno != EINVAL && errno != ENOTSUP &&
+        errno != EOPNOTSUPP) {
+        return GIT_FINALIZATION_PUBLISH_ERROR;
+    }
+#elif defined(__APPLE__) && defined(RENAME_EXCL)
+    if (renameatx_np(directory_fd, source, directory_fd, destination,
+                     RENAME_EXCL) == 0) {
+        return GIT_FINALIZATION_PUBLISH_MOVED;
+    }
+    if (errno != EINVAL && errno != ENOTSUP &&
+        errno != EOPNOTSUPP) {
+        return GIT_FINALIZATION_PUBLISH_ERROR;
+    }
+#endif
+    /* linkat() is itself atomic and no-replace. The complete marker is
+     * recoverable during the short two-link interval; recovery accepts only
+     * the exact generated private alias plus the canonical name. */
+    if (linkat(directory_fd, source, directory_fd, destination, 0) != 0) {
+        return GIT_FINALIZATION_PUBLISH_ERROR;
+    }
+    return GIT_FINALIZATION_PUBLISH_LINKED;
+}
+
+static int git_finalization_refresh_canonical(
+    git_config_finalization_lock_t *lock, nlink_t expected_links) {
+    struct stat current;
+
+    if (!lock || lock->parent_fd < 0 || lock->lock_fd < 0 ||
+        !lock->marker_data || lock->marker_length == 0U ||
+        fstat(lock->lock_fd, &current) != 0 ||
+        !S_ISREG(current.st_mode) ||
+        current.st_nlink != expected_links ||
+        current.st_uid != geteuid() ||
+        (current.st_mode & 07777) != 0600 ||
+        !git_file_at_matches_witness(
+            lock->parent_fd, lock->lock_leaf, lock->lock_fd,
+            &current, lock->marker_data, lock->marker_length, NULL)) {
+        errno = errno ? errno : EAGAIN;
+        return -1;
+    }
+    lock->lock_stat = current;
+    return 0;
+}
+
+static int git_finalization_remove_private_alias(
+    git_config_finalization_lock_t *lock) {
+    git_scope_lock_t cleanup_lock;
+    git_cleanup_result_t cleanup;
+    struct stat current;
+
+    if (!lock || !lock->private_created) return 0;
+    if (lock->parent_fd < 0 || lock->lock_fd < 0 ||
+        !lock->marker_data || lock->marker_length == 0U) {
+        errno = EINVAL;
+        return -1;
+    }
+    memset(&cleanup_lock, 0, sizeof(cleanup_lock));
+    cleanup_lock.dir_fd = lock->parent_fd;
+    cleanup = git_scope_lock_cleanup_name_once(
+        &cleanup_lock, lock->private_leaf,
+        "finalization private recovery marker", lock->lock_fd,
+        &lock->lock_stat, lock->marker_data, lock->marker_length,
+        true, false);
+    if (cleanup == GIT_CLEANUP_RETRY) {
+        errno = errno ? errno : EAGAIN;
+        set_system_error(
+            ERR_GIT_CONFIG_FAILED,
+            "Cannot retire the private Git finalization certificate");
+        return -1;
+    }
+    if (lock->canonical_published) {
+        if (fstat(lock->lock_fd, &current) != 0 ||
+            !S_ISREG(current.st_mode) || current.st_nlink != 1 ||
+            current.st_uid != geteuid() ||
+            (current.st_mode & 07777) != 0600 ||
+            !git_file_at_matches_witness(
+                lock->parent_fd, lock->lock_leaf, lock->lock_fd,
+                &current, lock->marker_data, lock->marker_length, NULL)) {
+            errno = errno ? errno : EAGAIN;
+            set_system_error(
+                ERR_GIT_CONFIG_FAILED,
+                "Cannot re-prove the canonical Git finalization certificate");
+            return -1;
+        }
+        lock->lock_stat = current;
+    }
+    /* Keep the retry bit set until directory durability is proven. If the
+     * unlink already happened, the checked cleanup above simply observes
+     * ENOENT on retry and synchronizes the same transition again. */
+    if (fsync(lock->parent_fd) != 0) {
+        set_system_error(
+            ERR_GIT_CONFIG_FAILED,
+            "Cannot synchronize private Git finalization-certificate removal");
+        return -1;
+    }
+    lock->private_created = false;
+    lock->private_leaf[0] = '\0';
+    return 0;
+}
+
+static int git_finalization_prepare_private_marker(
+    git_config_finalization_lock_t *lock) {
+    static unsigned long marker_nonce;
+    static const unsigned char newline = '\n';
+    git_recovery_marker_t parsed;
+    struct stat empty_stage;
+    struct stat named;
+    char header[GIT_RECOVERY_HEADER_MAX];
+    int header_length;
+
+    if (!lock || lock->parent_fd < 0) {
+        errno = EINVAL;
+        return -1;
+    }
+    memset(&empty_stage, 0, sizeof(empty_stage));
+    memset(&parsed, 0, sizeof(parsed));
+    header_length = git_recovery_format_header(
+        header, sizeof(header), "-", &empty_stage, 0U);
+    if (header_length < 0) {
+        set_system_error(
+            ERR_GIT_CONFIG_FAILED,
+            "Cannot format the Git finalization recovery certificate");
+        return -1;
+    }
+    for (unsigned attempt = 0U; attempt < 100U; attempt++) {
+        unsigned long nonce = ++marker_nonce;
+
+        if ((size_t)snprintf(
+                lock->private_leaf, sizeof(lock->private_leaf),
+                ".gitswitch-finalization-%ld-%lu", (long)getpid(),
+                nonce) >= sizeof(lock->private_leaf)) {
+            errno = ENAMETOOLONG;
+            break;
+        }
+        lock->lock_fd = openat(
+            lock->parent_fd, lock->private_leaf,
+            O_RDWR | O_CREAT | O_EXCL | O_CLOEXEC, 0600);
+        if (lock->lock_fd >= 0) {
+            lock->private_created = true;
+            break;
+        }
+        if (errno != EEXIST) break;
+    }
+    if (lock->lock_fd < 0) {
+        set_system_error(
+            ERR_GIT_CONFIG_FAILED,
+            "Cannot create a private Git finalization certificate");
+        return -1;
+    }
+    if (git_scope_lock_claim_fd(lock->lock_fd) != 0 ||
+        fchmod(lock->lock_fd, 0600) != 0 ||
+        git_write_all(lock->lock_fd, (const unsigned char *)header,
+                      (size_t)header_length) != 0 ||
+        git_write_all(lock->lock_fd, &newline, 1U) != 0 ||
+        fsync(lock->lock_fd) != 0 ||
+        git_capture_fd_bytes_exact_bounded(
+            lock->lock_fd, &lock->marker_data, &lock->marker_length,
+            &lock->lock_stat, GIT_RECOVERY_MARKER_MAX_BYTES) != 0 ||
+        lock->marker_length != (size_t)header_length + 1U ||
+        !S_ISREG(lock->lock_stat.st_mode) ||
+        lock->lock_stat.st_nlink != 1 ||
+        lock->lock_stat.st_uid != geteuid() ||
+        (lock->lock_stat.st_mode & 07777) != 0600 ||
+        !git_file_at_matches_witness(
+            lock->parent_fd, lock->private_leaf, lock->lock_fd,
+            &lock->lock_stat, lock->marker_data, lock->marker_length,
+            &named) ||
+        !git_fd_matches_recovery_marker(
+            lock->lock_fd, header, (size_t)header_length, NULL, 0U) ||
+        !git_recovery_marker_parse(
+            lock->marker_data, lock->marker_length, &parsed) ||
+        parsed.stage_present) {
+        errno = errno ? errno : EAGAIN;
+        set_system_error(
+            ERR_GIT_CONFIG_FAILED,
+            "Cannot validate the private Git finalization certificate");
+        return -1;
+    }
+    lock->lock_stat = named;
+    return 0;
+}
+
+static int git_finalization_recover_existing_marker(
+    const git_config_finalization_lock_t *lock) {
+    git_scope_lock_t recovery;
+
+    if (!lock || lock->parent_fd < 0) {
+        errno = EINVAL;
+        return -1;
+    }
+    memset(&recovery, 0, sizeof(recovery));
+    recovery.dir_fd = git_dup_cloexec(lock->parent_fd);
+    recovery.lock_fd = -1;
+    recovery.stage_fd = -1;
+    recovery.original_fd = -1;
+    recovery.published_fd = -1;
+    if (recovery.dir_fd < 0 ||
+        safe_strncpy(recovery.lock_leaf, lock->lock_leaf,
+                     sizeof(recovery.lock_leaf)) != 0) {
+        if (recovery.dir_fd >= 0) (void)close(recovery.dir_fd);
+        return -1;
+    }
+    if (git_scope_lock_recover_marker(&recovery) != 0) {
+        int saved_errno = errno;
+        git_scope_lock_close(&recovery);
+        errno = saved_errno;
+        return -1;
+    }
+    git_scope_lock_close(&recovery);
+    return 0;
+}
+
+static void git_finalization_cleanup_unpublished_private(
+    git_config_finalization_lock_t *lock) {
+    struct stat named;
+    struct stat pinned;
+
+    if (!lock || !lock->private_created || lock->parent_fd < 0 ||
+        lock->lock_fd < 0 ||
+        fstat(lock->lock_fd, &pinned) != 0 ||
+        fstatat(lock->parent_fd, lock->private_leaf, &named,
+                AT_SYMLINK_NOFOLLOW) != 0 ||
+        named.st_dev != pinned.st_dev || named.st_ino != pinned.st_ino) {
+        return;
+    }
+    (void)unlinkat(lock->parent_fd, lock->private_leaf, 0);
+    (void)fsync(lock->parent_fd);
+}
+
+/* Finalization-private names are distinct from the older rollback marker
+ * staging namespace. That lets a later process remove only a fully formed,
+ * unclaimed, no-stage finalization certificate left before canonical
+ * publication. Partial files, live claimed files, stage-bearing rollback
+ * markers, and foreign replacements remain untouched. */
+static int git_finalization_reconcile_private_orphans(int directory_fd) {
+    git_scope_lock_t cleanup_lock;
+    git_recovery_marker_t parsed;
+    git_cleanup_result_t cleanup;
+    struct dirent *entry;
+    DIR *directory = NULL;
+    int scan_fd = -1;
+    int marker_fd = -1;
+    int saved_errno = 0;
+
+    if (directory_fd < 0) {
+        errno = EINVAL;
+        return -1;
+    }
+    scan_fd = openat(
+        directory_fd, ".",
+        O_RDONLY | O_DIRECTORY | O_CLOEXEC | O_NOFOLLOW);
+    if (scan_fd < 0 || (directory = fdopendir(scan_fd)) == NULL) {
+        saved_errno = errno ? errno : EIO;
+        if (scan_fd >= 0) (void)close(scan_fd);
+        errno = saved_errno;
+        return -1;
+    }
+    scan_fd = -1;
+    errno = 0;
+    while ((entry = readdir(directory)) != NULL) {
+        unsigned char *marker_data = NULL;
+        size_t marker_length = 0U;
+        struct stat marker_stat;
+
+        if (!git_finalization_private_leaf_valid(entry->d_name)) {
+            continue;
+        }
+        marker_fd = openat(
+            directory_fd, entry->d_name,
+            O_RDWR | O_CLOEXEC | O_NOFOLLOW);
+        if (marker_fd < 0 || git_scope_lock_claim_fd(marker_fd) != 0) {
+            if (marker_fd >= 0) (void)close(marker_fd);
+            marker_fd = -1;
+            errno = 0;
+            continue;
+        }
+        memset(&parsed, 0, sizeof(parsed));
+        if (git_capture_fd_bytes_exact_bounded(
+                marker_fd, &marker_data, &marker_length, &marker_stat,
+                GIT_RECOVERY_MARKER_MAX_BYTES) != 0 ||
+            !S_ISREG(marker_stat.st_mode) ||
+            marker_stat.st_nlink != 1 ||
+            marker_stat.st_uid != geteuid() ||
+            (marker_stat.st_mode & 07777) != 0600 ||
+            !git_file_at_matches_witness(
+                directory_fd, entry->d_name, marker_fd, &marker_stat,
+                marker_data, marker_length, NULL) ||
+            !git_recovery_marker_parse(
+                marker_data, marker_length, &parsed) ||
+            parsed.stage_present) {
+            if (marker_data) {
+                secure_zero_memory(marker_data, marker_length);
+                free(marker_data);
+            }
+            (void)close(marker_fd);
+            marker_fd = -1;
+            errno = 0;
+            continue;
+        }
+        memset(&cleanup_lock, 0, sizeof(cleanup_lock));
+        cleanup_lock.dir_fd = directory_fd;
+        cleanup = git_scope_lock_cleanup_name_once(
+            &cleanup_lock, entry->d_name,
+            "orphaned private finalization certificate", marker_fd,
+            &marker_stat, marker_data, marker_length, true, false);
+        secure_zero_memory(marker_data, marker_length);
+        free(marker_data);
+        (void)close(marker_fd);
+        marker_fd = -1;
+        if (cleanup == GIT_CLEANUP_RETRY) {
+            saved_errno = errno ? errno : EAGAIN;
+            goto done;
+        }
+        if (cleanup == GIT_CLEANUP_REMOVED &&
+            fsync(directory_fd) != 0) {
+            saved_errno = errno ? errno : EIO;
+            goto done;
+        }
+        errno = 0;
+    }
+    if (errno != 0) saved_errno = errno;
+
+done:
+    if (marker_fd >= 0) (void)close(marker_fd);
+    if (directory) (void)closedir(directory);
+    if (saved_errno != 0) {
+        errno = saved_errno;
+        set_system_error(
+            ERR_GIT_CONFIG_FAILED,
+            "Cannot reconcile private Git finalization certificates");
+        return -1;
+    }
+    return 0;
+}
+
+static int git_finalization_lock_acquire(
+    git_config_finalization_t *finalization,
+    const git_scope_generation_t *generation) {
+    git_config_finalization_lock_t *lock;
+    git_finalization_publish_result_t publication;
+    struct stat pinned_parent;
+
+    if (!finalization || !generation || !generation->valid ||
+        finalization->count >=
+            sizeof(finalization->locks) /
+                sizeof(finalization->locks[0])) {
+        errno = EINVAL;
+        set_error(ERR_INVALID_ARGS,
+                  "Invalid Git finalization-lock request");
+        return -1;
+    }
+    if (git_finalization_has_destination(finalization, generation)) {
+        return 0;
+    }
+    lock = &finalization->locks[finalization->count];
+    memset(lock, 0, sizeof(*lock));
+    lock->parent_fd = -1;
+    lock->lock_fd = -1;
+    if (safe_strncpy(
+            lock->config_leaf, generation->leaf,
+            sizeof(lock->config_leaf)) != 0 ||
+        (size_t)snprintf(
+            lock->lock_leaf, sizeof(lock->lock_leaf), "%s.lock",
+            generation->leaf) >= sizeof(lock->lock_leaf)) {
+        errno = ENAMETOOLONG;
+        set_error(ERR_GIT_CONFIG_FAILED,
+                  "Git finalization lock name is too long");
+        return -1;
+    }
+    lock->parent_fd = git_dup_cloexec(generation->parent_fd);
+    if (lock->parent_fd < 0 ||
+        fstat(lock->parent_fd, &pinned_parent) != 0 ||
+        !git_same_object_identity(
+            &generation->parent_stat, &pinned_parent)) {
+        set_system_error(
+            ERR_GIT_CONFIG_FAILED,
+            "Cannot pin the Git finalization-lock directory");
+        git_finalization_lock_dispose(lock);
+        return -1;
+    }
+    lock->parent_stat = pinned_parent;
+    if (git_finalization_reconcile_private_orphans(
+            lock->parent_fd) != 0 ||
+        git_finalization_prepare_private_marker(lock) != 0) {
+        git_finalization_cleanup_unpublished_private(lock);
+        git_finalization_lock_dispose(lock);
+        return -1;
+    }
+    if (g_finalization_test_hook &&
+        g_finalization_test_hook(
+            GIT_FINALIZATION_TEST_AFTER_PRIVATE_PREPARE,
+            lock->parent_fd, lock->lock_leaf)) {
+        errno = EIO;
+        set_system_error(
+            ERR_GIT_CONFIG_FAILED,
+            "Injected private Git finalization-certificate interruption");
+        git_finalization_cleanup_unpublished_private(lock);
+        git_finalization_lock_dispose(lock);
+        return -1;
+    }
+    lock->active = true;
+    finalization->count++;
+
+    publication = git_finalization_publish_noreplace(
+        lock->parent_fd, lock->private_leaf, lock->lock_leaf);
+    if (publication == GIT_FINALIZATION_PUBLISH_ERROR &&
+        errno == EEXIST &&
+        git_finalization_recover_existing_marker(lock) == 0) {
+        publication = git_finalization_publish_noreplace(
+            lock->parent_fd, lock->private_leaf, lock->lock_leaf);
+    }
+    if (publication == GIT_FINALIZATION_PUBLISH_ERROR) {
+        set_system_error(
+            ERR_GIT_CONFIG_FAILED,
+            "Cannot publish the Git finalization recovery certificate");
+        return -1;
+    }
+    lock->canonical_published = true;
+    if (publication == GIT_FINALIZATION_PUBLISH_MOVED) {
+        lock->private_created = false;
+        lock->private_leaf[0] = '\0';
+        if (git_finalization_refresh_canonical(lock, 1) != 0) {
+            set_system_error(
+                ERR_GIT_CONFIG_FAILED,
+                "Cannot prove the canonical Git finalization certificate");
+            return -1;
+        }
+    } else if (git_finalization_refresh_canonical(lock, 2) != 0) {
+        set_system_error(
+            ERR_GIT_CONFIG_FAILED,
+            "Cannot prove the linked Git finalization certificate");
+        return -1;
+    }
+
+    if (g_finalization_test_hook &&
+        g_finalization_test_hook(
+            GIT_FINALIZATION_TEST_AFTER_CANONICAL_PUBLISH,
+            lock->parent_fd, lock->lock_leaf)) {
+        errno = EIO;
+        set_system_error(
+            ERR_GIT_CONFIG_FAILED,
+            "Injected Git finalization publication interruption");
+        return -1;
+    }
+    if (lock->private_created &&
+        git_finalization_remove_private_alias(lock) != 0) {
+        return -1;
+    }
+    if (fsync(lock->parent_fd) != 0 ||
+        git_finalization_refresh_canonical(lock, 1) != 0) {
+        errno = errno ? errno : EIO;
+        set_system_error(
+            ERR_GIT_CONFIG_FAILED,
+            "Cannot durably prove the Git finalization certificate");
+        return -1;
+    }
+    return 0;
+}
+
+static git_finalization_release_result_t
+git_finalization_lock_release(git_config_finalization_lock_t *lock) {
+    git_scope_lock_t cleanup_lock;
+    git_cleanup_result_t cleanup;
+
+    if (!lock || !lock->active) return GIT_FINALIZATION_RELEASE_OK;
+    if (lock->private_created &&
+        git_finalization_remove_private_alias(lock) != 0) {
+        return GIT_FINALIZATION_RELEASE_RETRY;
+    }
+    if (!lock->canonical_published) {
+        lock->active = false;
+        git_finalization_lock_dispose(lock);
+        return GIT_FINALIZATION_RELEASE_OK;
+    }
+    if (!lock->canonical_unlinked) {
+        if (g_finalization_test_hook &&
+            g_finalization_test_hook(
+                GIT_FINALIZATION_TEST_BEFORE_RELEASE,
+                lock->parent_fd, lock->lock_leaf)) {
+            errno = EIO;
+            set_error(
+                ERR_GIT_CONFIG_FAILED,
+                "Injected Git finalization-certificate release failure");
+            return GIT_FINALIZATION_RELEASE_RETRY;
+        }
+        memset(&cleanup_lock, 0, sizeof(cleanup_lock));
+        cleanup_lock.dir_fd = lock->parent_fd;
+        cleanup = git_scope_lock_cleanup_name_once(
+            &cleanup_lock, lock->lock_leaf,
+            "finalization recovery certificate", lock->lock_fd,
+            &lock->lock_stat, lock->marker_data, lock->marker_length,
+            true, false);
+        if (cleanup == GIT_CLEANUP_RETRY) {
+            errno = errno ? errno : EAGAIN;
+            set_system_error(
+                ERR_GIT_CONFIG_FAILED,
+                "Cannot remove the Git finalization recovery certificate");
+            return GIT_FINALIZATION_RELEASE_RETRY;
+        }
+        if (cleanup == GIT_CLEANUP_FOREIGN) {
+            errno = ESTALE;
+            set_error(
+                ERR_GIT_CONFIG_FAILED,
+                "Git finalization certificate changed before release; "
+                "foreign namespace entry was preserved");
+            lock->active = false;
+            git_finalization_lock_dispose(lock);
+            return GIT_FINALIZATION_RELEASE_FOREIGN;
+        }
+        lock->canonical_unlinked = true;
+    }
+    if (g_finalization_test_hook &&
+        g_finalization_test_hook(
+            GIT_FINALIZATION_TEST_BEFORE_RELEASE_DIRECTORY_SYNC,
+            lock->parent_fd, lock->lock_leaf)) {
+        errno = EIO;
+        set_error(
+            ERR_GIT_CONFIG_FAILED,
+            "Injected Git finalization-certificate sync failure");
+        return GIT_FINALIZATION_RELEASE_RETRY;
+    }
+    if (fsync(lock->parent_fd) != 0) {
+        set_system_error(
+            ERR_GIT_CONFIG_FAILED,
+            "Cannot synchronize Git finalization-certificate removal");
+        return GIT_FINALIZATION_RELEASE_RETRY;
+    }
+    lock->active = false;
+    git_finalization_lock_dispose(lock);
+    return GIT_FINALIZATION_RELEASE_OK;
+}
+
+static void git_config_finalization_abandon(
+    git_config_finalization_t **finalization) {
+    git_config_finalization_t *owned;
+
+    if (!finalization || !*finalization) return;
+    owned = *finalization;
+    *finalization = NULL;
+    for (size_t i = 0U; i < owned->count; i++) {
+        git_finalization_lock_dispose(&owned->locks[i]);
+    }
+    secure_zero_memory(owned, sizeof(*owned));
+    free(owned);
+}
+
+int git_config_finalization_end(
+    git_config_finalization_t **finalization) {
+    error_accumulator_t failures;
+    git_config_finalization_t *owned;
+    int result = 0;
+
+    if (!finalization || !*finalization) return 0;
+    owned = *finalization;
+    error_accumulator_init(&failures);
+    for (size_t i = owned->count; i > 0U; i--) {
+        git_finalization_release_result_t released =
+            git_finalization_lock_release(
+                &owned->locks[i - 1U]);
+
+        if (released == GIT_FINALIZATION_RELEASE_RETRY) {
+            result = -1;
+            (void)error_accumulator_add_last(
+                &failures, "Git finalization-lock release");
+        } else if (released == GIT_FINALIZATION_RELEASE_FOREIGN) {
+            result = -1;
+            (void)error_accumulator_add_last(
+                &failures, "Git finalization-lock ownership");
+        }
+    }
+    /* Failed pathname cleanup retains a complete canonical certificate; a
+     * failed post-unlink sync can at worst replay that same certificate after
+     * a crash. Release process-local fcntl claims now so an embedded caller,
+     * not only a restarted CLI, can self-heal on its next managed write. */
+    git_config_finalization_abandon(finalization);
+    if (failures.active) {
+        (void)error_accumulator_publish(&failures);
+    }
+    return result;
+}
+
+int git_config_finalization_begin(
+    git_config_finalization_t **finalization) {
+    const git_scope_generation_t *generations[] = {
+        &g_git_snapshot.primary_generation,
+        &g_git_snapshot.local_generation,
+        &g_git_snapshot.worktree_generation
+    };
+    git_config_finalization_t *owned = NULL;
+    error_context_t primary_error;
+    int primary_errno;
+
+    if (!finalization || *finalization) {
+        errno = EINVAL;
+        set_error(ERR_INVALID_ARGS,
+                  "Invalid Git finalization output handle");
+        return -1;
+    }
+    if (!g_git_snapshot.valid ||
+        !g_git_snapshot.postimage_sealed) {
+        errno = EINVAL;
+        set_error(ERR_INVALID_ARGS,
+                  "No sealed Git transaction is available to finalize");
+        return -1;
+    }
+    owned = calloc(1U, sizeof(*owned));
+    if (!owned) {
+        set_error(
+            ERR_MEMORY_ALLOCATION,
+            "Cannot allocate Git transaction finalization state");
+        return -1;
+    }
+    for (size_t i = 0;
+         i < sizeof(generations) / sizeof(generations[0]); i++) {
+        if (generations[i]->valid &&
+            (git_scope_generation_verify_namespace(
+                 generations[i]) != 0 ||
+             git_finalization_lock_acquire(
+                 owned, generations[i]) != 0)) {
+            goto begin_failed;
+        }
+    }
+    if (git_snapshot_verify_generations(
+            &g_git_snapshot, true) != 0 ||
+        git_snapshot_verify_managed_postimage(
+            &g_git_snapshot, true) != 0 ||
+        git_snapshot_verify_generations(
+            &g_git_snapshot, true) != 0) {
+        goto begin_failed;
+    }
+    *finalization = owned;
+    return 0;
+
+begin_failed:
+    primary_error = *get_last_error();
+    primary_errno = errno ? errno : EIO;
+    if (git_config_finalization_end(&owned) != 0) {
+        error_context_t cleanup_error = *get_last_error();
+        int cleanup_errno = errno;
+        error_accumulator_t failures;
+
+        /* A canonical residue is a complete self-describing recovery
+         * certificate, so process-local descriptor ownership may be released
+         * after the cleanup failure is captured. A later managed write will
+         * claim and remove only that exact marker. */
+        git_config_finalization_abandon(&owned);
+        error_accumulator_init(&failures);
+        errno = primary_errno;
+        (void)error_accumulator_add(
+            &failures, "Git finalization admission", &primary_error);
+        errno = cleanup_errno;
+        (void)error_accumulator_add(
+            &failures, "Git finalization cleanup", &cleanup_error);
+        (void)error_accumulator_publish(&failures);
+    } else {
+        g_last_error = primary_error;
+        errno = primary_errno;
+    }
+    return -1;
 }
 
 static git_scope_generation_t *git_transaction_generation(git_scope_t scope) {
@@ -4834,14 +5828,6 @@ int git_config_snapshot(git_scope_t scope) {
 }
 
 int git_config_seal(void) {
-    git_scope_snapshot_t observed_primary;
-    git_scope_snapshot_t observed_local;
-    git_scope_snapshot_t observed_worktree;
-    int differences;
-
-    memset(&observed_primary, 0, sizeof(observed_primary));
-    memset(&observed_local, 0, sizeof(observed_local));
-    memset(&observed_worktree, 0, sizeof(observed_worktree));
     if (!g_git_snapshot.valid) {
         set_error(ERR_INVALID_ARGS, "No Git snapshot to seal");
         return -1;
@@ -4863,33 +5849,9 @@ int git_config_seal(void) {
     if (g_git_snapshot.postimage_sealed) return 0;
     if (git_snapshot_verify_generations(&g_git_snapshot, false) != 0 ||
         git_snapshot_pin_post_configs(&g_git_snapshot) != 0 ||
-        git_capture_transaction_scopes(&observed_primary, &observed_local,
-                                       &observed_worktree) != 0 ||
-        git_snapshot_verify_generations(&g_git_snapshot, true) != 0) {
-        git_scope_snapshot_clear(&observed_primary);
-        git_scope_snapshot_clear(&observed_local);
-        git_scope_snapshot_clear(&observed_worktree);
+        git_snapshot_verify_managed_postimage(
+            &g_git_snapshot, false) != 0) {
         git_snapshot_clear_post_configs(&g_git_snapshot);
-        return -1;
-    }
-    differences = git_scope_snapshot_difference_count(
-        &g_git_snapshot.post_primary, &observed_primary);
-    if (g_git_snapshot.local_also) {
-        differences += git_scope_snapshot_difference_count(
-            &g_git_snapshot.post_local, &observed_local);
-    }
-    if (g_git_snapshot.worktree_also) {
-        differences += git_scope_snapshot_difference_count(
-            &g_git_snapshot.post_worktree, &observed_worktree);
-    }
-    git_scope_snapshot_clear(&observed_primary);
-    git_scope_snapshot_clear(&observed_local);
-    git_scope_snapshot_clear(&observed_worktree);
-    if (differences != 0) {
-        git_snapshot_clear_post_configs(&g_git_snapshot);
-        set_error(ERR_GIT_CONFIG_FAILED,
-                  "Cannot seal Git transaction: %d managed vector(s) changed outside this transaction before post-image verification",
-                  differences);
         return -1;
     }
     g_git_snapshot.postimage_sealed = true;
@@ -5010,32 +5972,17 @@ int git_publication_verify_program_identity(
     return 0;
 }
 
-/* AR-12 H2: expose only the destination identity of the active snapshot so
- * the publication-capacity preflight can recognize an in-place replacement
- * before any mutation. Available from git_config_snapshot() on; requires no
- * sealed post-image. */
-int git_config_snapshot_export_destination(publication_record_t *out) {
-    const git_scope_generation_t *generation;
-
-    if (!out) {
-        set_error(ERR_INVALID_ARGS,
-                  "Invalid Git snapshot destination export request");
-        return -1;
-    }
-    if (!g_git_snapshot.valid) {
-        set_error(ERR_GIT_CONFIG_FAILED,
-                  "No Git snapshot is available to export a destination");
-        return -1;
-    }
-    generation = &g_git_snapshot.primary_generation;
-    if (!generation->valid) {
+static int git_snapshot_export_generation_destination(
+    const git_scope_generation_t *generation, git_scope_t scope,
+    publication_record_t *out) {
+    if (!generation || !generation->valid || !out) {
+        errno = EINVAL;
         set_error(ERR_GIT_CONFIG_FAILED,
                   "Git snapshot has no captured destination generation");
         return -1;
     }
     publication_record_init(out);
-    if (git_publication_scope_from_git(g_git_snapshot.scope,
-                                       &out->scope) != 0 ||
+    if (git_publication_scope_from_git(scope, &out->scope) != 0 ||
         safe_strncpy(out->config_path, generation->path,
                      sizeof(out->config_path)) != 0) {
         set_error(ERR_GIT_CONFIG_FAILED,
@@ -5054,6 +6001,78 @@ int git_config_snapshot_export_destination(publication_record_t *out) {
         }
         publication_identity_from_stat(&out->repository,
                                        &generation->repository_stat);
+    }
+    return 0;
+}
+
+/* AR-12 H2: expose only the primary destination identity of the active
+ * snapshot so publication-capacity preflight can recognize an in-place
+ * replacement before any mutation. */
+int git_config_snapshot_export_destination(publication_record_t *out) {
+    if (!out) {
+        set_error(ERR_INVALID_ARGS,
+                  "Invalid Git snapshot destination export request");
+        return -1;
+    }
+    if (!g_git_snapshot.valid) {
+        set_error(ERR_GIT_CONFIG_FAILED,
+                  "No Git snapshot is available to export a destination");
+        return -1;
+    }
+    return git_snapshot_export_generation_destination(
+        &g_git_snapshot.primary_generation, g_git_snapshot.scope, out);
+}
+
+/* AR-14 H1: recovery owns every namespace the transaction can mutate, not
+ * only its primary publication scope. The order is a canonical part of the
+ * switch marker so a restart from another repository/topology cannot adopt
+ * the marker and silently omit or add a secondary scope. */
+int git_config_snapshot_export_destinations(
+    publication_record_t *out, size_t capacity, size_t *count) {
+    const git_scope_generation_t *generations[3];
+    git_scope_t scopes[3];
+    size_t required = 0U;
+
+    if (!out || !count) {
+        errno = EINVAL;
+        set_error(ERR_INVALID_ARGS,
+                  "Invalid Git snapshot destination-set export request");
+        return -1;
+    }
+    *count = 0U;
+    if (!g_git_snapshot.valid) {
+        set_error(ERR_GIT_CONFIG_FAILED,
+                  "No Git snapshot is available to export destinations");
+        return -1;
+    }
+    generations[required] = &g_git_snapshot.primary_generation;
+    scopes[required++] = g_git_snapshot.scope;
+    if (g_git_snapshot.local_also) {
+        generations[required] = &g_git_snapshot.local_generation;
+        scopes[required++] = GIT_SCOPE_LOCAL;
+    }
+    if (g_git_snapshot.worktree_also) {
+        generations[required] = &g_git_snapshot.worktree_generation;
+        scopes[required++] = GIT_SCOPE_WORKTREE_INTERNAL;
+    }
+    *count = required;
+    if (capacity < required) {
+        errno = ENOSPC;
+        set_error(
+            ERR_INVALID_ARGS,
+            "Git snapshot destination export needs %zu slots, but only %zu were supplied",
+            required, capacity);
+        return -1;
+    }
+    for (size_t i = 0U; i < required; i++) {
+        if (git_snapshot_export_generation_destination(
+                generations[i], scopes[i], &out[i]) != 0) {
+            for (size_t j = 0U; j < required; j++) {
+                secure_zero_memory(&out[j], sizeof(out[j]));
+            }
+            *count = 0U;
+            return -1;
+        }
     }
     return 0;
 }
@@ -8263,8 +9282,23 @@ static int git_set_config_value_impl(const char *key, const char *value,
     }
     log_debug("Setting git config: %s = %s (%s)", key, value, scope_flag);
 
-    if (git_run(output, sizeof(output), "config", scope_flag, key, value,
-                (const char *)NULL) != 0) {
+    {
+        int write_result = git_run(
+            output, sizeof(output), "config", scope_flag, key, value,
+            (const char *)NULL);
+
+        if (write_result != 0 &&
+            git_recover_scope_finalization_marker(scope) == 1) {
+            output[0] = '\0';
+            write_result = git_run(
+                output, sizeof(output), "config", scope_flag, key, value,
+                (const char *)NULL);
+        }
+        if (write_result == 0) {
+            git_transaction_commit_vector(&post_update);
+            cfg_cache_store(s, k, CFG_WRITTEN, true, value);
+            return 0;
+        }
         git_transaction_discard_vector(&post_update);
         /* The key's on-disk state is now uncertain; never skip/serve it. */
         cfg_cache_store(s, k, CFG_UNKNOWN, false, "");
@@ -8275,10 +9309,6 @@ static int git_set_config_value_impl(const char *key, const char *value,
                       : "git produced no diagnostic output");
         return -1;
     }
-
-    git_transaction_commit_vector(&post_update);
-    cfg_cache_store(s, k, CFG_WRITTEN, true, value);
-    return 0;
 }
 
 int git_set_config_value(const char *key, const char *value, git_scope_t scope) {
@@ -8457,6 +9487,12 @@ static int git_unset_config_value_impl(const char *key, git_scope_t scope,
         opts.out_size = sizeof(output);
         opts.merge_stderr = true;
         run_argv(argv, &opts, &res);
+        if (res.exit_code != 0 && res.exit_code != 5 &&
+            git_recover_scope_finalization_marker(scope) == 1) {
+            memset(&res, 0, sizeof(res));
+            output[0] = '\0';
+            run_argv(argv, &opts, &res);
+        }
 
         /* exit 0 = removed; exit 5 with --unset-all = the key did not exist.
          * Both prove the key is now absent, so caching CFG_WRITTEN/absent is
