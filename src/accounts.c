@@ -6263,7 +6263,13 @@ int accounts_show_status(const gitswitch_ctx_t *ctx) {
                         git_config->gpg_openpgp_program.present &&
                         !git_config->gpg_openpgp_program.value_unknown &&
                         strcmp(git_config->gpg_openpgp_program.value,
-                               expected_gpg_program) == 0;
+                               expected_gpg_program) == 0 &&
+                        account_publication_scope_matches_origin(
+                            publication->scope,
+                            git_config->gpg_openpgp_program.scope) &&
+                        account_publication_origin_matches(
+                            publication,
+                            git_config->gpg_openpgp_program.origin);
                     gpg_programs_match = gpg_openpgp_matches &&
                                          !foreign_gpg_program_present;
                 }
