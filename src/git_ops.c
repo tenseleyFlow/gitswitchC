@@ -36,7 +36,6 @@
 #include "git_ops_internal.h"
 #include "git_status_internal.h"
 #undef GITSWITCH_INTERNAL_API
-#include "gpg_manager.h"
 #include "error.h"
 #include "utils.h"
 #include "display.h"
@@ -9835,10 +9834,14 @@ int git_test_config(const account_t *account, git_scope_t scope,
      * create a commit or signature; functional signing must be tested by a
      * caller that explicitly owns those side effects. Which keyring gpg
      * consults is decided by GNUPGHOME — by the time a switch validates itself
-     * that is already the account's isolated home. The probe is skipped when
-     * an earlier spawn already proved the key's presence (AR-02 #14). */
-    if (gpg_expected &&
-        !gpg_manager_key_available_cached(account->gpg_key_id)) {
+     * that is already the account's isolated home. A selector-only process
+     * memo cannot prove this executable/home context, so this deliberately
+     * remains an independent raw sanity probe. */
+    if (gpg_expected) {
+        const char *const gpg_unset_env[] = {
+            "GPG_AGENT_INFO",
+            NULL
+        };
         const char *gpg_argv[] = {
             expected_gpg_program, "--list-secret-keys",
             account->gpg_key_id, NULL
@@ -9846,12 +9849,12 @@ int git_test_config(const account_t *account, git_scope_t scope,
         run_opts_t gpg_opts;
         memset(&gpg_opts, 0, sizeof(gpg_opts));
         gpg_opts.stderr_to_devnull = true;
+        gpg_opts.unset_env = gpg_unset_env;
         if (run_argv(gpg_argv, &gpg_opts, NULL) != 0) {
             set_error(ERR_GPG_KEY_NOT_FOUND, "GPG key not available: %s",
                       account->gpg_key_id);
             return -1;
         }
-        gpg_manager_note_key_available(account->gpg_key_id);
     }
 
     log_info("Git configuration test passed for %s", account->name);

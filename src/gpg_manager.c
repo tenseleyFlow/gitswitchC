@@ -40,6 +40,7 @@
 #include "utils.h"
 #include "display.h"
 #include "git_ops.h"
+#include "runner_internal.h"
 #include "signals.h"
 
 /* When set, gpg_get_base_dir suppresses the "XDG_RUNTIME_DIR unset / not
@@ -123,9 +124,13 @@ static int gpg_validate_pinned_home(const gpg_pinned_home_t *home);
 static int gpg_mount_identity_fd(int fd, gpg_mount_identity_t *identity);
 static bool gpg_same_mount(const gpg_mount_identity_t *left,
                            const gpg_mount_identity_t *right);
+static bool gpg_same_file_version(const struct stat *left,
+                                  const struct stat *right);
 static int gpg_user_source_home(char *buf, size_t size);
 static int gpg_open_user_source_home(gpg_source_home_t *source);
 static int gpg_validate_source_home(const gpg_source_home_t *source);
+static int gpg_validate_source_home_binding(
+    const gpg_source_home_t *source);
 static void gpg_close_source_home(gpg_source_home_t *source);
 static int gpg_resolve_source_key(const gpg_config_t *gpg_config,
                                   const char *selector, bool require_signing,
@@ -167,6 +172,7 @@ static gpg_reset_quarantine_hook_fn g_reset_quarantine_hook;
 static gpg_mount_identity_probe_fn g_mount_identity_probe;
 static gpg_agent_conf_sync_fn g_agent_conf_sync =
     gpg_default_agent_conf_sync;
+static gpg_key_cache_post_scan_hook_fn g_key_cache_post_scan_hook;
 
 static void gpg_agent_config_update_init(gpg_agent_config_update_t *update) {
     if (!update) return;
@@ -307,16 +313,21 @@ gpg_manager_set_agent_conf_sync_fn(gpg_agent_conf_sync_fn fn) {
     return previous;
 }
 
-/* Process-lifetime memo of GPG key ids whose secret-key presence a gpg spawn
- * already proved this run (AR-02 #14). A single GPG switch used to spawn gpg
- * 4-6 times re-proving the same key — the up-front availability probe, the
- * import idempotency check, the signing-capability test, and git_test_config's
- * read-back check each ran their own listing. The memo lets the later sanity
- * checks reuse the earlier proof. Deliberately coarse: it says "a keyring this
- * process consulted holds the secret key", which is exactly the availability
- * question those redundant spawns re-asked; the strict per-home validation on
- * the switch path still runs against the isolated home itself. Same
- * short-lived, single-threaded caching assumptions as git_ops.c's exec caches. */
+gpg_key_cache_post_scan_hook_fn
+gpg_manager_set_key_cache_post_scan_hook_fn(
+    gpg_key_cache_post_scan_hook_fn fn) {
+    gpg_key_cache_post_scan_hook_fn previous =
+        g_key_cache_post_scan_hook;
+    g_key_cache_post_scan_hook = fn;
+    return previous;
+}
+
+/* The original AR-02 availability memo retained only caller-supplied key
+ * spellings. It remains as a compatibility surface for deterministic mock
+ * runners, but a production runner must never treat a post-hoc note as
+ * executable, home, capability, or key evidence. Real reuse is owned by the
+ * proof cache below and can be produced only by a successful structured
+ * secret-key listing. */
 #define GPG_SEEN_KEYS_MAX 8
 static char g_seen_keys[GPG_SEEN_KEYS_MAX][GPG_FINGERPRINT_BUFSIZE];
 static size_t g_seen_key_count;
@@ -334,7 +345,7 @@ void gpg_manager_note_key_available(const char *key_id) {
 }
 
 bool gpg_manager_key_available_cached(const char *key_id) {
-    if (!key_id) {
+    if (!key_id || run_uses_default_runner()) {
         return false;
     }
     for (size_t i = 0; i < g_seen_key_count; i++) {
@@ -343,6 +354,567 @@ bool gpg_manager_key_available_cached(const char *key_id) {
         }
     }
     return false;
+}
+
+typedef enum {
+    GPG_KEY_CACHE_HOME_SYSTEM = 1,
+    GPG_KEY_CACHE_HOME_ISOLATED = 2
+} gpg_key_cache_home_kind_t;
+
+typedef struct {
+    char *relative_path;
+    struct stat identity;
+} gpg_key_cache_home_entry_t;
+
+typedef struct {
+    bool valid;
+    gpg_key_cache_home_kind_t kind;
+    char path[MAX_PATH_LEN];
+    struct stat root_identity;
+    gpg_mount_identity_t root_mount;
+    gpg_key_cache_home_entry_t *entries;
+    size_t count;
+    size_t capacity;
+} gpg_key_cache_home_generation_t;
+
+typedef struct {
+    bool valid;
+    bool signing_capability;
+    uint64_t sequence;
+    uint32_t listing_contract;
+    char fingerprint[GPG_FINGERPRINT_BUFSIZE];
+    char program[MAX_PATH_LEN];
+    run_launch_witness_t launch;
+    gpg_key_cache_home_generation_t home;
+} gpg_key_cache_entry_t;
+
+enum {
+    GPG_KEY_CACHE_MAX = 8,
+    GPG_KEY_CACHE_MAX_DEPTH = 16,
+    GPG_KEY_CACHE_MAX_HOME_ENTRIES = 512,
+    GPG_KEY_CACHE_LISTING_CONTRACT = 1
+};
+
+static gpg_key_cache_entry_t g_key_cache[GPG_KEY_CACHE_MAX];
+static uint64_t g_key_cache_sequence;
+
+static void gpg_key_cache_home_generation_clear(
+    gpg_key_cache_home_generation_t *generation) {
+    size_t index;
+
+    if (!generation) return;
+    for (index = 0; index < generation->count; index++) {
+        free(generation->entries[index].relative_path);
+    }
+    free(generation->entries);
+    memset(generation, 0, sizeof(*generation));
+}
+
+static bool gpg_key_cache_stat_equal(const struct stat *left,
+                                     const struct stat *right) {
+    return left && right && gpg_same_file_version(left, right) &&
+           left->st_gid == right->st_gid &&
+           left->st_rdev == right->st_rdev;
+}
+
+static int gpg_key_cache_home_entry_compare(const void *left,
+                                            const void *right) {
+    const gpg_key_cache_home_entry_t *a = left;
+    const gpg_key_cache_home_entry_t *b = right;
+
+    return strcmp(a->relative_path, b->relative_path);
+}
+
+static int gpg_key_cache_home_generation_append(
+    gpg_key_cache_home_generation_t *generation, const char *relative_path,
+    const struct stat *identity) {
+    gpg_key_cache_home_entry_t *grown;
+    gpg_key_cache_home_entry_t *entry;
+    size_t capacity;
+
+    if (!generation || !relative_path || !*relative_path || !identity) {
+        errno = EINVAL;
+        return -1;
+    }
+    if (generation->count >= GPG_KEY_CACHE_MAX_HOME_ENTRIES) {
+        errno = E2BIG;
+        return -1;
+    }
+    if (generation->count == generation->capacity) {
+        capacity = generation->capacity == 0
+                       ? 32U
+                       : generation->capacity * 2U;
+        if (capacity > GPG_KEY_CACHE_MAX_HOME_ENTRIES) {
+            capacity = GPG_KEY_CACHE_MAX_HOME_ENTRIES;
+        }
+        grown = realloc(generation->entries,
+                        capacity * sizeof(*generation->entries));
+        if (!grown) return -1;
+        generation->entries = grown;
+        generation->capacity = capacity;
+    }
+    entry = &generation->entries[generation->count];
+    memset(entry, 0, sizeof(*entry));
+    entry->relative_path = strdup(relative_path);
+    if (!entry->relative_path) return -1;
+    entry->identity = *identity;
+    generation->count++;
+    return 0;
+}
+
+static int gpg_key_cache_capture_directory(
+    int directory_fd, const char *relative_prefix, unsigned int depth,
+    const gpg_mount_identity_t *root_mount,
+    gpg_key_cache_home_generation_t *generation) {
+    struct stat directory_before;
+    struct stat directory_after;
+    gpg_mount_identity_t directory_mount;
+    int scan_fd;
+    DIR *directory;
+    struct dirent *dirent;
+
+    if (directory_fd < 0 || !relative_prefix || !root_mount || !generation ||
+        depth > GPG_KEY_CACHE_MAX_DEPTH ||
+        fstat(directory_fd, &directory_before) != 0 ||
+        !S_ISDIR(directory_before.st_mode) ||
+        gpg_mount_identity_fd(directory_fd, &directory_mount) != 0 ||
+        !gpg_same_mount(root_mount, &directory_mount)) {
+        if (errno == 0) errno = depth > GPG_KEY_CACHE_MAX_DEPTH ? E2BIG : EXDEV;
+        return -1;
+    }
+    scan_fd = openat(directory_fd, ".",
+                     O_RDONLY | O_DIRECTORY | O_CLOEXEC | O_NOFOLLOW);
+    if (scan_fd < 0) return -1;
+    directory = fdopendir(scan_fd);
+    if (!directory) {
+        int saved_errno = errno;
+
+        close(scan_fd);
+        errno = saved_errno;
+        return -1;
+    }
+    for (;;) {
+        char relative_path[MAX_PATH_LEN];
+        struct stat named_before;
+        struct stat named_after;
+
+        errno = 0;
+        dirent = readdir(directory);
+        if (!dirent) {
+            if (errno != 0) {
+                int saved_errno = errno;
+
+                closedir(directory);
+                errno = saved_errno;
+                return -1;
+            }
+            break;
+        }
+        if (strcmp(dirent->d_name, ".") == 0 ||
+            strcmp(dirent->d_name, "..") == 0) {
+            continue;
+        }
+        if ((relative_prefix[0]
+                 ? safe_snprintf(relative_path, sizeof(relative_path),
+                                 "%s/%s", relative_prefix, dirent->d_name)
+                 : safe_snprintf(relative_path, sizeof(relative_path), "%s",
+                                 dirent->d_name)) != 0 ||
+            fstatat(directory_fd, dirent->d_name, &named_before,
+                    AT_SYMLINK_NOFOLLOW) != 0) {
+            int saved_errno = errno;
+
+            closedir(directory);
+            errno = saved_errno;
+            return -1;
+        }
+        /* A symlink's inode metadata does not bind the content reached by
+         * GnuPG. Decline caching instead of turning an unobserved target into
+         * reusable key evidence; the authoritative listing still runs. */
+        if (S_ISLNK(named_before.st_mode)) {
+            closedir(directory);
+            errno = ELOOP;
+            return -1;
+        }
+        if (gpg_key_cache_home_generation_append(
+                generation, relative_path, &named_before) != 0) {
+            int saved_errno = errno;
+
+            closedir(directory);
+            errno = saved_errno;
+            return -1;
+        }
+        if (S_ISDIR(named_before.st_mode)) {
+            struct stat opened;
+            gpg_mount_identity_t child_mount;
+            int child_fd = openat(
+                directory_fd, dirent->d_name,
+                O_RDONLY | O_DIRECTORY | O_CLOEXEC | O_NOFOLLOW);
+
+            if (child_fd < 0 || fstat(child_fd, &opened) != 0 ||
+                gpg_mount_identity_fd(child_fd, &child_mount) != 0 ||
+                !gpg_same_mount(root_mount, &child_mount) ||
+                !gpg_key_cache_stat_equal(&named_before, &opened) ||
+                gpg_key_cache_capture_directory(
+                    child_fd, relative_path, depth + 1U, root_mount,
+                    generation) != 0 ||
+                fstatat(directory_fd, dirent->d_name, &named_after,
+                        AT_SYMLINK_NOFOLLOW) != 0 ||
+                !gpg_key_cache_stat_equal(&opened, &named_after)) {
+                int saved_errno = errno ? errno : ESTALE;
+
+                if (child_fd >= 0) close(child_fd);
+                closedir(directory);
+                errno = saved_errno;
+                return -1;
+            }
+            close(child_fd);
+        } else {
+            if (fstatat(directory_fd, dirent->d_name, &named_after,
+                        AT_SYMLINK_NOFOLLOW) != 0 ||
+                !gpg_key_cache_stat_equal(&named_before, &named_after)) {
+                int saved_errno = errno ? errno : ESTALE;
+
+                closedir(directory);
+                errno = saved_errno;
+                return -1;
+            }
+        }
+    }
+    if (fstat(directory_fd, &directory_after) != 0 ||
+        !gpg_key_cache_stat_equal(&directory_before, &directory_after)) {
+        int saved_errno = errno ? errno : ESTALE;
+
+        closedir(directory);
+        errno = saved_errno;
+        return -1;
+    }
+    closedir(directory);
+    return 0;
+}
+
+static int gpg_key_cache_home_generation_capture_once(
+    int home_fd, const char *path, gpg_key_cache_home_kind_t kind,
+    gpg_key_cache_home_generation_t *generation) {
+    struct stat root_after;
+
+    if (home_fd < 0 || !path || path[0] != '/' || !generation) {
+        errno = EINVAL;
+        return -1;
+    }
+    memset(generation, 0, sizeof(*generation));
+    generation->kind = kind;
+    if (safe_strncpy(generation->path, path,
+                     sizeof(generation->path)) != 0 ||
+        fstat(home_fd, &generation->root_identity) != 0 ||
+        !S_ISDIR(generation->root_identity.st_mode) ||
+        gpg_mount_identity_fd(home_fd, &generation->root_mount) != 0 ||
+        gpg_key_cache_capture_directory(
+            home_fd, "", 0, &generation->root_mount, generation) != 0 ||
+        fstat(home_fd, &root_after) != 0 ||
+        !gpg_key_cache_stat_equal(&generation->root_identity, &root_after)) {
+        int saved_errno = errno ? errno : ESTALE;
+
+        gpg_key_cache_home_generation_clear(generation);
+        errno = saved_errno;
+        return -1;
+    }
+    if (generation->count > 1) {
+        qsort(generation->entries, generation->count,
+              sizeof(*generation->entries),
+              gpg_key_cache_home_entry_compare);
+    }
+    generation->valid = true;
+    return 0;
+}
+
+static bool gpg_key_cache_home_generation_equal(
+    const gpg_key_cache_home_generation_t *left,
+    const gpg_key_cache_home_generation_t *right) {
+    size_t index;
+
+    if (!left || !right || !left->valid || !right->valid ||
+        left->kind != right->kind || strcmp(left->path, right->path) != 0 ||
+        !gpg_key_cache_stat_equal(&left->root_identity,
+                                  &right->root_identity) ||
+        !gpg_same_mount(&left->root_mount, &right->root_mount) ||
+        left->count != right->count) {
+        return false;
+    }
+    for (index = 0; index < left->count; index++) {
+        if (strcmp(left->entries[index].relative_path,
+                   right->entries[index].relative_path) != 0 ||
+            !gpg_key_cache_stat_equal(&left->entries[index].identity,
+                                      &right->entries[index].identity)) {
+            return false;
+        }
+    }
+    return true;
+}
+
+static int gpg_key_cache_home_generation_capture(
+    int home_fd, const char *path, gpg_key_cache_home_kind_t kind,
+    gpg_key_cache_home_generation_t *generation) {
+    gpg_key_cache_home_generation_t first;
+    gpg_key_cache_home_generation_t second;
+
+    memset(&first, 0, sizeof(first));
+    memset(&second, 0, sizeof(second));
+    if (gpg_key_cache_home_generation_capture_once(
+            home_fd, path, kind, &first) != 0 ||
+        gpg_key_cache_home_generation_capture_once(
+            home_fd, path, kind, &second) != 0 ||
+        !gpg_key_cache_home_generation_equal(&first, &second)) {
+        int saved_errno = errno ? errno : ESTALE;
+
+        gpg_key_cache_home_generation_clear(&first);
+        gpg_key_cache_home_generation_clear(&second);
+        errno = saved_errno;
+        return -1;
+    }
+    gpg_key_cache_home_generation_clear(&second);
+    *generation = first;
+    return 0;
+}
+
+static bool gpg_key_cache_normalize_fingerprint(
+    const char *selector, char fingerprint[GPG_FINGERPRINT_BUFSIZE]) {
+    const char *digits;
+    size_t length;
+    size_t index;
+
+    if (!selector || !fingerprint) return false;
+    digits = selector;
+    if (digits[0] == '0' && (digits[1] == 'x' || digits[1] == 'X')) {
+        digits += 2;
+    }
+    length = strlen(digits);
+    if (length != 40 && length != 64) return false;
+    for (index = 0; index < length; index++) {
+        if (!isxdigit((unsigned char)digits[index])) return false;
+        fingerprint[index] =
+            (char)toupper((unsigned char)digits[index]);
+    }
+    fingerprint[length] = '\0';
+    return true;
+}
+
+static int gpg_key_cache_home_coordinates(
+    const gpg_pinned_home_t *home, const gpg_source_home_t *source,
+    int *home_fd, const char **path, gpg_key_cache_home_kind_t *kind) {
+    if (!home_fd || !path || !kind || (!home && !source) ||
+        (home && source)) {
+        errno = EINVAL;
+        return -1;
+    }
+    if (home) {
+        *home_fd = home->home_fd;
+        *path = home->path;
+        *kind = GPG_KEY_CACHE_HOME_ISOLATED;
+    } else {
+        *home_fd = source->fd;
+        *path = source->path;
+        *kind = GPG_KEY_CACHE_HOME_SYSTEM;
+    }
+    if (*home_fd < 0 || !*path || (*path)[0] != '/') {
+        errno = EINVAL;
+        return -1;
+    }
+    return 0;
+}
+
+/* Return 1 for a reusable proof, 0 for an ordinary cache miss, and -1 when a
+ * candidate's final public namespace binding changed during lookup. */
+static int gpg_key_cache_lookup(
+    const gpg_config_t *gpg_config, const gpg_pinned_home_t *home,
+    const gpg_source_home_t *source, const char *selector,
+    bool require_signing, char *fingerprint, size_t fingerprint_size) {
+    error_context_t prior_error = g_last_error;
+    int prior_errno = errno;
+    char canonical[GPG_FINGERPRINT_BUFSIZE];
+    gpg_key_cache_home_generation_t current;
+    gpg_key_cache_home_generation_t confirmed;
+    gpg_key_cache_home_kind_t kind;
+    const char *path;
+    int home_fd;
+    size_t index;
+    bool have_candidate = false;
+    bool matched = false;
+    bool fatal_binding = false;
+    error_context_t fatal_error;
+    int fatal_errno = 0;
+    bool post_scan_checked = false;
+    bool post_scan_failed = false;
+
+    memset(&current, 0, sizeof(current));
+    memset(&confirmed, 0, sizeof(confirmed));
+    if (!gpg_config || gpg_config->executable_path[0] != '/' ||
+        !fingerprint || fingerprint_size == 0 ||
+        !gpg_key_cache_normalize_fingerprint(selector, canonical) ||
+        strlen(canonical) + 1U > fingerprint_size ||
+        gpg_key_cache_home_coordinates(home, source, &home_fd, &path,
+                                       &kind) != 0) {
+        g_last_error = prior_error;
+        errno = prior_errno;
+        return 0;
+    }
+    for (index = 0; index < GPG_KEY_CACHE_MAX; index++) {
+        const gpg_key_cache_entry_t *entry = &g_key_cache[index];
+
+        if (entry->valid &&
+            entry->listing_contract == GPG_KEY_CACHE_LISTING_CONTRACT &&
+            strcmp(entry->fingerprint, canonical) == 0 &&
+            strcmp(entry->program, gpg_config->executable_path) == 0 &&
+            entry->home.kind == kind &&
+            strcmp(entry->home.path, path) == 0 &&
+            (!require_signing || entry->signing_capability)) {
+            have_candidate = true;
+            break;
+        }
+    }
+    if (have_candidate &&
+        gpg_key_cache_home_generation_capture(home_fd, path, kind,
+                                              &current) == 0) {
+        for (index = 0; index < GPG_KEY_CACHE_MAX; index++) {
+            gpg_key_cache_entry_t *entry = &g_key_cache[index];
+
+            if (!entry->valid ||
+                entry->listing_contract !=
+                    GPG_KEY_CACHE_LISTING_CONTRACT ||
+                strcmp(entry->fingerprint, canonical) != 0 ||
+                strcmp(entry->program,
+                       gpg_config->executable_path) != 0 ||
+                entry->home.kind != kind ||
+                strcmp(entry->home.path, path) != 0 ||
+                (require_signing && !entry->signing_capability)) {
+                continue;
+            }
+            if (!gpg_key_cache_home_generation_equal(&entry->home,
+                                                     &current) ||
+                !run_launch_witness_revalidate(
+                    gpg_config->executable_path, &entry->launch)) {
+                gpg_key_cache_home_generation_clear(&entry->home);
+                memset(entry, 0, sizeof(*entry));
+                continue;
+            }
+            if (!post_scan_checked) {
+                post_scan_checked = true;
+                post_scan_failed =
+                    g_key_cache_post_scan_hook &&
+                    g_key_cache_post_scan_hook(
+                        path,
+                        kind == GPG_KEY_CACHE_HOME_ISOLATED) != 0;
+            }
+            /* The executable check above is deliberately not the last proof:
+             * recapture the complete home generation afterwards, then bind
+             * the public source/managed-home namespace to the retained fd.
+             * A rename/rebind during the first scan therefore cannot be
+             * erased by the unchanged descriptor-backed tree. */
+            {
+                int generation_rc =
+                    gpg_key_cache_home_generation_capture(
+                        home_fd, path, kind, &confirmed);
+                int binding_rc =
+                    home ? gpg_validate_pinned_home(home)
+                         : gpg_validate_source_home_binding(source);
+
+                if (binding_rc != 0) {
+                    fatal_error = g_last_error;
+                    fatal_errno = errno;
+                    fatal_binding = true;
+                    gpg_key_cache_home_generation_clear(&confirmed);
+                    gpg_key_cache_home_generation_clear(&entry->home);
+                    memset(entry, 0, sizeof(*entry));
+                    break;
+                }
+                if (post_scan_failed || generation_rc != 0 ||
+                    !gpg_key_cache_home_generation_equal(
+                        &entry->home, &confirmed)) {
+                    gpg_key_cache_home_generation_clear(&confirmed);
+                    gpg_key_cache_home_generation_clear(&entry->home);
+                    memset(entry, 0, sizeof(*entry));
+                    continue;
+                }
+            }
+            gpg_key_cache_home_generation_clear(&confirmed);
+            memcpy(fingerprint, canonical, strlen(canonical) + 1U);
+            entry->sequence = ++g_key_cache_sequence;
+            matched = true;
+            break;
+        }
+    }
+    gpg_key_cache_home_generation_clear(&current);
+    gpg_key_cache_home_generation_clear(&confirmed);
+    if (fatal_binding) {
+        g_last_error = fatal_error;
+        errno = fatal_errno;
+        return -1;
+    }
+    g_last_error = prior_error;
+    errno = prior_errno;
+    return matched ? 1 : 0;
+}
+
+static void gpg_key_cache_store(
+    const gpg_config_t *gpg_config, const gpg_pinned_home_t *home,
+    const gpg_source_home_t *source, const char *fingerprint,
+    bool require_signing, const run_launch_witness_t *launch) {
+    error_context_t prior_error = g_last_error;
+    int prior_errno = errno;
+    char canonical[GPG_FINGERPRINT_BUFSIZE];
+    gpg_key_cache_home_generation_t generation;
+    gpg_key_cache_home_kind_t kind;
+    const char *path;
+    int home_fd;
+    size_t selected = 0;
+    uint64_t oldest = UINT64_MAX;
+    size_t index;
+
+    memset(&generation, 0, sizeof(generation));
+    if (!run_uses_default_runner() || !launch || !launch->valid ||
+        !gpg_config || gpg_config->executable_path[0] != '/' ||
+        !gpg_key_cache_normalize_fingerprint(fingerprint, canonical) ||
+        gpg_key_cache_home_coordinates(home, source, &home_fd, &path,
+                                       &kind) != 0 ||
+        gpg_key_cache_home_generation_capture(
+            home_fd, path, kind, &generation) != 0) {
+        gpg_key_cache_home_generation_clear(&generation);
+        g_last_error = prior_error;
+        errno = prior_errno;
+        return;
+    }
+    for (index = 0; index < GPG_KEY_CACHE_MAX; index++) {
+        if (!g_key_cache[index].valid) {
+            selected = index;
+            oldest = 0;
+            break;
+        }
+        if (g_key_cache[index].sequence < oldest) {
+            selected = index;
+            oldest = g_key_cache[index].sequence;
+        }
+    }
+    gpg_key_cache_home_generation_clear(&g_key_cache[selected].home);
+    memset(&g_key_cache[selected], 0, sizeof(g_key_cache[selected]));
+    g_key_cache[selected].valid = true;
+    g_key_cache[selected].signing_capability = require_signing;
+    g_key_cache[selected].sequence = ++g_key_cache_sequence;
+    g_key_cache[selected].listing_contract =
+        GPG_KEY_CACHE_LISTING_CONTRACT;
+    memcpy(g_key_cache[selected].fingerprint, canonical,
+           strlen(canonical) + 1U);
+    if (safe_strncpy(g_key_cache[selected].program,
+                     gpg_config->executable_path,
+                     sizeof(g_key_cache[selected].program)) != 0) {
+        gpg_key_cache_home_generation_clear(&generation);
+        memset(&g_key_cache[selected], 0, sizeof(g_key_cache[selected]));
+        g_last_error = prior_error;
+        errno = prior_errno;
+        return;
+    }
+    g_key_cache[selected].launch = *launch;
+    g_key_cache[selected].home = generation;
+    g_last_error = prior_error;
+    errno = prior_errno;
 }
 
 static bool gpg_executable_may_try_compat_name(int resolve_errno) {
@@ -782,11 +1354,6 @@ int gpg_switch_account(gpg_config_t *gpg_config, const account_t *account) {
         gpg_config->published_link_valid = retarget.published_link.valid;
     }
     gpg_config->signing_enabled = account->gpg_signing_enabled;
-    gpg_manager_note_key_available(fingerprint);
-    /* The selector is now an alias backed by the strict fingerprint proof.
-     * Memoizing it prevents downstream validation from re-running gpg with
-     * the less-specific account input. */
-    gpg_manager_note_key_available(account->gpg_key_id);
 
     log_info("Successfully switched to GPG configuration for account: %s", account->name);
     rc = 0;
@@ -5369,6 +5936,17 @@ static int gpg_capture_secret_listing(const gpg_config_t *gpg_config,
             fingerprint_size);
         secure_zero_memory(listing, GPG_KEY_LISTING_CAP);
         free(listing);
+        if (parse_rc == 0) {
+            gpg_key_cache_store(gpg_config, home, source, fingerprint,
+                                require_signing, &res.launch_witness);
+            /* Preserve the selector-only compatibility memo for injected
+             * runners. Production callers cannot consume these notes; their
+             * reusable proof is the context-bound cache populated above. */
+            if (!run_uses_default_runner()) {
+                gpg_manager_note_key_available(fingerprint);
+                gpg_manager_note_key_available(selector);
+            }
+        }
         return parse_rc;
     }
 }
@@ -5378,6 +5956,7 @@ static int gpg_resolve_source_key(const gpg_config_t *gpg_config,
                                   char *fingerprint,
                                   size_t fingerprint_size) {
     gpg_source_home_t source;
+    int cache_rc;
     int open_rc;
     int rc;
 
@@ -5393,6 +5972,17 @@ static int gpg_resolve_source_key(const gpg_config_t *gpg_config,
                       "System GPG keyring home is absent");
         }
         return -1;
+    }
+    if (gpg_validate_source_home(&source) != 0) {
+        gpg_close_source_home(&source);
+        return -1;
+    }
+    cache_rc = gpg_key_cache_lookup(
+        gpg_config, NULL, &source, selector, require_signing,
+        fingerprint, fingerprint_size);
+    if (cache_rc != 0) {
+        gpg_close_source_home(&source);
+        return cache_rc > 0 ? 0 : -1;
     }
     rc = gpg_capture_secret_listing(gpg_config, NULL, &source, selector,
                                     require_signing, fingerprint,
@@ -5411,6 +6001,15 @@ static int gpg_resolve_pinned_key(const gpg_config_t *gpg_config,
                                   const char *selector, bool require_signing,
                                   char *fingerprint,
                                   size_t fingerprint_size) {
+    int cache_rc;
+
+    if (gpg_validate_pinned_home(home) != 0) {
+        return -1;
+    }
+    cache_rc = gpg_key_cache_lookup(
+        gpg_config, home, NULL, selector, require_signing,
+        fingerprint, fingerprint_size);
+    if (cache_rc != 0) return cache_rc > 0 ? 0 : -1;
     return gpg_capture_secret_listing(gpg_config, home, NULL, selector,
                                       require_signing, fingerprint,
                                       fingerprint_size);
@@ -5465,7 +6064,6 @@ static int copy_key_from_system_keyring(const gpg_config_t *gpg_config,
     if (present_rc == 0) {
         log_debug("Secret key already present in isolated home; skipping import: %s",
                   fingerprint);
-        gpg_manager_note_key_available(fingerprint);
         return 0;
     }
     if (present_rc < 0) {
@@ -5642,7 +6240,6 @@ static int copy_key_from_system_keyring(const gpg_config_t *gpg_config,
     }
     log_info("Successfully copied GPG key to isolated environment: %s",
              fingerprint);
-    gpg_manager_note_key_available(fingerprint);
     return 0;
 }
 
@@ -7428,6 +8025,38 @@ static int gpg_validate_source_home(const gpg_source_home_t *source) {
         return -1;
     }
     return gpg_source_proof_revalidate(source->proof);
+}
+
+/* Cache acceptance is stricter than a real descriptor-pinned listing: no
+ * helper runs on a hit, so the public source pathname must still reopen to the
+ * exact retained directory and mount immediately before reuse. Real listings
+ * intentionally keep operating on their already-pinned source if that public
+ * name is concurrently replaced, then report the result from the object they
+ * actually inspected. */
+static int gpg_validate_source_home_binding(
+    const gpg_source_home_t *source) {
+    struct stat named;
+    gpg_mount_identity_t named_mount;
+    int named_fd;
+
+    if (gpg_validate_source_home(source) != 0) return -1;
+    named_fd = open(source->path,
+                    O_RDONLY | O_DIRECTORY | O_CLOEXEC | O_NOFOLLOW);
+    if (named_fd < 0 || fstat(named_fd, &named) != 0 ||
+        gpg_mount_identity_fd(named_fd, &named_mount) != 0 ||
+        !S_ISDIR(named.st_mode) || named.st_uid != getuid() ||
+        (named.st_mode & 022) != 0 ||
+        named.st_dev != source->identity.st_dev ||
+        named.st_ino != source->identity.st_ino ||
+        !gpg_same_mount(&named_mount, &source->mount)) {
+        if (named_fd >= 0) close(named_fd);
+        set_error(ERR_PERMISSION_DENIED,
+                  "GPG source pathname no longer names the pinned home: %s",
+                  source->path);
+        return -1;
+    }
+    close(named_fd);
+    return 0;
 }
 
 /* Return 0 with a retained descriptor, 1 only for confirmed ENOENT, and -1

@@ -937,10 +937,13 @@ static void exercise_optional_prompt_read_error(
 TEST(optional_prompt_failures_never_publish_add_or_edit_candidates) {
     char root[] = "/tmp/gsw-prompt-m1-XXXXXX";
     char key_path[256];
+    command_runner_fn old_runner;
     int key_result = create_prompt_key(root, key_path, sizeof(key_path));
 
     CHECK_EQ_INT(key_result, 0);
     if (key_result != 0) return;
+    g_unavailable_gpg_runner_calls = 0;
+    old_runner = run_set_runner(unavailable_gpg_runner);
     gpg_manager_note_key_available("ABCDEF0123456789");
     for (int edit = 0; edit <= 1; edit++) {
         for (optional_prompt_stage_t stage = OPTIONAL_DESCRIPTION;
@@ -951,6 +954,8 @@ TEST(optional_prompt_failures_never_publish_add_or_edit_candidates) {
 #endif
         }
     }
+    run_set_runner(old_runner);
+    CHECK_EQ_INT(g_unavailable_gpg_runner_calls, 0);
 }
 
 TEST(successful_blank_optional_answers_apply_only_documented_defaults) {
@@ -989,6 +994,7 @@ TEST(successful_nested_blank_answers_do_not_invent_alias_or_signing) {
     gitswitch_ctx_t ctx;
     FILE *stream;
     redirected_stream_t redirected = { .stream = NULL, .saved_fd = -1 };
+    command_runner_fn old_runner;
     int result = -2;
     int key_result;
     int answer_length;
@@ -1008,10 +1014,14 @@ TEST(successful_nested_blank_answers_do_not_invent_alias_or_signing) {
     if (!stream) return;
     initialize_prompt_context(&ctx, false);
     CHECK_EQ_INT(begin_input(stream, &redirected), 0);
+    g_unavailable_gpg_runner_calls = 0;
+    old_runner = run_set_runner(unavailable_gpg_runner);
     if (redirected.saved_fd >= 0) result = invoke_account_prompt_flow(&ctx, false);
+    run_set_runner(old_runner);
     end_input(&redirected);
     fclose(stream);
 
+    CHECK_EQ_INT(g_unavailable_gpg_runner_calls, 0);
     CHECK_EQ_INT(result, 0);
     CHECK_EQ_INT(ctx.account_count, 1);
     if (ctx.account_count == 1) {
@@ -1238,6 +1248,7 @@ TEST(account_flow_reprompts_without_accepting_any_prefix) {
     FILE *capture = tmpfile();
     redirected_stream_t redirected_input = { .stream = NULL, .saved_fd = -1 };
     redirected_stream_t redirected_output = { .stream = NULL, .saved_fd = -1 };
+    command_runner_fn old_runner;
     int rc = -1;
     char *fixture_root;
 
@@ -1293,13 +1304,17 @@ TEST(account_flow_reprompts_without_accepting_any_prefix) {
     CHECK_EQ_INT(begin_input(input, &redirected_input), 0);
     CHECK_EQ_INT(fflush(stdout), 0);
     CHECK_EQ_INT(redirect_fd(capture, STDOUT_FILENO, &redirected_output), 0);
+    g_unavailable_gpg_runner_calls = 0;
+    old_runner = run_set_runner(unavailable_gpg_runner);
     if (redirected_input.saved_fd >= 0 && redirected_output.saved_fd >= 0) {
         rc = accounts_add_interactive(&ctx);
     }
+    run_set_runner(old_runner);
     CHECK_EQ_INT(fflush(stdout), 0);
     restore_fd(STDOUT_FILENO, &redirected_output);
     end_input(&redirected_input);
 
+    CHECK_EQ_INT(g_unavailable_gpg_runner_calls, 0);
     CHECK_EQ_INT(rc, 0);
     CHECK_EQ_INT(ctx.account_count, 1);
     if (ctx.account_count == 1) {

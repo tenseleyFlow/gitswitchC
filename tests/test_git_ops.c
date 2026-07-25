@@ -1230,7 +1230,7 @@ TEST(git_test_config_rejects_wrong_effective_signing_state) {
     CHECK_EQ_INT(git_set_config_value(GIT_CONFIG_GPG_OPENPGP_PROGRAM,
                                       expected_program,
                                       GIT_SCOPE_GLOBAL), 0);
-    gpg_manager_note_key_available(acct.gpg_key_id);
+    fk_allowed_gpg_program = expected_program;
     signing_key = fk_find("--global", GIT_CONFIG_USER_SIGNINGKEY);
     signing_enabled = fk_find("--global", GIT_CONFIG_COMMIT_GPGSIGN);
     CHECK(signing_key >= 0 && signing_enabled >= 0);
@@ -1361,11 +1361,12 @@ TEST(v5_fingerprint_survives_git_current_config_snapshot) {
     run_set_runner(prev);
 }
 
-/* AR-02 #14: git_test_config's GPG availability probe must be skipped when a
- * gpg spawn earlier in this process already proved the key present. The fake
- * runner refuses every non-git argv, so a gpg spawn here FAILS the check —
- * the post-memo success is only reachable via the skip. */
-TEST(git_test_config_skips_gpg_probe_when_key_seen) {
+/* A context-free selector note cannot authorize git_test_config's raw
+ * executable/home sanity probe. The fake refuses every non-git argv, so both
+ * calls must reach and fail that probe even after the compatibility memo is
+ * populated. This is causal coverage for removal of the obsolete production
+ * selector-cache branch. */
+TEST(git_test_config_selector_note_never_skips_raw_probe) {
     static const char expected_program[] = "/trusted/ar11/cached-gpg";
     git_ops_test_reset_caches();
     fk_reset();
@@ -1389,12 +1390,12 @@ TEST(git_test_config_skips_gpg_probe_when_key_seen) {
      * when nothing vouches for the key. */
     CHECK_EQ_INT(git_test_config(&acct, GIT_SCOPE_GLOBAL,
                                  expected_program), -1);
+    CHECK_EQ_INT(fk_non_git_execs, 1);
 
-    /* Once proven (as every real switch does before its read-back validation),
-     * the probe is skipped and the identical call succeeds with no gpg exec. */
     gpg_manager_note_key_available(acct.gpg_key_id);
     CHECK_EQ_INT(git_test_config(&acct, GIT_SCOPE_GLOBAL,
-                                 expected_program), 0);
+                                 expected_program), -1);
+    CHECK_EQ_INT(fk_non_git_execs, 2);
 
     run_set_runner(prev);
 }
@@ -2683,7 +2684,7 @@ TEST_MAIN_BEGIN()
     RUN_TEST(git_test_config_rechecks_external_identity);
     RUN_TEST(git_test_config_rejects_wrong_effective_signing_state);
     RUN_TEST(v5_fingerprint_survives_git_current_config_snapshot);
-    RUN_TEST(git_test_config_skips_gpg_probe_when_key_seen);
+    RUN_TEST(git_test_config_selector_note_never_skips_raw_probe);
     RUN_TEST(git_test_config_probes_with_exact_absolute_program);
     RUN_TEST(git_test_config_rejects_invalid_program_contract_before_exec);
     RUN_TEST(retire_global_publication_ignores_environment_but_checks_generation);

@@ -37,6 +37,7 @@
 
 #include "utils.h"
 #include "error.h"
+#include "runner_internal.h"
 #include "signals.h"
 
 /* POSIX exposes the process environment through this external object, but
@@ -3525,6 +3526,7 @@ int run_argv_real(const char *const argv[], const run_opts_t *opts, run_result_t
     result->spawned = false;
     result->out_len = 0;
     result->out_truncated = false;
+    memset(&result->launch_witness, 0, sizeof(result->launch_witness));
     /* AR-12 L12 (defense in depth): terminate the caller's capture buffer
      * before any early-return validation path, so a pre-spawn failure never
      * leaves callers formatting uninitialized bytes. */
@@ -4626,6 +4628,21 @@ int run_argv_real(const char *const argv[], const run_opts_t *opts, run_result_t
         }
         return -1;
     }
+    result->launch_witness.valid = true;
+    result->launch_witness.is_script = script_launch.is_script;
+    result->launch_witness.executable_identity = exec_identity;
+    if (script_launch.is_script) {
+        result->launch_witness.has_interpreter_arg =
+            script_launch.has_interpreter_arg;
+        result->launch_witness.interpreter_identity =
+            script_launch.interpreter_identity;
+        memcpy(result->launch_witness.interpreter_argv0,
+               script_launch.interpreter_argv0,
+               sizeof(result->launch_witness.interpreter_argv0));
+        memcpy(result->launch_witness.interpreter_arg,
+               script_launch.interpreter_arg,
+               sizeof(result->launch_witness.interpreter_arg));
+    }
     return 0;
 }
 
@@ -5397,6 +5414,51 @@ int find_command_path(const char *name, char *buf, size_t size) {
     trusted_script_launch_cleanup(&launch);
     close(fd);
     return 0;
+}
+
+bool run_launch_witness_revalidate(
+    const char *program_path, const run_launch_witness_t *witness) {
+    const char *probe_argv[] = {program_path, NULL};
+    char resolved[MAX_PATH_LEN];
+    struct stat executable_identity;
+    trusted_script_launch_t launch;
+    int fd;
+    bool matches;
+
+    if (!program_path || program_path[0] != '/' || !witness ||
+        !witness->valid) {
+        errno = EINVAL;
+        return false;
+    }
+    memset(&launch, 0, sizeof(launch));
+    launch.interpreter_fd = -1;
+    fd = open_trusted_command(program_path, resolved, sizeof(resolved),
+                              &executable_identity);
+    if (fd < 0) return false;
+    if (strcmp(resolved, program_path) != 0 ||
+        !exec_stat_identity_matches(&witness->executable_identity,
+                                    &executable_identity) ||
+        prepare_trusted_script_launch(fd, probe_argv, &launch) != 0) {
+        int saved_errno = errno ? errno : ESTALE;
+
+        close(fd);
+        trusted_script_launch_cleanup(&launch);
+        errno = saved_errno;
+        return false;
+    }
+    matches =
+        launch.is_script == witness->is_script &&
+        (!launch.is_script ||
+         (launch.has_interpreter_arg == witness->has_interpreter_arg &&
+          strcmp(launch.interpreter_argv0,
+                 witness->interpreter_argv0) == 0 &&
+          strcmp(launch.interpreter_arg, witness->interpreter_arg) == 0 &&
+          exec_stat_identity_matches(&witness->interpreter_identity,
+                                     &launch.interpreter_identity)));
+    close(fd);
+    trusted_script_launch_cleanup(&launch);
+    if (!matches) errno = ESTALE;
+    return matches;
 }
 
 bool command_exists(const char *command) {

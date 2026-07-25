@@ -4,6 +4,7 @@
 #define UTILS_H
 
 #include <sys/types.h>
+#include <sys/stat.h>
 #include <stdbool.h>
 #include <stdint.h>
 #include <time.h>
@@ -200,6 +201,21 @@ typedef struct {
     bool        use_cwd_fd;         /* fchdir(cwd_fd) in the child before closing inherited descriptors */
 } run_opts_t;
 
+/* Exact launch generation retained by the production runner after a clean
+ * invocation. The caller supplies the canonical program pathname when
+ * revalidating this witness; scripts additionally bind the exact direct
+ * interpreter spelling, optional shebang argument, and interpreter
+ * generation. Custom runners leave this structure invalid. */
+typedef struct {
+    bool valid;
+    bool is_script;
+    bool has_interpreter_arg;
+    struct stat executable_identity;
+    struct stat interpreter_identity;
+    char interpreter_argv0[256];
+    char interpreter_arg[256];
+} run_launch_witness_t;
+
 /* Result of a child invocation. */
 typedef struct {
     int    exit_code;     /* WEXITSTATUS on normal exit; -1 if killed by signal or spawn failed */
@@ -210,6 +226,7 @@ typedef struct {
                            * the capture is INCOMPLETE, not just short. Callers
                            * feeding `out` onward (e.g. a gpg key export into an
                            * import) must treat this as an error (AR-02 #4). */
+    run_launch_witness_t launch_witness;
 } run_result_t;
 
 /* Pluggable runner (tests install a recording fake via run_set_runner). */

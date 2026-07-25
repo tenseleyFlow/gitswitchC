@@ -119,6 +119,11 @@ typedef int (*gpg_reset_quarantine_hook_fn)(
  * restores the native statx/fsid and fsync implementations. */
 typedef int (*gpg_mount_identity_probe_fn)(int fd, uint64_t *identity);
 typedef int (*gpg_agent_conf_sync_fn)(int fd, bool directory);
+/* Deterministic cache-hit race seam. It runs after the first recursive home
+ * generation and executable witness have been checked, but before the
+ * mandatory final generation and public-namespace binding validation. */
+typedef int (*gpg_key_cache_post_scan_hook_fn)(const char *home_path,
+                                               bool isolated);
 gpg_readdir_fn gpg_manager_set_readdir_fn(gpg_readdir_fn fn);
 gpg_agent_conf_preopen_fn
 gpg_manager_set_agent_conf_preopen_fn(gpg_agent_conf_preopen_fn fn);
@@ -147,6 +152,9 @@ gpg_mount_identity_probe_fn
 gpg_manager_set_mount_identity_probe_fn(gpg_mount_identity_probe_fn fn);
 gpg_agent_conf_sync_fn
 gpg_manager_set_agent_conf_sync_fn(gpg_agent_conf_sync_fn fn);
+gpg_key_cache_post_scan_hook_fn
+gpg_manager_set_key_cache_post_scan_hook_fn(
+    gpg_key_cache_post_scan_hook_fn fn);
 
 /* Focused verification entry point for the otherwise-internal managed writer.
  * It stages a durable reload obligation but never launches gpgconf; production
@@ -364,9 +372,11 @@ int gpg_manager_restore_current_if(gpg_config_t *gpg_config,
                                    bool *changed);
 
 /**
- * Process-lifetime memo of key ids whose secret-key presence a gpg spawn
- * already proved this run, so later availability sanity checks (e.g.
- * git_test_config's read-back probe) can skip a redundant spawn (AR-02 #14).
+ * Compatibility memo for callers using an injected test runner. Production
+ * callers using the real runner never treat selector-only notes as proof:
+ * reusable secret-key evidence is maintained internally and is bound to the
+ * canonical fingerprint, requested capability, exact launch witness, and GPG
+ * home generation.
  */
 void gpg_manager_note_key_available(const char *key_id);
 bool gpg_manager_key_available_cached(const char *key_id);

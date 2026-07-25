@@ -16,6 +16,7 @@
 #include "gpg_manager.h"
 #include "prompt.h"
 #include "publication.h"
+#include "runner_internal.h"
 #include "signals.h"
 #include "ssh_manager.h"
 #include "toml_parser.h"
@@ -256,6 +257,7 @@ TEST(all_retained_public_apis_compile_and_link) {
     REQUIRE_PUBLIC_API(gpg_manager_set_agent_conf_preopen_fn);
     REQUIRE_PUBLIC_API(gpg_manager_set_agent_conf_sync_fn);
     REQUIRE_PUBLIC_API(gpg_manager_set_cleanup_predelete_fn);
+    REQUIRE_PUBLIC_API(gpg_manager_set_key_cache_post_scan_hook_fn);
     REQUIRE_PUBLIC_API(gpg_manager_set_mount_identity_probe_fn);
     REQUIRE_PUBLIC_API(gpg_manager_set_readdir_fn);
     REQUIRE_PUBLIC_API(gpg_manager_set_rename_noreplace_fn);
@@ -310,6 +312,7 @@ TEST(all_retained_public_apis_compile_and_link) {
     REQUIRE_PUBLIC_API(read_file_to_string);
     REQUIRE_PUBLIC_API(run_argv);
     REQUIRE_PUBLIC_API(run_argv_real);
+    REQUIRE_PUBLIC_API(run_launch_witness_revalidate);
     REQUIRE_PUBLIC_API(run_set_runner);
     REQUIRE_PUBLIC_API(run_test_fd_close_bulk_supported);
     REQUIRE_PUBLIC_API(run_test_get_fd_close_observation);

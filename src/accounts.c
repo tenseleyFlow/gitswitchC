@@ -6735,9 +6735,12 @@ static int validate_gpg_key_availability_mode(const char *gpg_key_id,
         return -1;
     }
 
-    /* A gpg spawn earlier in this process already proved this key's presence
-     * — don't fork gpg again just to re-ask (AR-02 #14). */
-    if (allow_cached && gpg_manager_key_available_cached(gpg_key_id)) {
+    /* Mock-runner compatibility only: production reuse is performed inside
+     * the structured resolver, where it is bound to the exact executable,
+     * capability, keyring context, and home generation. A key-only note must
+     * never authorize a production skip. */
+    if (allow_cached && !run_uses_default_runner() &&
+        gpg_manager_key_available_cached(gpg_key_id)) {
         return 0;
     }
 
@@ -6755,8 +6758,10 @@ static int validate_gpg_key_availability_mode(const char *gpg_key_id,
         return -1;
     }
 
-    gpg_manager_note_key_available(canonical);
-    gpg_manager_note_key_available(gpg_key_id);
+    if (!run_uses_default_runner()) {
+        gpg_manager_note_key_available(canonical);
+        gpg_manager_note_key_available(gpg_key_id);
+    }
     return 0;
 }
 
