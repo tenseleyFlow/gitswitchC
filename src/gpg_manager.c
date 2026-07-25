@@ -6682,12 +6682,23 @@ static bool gpg_listing_has_empty_secret_material(const char *listing) {
     return false;
 }
 
+typedef enum {
+    GPG_LISTING_STATUS_UNEXPECTED_NONE,
+    GPG_LISTING_STATUS_UNEXPECTED_ERROR,
+    GPG_LISTING_STATUS_UNEXPECTED_FAILURE
+} gpg_listing_unexpected_kind_t;
+
 typedef struct {
     bool malformed;
     bool keylist_error_seen;
     bool keylist_error_conflict;
     unsigned long long keylist_error;
     bool gpg_exit_failure_seen;
+    gpg_listing_unexpected_kind_t unexpected_kind;
+    const char *unexpected_location;
+    size_t unexpected_location_len;
+    unsigned long long unexpected_code;
+    size_t unexpected_count;
 } gpg_listing_status_t;
 
 enum { GPG_KEY_LISTING_CAP = 512 * 1024 };
@@ -6730,8 +6741,10 @@ static bool gpg_status_token_is(const char *token, size_t token_len,
 }
 
 /* Parse only the status records needed to classify key listing. Unknown
- * records are forward-compatible. ERROR and FAILURE records are structural
- * evidence, so an incomplete or non-decimal form makes the capture unusable. */
+ * non-error records are forward-compatible. ERROR and FAILURE records are
+ * structural evidence, so an incomplete or non-decimal form makes the capture
+ * unusable; a valid but unrecognized pair retains its first complete identity
+ * plus the total count so it cannot disappear behind ordinary-miss evidence. */
 static void gpg_collect_listing_status(const char *capture,
                                        gpg_listing_status_t *status) {
     const char *line;
@@ -6773,8 +6786,12 @@ static void gpg_collect_listing_status(const char *capture,
             if (is_error &&
                 gpg_status_token_is(location, location_len,
                                     "keylist.getkey")) {
+                /* GnuPG may emit the same portable code with or without
+                 * libgpg-error source bits. Only low-16 disagreement is a
+                 * contradictory key-list result. */
                 if (status->keylist_error_seen &&
-                    status->keylist_error != code) {
+                    (status->keylist_error & 0xffffULL) !=
+                        (code & 0xffffULL)) {
                     status->keylist_error_conflict = true;
                 }
                 status->keylist_error_seen = true;
@@ -6783,11 +6800,41 @@ static void gpg_collect_listing_status(const char *capture,
                        gpg_status_token_is(location, location_len,
                                            "gpg-exit")) {
                 status->gpg_exit_failure_seen = true;
+            } else if (is_error || is_failure) {
+                status->unexpected_count++;
+                if (status->unexpected_kind ==
+                    GPG_LISTING_STATUS_UNEXPECTED_NONE) {
+                    status->unexpected_kind =
+                        is_error ? GPG_LISTING_STATUS_UNEXPECTED_ERROR
+                                 : GPG_LISTING_STATUS_UNEXPECTED_FAILURE;
+                    status->unexpected_location = location;
+                    status->unexpected_location_len = location_len;
+                    status->unexpected_code = code;
+                }
             }
         }
         if (!eol) break;
         line = eol + 1;
     }
+}
+
+static void gpg_set_unexpected_listing_status_error(
+    const gpg_listing_status_t *status, const char *selector) {
+    const char *kind =
+        status->unexpected_kind == GPG_LISTING_STATUS_UNEXPECTED_ERROR
+            ? "ERROR"
+            : "FAILURE";
+    int location_len =
+        status->unexpected_location_len > (size_t)INT_MAX
+            ? INT_MAX
+            : (int)status->unexpected_location_len;
+
+    set_error(
+        ERR_GPG_KEY_FAILED,
+        "GPG secret-key helper returned unexpected structured status "
+        "%s %.*s code %llu (%zu unexpected ERROR/FAILURE records) for %s",
+        kind, location_len, status->unexpected_location,
+        status->unexpected_code, status->unexpected_count, selector);
 }
 
 /* Classify the runner result without collapsing transport/setup or keyring
@@ -6815,8 +6862,18 @@ static int gpg_classify_secret_listing_run(int run_rc,
     if (run_rc == 0) {
         if (res->spawned && res->exit_code == 0 && res->term_signal == 0) {
             gpg_collect_listing_status(capture, &status);
-            if (status.malformed || status.keylist_error_conflict ||
-                status.keylist_error_seen || status.gpg_exit_failure_seen) {
+            if (status.malformed || status.keylist_error_conflict) {
+                set_error(ERR_GPG_KEY_FAILED,
+                          "GPG secret-key helper returned inconsistent "
+                          "structured success for %s",
+                          selector);
+                return -1;
+            }
+            if (status.unexpected_count > 0U) {
+                gpg_set_unexpected_listing_status_error(&status, selector);
+                return -1;
+            }
+            if (status.keylist_error_seen || status.gpg_exit_failure_seen) {
                 set_error(ERR_GPG_KEY_FAILED,
                           "GPG secret-key helper returned inconsistent "
                           "structured success for %s",
@@ -6844,6 +6901,10 @@ static int gpg_classify_secret_listing_run(int run_rc,
                       "GPG secret-key helper returned contradictory structured "
                       "status output for %s",
                       selector);
+            return -1;
+        }
+        if (status.unexpected_count > 0U) {
+            gpg_set_unexpected_listing_status_error(&status, selector);
             return -1;
         }
         /* libgpg-error stores the portable code in the low 16 bits; the high

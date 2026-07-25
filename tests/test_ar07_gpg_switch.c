@@ -395,6 +395,14 @@ static void fill_account(account_t *account, const char *name,
 enum listing_result_mode {
     LISTING_RESULT_MATCH,
     LISTING_RESULT_MISS,
+    LISTING_RESULT_MISS_SOURCE_QUALIFIED_DUPLICATE,
+    LISTING_RESULT_MISS_UNEXPECTED_ERROR,
+    LISTING_RESULT_MISS_UNEXPECTED_FAILURE,
+    LISTING_RESULT_MATCH_UNEXPECTED_ERROR,
+    LISTING_RESULT_MATCH_UNEXPECTED_FAILURE,
+    LISTING_RESULT_MISS_SWAPPED_STATUS,
+    LISTING_RESULT_MATCH_UNKNOWN_STATUS,
+    LISTING_RESULT_MISS_UNKNOWN_STATUS,
     LISTING_RESULT_INVALID_KEYBOX,
     LISTING_RESULT_TRUNCATED_STATUS,
     LISTING_RESULT_SPAWN_FAILURE,
@@ -436,6 +444,89 @@ static int listing_result_runner(const char *const argv[],
                 case LISTING_RESULT_MISS:
                     if (opts && opts->out && opts->out_size > 0) {
                         snprintf(opts->out, opts->out_size, "%s",
+                                 STATUS_NO_SECRET_KEY);
+                        if (result) result->out_len = strlen(opts->out);
+                    }
+                    if (result) result->exit_code = 2;
+                    return -1;
+                case LISTING_RESULT_MISS_SOURCE_QUALIFIED_DUPLICATE:
+                    if (opts && opts->out && opts->out_size > 0) {
+                        snprintf(
+                            opts->out, opts->out_size,
+                            "[GNUPG:] ERROR keylist.getkey 17 "
+                            "first-source-form\n"
+                            "[GNUPG:] ERROR keylist.getkey 33554449 "
+                            "qualified-source-form\n"
+                            "[GNUPG:] FAILURE gpg-exit 33554433 "
+                            "terminal-detail\n");
+                        if (result) result->out_len = strlen(opts->out);
+                    }
+                    if (result) result->exit_code = 2;
+                    return -1;
+                case LISTING_RESULT_MISS_UNEXPECTED_ERROR:
+                    if (opts && opts->out && opts->out_size > 0) {
+                        snprintf(opts->out, opts->out_size,
+                                 "%s"
+                                 "[GNUPG:] ERROR keybox.search 14\n"
+                                 "[GNUPG:] FAILURE random-operation 99\n",
+                                 STATUS_NO_SECRET_KEY);
+                        if (result) result->out_len = strlen(opts->out);
+                    }
+                    if (result) result->exit_code = 2;
+                    return -1;
+                case LISTING_RESULT_MISS_UNEXPECTED_FAILURE:
+                    if (opts && opts->out && opts->out_size > 0) {
+                        snprintf(opts->out, opts->out_size,
+                                 "%s"
+                                 "[GNUPG:] FAILURE keybox.open 123\n",
+                                 STATUS_NO_SECRET_KEY);
+                        if (result) result->out_len = strlen(opts->out);
+                    }
+                    if (result) result->exit_code = 2;
+                    return -1;
+                case LISTING_RESULT_MATCH_UNEXPECTED_ERROR:
+                    if (opts && opts->out && opts->out_size > 0) {
+                        snprintf(opts->out, opts->out_size,
+                                 "%s"
+                                 "[GNUPG:] ERROR keybox.search 14\n",
+                                 PRIMARY_SIGN);
+                        if (result) result->out_len = strlen(opts->out);
+                    }
+                    return 0;
+                case LISTING_RESULT_MATCH_UNEXPECTED_FAILURE:
+                    if (opts && opts->out && opts->out_size > 0) {
+                        snprintf(opts->out, opts->out_size,
+                                 "%s"
+                                 "[GNUPG:] FAILURE keybox.open 123\n",
+                                 PRIMARY_SIGN);
+                        if (result) result->out_len = strlen(opts->out);
+                    }
+                    return 0;
+                case LISTING_RESULT_MISS_SWAPPED_STATUS:
+                    if (opts && opts->out && opts->out_size > 0) {
+                        snprintf(opts->out, opts->out_size,
+                                 "%s"
+                                 "[GNUPG:] FAILURE keylist.getkey 17\n"
+                                 "[GNUPG:] ERROR gpg-exit 33554433\n",
+                                 STATUS_NO_SECRET_KEY);
+                        if (result) result->out_len = strlen(opts->out);
+                    }
+                    if (result) result->exit_code = 2;
+                    return -1;
+                case LISTING_RESULT_MATCH_UNKNOWN_STATUS:
+                    if (opts && opts->out && opts->out_size > 0) {
+                        snprintf(opts->out, opts->out_size,
+                                 "%s"
+                                 "[GNUPG:] PROGRESS keylist 0 1\n",
+                                 PRIMARY_SIGN);
+                        if (result) result->out_len = strlen(opts->out);
+                    }
+                    return 0;
+                case LISTING_RESULT_MISS_UNKNOWN_STATUS:
+                    if (opts && opts->out && opts->out_size > 0) {
+                        snprintf(opts->out, opts->out_size,
+                                 "%s"
+                                 "[GNUPG:] PROGRESS keylist 0 1\n",
                                  STATUS_NO_SECRET_KEY);
                         if (result) result->out_len = strlen(opts->out);
                     }
@@ -714,6 +805,85 @@ TEST(structured_status_distinguishes_absence_from_keyring_failure) {
     CHECK(g_listing_status_requested);
     CHECK_EQ_INT(error_code, ERR_GPG_KEY_FAILED);
     CHECK(strstr(diagnostic, "child setup or exec") != NULL);
+}
+
+TEST(unexpected_structured_statuses_fail_before_secret_key_transfer) {
+    static const struct {
+        enum listing_result_mode mode;
+        const char *kind;
+        const char *location;
+        const char *code;
+        const char *count;
+    } failures[] = {
+        {
+            LISTING_RESULT_MISS_UNEXPECTED_ERROR,
+            "ERROR", "keybox.search", "14", "2 unexpected"
+        },
+        {
+            LISTING_RESULT_MISS_UNEXPECTED_FAILURE,
+            "FAILURE", "keybox.open", "123", "1 unexpected"
+        },
+        {
+            LISTING_RESULT_MATCH_UNEXPECTED_ERROR,
+            "ERROR", "keybox.search", "14", "1 unexpected"
+        },
+        {
+            LISTING_RESULT_MATCH_UNEXPECTED_FAILURE,
+            "FAILURE", "keybox.open", "123", "1 unexpected"
+        },
+        {
+            LISTING_RESULT_MISS_SWAPPED_STATUS,
+            "FAILURE", "keylist.getkey", "17", "2 unexpected"
+        }
+    };
+    char diagnostic[512];
+    int listings;
+    int exports;
+    int imports;
+    size_t capacity;
+    size_t i;
+
+    for (i = 0; i < sizeof(failures) / sizeof(failures[0]); i++) {
+        CHECK_EQ_INT(run_listing_result_case(
+                         failures[i].mode, &listings, &exports, &imports,
+                         &capacity, diagnostic, sizeof(diagnostic)), -1);
+        CHECK_EQ_INT(get_last_error()->code, ERR_GPG_KEY_FAILED);
+        CHECK_EQ_INT(listings, 1);
+        CHECK_EQ_INT(exports, 0);
+        CHECK_EQ_INT(imports, 0);
+        CHECK(strstr(diagnostic, failures[i].kind) != NULL);
+        CHECK(strstr(diagnostic, failures[i].location) != NULL);
+        CHECK(strstr(diagnostic, failures[i].code) != NULL);
+        CHECK(strstr(diagnostic, failures[i].count) != NULL);
+    }
+
+    /* Unknown non-error status records remain forward-compatible on both a
+     * successful listing and the exact structured no-secret-key miss. */
+    CHECK_EQ_INT(run_listing_result_case(
+                     LISTING_RESULT_MATCH_UNKNOWN_STATUS,
+                     &listings, &exports, &imports, &capacity,
+                     diagnostic, sizeof(diagnostic)), 0);
+    CHECK_EQ_INT(listings, 1);
+    CHECK_EQ_INT(exports, 0);
+    CHECK_EQ_INT(imports, 0);
+    CHECK_EQ_INT(run_listing_result_case(
+                     LISTING_RESULT_MISS_UNKNOWN_STATUS,
+                     &listings, &exports, &imports, &capacity,
+                     diagnostic, sizeof(diagnostic)), 0);
+    CHECK_EQ_INT(listings, 3);
+    CHECK_EQ_INT(exports, 1);
+    CHECK_EQ_INT(imports, 1);
+
+    /* Duplicate portable code 17 remains the same miss even if one GnuPG
+     * status carries source bits. Legal trailing status arguments are ignored
+     * rather than turning otherwise complete evidence into malformed input. */
+    CHECK_EQ_INT(run_listing_result_case(
+                     LISTING_RESULT_MISS_SOURCE_QUALIFIED_DUPLICATE,
+                     &listings, &exports, &imports, &capacity,
+                     diagnostic, sizeof(diagnostic)), 0);
+    CHECK_EQ_INT(listings, 3);
+    CHECK_EQ_INT(exports, 1);
+    CHECK_EQ_INT(imports, 1);
 }
 
 TEST(truncated_secret_listing_is_one_shot_at_the_documented_cap) {
@@ -3141,6 +3311,7 @@ TEST_MAIN_BEGIN()
     RUN_TEST(selector_inventory_is_exact_and_canonical);
     RUN_TEST(secret_listing_result_matrix_is_causal_and_exact);
     RUN_TEST(structured_status_distinguishes_absence_from_keyring_failure);
+    RUN_TEST(unexpected_structured_statuses_fail_before_secret_key_transfer);
     RUN_TEST(truncated_secret_listing_is_one_shot_at_the_documented_cap);
     RUN_TEST(system_key_helper_stays_on_pinned_source_after_directory_replacement);
 #ifdef __linux__

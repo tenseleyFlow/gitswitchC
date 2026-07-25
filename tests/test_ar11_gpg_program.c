@@ -159,13 +159,15 @@ static bool m15_fixture_setup(m15_fixture_t *fixture, const char *stem) {
     return true;
 }
 
-static int m15_write_program_at(const char *path, const char *interpreter,
-                                const char *interpreter_arg,
-                                const char *tag, bool valid_listing) {
+static int m15_write_program_output_at(const char *path,
+                                       const char *interpreter,
+                                       const char *interpreter_arg,
+                                       const char *tag,
+                                       const char *listing) {
     char program[4096];
     int written;
 
-    if (!path || !interpreter || !tag) {
+    if (!path || !interpreter || !tag || !listing) {
         errno = EINVAL;
         return -1;
     }
@@ -178,12 +180,20 @@ static int m15_write_program_at(const char *path, const char *interpreter,
         "exit 0\n",
         interpreter, interpreter_arg && *interpreter_arg ? " " : "",
         interpreter_arg && *interpreter_arg ? interpreter_arg : "", tag,
-        valid_listing ? TEST_GPG_LISTING : "not-a-secret-key-listing\\n");
+        listing);
     if (written < 0 || (size_t)written >= sizeof(program)) {
         errno = ENAMETOOLONG;
         return -1;
     }
     return write_string_to_file(path, program, 0700);
+}
+
+static int m15_write_program_at(const char *path, const char *interpreter,
+                                const char *interpreter_arg,
+                                const char *tag, bool valid_listing) {
+    return m15_write_program_output_at(
+        path, interpreter, interpreter_arg, tag,
+        valid_listing ? TEST_GPG_LISTING : "not-a-secret-key-listing\\n");
 }
 
 static int m15_replace_program(const m15_fixture_t *fixture,
@@ -791,6 +801,39 @@ TEST(failed_listing_never_promotes_cache_entry) {
     m15_fixture_cleanup(&fixture);
 }
 
+TEST(unexpected_structured_listing_never_promotes_cache_entry) {
+    static const char listing[] =
+        TEST_GPG_LISTING
+        "[GNUPG:] ERROR keybox.search 14\n";
+    m15_fixture_t fixture;
+    char fingerprint[GPG_FINGERPRINT_BUFSIZE];
+
+    if (!m15_fixture_setup(&fixture, "gitswitch-ar14-m19-status")) {
+        CHECK(!"failed to prepare M19 structured-status fixture");
+        return;
+    }
+    CHECK_EQ_INT(m15_write_program_output_at(
+                     fixture.program, "/bin/sh", NULL,
+                     "unexpected-status", listing), 0);
+    clear_error();
+    CHECK_EQ_INT(m15_resolve(false, fingerprint, sizeof(fingerprint)), -1);
+    CHECK_EQ_INT(get_last_error()->code, ERR_GPG_KEY_FAILED);
+    CHECK_EQ_INT((int)m15_listing_call_count(&fixture), 1);
+    clear_error();
+    CHECK_EQ_INT(m15_resolve(false, fingerprint, sizeof(fingerprint)), -1);
+    CHECK_EQ_INT(get_last_error()->code, ERR_GPG_KEY_FAILED);
+    CHECK_EQ_INT((int)m15_listing_call_count(&fixture), 2);
+
+    CHECK_EQ_INT(m15_replace_program(&fixture, "/bin/sh", NULL,
+                                     "recovered", true), 0);
+    CHECK_EQ_INT(m15_resolve(false, fingerprint, sizeof(fingerprint)), 0);
+    CHECK_STR_EQ(fingerprint, TEST_GPG_FINGERPRINT);
+    CHECK_EQ_INT((int)m15_listing_call_count(&fixture), 3);
+    CHECK_EQ_INT(m15_resolve(false, fingerprint, sizeof(fingerprint)), 0);
+    CHECK_EQ_INT((int)m15_listing_call_count(&fixture), 3);
+    m15_fixture_cleanup(&fixture);
+}
+
 TEST(script_cache_binds_same_path_interpreter_generation) {
     m15_fixture_t fixture;
     char shell[MAX_PATH_LEN];
@@ -1021,6 +1064,7 @@ int main(int argc, char *argv[]) {
     RUN_TEST(system_proof_does_not_satisfy_isolated_home);
     RUN_TEST(signing_capability_requires_its_own_proof);
     RUN_TEST(failed_listing_never_promotes_cache_entry);
+    RUN_TEST(unexpected_structured_listing_never_promotes_cache_entry);
     RUN_TEST(script_cache_binds_same_path_interpreter_generation);
     RUN_TEST(selector_only_note_never_authorizes_production_cache);
     RUN_TEST(cache_hit_revalidates_public_source_binding_after_final_scan);
