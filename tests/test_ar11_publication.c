@@ -614,6 +614,46 @@ static int create_complete_global_publication(
     return publication_record_validate(record);
 }
 
+static int bind_live_local_destination(publication_record_t *record,
+                                       const char *repository_path,
+                                       const char *config_parent_path,
+                                       const char *config_path) {
+    struct stat st;
+
+    if (!record || !repository_path || !config_parent_path || !config_path ||
+        snprintf(record->repository_path, sizeof(record->repository_path),
+                 "%s", repository_path) >=
+            (int)sizeof(record->repository_path) ||
+        snprintf(record->config_path, sizeof(record->config_path), "%s",
+                 config_path) >= (int)sizeof(record->config_path) ||
+        stat(repository_path, &st) != 0) {
+        return -1;
+    }
+    publication_identity_from_stat(&record->repository, &st);
+    if (stat(config_parent_path, &st) != 0) return -1;
+    publication_identity_from_stat(&record->config_parent, &st);
+    if (stat(config_path, &st) != 0) return -1;
+    publication_identity_from_stat(&record->post_config, &st);
+    return publication_record_validate(record);
+}
+
+static int encode_upper_hex(const char *value, char *out, size_t out_size) {
+    static const char digits[] = "0123456789ABCDEF";
+    size_t length;
+
+    if (!value || !out ||
+        (length = strlen(value)) > (out_size - 1U) / 2U) {
+        return -1;
+    }
+    for (size_t i = 0U; i < length; i++) {
+        unsigned char byte = (unsigned char)value[i];
+        out[i * 2U] = digits[byte >> 4U];
+        out[i * 2U + 1U] = digits[byte & 0x0fU];
+    }
+    out[length * 2U] = '\0';
+    return 0;
+}
+
 static void check_record_identity(const publication_record_t *record,
                                   const char *repository_path,
                                   const char *fingerprint) {
@@ -1773,6 +1813,514 @@ TEST(upsert_replaces_only_the_exact_publication_destination) {
     check_record_identity(found, "/tmp/ar11-publication/other-repository",
                           FINGERPRINT_A);
     publication_ledger_clear(&ledger);
+}
+
+TEST(destination_aliases_share_one_canonical_upsert_lookup_and_live_key) {
+    char root[MAX_PATH_LEN] = "/tmp/gsw-ar14-publication-alias.XXXXXX";
+    char repository[MAX_PATH_LEN];
+    char config_parent[MAX_PATH_LEN];
+    char config_path[MAX_PATH_LEN];
+    char repository_alias[MAX_PATH_LEN];
+    char alias_config[MAX_PATH_LEN];
+    char alias_repository[MAX_PATH_LEN];
+    publication_record_t canonical;
+    publication_record_t alias;
+    publication_record_t replacement;
+    publication_ledger_t ledger;
+    const publication_record_t *found = NULL;
+    const publication_record_t *generation_records[1];
+    int fd = -1;
+    static const char contents[] = "[alias]\n";
+
+    publication_ledger_init(&ledger);
+    CHECK(ts_mkdtemp(root) != NULL);
+    if (!root[0] || ts_canonicalize_dir_path(root, sizeof(root)) != 0 ||
+        snprintf(repository, sizeof(repository), "%s/repository", root) >=
+            (int)sizeof(repository) ||
+        snprintf(config_parent, sizeof(config_parent), "%s/.git",
+                 repository) >= (int)sizeof(config_parent) ||
+        snprintf(config_path, sizeof(config_path), "%s/config",
+                 config_parent) >= (int)sizeof(config_path) ||
+        snprintf(repository_alias, sizeof(repository_alias), "%s/repo-link",
+                 root) >= (int)sizeof(repository_alias) ||
+        mkdir(repository, 0700) != 0 ||
+        mkdir(config_parent, 0700) != 0) {
+        CHECK(false);
+        goto cleanup;
+    }
+    fd = open(config_path, O_WRONLY | O_CREAT | O_EXCL | O_CLOEXEC, 0600);
+    if (fd < 0 ||
+        write(fd, contents, sizeof(contents) - 1U) !=
+            (ssize_t)(sizeof(contents) - 1U) ||
+        close(fd) != 0 ||
+        symlink(repository, repository_alias) != 0) {
+        CHECK(false);
+        fd = -1;
+        goto cleanup;
+    }
+    fd = -1;
+    if (snprintf(alias_config, sizeof(alias_config),
+                 "%s//.git/./config", repository_alias) >=
+            (int)sizeof(alias_config) ||
+        snprintf(alias_repository, sizeof(alias_repository), "%s//.",
+                 repository_alias) >= (int)sizeof(alias_repository)) {
+        CHECK(false);
+        goto cleanup;
+    }
+
+    fill_gpg_record(&canonical, repository, FINGERPRINT_A);
+    CHECK_EQ_INT(bind_live_local_destination(
+                     &canonical, repository, config_parent, config_path), 0);
+    alias = canonical;
+    CHECK_EQ_INT(safe_strncpy(alias.config_path, alias_config,
+                              sizeof(alias.config_path)), 0);
+    CHECK_EQ_INT(safe_strncpy(alias.repository_path, alias_repository,
+                              sizeof(alias.repository_path)), 0);
+
+    errno = E2BIG;
+    CHECK(publication_record_same_config_destination(&canonical, &alias));
+    CHECK(publication_record_same_destination(&canonical, &alias));
+    CHECK_EQ_INT(errno, E2BIG);
+
+    CHECK_EQ_INT(publication_ledger_upsert(&ledger, &alias), 0);
+    CHECK_EQ_INT((long)ledger.count, 1);
+    CHECK_STR_EQ(ledger.records[0].config_path, config_path);
+    CHECK_STR_EQ(ledger.records[0].repository_path, repository);
+
+    CHECK_LOOKUP_STATUS(publication_ledger_find(
+                     &ledger, canonical.account_id,
+                     canonical.account_incarnation, canonical.scope,
+                     alias_config, alias_repository, &found),
+                 PUBLICATION_LOOKUP_FOUND);
+    CHECK(found == &ledger.records[0]);
+    CHECK_LOOKUP_STATUS(publication_ledger_find(
+                     &ledger, canonical.account_id,
+                     canonical.account_incarnation, canonical.scope,
+                     config_path, repository, &found),
+                 PUBLICATION_LOOKUP_FOUND);
+    CHECK(found == &ledger.records[0]);
+
+    replacement = alias;
+    snprintf(replacement.gpg_fingerprint,
+             sizeof(replacement.gpg_fingerprint), "%s", FINGERPRINT_B);
+    CHECK_EQ_INT(publication_ledger_upsert(&ledger, &replacement), 0);
+    CHECK_EQ_INT((long)ledger.count, 1);
+    CHECK_STR_EQ(ledger.records[0].config_path, config_path);
+    CHECK_STR_EQ(ledger.records[0].repository_path, repository);
+    CHECK_STR_EQ(ledger.records[0].gpg_fingerprint, FINGERPRINT_B);
+
+    generation_records[0] = &ledger.records[0];
+    CHECK_EQ_INT(publication_record_verify_live_destination(
+                     &ledger.records[0], generation_records, 1U, &found), 0);
+    CHECK(found == &ledger.records[0]);
+
+cleanup:
+    if (fd >= 0) close(fd);
+    publication_ledger_clear(&ledger);
+    ts_rm_rf(root);
+}
+
+TEST(absent_config_leaf_uses_anchored_parent_but_conflicts_stay_unresolved) {
+    char root[MAX_PATH_LEN] = "/tmp/gsw-ar14-publication-absent.XXXXXX";
+    char repository[MAX_PATH_LEN];
+    char config_parent[MAX_PATH_LEN];
+    char config_path[MAX_PATH_LEN];
+    char repository_alias[MAX_PATH_LEN];
+    char missing_alias[MAX_PATH_LEN];
+    char expected_missing[MAX_PATH_LEN];
+    char dangling_path[MAX_PATH_LEN];
+    char dangling_alias[MAX_PATH_LEN];
+    char conflicting_alias[MAX_PATH_LEN];
+    publication_record_t live;
+    publication_record_t absent;
+    publication_record_t dangling;
+    publication_record_t conflicting;
+    publication_ledger_t ledger;
+    int fd = -1;
+    static const char contents[] = "[anchor]\n";
+
+    publication_ledger_init(&ledger);
+    CHECK(ts_mkdtemp(root) != NULL);
+    if (!root[0] || ts_canonicalize_dir_path(root, sizeof(root)) != 0 ||
+        snprintf(repository, sizeof(repository), "%s/repository", root) >=
+            (int)sizeof(repository) ||
+        snprintf(config_parent, sizeof(config_parent), "%s/.git",
+                 repository) >= (int)sizeof(config_parent) ||
+        snprintf(config_path, sizeof(config_path), "%s/config",
+                 config_parent) >= (int)sizeof(config_path) ||
+        snprintf(repository_alias, sizeof(repository_alias), "%s/repo-link",
+                 root) >= (int)sizeof(repository_alias) ||
+        mkdir(repository, 0700) != 0 ||
+        mkdir(config_parent, 0700) != 0) {
+        CHECK(false);
+        goto cleanup;
+    }
+    fd = open(config_path, O_WRONLY | O_CREAT | O_EXCL | O_CLOEXEC, 0600);
+    if (fd < 0 ||
+        write(fd, contents, sizeof(contents) - 1U) !=
+            (ssize_t)(sizeof(contents) - 1U) ||
+        close(fd) != 0 ||
+        symlink(repository, repository_alias) != 0) {
+        CHECK(false);
+        fd = -1;
+        goto cleanup;
+    }
+    fd = -1;
+    if (snprintf(missing_alias, sizeof(missing_alias),
+                 "%s//.git/./future-config", repository_alias) >=
+            (int)sizeof(missing_alias) ||
+        snprintf(expected_missing, sizeof(expected_missing),
+                 "%s/future-config", config_parent) >=
+            (int)sizeof(expected_missing) ||
+        snprintf(dangling_path, sizeof(dangling_path), "%s/dangling",
+                 config_parent) >= (int)sizeof(dangling_path) ||
+        snprintf(dangling_alias, sizeof(dangling_alias), "%s/.git/dangling",
+                 repository_alias) >= (int)sizeof(dangling_alias) ||
+        snprintf(conflicting_alias, sizeof(conflicting_alias),
+                 "%s/.git/config", repository_alias) >=
+            (int)sizeof(conflicting_alias) ||
+        symlink("/definitely/missing/ar14-target", dangling_path) != 0) {
+        CHECK(false);
+        goto cleanup;
+    }
+
+    fill_gpg_record(&live, repository, FINGERPRINT_A);
+    CHECK_EQ_INT(bind_live_local_destination(
+                     &live, repository, config_parent, config_path), 0);
+
+    absent = live;
+    CHECK_EQ_INT(safe_strncpy(absent.config_path, missing_alias,
+                              sizeof(absent.config_path)), 0);
+    CHECK_EQ_INT(publication_ledger_upsert(&ledger, &absent), 0);
+    CHECK_STR_EQ(ledger.records[0].config_path, expected_missing);
+    CHECK_STR_EQ(ledger.records[0].repository_path, repository);
+
+    publication_ledger_clear(&ledger);
+    dangling = live;
+    CHECK_EQ_INT(safe_strncpy(dangling.config_path, dangling_alias,
+                              sizeof(dangling.config_path)), 0);
+    CHECK_EQ_INT(publication_ledger_upsert(&ledger, &dangling), 0);
+    CHECK_STR_EQ(ledger.records[0].config_path, dangling_alias);
+    CHECK_STR_EQ(ledger.records[0].repository_path, repository);
+
+    publication_ledger_clear(&ledger);
+    conflicting = live;
+    conflicting.config_parent.inode++;
+    CHECK_EQ_INT(safe_strncpy(conflicting.config_path, conflicting_alias,
+                              sizeof(conflicting.config_path)), 0);
+    CHECK_EQ_INT(publication_ledger_upsert(&ledger, &conflicting), 0);
+    CHECK_STR_EQ(ledger.records[0].config_path, conflicting_alias);
+    CHECK_STR_EQ(ledger.records[0].repository_path, repository);
+    CHECK(!publication_record_same_config_destination(&live, &conflicting));
+
+cleanup:
+    if (fd >= 0) close(fd);
+    publication_ledger_clear(&ledger);
+    ts_rm_rf(root);
+}
+
+TEST(offline_destination_spellings_round_trip_without_ancestry_rewrite) {
+    publication_record_t record;
+    publication_ledger_t source;
+    publication_ledger_t loaded;
+    publication_ledger_t ancestry;
+    const publication_record_t *found = NULL;
+    unsigned char *serialized = NULL;
+    unsigned char *reserialized = NULL;
+    size_t serialized_length = 0U;
+    size_t reserialized_length = 0U;
+    static const char config_alias[] =
+        "/offline-ar14//repository/./.git/config";
+    static const char repository_alias[] =
+        "/offline-ar14//repository/.";
+    static const char ancestry_config[] =
+        "/offline-ar14/base/../repository/.git/config";
+    static const char ancestry_repository[] =
+        "/offline-ar14/base/../repository";
+
+    publication_ledger_init(&source);
+    publication_ledger_init(&loaded);
+    publication_ledger_init(&ancestry);
+    fill_gpg_record(&record, repository_alias, FINGERPRINT_A);
+    CHECK_EQ_INT(safe_strncpy(record.config_path, config_alias,
+                              sizeof(record.config_path)), 0);
+    source.present = true;
+    source.version = PUBLICATION_LEDGER_VERSION;
+    source.records = &record;
+    source.count = 1U;
+
+    CHECK_EQ_INT(publication_ledger_serialize(
+                     &source, &serialized, &serialized_length), 0);
+    CHECK_EQ_INT(publication_ledger_parse(
+                     serialized, serialized_length, &loaded), 0);
+    CHECK_STR_EQ(loaded.records[0].config_path, config_alias);
+    CHECK_STR_EQ(loaded.records[0].repository_path, repository_alias);
+    CHECK_LOOKUP_STATUS(publication_ledger_find(
+                     &loaded, record.account_id, record.account_incarnation,
+                     record.scope,
+                     "/offline-ar14/repository/.git/config",
+                     "/offline-ar14/repository", &found),
+                 PUBLICATION_LOOKUP_FOUND);
+    CHECK(found == &loaded.records[0]);
+    CHECK_EQ_INT(publication_ledger_serialize(
+                     &loaded, &reserialized, &reserialized_length), 0);
+    CHECK_EQ_INT((long)reserialized_length, (long)serialized_length);
+    if (serialized && reserialized &&
+        serialized_length == reserialized_length) {
+        CHECK(memcmp(serialized, reserialized, serialized_length) == 0);
+    }
+
+    CHECK_EQ_INT(safe_strncpy(record.config_path, ancestry_config,
+                              sizeof(record.config_path)), 0);
+    CHECK_EQ_INT(safe_strncpy(record.repository_path, ancestry_repository,
+                              sizeof(record.repository_path)), 0);
+    CHECK_EQ_INT(publication_ledger_upsert(&ancestry, &record), 0);
+    CHECK_STR_EQ(ancestry.records[0].config_path, ancestry_config);
+    CHECK_STR_EQ(ancestry.records[0].repository_path, ancestry_repository);
+    CHECK_LOOKUP_STATUS(publication_ledger_find(
+                     &ancestry, record.account_id,
+                     record.account_incarnation, record.scope,
+                     "/offline-ar14/repository/.git/config",
+                     "/offline-ar14/repository", &found),
+                 PUBLICATION_LOOKUP_ABSENT);
+
+    free(reserialized);
+    free(serialized);
+    publication_ledger_clear(&ancestry);
+    publication_ledger_clear(&loaded);
+}
+
+TEST(alias_duplicate_destinations_fail_closed_in_serializer_and_parser) {
+    char root[MAX_PATH_LEN] = "/tmp/gsw-ar14-publication-duplicate.XXXXXX";
+    char repository[MAX_PATH_LEN];
+    char config_parent[MAX_PATH_LEN];
+    char config_path[MAX_PATH_LEN];
+    char repository_alias[MAX_PATH_LEN];
+    char alias_config[MAX_PATH_LEN];
+    char distinct_config[MAX_PATH_LEN];
+    char distinct_repository[MAX_PATH_LEN];
+    char config_hex[MAX_PATH_LEN * 2U + 1U];
+    char repository_hex[MAX_PATH_LEN * 2U + 1U];
+    publication_record_t records[2];
+    publication_ledger_t ledger;
+    publication_ledger_t parsed;
+    unsigned char *serialized = NULL;
+    unsigned char *config_replaced = NULL;
+    unsigned char *alias_bytes = NULL;
+    size_t serialized_length = 0U;
+    size_t config_replaced_length = 0U;
+    size_t alias_length = 0U;
+    int fd = -1;
+    static const char contents[] = "[duplicate]\n";
+
+    publication_ledger_init(&ledger);
+    publication_ledger_init(&parsed);
+    CHECK(ts_mkdtemp(root) != NULL);
+    if (!root[0] || ts_canonicalize_dir_path(root, sizeof(root)) != 0 ||
+        snprintf(repository, sizeof(repository), "%s/repository", root) >=
+            (int)sizeof(repository) ||
+        snprintf(config_parent, sizeof(config_parent), "%s/.git",
+                 repository) >= (int)sizeof(config_parent) ||
+        snprintf(config_path, sizeof(config_path), "%s/config",
+                 config_parent) >= (int)sizeof(config_path) ||
+        snprintf(repository_alias, sizeof(repository_alias), "%s/repo-link",
+                 root) >= (int)sizeof(repository_alias) ||
+        mkdir(repository, 0700) != 0 ||
+        mkdir(config_parent, 0700) != 0) {
+        CHECK(false);
+        goto cleanup;
+    }
+    fd = open(config_path, O_WRONLY | O_CREAT | O_EXCL | O_CLOEXEC, 0600);
+    if (fd < 0 ||
+        write(fd, contents, sizeof(contents) - 1U) !=
+            (ssize_t)(sizeof(contents) - 1U) ||
+        close(fd) != 0 ||
+        symlink(repository, repository_alias) != 0) {
+        CHECK(false);
+        fd = -1;
+        goto cleanup;
+    }
+    fd = -1;
+    if (snprintf(alias_config, sizeof(alias_config),
+                 "%s//.git/./config", repository_alias) >=
+            (int)sizeof(alias_config) ||
+        snprintf(distinct_config, sizeof(distinct_config),
+                 "%s/offline/.git/config", root) >=
+            (int)sizeof(distinct_config) ||
+        snprintf(distinct_repository, sizeof(distinct_repository),
+                 "%s/offline", root) >= (int)sizeof(distinct_repository) ||
+        encode_upper_hex(alias_config, config_hex, sizeof(config_hex)) != 0 ||
+        encode_upper_hex(repository_alias, repository_hex,
+                         sizeof(repository_hex)) != 0) {
+        CHECK(false);
+        goto cleanup;
+    }
+
+    fill_gpg_record(&records[0], repository, FINGERPRINT_A);
+    CHECK_EQ_INT(bind_live_local_destination(
+                     &records[0], repository, config_parent, config_path), 0);
+    records[1] = records[0];
+    records[1].account_id++;
+    CHECK_EQ_INT(safe_strncpy(records[1].config_path, alias_config,
+                              sizeof(records[1].config_path)), 0);
+    CHECK_EQ_INT(safe_strncpy(records[1].repository_path, repository_alias,
+                              sizeof(records[1].repository_path)), 0);
+    ledger.present = true;
+    ledger.version = PUBLICATION_LEDGER_VERSION;
+    ledger.records = records;
+    ledger.count = 2U;
+    clear_error();
+    CHECK_EQ_INT(publication_ledger_serialize(
+                     &ledger, &serialized, &serialized_length), -1);
+    CHECK(serialized == NULL);
+    CHECK(strstr(get_last_error()->message, "duplicate destinations") != NULL);
+
+    CHECK_EQ_INT(safe_strncpy(records[1].config_path, distinct_config,
+                              sizeof(records[1].config_path)), 0);
+    CHECK_EQ_INT(safe_strncpy(records[1].repository_path,
+                              distinct_repository,
+                              sizeof(records[1].repository_path)), 0);
+    CHECK_EQ_INT(publication_ledger_serialize(
+                     &ledger, &serialized, &serialized_length), 0);
+    config_replaced = replace_serialized_field_value(
+        serialized, serialized_length, "p.1.config=", config_hex,
+        &config_replaced_length);
+    CHECK(config_replaced != NULL);
+    if (config_replaced) {
+        alias_bytes = replace_serialized_field_value(
+            config_replaced, config_replaced_length, "p.1.repository=",
+            repository_hex, &alias_length);
+    }
+    CHECK(alias_bytes != NULL);
+    clear_error();
+    if (alias_bytes) {
+        CHECK_EQ_INT(publication_ledger_parse(
+                         alias_bytes, alias_length, &parsed), -1);
+    }
+    CHECK(!parsed.present);
+    CHECK(strstr(get_last_error()->message, "duplicate destinations") != NULL);
+
+cleanup:
+    if (fd >= 0) close(fd);
+    free(alias_bytes);
+    free(config_replaced);
+    free(serialized);
+    publication_ledger_clear(&parsed);
+    ts_rm_rf(root);
+}
+
+TEST(upsert_rejects_offline_aliases_that_converge_without_model_mutation) {
+    char root[MAX_PATH_LEN] = "/tmp/gsw-ar14-publication-converge.XXXXXX";
+    char repository[MAX_PATH_LEN];
+    char config_parent[MAX_PATH_LEN];
+    char config_path[MAX_PATH_LEN];
+    char alias_a[MAX_PATH_LEN];
+    char alias_b[MAX_PATH_LEN];
+    char config_a[MAX_PATH_LEN];
+    char config_b[MAX_PATH_LEN];
+    publication_record_t incoming;
+    publication_record_t records[2];
+    publication_record_t before[2];
+    publication_record_t *records_before;
+    publication_ledger_t source;
+    publication_ledger_t parsed;
+    unsigned char *serialized = NULL;
+    size_t serialized_length = 0U;
+    size_t count_before;
+    unsigned int version_before;
+    bool present_before;
+    int fd = -1;
+    static const char contents[] = "[converge]\n";
+
+    publication_ledger_init(&source);
+    publication_ledger_init(&parsed);
+    CHECK(ts_mkdtemp(root) != NULL);
+    if (!root[0] || ts_canonicalize_dir_path(root, sizeof(root)) != 0 ||
+        snprintf(repository, sizeof(repository), "%s/repository", root) >=
+            (int)sizeof(repository) ||
+        snprintf(config_parent, sizeof(config_parent), "%s/.git",
+                 repository) >= (int)sizeof(config_parent) ||
+        snprintf(config_path, sizeof(config_path), "%s/config",
+                 config_parent) >= (int)sizeof(config_path) ||
+        snprintf(alias_a, sizeof(alias_a), "%s/offline-a", root) >=
+            (int)sizeof(alias_a) ||
+        snprintf(alias_b, sizeof(alias_b), "%s/offline-b", root) >=
+            (int)sizeof(alias_b) ||
+        snprintf(config_a, sizeof(config_a), "%s/.git/config", alias_a) >=
+            (int)sizeof(config_a) ||
+        snprintf(config_b, sizeof(config_b), "%s/.git/config", alias_b) >=
+            (int)sizeof(config_b) ||
+        mkdir(repository, 0700) != 0 ||
+        mkdir(config_parent, 0700) != 0) {
+        CHECK(false);
+        goto cleanup;
+    }
+    fd = open(config_path, O_WRONLY | O_CREAT | O_EXCL | O_CLOEXEC, 0600);
+    if (fd < 0 ||
+        write(fd, contents, sizeof(contents) - 1U) !=
+            (ssize_t)(sizeof(contents) - 1U) ||
+        close(fd) != 0) {
+        CHECK(false);
+        fd = -1;
+        goto cleanup;
+    }
+    fd = -1;
+
+    fill_gpg_record(&incoming, repository, FINGERPRINT_A);
+    CHECK_EQ_INT(bind_live_local_destination(
+                     &incoming, repository, config_parent, config_path), 0);
+    records[0] = incoming;
+    records[1] = incoming;
+    records[1].account_id++;
+    CHECK_EQ_INT(safe_strncpy(records[0].config_path, config_a,
+                              sizeof(records[0].config_path)), 0);
+    CHECK_EQ_INT(safe_strncpy(records[0].repository_path, alias_a,
+                              sizeof(records[0].repository_path)), 0);
+    CHECK_EQ_INT(safe_strncpy(records[1].config_path, config_b,
+                              sizeof(records[1].config_path)), 0);
+    CHECK_EQ_INT(safe_strncpy(records[1].repository_path, alias_b,
+                              sizeof(records[1].repository_path)), 0);
+
+    /* Step 1/2: while both aliases are offline, their byte-distinct spellings
+     * are a valid legacy ledger and survive serialization plus parsing. */
+    source.present = true;
+    source.version = PUBLICATION_LEDGER_VERSION;
+    source.records = records;
+    source.count = 2U;
+    CHECK_EQ_INT(publication_ledger_serialize(
+                     &source, &serialized, &serialized_length), 0);
+    CHECK_EQ_INT(publication_ledger_parse(
+                     serialized, serialized_length, &parsed), 0);
+    CHECK_EQ_INT((long)parsed.count, 2);
+
+    records_before = parsed.records;
+    count_before = parsed.count;
+    version_before = parsed.version;
+    present_before = parsed.present;
+    memcpy(before, parsed.records, sizeof(before));
+
+    /* Step 3: both previously unresolved names now resolve to the exact same
+     * anchored repository and config parent. */
+    CHECK_EQ_INT(symlink(repository, alias_a), 0);
+    CHECK_EQ_INT(symlink(repository, alias_b), 0);
+
+    /* Step 4: upsert must classify every existing match before mutation.
+     * Replacing only the first would leave a second live alias and an
+     * ambiguous ownership model. */
+    clear_error();
+    CHECK_EQ_INT(publication_ledger_upsert(&parsed, &incoming), -1);
+    CHECK(strstr(get_last_error()->message, "ambiguous") != NULL);
+    CHECK(parsed.records == records_before);
+    CHECK_EQ_INT((long)parsed.count, (long)count_before);
+    CHECK_EQ_INT((int)parsed.version, (int)version_before);
+    CHECK(parsed.present == present_before);
+    CHECK(memcmp(parsed.records, before, sizeof(before)) == 0);
+
+cleanup:
+    if (fd >= 0) close(fd);
+    free(serialized);
+    publication_ledger_clear(&parsed);
+    ts_rm_rf(root);
 }
 
 TEST(guarded_publication_clears_install_state_before_input_validation) {
@@ -3182,6 +3730,11 @@ TEST_MAIN_BEGIN()
     RUN_TEST(identity_parser_rejects_malformed_overflow_and_noncanonical_numbers);
     RUN_TEST(serializer_rejects_duplicate_publication_destinations);
     RUN_TEST(upsert_replaces_only_the_exact_publication_destination);
+    RUN_TEST(destination_aliases_share_one_canonical_upsert_lookup_and_live_key);
+    RUN_TEST(absent_config_leaf_uses_anchored_parent_but_conflicts_stay_unresolved);
+    RUN_TEST(offline_destination_spellings_round_trip_without_ancestry_rewrite);
+    RUN_TEST(alias_duplicate_destinations_fail_closed_in_serializer_and_parser);
+    RUN_TEST(upsert_rejects_offline_aliases_that_converge_without_model_mutation);
     RUN_TEST(guarded_publication_clears_install_state_before_input_validation);
     RUN_TEST(guarded_publication_requires_the_exact_live_active_incarnation);
     RUN_TEST(guarded_publication_preserves_intervening_writer_generation);

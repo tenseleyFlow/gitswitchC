@@ -130,11 +130,215 @@ static bool publication_identity_same_object(
            left->device == right->device && left->inode == right->inode;
 }
 
+typedef enum {
+    PUBLICATION_PATH_CONFIG,
+    PUBLICATION_PATH_REPOSITORY
+} publication_path_kind_t;
+
+/* Produce only the lexical normalizations that do not consult the process
+ * working directory or reinterpret ancestry: repeated separators and literal
+ * "." components. Any ".." component leaves the spelling byte-exact unless
+ * the anchored physical resolution below succeeds. */
+static bool publication_path_lexical_key(
+    const char *path, char out[MAX_PATH_LEN]) {
+    const char *cursor;
+    size_t path_length;
+    size_t used = 1U;
+
+    if (!path || !out ||
+        (path_length = strnlen(path, MAX_PATH_LEN)) >= MAX_PATH_LEN ||
+        path[0] != '/') {
+        return false;
+    }
+    cursor = path;
+    while (*cursor) {
+        const char *component;
+        size_t length;
+
+        while (*cursor == '/') cursor++;
+        component = cursor;
+        while (*cursor && *cursor != '/') cursor++;
+        length = (size_t)(cursor - component);
+        if (length == 2U && component[0] == '.' &&
+            component[1] == '.') {
+            memcpy(out, path, path_length + 1U);
+            return true;
+        }
+    }
+
+    out[0] = '/';
+    cursor = path;
+    while (*cursor) {
+        const char *component;
+        size_t length;
+
+        while (*cursor == '/') cursor++;
+        component = cursor;
+        while (*cursor && *cursor != '/') cursor++;
+        length = (size_t)(cursor - component);
+        if (length == 0U ||
+            (length == 1U && component[0] == '.')) {
+            continue;
+        }
+        if (used > 1U) out[used++] = '/';
+        memcpy(out + used, component, length);
+        used += length;
+    }
+    out[used] = '\0';
+    return true;
+}
+
+static bool publication_path_parent_and_leaf(
+    const char *path, char parent[MAX_PATH_LEN], const char **leaf) {
+    const char *slash;
+    size_t parent_length;
+
+    if (!path || !parent || !leaf || path[0] != '/') return false;
+    slash = strrchr(path, '/');
+    if (!slash || !slash[1] || strcmp(slash + 1U, ".") == 0 ||
+        strcmp(slash + 1U, "..") == 0) {
+        return false;
+    }
+    parent_length = slash == path ? 1U : (size_t)(slash - path);
+    if (parent_length >= MAX_PATH_LEN) return false;
+    memcpy(parent, path, parent_length);
+    parent[parent_length] = '\0';
+    *leaf = slash + 1U;
+    return true;
+}
+
+static bool publication_directory_anchor_matches_path(
+    const char *path, const publication_identity_t *identity,
+    int *directory_fd) {
+    struct stat st;
+    int fd;
+
+    if (directory_fd) *directory_fd = -1;
+    if (!path || !identity || !identity->present) return false;
+    fd = open(path, O_RDONLY | O_DIRECTORY | O_CLOEXEC | O_NOFOLLOW);
+    if (fd < 0) return false;
+    if (fstat(fd, &st) != 0 || !S_ISDIR(st.st_mode) ||
+        identity->device != (uintmax_t)st.st_dev ||
+        identity->inode != (uintmax_t)st.st_ino) {
+        (void)close(fd);
+        return false;
+    }
+    if (directory_fd) {
+        *directory_fd = fd;
+    } else {
+        (void)close(fd);
+    }
+    return true;
+}
+
+static bool publication_config_physical_key(
+    const char *path, const publication_identity_t *config_parent,
+    char out[MAX_PATH_LEN]) {
+    char canonical[MAX_PATH_LEN];
+    char parent[MAX_PATH_LEN];
+    char canonical_parent[MAX_PATH_LEN];
+    const char *leaf;
+    struct stat leaf_stat;
+    int parent_fd = -1;
+    int resolve_errno;
+    size_t parent_length;
+    size_t leaf_length;
+
+    if (realpath(path, canonical) != NULL) {
+        if (!publication_path_parent_and_leaf(canonical, parent, &leaf) ||
+            !publication_directory_anchor_matches_path(
+                parent, config_parent, NULL)) {
+            return false;
+        }
+        memcpy(out, canonical, strlen(canonical) + 1U);
+        return true;
+    }
+    resolve_errno = errno;
+    if (resolve_errno != ENOENT ||
+        !publication_path_parent_and_leaf(path, parent, &leaf) ||
+        realpath(parent, canonical_parent) == NULL ||
+        !publication_directory_anchor_matches_path(
+            canonical_parent, config_parent, &parent_fd)) {
+        return false;
+    }
+    errno = 0;
+    if (fstatat(parent_fd, leaf, &leaf_stat, AT_SYMLINK_NOFOLLOW) == 0 ||
+        errno != ENOENT) {
+        (void)close(parent_fd);
+        return false;
+    }
+    (void)close(parent_fd);
+    parent_length = strlen(canonical_parent);
+    leaf_length = strlen(leaf);
+    if (parent_length + (parent_length == 1U ? 0U : 1U) + leaf_length >=
+        MAX_PATH_LEN) {
+        return false;
+    }
+    memcpy(out, canonical_parent, parent_length);
+    if (parent_length != 1U) out[parent_length++] = '/';
+    memcpy(out + parent_length, leaf, leaf_length + 1U);
+    return true;
+}
+
+static bool publication_repository_physical_key(
+    const char *path, const publication_identity_t *repository,
+    char out[MAX_PATH_LEN]) {
+    char canonical[MAX_PATH_LEN];
+
+    if (realpath(path, canonical) == NULL ||
+        !publication_directory_anchor_matches_path(
+            canonical, repository, NULL)) {
+        return false;
+    }
+    memcpy(out, canonical, strlen(canonical) + 1U);
+    return true;
+}
+
+/* Derive one stable destination key without ever changing the caller's error
+ * state. Anchored physical resolution wins when it can be proven. Offline or
+ * otherwise unresolved legacy spellings retain only the safe lexical
+ * normalization above and remain serializable byte-for-byte. */
+static bool publication_destination_path_key(
+    const char *path, const publication_identity_t *anchor,
+    publication_path_kind_t kind, char out[MAX_PATH_LEN]) {
+    char physical[MAX_PATH_LEN];
+    int saved_errno = errno;
+    bool physical_ready;
+
+    if (kind == PUBLICATION_PATH_REPOSITORY && path && path[0] == '\0') {
+        out[0] = '\0';
+        errno = saved_errno;
+        return true;
+    }
+    if (!publication_path_lexical_key(path, out)) {
+        errno = saved_errno;
+        return false;
+    }
+    physical_ready =
+        kind == PUBLICATION_PATH_CONFIG
+            ? publication_config_physical_key(path, anchor, physical)
+            : publication_repository_physical_key(path, anchor, physical);
+    if (physical_ready) {
+        memcpy(out, physical, strlen(physical) + 1U);
+    }
+    errno = saved_errno;
+    return true;
+}
+
 bool publication_record_same_config_destination(
     const publication_record_t *left,
     const publication_record_t *right) {
+    char left_path[MAX_PATH_LEN];
+    char right_path[MAX_PATH_LEN];
+
     return left && right &&
-           strcmp(left->config_path, right->config_path) == 0 &&
+           publication_destination_path_key(
+               left->config_path, &left->config_parent,
+               PUBLICATION_PATH_CONFIG, left_path) &&
+           publication_destination_path_key(
+               right->config_path, &right->config_parent,
+               PUBLICATION_PATH_CONFIG, right_path) &&
+           strcmp(left_path, right_path) == 0 &&
            publication_identity_same_object(&left->config_parent,
                                             &right->config_parent);
 }
@@ -495,8 +699,8 @@ int publication_record_verify_live_destination(
     const publication_record_t *const generation_records[],
     size_t generation_count,
     const publication_record_t **live_generation) {
-    char canonical_config[MAX_PATH_LEN];
-    char canonical_repository[MAX_PATH_LEN];
+    char destination_config[MAX_PATH_LEN];
+    char destination_repository[MAX_PATH_LEN];
     char parent_path[MAX_PATH_LEN];
     const char *slash;
     const char *leaf;
@@ -529,22 +733,23 @@ int publication_record_verify_live_destination(
         }
     }
 
-    slash = strrchr(record->config_path, '/');
-    if (!slash || !slash[1] ||
-        realpath(record->config_path, canonical_config) == NULL ||
-        strcmp(canonical_config, record->config_path) != 0) {
+    if (!publication_destination_path_key(
+            record->config_path, &record->config_parent,
+            PUBLICATION_PATH_CONFIG, destination_config)) {
         goto mismatch;
     }
+    slash = strrchr(destination_config, '/');
+    if (!slash || !slash[1]) goto mismatch;
     leaf = slash + 1U;
-    if (slash == record->config_path) {
+    if (slash == destination_config) {
         if (safe_strncpy(parent_path, "/", sizeof(parent_path)) != 0) {
             goto mismatch;
         }
     } else {
-        size_t parent_length = (size_t)(slash - record->config_path);
+        size_t parent_length = (size_t)(slash - destination_config);
 
         if (parent_length >= sizeof(parent_path)) goto mismatch;
-        memcpy(parent_path, record->config_path, parent_length);
+        memcpy(parent_path, destination_config, parent_length);
         parent_path[parent_length] = '\0';
     }
     parent_fd = open(parent_path,
@@ -582,11 +787,12 @@ int publication_record_verify_live_destination(
         destination_matches = true;
         goto cleanup;
     }
-    if (realpath(record->repository_path, canonical_repository) == NULL ||
-        strcmp(canonical_repository, record->repository_path) != 0) {
+    if (!publication_destination_path_key(
+            record->repository_path, &record->repository,
+            PUBLICATION_PATH_REPOSITORY, destination_repository)) {
         goto mismatch;
     }
-    repository_fd = open(record->repository_path,
+    repository_fd = open(destination_repository,
                          O_RDONLY | O_DIRECTORY | O_CLOEXEC | O_NOFOLLOW);
     if (repository_fd < 0 || fstat(repository_fd, &repository_stat) != 0 ||
         !publication_directory_identity_matches_stat(
@@ -611,12 +817,19 @@ cleanup:
 
 bool publication_record_same_destination(const publication_record_t *left,
                                          const publication_record_t *right) {
+    char left_repository[MAX_PATH_LEN];
+    char right_repository[MAX_PATH_LEN];
+
     if (!left || !right) return false;
     return left->scope == right->scope &&
-           strcmp(left->config_path, right->config_path) == 0 &&
-           publication_identity_same_object(&left->config_parent,
-                                            &right->config_parent) &&
-           strcmp(left->repository_path, right->repository_path) == 0 &&
+           publication_record_same_config_destination(left, right) &&
+           publication_destination_path_key(
+               left->repository_path, &left->repository,
+               PUBLICATION_PATH_REPOSITORY, left_repository) &&
+           publication_destination_path_key(
+               right->repository_path, &right->repository,
+               PUBLICATION_PATH_REPOSITORY, right_repository) &&
+           strcmp(left_repository, right_repository) == 0 &&
            ((left->repository_path[0] == '\0' &&
              right->repository_path[0] == '\0') ||
             publication_identity_same_object(&left->repository,
@@ -799,18 +1012,39 @@ void publication_ledger_clear(publication_ledger_t *ledger) {
 
 int publication_ledger_upsert(publication_ledger_t *ledger,
                               const publication_record_t *record) {
+    publication_record_t canonical;
     publication_record_t *grown;
+    size_t matching_index = SIZE_MAX;
+
     if (!ledger || publication_record_validate(record) != 0) return -1;
+    canonical = *record;
+    if (!publication_destination_path_key(
+            record->config_path, &record->config_parent,
+            PUBLICATION_PATH_CONFIG, canonical.config_path) ||
+        !publication_destination_path_key(
+            record->repository_path, &record->repository,
+            PUBLICATION_PATH_REPOSITORY, canonical.repository_path) ||
+        publication_record_validate(&canonical) != 0) {
+        return -1;
+    }
     if (ledger->present && ledger->version != PUBLICATION_LEDGER_VERSION) {
         return publication_invalid("Unsupported publication ledger version");
     }
     for (size_t i = 0; i < ledger->count; i++) {
-        if (publication_record_same_destination(&ledger->records[i], record)) {
-            ledger->records[i] = *record;
-            ledger->present = true;
-            ledger->version = PUBLICATION_LEDGER_VERSION;
-            return 0;
+        if (publication_record_same_destination(&ledger->records[i],
+                                                &canonical)) {
+            if (matching_index != SIZE_MAX) {
+                return publication_invalid(
+                    "Publication ledger upsert destination is ambiguous");
+            }
+            matching_index = i;
         }
+    }
+    if (matching_index != SIZE_MAX) {
+        ledger->records[matching_index] = canonical;
+        ledger->present = true;
+        ledger->version = PUBLICATION_LEDGER_VERSION;
+        return 0;
     }
     if (ledger->count >= PUBLICATION_LEDGER_MAX_RECORDS) {
         return publication_invalid("Publication ledger record limit reached");
@@ -823,7 +1057,7 @@ int publication_ledger_upsert(publication_ledger_t *ledger,
         return -1;
     }
     ledger->records = grown;
-    ledger->records[ledger->count++] = *record;
+    ledger->records[ledger->count++] = canonical;
     ledger->present = true;
     ledger->version = PUBLICATION_LEDGER_VERSION;
     return 0;
@@ -870,6 +1104,10 @@ publication_lookup_status_t publication_ledger_find(
     }
     for (size_t i = 0; i < ledger->count; i++) {
         const publication_record_t *candidate = &ledger->records[i];
+        char candidate_config[MAX_PATH_LEN];
+        char candidate_repository[MAX_PATH_LEN];
+        char query_config[MAX_PATH_LEN];
+        char query_repository[MAX_PATH_LEN];
 
         if (publication_record_validate(candidate) != 0) {
             return PUBLICATION_LOOKUP_ERROR;
@@ -886,8 +1124,20 @@ publication_lookup_status_t publication_ledger_find(
             strcmp(candidate->account_incarnation,
                    account_incarnation) != 0 ||
             candidate->scope != scope ||
-            strcmp(candidate->config_path, config_path) != 0 ||
-            strcmp(candidate->repository_path, repository) != 0) {
+            !publication_destination_path_key(
+                candidate->config_path, &candidate->config_parent,
+                PUBLICATION_PATH_CONFIG, candidate_config) ||
+            !publication_destination_path_key(
+                config_path, &candidate->config_parent,
+                PUBLICATION_PATH_CONFIG, query_config) ||
+            strcmp(candidate_config, query_config) != 0 ||
+            !publication_destination_path_key(
+                candidate->repository_path, &candidate->repository,
+                PUBLICATION_PATH_REPOSITORY, candidate_repository) ||
+            !publication_destination_path_key(
+                repository, &candidate->repository,
+                PUBLICATION_PATH_REPOSITORY, query_repository) ||
+            strcmp(candidate_repository, query_repository) != 0) {
             continue;
         }
         if (match) {
