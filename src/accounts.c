@@ -3634,7 +3634,14 @@ static int add_or_edit_account(gitswitch_ctx_t *ctx, account_t *existing,
         safe_strncpy(acct.gpg_key_id, input, sizeof(acct.gpg_key_id));
         acct.gpg_enabled = true;
         printf("[OK]: GPG key validated: %s\n", input);
+        break;
+    }
 
+    /* Keeping an existing selector is not a request to resolve it again.
+     * Signing preference is an independent account field, so an edit must
+     * still offer this prompt after Enter-to-keep even when the source keyring
+     * is temporarily unavailable. */
+    if (acct.gpg_enabled) {
         snprintf(prompt_text, sizeof(prompt_text),
                  "Enable GPG signing for commits? (y/N)%s: ",
                  (edit && acct.gpg_signing_enabled) ? " [Y]" : "");
@@ -3645,7 +3652,6 @@ static int add_or_edit_account(gitswitch_ctx_t *ctx, account_t *existing,
         if (strlen(input) > 0) {
             acct.gpg_signing_enabled = (tolower((unsigned char)input[0]) == 'y');
         }
-        break;
     }
 
     /* Preferred scope. Validate; empty keeps the shown default. */

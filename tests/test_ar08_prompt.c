@@ -10,6 +10,7 @@
 #include "error.h"
 #include "gpg_manager.h"
 #include "prompt.h"
+#include "utils.h"
 
 #include <signal.h>
 #include <sys/wait.h>
@@ -22,6 +23,23 @@ typedef struct {
     FILE *stream;
     int saved_fd;
 } redirected_stream_t;
+
+static int g_unavailable_gpg_runner_calls;
+
+static int unavailable_gpg_runner(const char *const argv[],
+                                  const run_opts_t *opts,
+                                  run_result_t *result) {
+    (void)argv;
+    (void)opts;
+    g_unavailable_gpg_runner_calls++;
+    if (result) {
+        memset(result, 0, sizeof(*result));
+        result->spawned = true;
+        result->exit_code = 2;
+    }
+    errno = EIO;
+    return -1;
+}
 
 static int redirect_fd(FILE *stream, int target_fd,
                        redirected_stream_t *redirected) {
@@ -812,6 +830,42 @@ TEST(successful_blank_edit_answers_preserve_the_account) {
     CHECK(memcmp(&ctx.accounts[0], &before, sizeof(before)) == 0);
 }
 
+TEST(blank_gpg_edit_can_change_only_signing_without_source_resolution) {
+    static const char retained_selector[] =
+        "1234567890ABCDEF1234567890ABCDEF12345678";
+    gitswitch_ctx_t ctx;
+    account_t expected;
+    FILE *stream = input_stream("\n\n\n\n\ny\n\n");
+    redirected_stream_t redirected = { .stream = NULL, .saved_fd = -1 };
+    command_runner_fn old_runner;
+    int result = -2;
+
+    CHECK(stream != NULL);
+    if (!stream) return;
+    initialize_prompt_context(&ctx, true);
+    ctx.accounts[0].gpg_enabled = true;
+    ctx.accounts[0].gpg_signing_enabled = false;
+    CHECK_EQ_INT(safe_strncpy(ctx.accounts[0].gpg_key_id,
+                              retained_selector,
+                              sizeof(ctx.accounts[0].gpg_key_id)), 0);
+    expected = ctx.accounts[0];
+    expected.gpg_signing_enabled = true;
+
+    g_unavailable_gpg_runner_calls = 0;
+    old_runner = run_set_runner(unavailable_gpg_runner);
+    CHECK_EQ_INT(begin_input(stream, &redirected), 0);
+    if (redirected.saved_fd >= 0) {
+        result = invoke_account_prompt_flow(&ctx, true);
+    }
+    end_input(&redirected);
+    run_set_runner(old_runner);
+    fclose(stream);
+
+    CHECK_EQ_INT(result, 0);
+    CHECK_EQ_INT(g_unavailable_gpg_runner_calls, 0);
+    CHECK(memcmp(&ctx.accounts[0], &expected, sizeof(expected)) == 0);
+}
+
 TEST(account_flow_reprompts_without_accepting_any_prefix) {
     gitswitch_ctx_t ctx;
     char root[] = "/tmp/gsw-prompt-XXXXXX";
@@ -938,5 +992,7 @@ TEST_MAIN_BEGIN()
     RUN_TEST(successful_blank_optional_answers_apply_only_documented_defaults);
     RUN_TEST(successful_nested_blank_answers_do_not_invent_alias_or_signing);
     RUN_TEST(successful_blank_edit_answers_preserve_the_account);
+    RUN_TEST(
+        blank_gpg_edit_can_change_only_signing_without_source_resolution);
     RUN_TEST(account_flow_reprompts_without_accepting_any_prefix);
 TEST_MAIN_END()
