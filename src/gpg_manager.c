@@ -26,6 +26,7 @@
 #include <ctype.h>
 #include <limits.h>
 #include <time.h>
+#include <stdarg.h>
 #ifdef __linux__
 #include <sys/syscall.h>
 #include <sys/vfs.h>
@@ -40,6 +41,9 @@
 #include "utils.h"
 #include "display.h"
 #include "git_ops.h"
+#define GITSWITCH_INTERNAL_API
+#include "git_ops_internal.h"
+#undef GITSWITCH_INTERNAL_API
 #include "runner_internal.h"
 #include "signals.h"
 
@@ -81,6 +85,8 @@ typedef struct {
     int marker_fd;
     struct stat marker_identity;
     char gpgconf_path[MAX_PATH_LEN];
+    run_launch_witness_t gpgconf_witness;
+    const gpg_config_t *gpg_config;
 } gpg_agent_config_update_t;
 typedef struct {
     bool injected;
@@ -112,8 +118,10 @@ static int copy_key_from_system_keyring(const gpg_config_t *gpg_config,
                                         bool require_signing,
                                         char *fingerprint,
                                         size_t fingerprint_size);
-static int setup_gpg_agent_config(int home_fd, const char *gnupg_home,
-                                  gpg_agent_config_update_t *update);
+static int setup_gpg_agent_config(const gpg_config_t *gpg_config,
+                                  int home_fd, const char *gnupg_home,
+                                  gpg_agent_config_update_t *update,
+                                  bool bind_toolchain);
 static int gpg_reload_agent_config(const gpg_pinned_home_t *home,
                                    gpg_agent_config_update_t *update);
 static int gpg_prepare_isolated_home_at(gpg_config_t *gpg_config,
@@ -167,6 +175,8 @@ static gpg_setenv_fn g_gpg_setenv = setenv;
 static gpg_unsetenv_fn g_gpg_unsetenv = unsetenv;
 static const char *const g_gpg_child_unset_env[] = {
     "GPG_AGENT_INFO",
+    "GNUPG_BUILDDIR",
+    "GNUPG_BUILD_ROOT",
     NULL
 };
 static gpg_cleanup_predelete_fn g_cleanup_predelete;
@@ -779,7 +789,7 @@ static int gpg_key_cache_lookup(
     bool have_candidate = false;
     bool matched = false;
     bool fatal_binding = false;
-    error_context_t fatal_error;
+    error_context_t fatal_error = {0};
     int fatal_errno = 0;
     bool post_scan_checked = false;
     bool post_scan_failed = false;
@@ -1030,10 +1040,33 @@ static int gpg_bind_executable_if_needed(gpg_config_t *gpg_config) {
                       "GPG manager executable binding is not absolute");
             return -1;
         }
+        if (!gpg_config->executable_witness.valid &&
+            !run_launch_witness_capture(gpg_config->executable_path,
+                                        &gpg_config->executable_witness)) {
+            set_error(ERR_GPG_NOT_FOUND,
+                      "Cannot bind exact GPG executable generation");
+            return -1;
+        }
+        if (!run_launch_witness_revalidate(
+                gpg_config->executable_path,
+                &gpg_config->executable_witness)) {
+            set_error(ERR_GPG_NOT_FOUND,
+                      "GPG executable generation changed during transaction");
+            return -1;
+        }
         return 0;
     }
-    return gpg_manager_resolve_executable(gpg_config->executable_path,
-                                          sizeof(gpg_config->executable_path));
+    if (gpg_manager_resolve_executable(
+            gpg_config->executable_path,
+            sizeof(gpg_config->executable_path)) != 0 ||
+        !run_launch_witness_capture(gpg_config->executable_path,
+                                    &gpg_config->executable_witness)) {
+        gpg_config->executable_path[0] = '\0';
+        set_error(ERR_GPG_NOT_FOUND,
+                  "Cannot bind exact GPG executable generation");
+        return -1;
+    }
+    return 0;
 }
 
 /* Initialize GPG manager with specified mode */
@@ -6001,7 +6034,8 @@ static int gpg_prepare_isolated_home_at(gpg_config_t *gpg_config,
         return -1;
     }
 
-    if (setup_gpg_agent_config(home_fd, gnupg_home, &update) != 0) {
+    if (setup_gpg_agent_config(gpg_config, home_fd, gnupg_home,
+                               &update, true) != 0) {
         gpg_agent_config_update_close(&update);
         close(home_fd);
         return -1;
@@ -6047,6 +6081,9 @@ int gpg_create_isolated_home(gpg_config_t *gpg_config, const account_t *account)
     if (!gpg_config || !account) {
         set_error(ERR_INVALID_ARGS,
                   "Invalid arguments to gpg_create_isolated_home");
+        return -1;
+    }
+    if (gpg_bind_executable_if_needed(gpg_config) != 0) {
         return -1;
     }
     base_fd = gpg_prepare_base_dir(base, sizeof(base));
@@ -6111,8 +6148,9 @@ int gpg_configure_git_signing(gpg_config_t *gpg_config, const account_t *account
     /* This is the last publication step before accounts.c seals the generic
      * managed-key transaction. Require the fresh merged image to select the
      * same executable and use it for any uncached secret-key probe. */
-    if (git_test_config(&configured_account, scope,
-                        gpg_config->executable_path) != 0) {
+    if (git_test_config_with_gpg_witness(
+            &configured_account, scope, gpg_config->executable_path,
+            &gpg_config->executable_witness) != 0) {
         return -1;
     }
 
@@ -7065,13 +7103,15 @@ static int gpg_query_secret_listing_contract(
         if (gpg_validate_pinned_home(home) != 0) return -1;
         opts.cwd_fd = home->home_fd;
         opts.use_cwd_fd = true;
-        run_rc = run_argv(argv, &opts, &result);
+        run_rc = run_argv_with_expected_launch(
+            argv, &opts, &gpg_config->executable_witness, &result);
         if (gpg_validate_pinned_home(home) != 0) return -1;
     } else {
         if (gpg_validate_source_home(source) != 0) return -1;
         opts.cwd_fd = source->fd;
         opts.use_cwd_fd = true;
-        run_rc = run_argv(argv, &opts, &result);
+        run_rc = run_argv_with_expected_launch(
+            argv, &opts, &gpg_config->executable_witness, &result);
         if (gpg_validate_source_home(source) != 0) return -1;
     }
     if (result.out_truncated) {
@@ -7156,7 +7196,8 @@ static int gpg_capture_secret_listing(const gpg_config_t *gpg_config,
         }
         opts.cwd_fd = home->home_fd;
         opts.use_cwd_fd = true;
-        run_rc = run_argv(argv, &opts, &res);
+        run_rc = run_argv_with_expected_launch(
+            argv, &opts, &gpg_config->executable_witness, &res);
         if (gpg_validate_pinned_home(home) != 0) {
             secure_zero_memory(listing, GPG_KEY_LISTING_CAP);
             free(listing);
@@ -7170,7 +7211,8 @@ static int gpg_capture_secret_listing(const gpg_config_t *gpg_config,
         }
         opts.cwd_fd = source->fd;
         opts.use_cwd_fd = true;
-        run_rc = run_argv(argv, &opts, &res);
+        run_rc = run_argv_with_expected_launch(
+            argv, &opts, &gpg_config->executable_witness, &res);
         if (gpg_validate_source_home(source) != 0) {
             secure_zero_memory(listing, GPG_KEY_LISTING_CAP);
             free(listing);
@@ -7399,7 +7441,8 @@ static int copy_key_from_system_keyring(const gpg_config_t *gpg_config,
             gpg_close_source_home(&source);
             return -1;
         }
-        export_rc = run_argv(export_argv, &opts, &res);
+        export_rc = run_argv_with_expected_launch(
+            export_argv, &opts, &gpg_config->executable_witness, &res);
         if (gpg_validate_source_home(&source) != 0) {
             secure_zero_memory(key_data, KEY_DATA_CAP);
             free(key_data);
@@ -7460,8 +7503,11 @@ static int copy_key_from_system_keyring(const gpg_config_t *gpg_config,
     {
         const char *import_argv[] = {gpg_config->executable_path, "--batch",
                                      "--import", NULL};
+        run_result_t import_result;
         int import_rc;
         memset(&opts, 0, sizeof(opts));
+        memset(&import_result, 0, sizeof(import_result));
+        import_result.exit_code = -1;
         opts.input = key_data;
         opts.input_len = res.out_len;
         opts.out = import_diag;
@@ -7471,13 +7517,18 @@ static int copy_key_from_system_keyring(const gpg_config_t *gpg_config,
         opts.extra_env = env;
         opts.cwd_fd = home->home_fd;
         opts.use_cwd_fd = true;
-        import_rc = run_argv(import_argv, &opts, NULL);
+        import_rc = run_argv_with_expected_launch(
+            import_argv, &opts, &gpg_config->executable_witness,
+            &import_result);
         if (gpg_validate_pinned_home(home) != 0) {
             secure_zero_memory(key_data, KEY_DATA_CAP);
             free(key_data);
             return -1;
         }
-        if (import_rc != 0) {
+        if (import_rc != 0 || !import_result.spawned ||
+            import_result.exit_code != 0 ||
+            import_result.term_signal != 0 ||
+            import_result.out_truncated) {
             secure_zero_memory(key_data, KEY_DATA_CAP);
             free(key_data);
             set_error(ERR_GPG_KEY_FAILED,
@@ -7506,7 +7557,179 @@ static int copy_key_from_system_keyring(const gpg_config_t *gpg_config,
 enum { GPG_AGENT_CONF_MAX = 64 * 1024 };
 
 #define GPG_AGENT_RELOAD_STATE ".gitswitch-gpg-agent-reload.state"
-enum { GPG_AGENT_RELOAD_STATE_MAX = 256 };
+enum {
+    GPG_AGENT_RELOAD_STATE_MAX = 64 * 1024,
+    GPGCONF_METADATA_MAX = 64 * 1024
+};
+
+static int gpg_run_bound_capture(
+    const char *const argv[], const run_launch_witness_t *witness,
+    char *output, size_t output_size) {
+    run_opts_t opts;
+    run_result_t result;
+    int rc;
+
+    if (!argv || !argv[0] || !witness || !witness->valid ||
+        !output || output_size < 2U) {
+        set_error(ERR_INVALID_ARGS, "Invalid bound GnuPG metadata request");
+        return -1;
+    }
+    memset(&opts, 0, sizeof(opts));
+    memset(&result, 0, sizeof(result));
+    result.exit_code = -1;
+    output[0] = '\0';
+    opts.out = output;
+    opts.out_size = output_size;
+    opts.stderr_to_devnull = true;
+    opts.unset_env = g_gpg_child_unset_env;
+    rc = run_argv_with_expected_launch(argv, &opts, witness, &result);
+    if (rc != 0 || !result.spawned || result.exit_code != 0 ||
+        result.term_signal != 0 || result.out_truncated ||
+        result.out_len >= output_size ||
+        result.out_len != strlen(output)) {
+        set_error(ERR_SYSTEM_COMMAND_FAILED,
+                  "Bound GnuPG metadata command failed");
+        return -1;
+    }
+    return 0;
+}
+
+static int gpg_percent_decode_field(const char *start, size_t length,
+                                    char *output, size_t output_size) {
+    size_t used = 0;
+
+    if (!start || !output || output_size == 0U) return -1;
+    for (size_t i = 0; i < length; i++) {
+        unsigned char value = (unsigned char)start[i];
+        if (value == '%') {
+            int high;
+            int low;
+            if (i + 2U >= length ||
+                !isxdigit((unsigned char)start[i + 1U]) ||
+                !isxdigit((unsigned char)start[i + 2U])) {
+                return -1;
+            }
+            high = isdigit((unsigned char)start[i + 1U])
+                       ? start[i + 1U] - '0'
+                       : 10 + (tolower((unsigned char)start[i + 1U]) - 'a');
+            low = isdigit((unsigned char)start[i + 2U])
+                      ? start[i + 2U] - '0'
+                      : 10 + (tolower((unsigned char)start[i + 2U]) - 'a');
+            value = (unsigned char)((high << 4) | low);
+            i += 2U;
+        }
+        if (value == '\0' || value == '\r' || value == '\n' ||
+            iscntrl(value) || used + 1U >= output_size) {
+            return -1;
+        }
+        output[used++] = (char)value;
+    }
+    output[used] = '\0';
+    return 0;
+}
+
+static int gpg_parse_component_gpg_path(const char *metadata,
+                                        char *gpg_path, size_t gpg_size) {
+    const char *cursor = metadata;
+    bool have_gpg = false;
+
+    if (!metadata || !gpg_path) return -1;
+    while (*cursor) {
+        const char *end = strchr(cursor, '\n');
+        const char *first;
+        const char *second;
+        const char *third;
+        size_t line_len;
+        char name[32];
+        char path[MAX_PATH_LEN];
+
+        if (!end) end = cursor + strlen(cursor);
+        line_len = (size_t)(end - cursor);
+        if (line_len > 0U && cursor[line_len - 1U] == '\r') line_len--;
+        if (line_len == 0U) return -1;
+        first = memchr(cursor, ':', line_len);
+        second = first ? memchr(first + 1, ':',
+                                line_len - (size_t)(first + 1 - cursor))
+                       : NULL;
+        third = second ? memchr(second + 1, ':',
+                               line_len - (size_t)(second + 1 - cursor))
+                       : NULL;
+        if (!first || !second ||
+            (size_t)(first - cursor) >= sizeof(name)) {
+            return -1;
+        }
+        memcpy(name, cursor, (size_t)(first - cursor));
+        name[first - cursor] = '\0';
+        if ((third && third != cursor + line_len - 1) ||
+            gpg_percent_decode_field(second + 1,
+                                     third
+                                         ? (size_t)(third - (second + 1))
+                                         : line_len -
+                                               (size_t)(second + 1 - cursor),
+                                     path, sizeof(path)) != 0 ||
+            path[0] != '/') {
+            return -1;
+        }
+        if (strcmp(name, "gpg") == 0) {
+            if (have_gpg || safe_strncpy(gpg_path, path, gpg_size) != 0)
+                return -1;
+            have_gpg = true;
+        }
+        cursor = *end ? end + 1 : end;
+    }
+    return have_gpg ? 0 : -1;
+}
+
+static int gpg_bind_agent_toolchain(
+    const gpg_config_t *gpg_config, gpg_agent_config_update_t *update) {
+    char metadata[GPGCONF_METADATA_MAX];
+    char component_gpg[MAX_PATH_LEN];
+    char resolved[MAX_PATH_LEN];
+    run_launch_witness_t component_gpg_witness;
+    const char *components_argv[3];
+
+    if (!gpg_config || !gpg_config->executable_witness.valid || !update) {
+        set_error(ERR_INVALID_ARGS, "Invalid GPG agent toolchain binding");
+        return -1;
+    }
+    if (find_command_path("gpgconf", update->gpgconf_path,
+                          sizeof(update->gpgconf_path)) != 0 ||
+        !run_launch_witness_capture(update->gpgconf_path,
+                                    &update->gpgconf_witness)) {
+        set_error(ERR_SYSTEM_COMMAND_FAILED,
+                  "Cannot bind trusted gpgconf for GPG agent reload");
+        return -1;
+    }
+    components_argv[0] = update->gpgconf_path;
+    components_argv[1] = "--list-components";
+    components_argv[2] = NULL;
+    if (gpg_run_bound_capture(components_argv, &update->gpgconf_witness,
+                              metadata, sizeof(metadata)) != 0) {
+        return -1;
+    }
+    if (gpg_parse_component_gpg_path(
+            metadata, component_gpg, sizeof(component_gpg)) != 0) {
+        set_error(ERR_SYSTEM_COMMAND_FAILED,
+                  "gpgconf returned invalid GnuPG component metadata");
+        return -1;
+    }
+    if (
+        find_command_path(component_gpg, resolved, sizeof(resolved)) != 0 ||
+        !run_launch_witness_capture(resolved,
+                                    &component_gpg_witness)) {
+        set_error(ERR_SYSTEM_COMMAND_FAILED,
+                  "gpgconf returned invalid GnuPG component metadata");
+        return -1;
+    }
+    if (!run_launch_witness_matches(&component_gpg_witness,
+                                    &gpg_config->executable_witness)) {
+        set_error(ERR_SYSTEM_COMMAND_FAILED,
+                  "gpgconf describes a different GPG executable generation");
+        return -1;
+    }
+    update->gpg_config = gpg_config;
+    return 0;
+}
 
 static bool conf_bytes_have_pinentry(const unsigned char *bytes, size_t len) {
     size_t offset = 0;
@@ -7727,60 +7950,148 @@ static int gpg_open_agent_reload_state(int home_fd, int *fd_out,
  * inode plus size/mtime/ctime closes both the pre-M20 migration gap (no record)
  * and non-cooperating same-uid rewrites which leave desired bytes unchanged
  * but may have reloaded a different intermediate configuration. */
-static int gpg_format_agent_reload_clean(
-    const struct stat *config_identity, unsigned char *output,
-    size_t output_size, size_t *length_out) {
+static int gpg_append_clean_record(unsigned char *output, size_t output_size,
+                                   size_t *used, const char *format, ...) {
+    va_list args;
     int written;
+
+    if (!output || !used || *used >= output_size || !format) return -1;
+    va_start(args, format);
+    written = vsnprintf((char *)output + *used, output_size - *used,
+                        format, args);
+    va_end(args);
+    if (written < 0 || (size_t)written >= output_size - *used) return -1;
+    *used += (size_t)written;
+    return 0;
+}
+
+static int gpg_append_clean_hex(unsigned char *output, size_t output_size,
+                                size_t *used, const char *value,
+                                size_t capacity) {
+    size_t length;
+
+    if (!value || !memchr(value, '\0', capacity)) return -1;
+    length = strlen(value);
+    if (gpg_append_clean_record(output, output_size, used, "%zu:", length) != 0)
+        return -1;
+    for (size_t i = 0; i < length; i++) {
+        if (gpg_append_clean_record(output, output_size, used, "%02x",
+                                    (unsigned char)value[i]) != 0)
+            return -1;
+    }
+    return 0;
+}
+
+static int gpg_append_clean_identity(unsigned char *output,
+                                     size_t output_size, size_t *used,
+                                     const struct stat *identity) {
     intmax_t mtime_sec;
     long mtime_nsec;
     intmax_t ctime_sec;
     long ctime_nsec;
 
-    if (!config_identity || !output || output_size == 0 || !length_out ||
-        config_identity->st_size < 0) {
-        set_error(ERR_INVALID_ARGS, "Invalid GPG agent clean-state record");
+    if (!identity || identity->st_size < 0) return -1;
+#ifdef __APPLE__
+    mtime_sec = (intmax_t)identity->st_mtimespec.tv_sec;
+    mtime_nsec = identity->st_mtimespec.tv_nsec;
+    ctime_sec = (intmax_t)identity->st_ctimespec.tv_sec;
+    ctime_nsec = identity->st_ctimespec.tv_nsec;
+#else
+    mtime_sec = (intmax_t)identity->st_mtim.tv_sec;
+    mtime_nsec = identity->st_mtim.tv_nsec;
+    ctime_sec = (intmax_t)identity->st_ctim.tv_sec;
+    ctime_nsec = identity->st_ctim.tv_nsec;
+#endif
+    return gpg_append_clean_record(
+        output, output_size, used,
+        "%ju:%ju:%ju:%ju:%ju:%ju:%ju:%jd:%ld:%jd:%ld;",
+        (uintmax_t)identity->st_dev, (uintmax_t)identity->st_ino,
+        (uintmax_t)identity->st_mode, (uintmax_t)identity->st_uid,
+        (uintmax_t)identity->st_gid, (uintmax_t)identity->st_nlink,
+        (uintmax_t)identity->st_size,
+        mtime_sec, mtime_nsec, ctime_sec, ctime_nsec);
+}
+
+static int gpg_append_clean_witness(unsigned char *output,
+                                    size_t output_size, size_t *used,
+                                    const run_launch_witness_t *witness) {
+    if (!witness || !witness->valid ||
+        gpg_append_clean_record(output, output_size, used, "%u:%u:%u;",
+                                witness->valid ? 1U : 0U,
+                                witness->is_script ? 1U : 0U,
+                                witness->has_interpreter_arg ? 1U : 0U) != 0 ||
+        gpg_append_clean_identity(output, output_size, used,
+                                  &witness->executable_identity) != 0 ||
+        gpg_append_clean_identity(output, output_size, used,
+                                  &witness->interpreter_identity) != 0 ||
+        gpg_append_clean_hex(output, output_size, used,
+                             witness->executable_path,
+                             sizeof(witness->executable_path)) != 0 ||
+        gpg_append_clean_hex(output, output_size, used,
+                             witness->interpreter_argv0,
+                             sizeof(witness->interpreter_argv0)) != 0 ||
+        gpg_append_clean_hex(output, output_size, used,
+                             witness->interpreter_arg,
+                             sizeof(witness->interpreter_arg)) != 0 ||
+        gpg_append_clean_record(output, output_size, used, ";") != 0) {
         return -1;
     }
-#ifdef __APPLE__
-    mtime_sec = (intmax_t)config_identity->st_mtimespec.tv_sec;
-    mtime_nsec = config_identity->st_mtimespec.tv_nsec;
-    ctime_sec = (intmax_t)config_identity->st_ctimespec.tv_sec;
-    ctime_nsec = config_identity->st_ctimespec.tv_nsec;
-#else
-    mtime_sec = (intmax_t)config_identity->st_mtim.tv_sec;
-    mtime_nsec = config_identity->st_mtim.tv_nsec;
-    ctime_sec = (intmax_t)config_identity->st_ctim.tv_sec;
-    ctime_nsec = config_identity->st_ctim.tv_nsec;
-#endif
-    written = snprintf(
-        (char *)output, output_size,
-        "C1:%ju:%ju:%ju:%jd:%ld:%jd:%ld\n",
-        (uintmax_t)config_identity->st_dev,
-        (uintmax_t)config_identity->st_ino,
-        (uintmax_t)config_identity->st_size,
-        mtime_sec, mtime_nsec, ctime_sec, ctime_nsec);
-    if (written < 0 || (size_t)written >= output_size) {
+    return 0;
+}
+
+static int gpg_format_agent_reload_clean(
+    const struct stat *config_identity,
+    const gpg_agent_config_update_t *update, unsigned char *output,
+    size_t output_size, size_t *length_out) {
+    size_t used = 0;
+
+    if (!config_identity || !update || !update->gpg_config ||
+        !output || output_size == 0U || !length_out ||
+        gpg_append_clean_record(output, output_size, &used, "C2;") != 0 ||
+        gpg_append_clean_identity(output, output_size, &used,
+                                  config_identity) != 0 ||
+        gpg_append_clean_witness(
+            output, output_size, &used,
+            &update->gpg_config->executable_witness) != 0 ||
+        gpg_append_clean_witness(output, output_size, &used,
+                                 &update->gpgconf_witness) != 0 ||
+        gpg_append_clean_record(output, output_size, &used, "\n") != 0) {
         set_error(ERR_FILE_IO, "GPG agent clean-state record is too large");
         return -1;
     }
-    *length_out = (size_t)written;
+    *length_out = used;
     return 0;
 }
 
 static int gpg_agent_reload_state_matches_config(
     int home_fd, int state_fd, const struct stat *state_identity,
-    const struct stat *config_identity, bool *matches_out) {
-    unsigned char expected[GPG_AGENT_RELOAD_STATE_MAX];
-    unsigned char actual[GPG_AGENT_RELOAD_STATE_MAX] = {0};
+    const struct stat *config_identity,
+    const gpg_agent_config_update_t *update, bool *matches_out) {
+    unsigned char *expected;
+    unsigned char *actual;
     struct stat opened;
     struct stat named;
     size_t expected_len;
     size_t offset = 0;
 
     if (home_fd < 0 || state_fd < 0 || !state_identity ||
-        !config_identity || !matches_out ||
-        gpg_format_agent_reload_clean(config_identity, expected,
-                                      sizeof(expected), &expected_len) != 0) {
+        !config_identity || !update || !matches_out) {
+        return -1;
+    }
+    expected = malloc(GPG_AGENT_RELOAD_STATE_MAX);
+    actual = calloc(1U, GPG_AGENT_RELOAD_STATE_MAX);
+    if (!expected || !actual) {
+        free(expected);
+        free(actual);
+        set_error(ERR_MEMORY_ALLOCATION,
+                  "Failed to allocate GPG agent clean-state proof");
+        return -1;
+    }
+    if (gpg_format_agent_reload_clean(
+            config_identity, update, expected,
+            GPG_AGENT_RELOAD_STATE_MAX, &expected_len) != 0) {
+        free(expected);
+        free(actual);
         return -1;
     }
     *matches_out = false;
@@ -7797,6 +8108,8 @@ static int gpg_agent_reload_state_matches_config(
                     set_error(ERR_FILE_IO,
                               "Short read of GPG agent clean state");
                 }
+                free(expected);
+                free(actual);
                 return -1;
             }
             offset += (size_t)n;
@@ -7810,8 +8123,12 @@ static int gpg_agent_reload_state_matches_config(
         !gpg_same_file_version(state_identity, &named)) {
         set_error(ERR_FILE_IO,
                   "GPG agent clean state changed while being verified");
+        free(expected);
+        free(actual);
         return -1;
     }
+    free(expected);
+    free(actual);
     return 0;
 }
 
@@ -8071,7 +8388,7 @@ static int gpg_set_agent_reload_clean(int home_fd,
     bool matches = false;
 
     if (!update || update->marker_fd < 0 ||
-        gpg_format_agent_reload_clean(&update->config_identity, clean,
+        gpg_format_agent_reload_clean(&update->config_identity, update, clean,
                                       sizeof(clean), &clean_len) != 0 ||
         gpg_validate_agent_update_entry(
             home_fd, GPG_AGENT_RELOAD_STATE, update->marker_fd,
@@ -8121,7 +8438,7 @@ static int gpg_set_agent_reload_clean(int home_fd,
     update->marker_identity = opened;
     if (gpg_agent_reload_state_matches_config(
             home_fd, update->marker_fd, &update->marker_identity,
-            &update->config_identity, &matches) != 0) {
+            &update->config_identity, update, &matches) != 0) {
         return -1;
     }
     if (!matches) {
@@ -8142,7 +8459,7 @@ static int gpg_reload_agent_config(const gpg_pinned_home_t *home,
 
     if (!home || !update || !update->reload_required ||
         update->config_fd < 0 || update->marker_fd < 0 ||
-        update->gpgconf_path[0] != '/') {
+        !update->gpg_config || update->gpgconf_path[0] != '/') {
         set_error(ERR_INVALID_ARGS, "Invalid GPG agent reload request");
         return -1;
     }
@@ -8154,6 +8471,15 @@ static int gpg_reload_agent_config(const gpg_pinned_home_t *home,
         return -1;
     }
 
+    if (!run_launch_witness_revalidate(
+            update->gpg_config->executable_path,
+            &update->gpg_config->executable_witness) ||
+        !run_launch_witness_revalidate(update->gpgconf_path,
+                                       &update->gpgconf_witness)) {
+        set_error(ERR_SYSTEM_COMMAND_FAILED,
+                  "GnuPG reload toolchain changed before activation");
+        return -1;
+    }
     argv[0] = update->gpgconf_path;
     argv[1] = "--reload";
     argv[2] = "gpg-agent";
@@ -8166,14 +8492,20 @@ static int gpg_reload_agent_config(const gpg_pinned_home_t *home,
     opts.stderr_to_devnull = true;
     opts.cwd_fd = home->home_fd;
     opts.use_cwd_fd = true;
-    run_rc = run_argv(argv, &opts, &result);
+    run_rc = run_argv_with_expected_launch(
+        argv, &opts, &update->gpgconf_witness, &result);
     if (run_rc != 0 || !result.spawned || result.exit_code != 0 ||
-        result.term_signal != 0) {
+        result.term_signal != 0 || result.out_truncated) {
         set_error(ERR_SYSTEM_COMMAND_FAILED,
                   "Failed to reload GPG agent configuration; retry required");
         return -1;
     }
     if (gpg_validate_pinned_home(home) != 0 ||
+        !run_launch_witness_revalidate(
+            update->gpg_config->executable_path,
+            &update->gpg_config->executable_witness) ||
+        !run_launch_witness_revalidate(update->gpgconf_path,
+                                       &update->gpgconf_witness) ||
         gpg_validate_agent_config_update(home->home_fd, update) != 0 ||
         gpg_validate_agent_update_entry(
             home->home_fd, GPG_AGENT_RELOAD_STATE, update->marker_fd,
@@ -9379,8 +9711,10 @@ static void gpg_close_source_home(gpg_source_home_t *source) {
  * defaults, and a *detected* pinentry is appended only if none is already set
  * (the compiled-in default can be wrong, e.g. on FreeBSD). Re-run each switch,
  * so edits to the user's real config propagate. */
-static int setup_gpg_agent_config(int home_fd, const char *gnupg_home,
-                                  gpg_agent_config_update_t *update) {
+static int setup_gpg_agent_config(const gpg_config_t *gpg_config,
+                                  int home_fd, const char *gnupg_home,
+                                  gpg_agent_config_update_t *update,
+                                  bool bind_toolchain) {
     static const char default_conf[] =
         "# GPG Agent configuration for gitswitch isolated environment\n"
         "default-cache-ttl 3600\n"
@@ -9414,11 +9748,17 @@ static int setup_gpg_agent_config(int home_fd, const char *gnupg_home,
     struct stat matched_identity;
     gpg_source_home_t source = { .fd = -1 };
 
-    if (home_fd < 0 || !gnupg_home || !update) {
+    if ((bind_toolchain &&
+         (!gpg_config || !gpg_config->executable_witness.valid)) ||
+        home_fd < 0 || !gnupg_home || !update) {
         set_error(ERR_INVALID_ARGS, "Invalid GPG agent config destination");
         return -1;
     }
     gpg_agent_config_update_init(update);
+    if (bind_toolchain &&
+        gpg_bind_agent_toolchain(gpg_config, update) != 0) {
+        return -1;
+    }
     if (safe_snprintf(gpg_agent_conf_path, sizeof(gpg_agent_conf_path),
                       "%s/gpg-agent.conf", gnupg_home) != 0) {
         set_error(ERR_INVALID_PATH, "GPG agent config path too long");
@@ -9587,10 +9927,10 @@ static int setup_gpg_agent_config(int home_fd, const char *gnupg_home,
                 &state_present, &state_pending) != 0) {
             goto fail;
         }
-        if (state_present && !state_pending &&
+        if (bind_toolchain && state_present && !state_pending &&
             gpg_agent_reload_state_matches_config(
                 home_fd, update->marker_fd, &update->marker_identity,
-                &matched_identity, &state_matches) != 0) {
+                &matched_identity, update, &state_matches) != 0) {
             goto fail;
         }
         if (state_matches &&
@@ -9615,16 +9955,6 @@ static int setup_gpg_agent_config(int home_fd, const char *gnupg_home,
             log_debug("Reused unchanged GPG agent configuration: %s",
                       gpg_agent_conf_path);
             return 0;
-        }
-        if (find_command_path("gpgconf", update->gpgconf_path,
-                              sizeof(update->gpgconf_path)) != 0) {
-            int resolve_errno = errno;
-            errno = resolve_errno;
-            set_system_error(
-                ERR_SYSTEM_COMMAND_FAILED,
-                "Cannot resolve trusted gpgconf for GPG agent reload");
-            errno = resolve_errno;
-            goto fail;
         }
         update->config_fd = matched_fd;
         update->config_identity = matched_identity;
@@ -9710,16 +10040,6 @@ static int setup_gpg_agent_config(int home_fd, const char *gnupg_home,
         (entry.st_mode & 0777) != 0600) {
         set_error(ERR_FILE_IO,
                   "Temporary gpg-agent.conf changed before atomic commit");
-        goto fail;
-    }
-    if (find_command_path("gpgconf", update->gpgconf_path,
-                          sizeof(update->gpgconf_path)) != 0) {
-        int resolve_errno = errno;
-        errno = resolve_errno;
-        set_system_error(
-            ERR_SYSTEM_COMMAND_FAILED,
-            "Cannot resolve trusted gpgconf for GPG agent reload");
-        errno = resolve_errno;
         goto fail;
     }
     if (gpg_open_agent_reload_state(
@@ -9817,7 +10137,7 @@ int gpg_manager_setup_agent_config_for_test(int home_fd,
     int rc;
 
     gpg_agent_config_update_init(&update);
-    rc = setup_gpg_agent_config(home_fd, gnupg_home, &update);
+    rc = setup_gpg_agent_config(NULL, home_fd, gnupg_home, &update, false);
     close_rc = gpg_agent_config_update_close(&update);
     if (rc == 0 && close_rc != 0) {
         set_system_error(ERR_FILE_IO,

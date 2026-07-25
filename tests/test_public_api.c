@@ -315,6 +315,9 @@ TEST(all_retained_public_apis_compile_and_link) {
     REQUIRE_PUBLIC_API(read_file_to_string);
     REQUIRE_PUBLIC_API(run_argv);
     REQUIRE_PUBLIC_API(run_argv_real);
+    REQUIRE_PUBLIC_API(run_argv_with_expected_launch);
+    REQUIRE_PUBLIC_API(run_launch_witness_capture);
+    REQUIRE_PUBLIC_API(run_launch_witness_matches);
     REQUIRE_PUBLIC_API(run_launch_witness_revalidate);
     REQUIRE_PUBLIC_API(run_set_runner);
     REQUIRE_PUBLIC_API(run_test_fd_close_bulk_supported);

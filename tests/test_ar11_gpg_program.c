@@ -3,6 +3,7 @@
 #include "error.h"
 #include "gitswitch.h"
 #include "gpg_manager.h"
+#include "runner_internal.h"
 #include "utils.h"
 
 #include <errno.h>
@@ -29,6 +30,12 @@ static char g_m15_rebind_source[MAX_PATH_LEN];
 static char g_m15_rebind_old[MAX_PATH_LEN];
 static int g_m15_rebind_hook_calls;
 static int g_m15_rebind_hook_result;
+static char g_m20_mutate_path[MAX_PATH_LEN];
+static int g_m20_mutate_hook_calls;
+static int g_m20_mutate_hook_result;
+static run_launch_witness_t g_m20_injected_witness;
+static bool g_m20_injected_returns_witness;
+static bool g_m20_injected_returns_mismatch;
 
 static int m15_binary_helper_run(void) {
     const char *counter = getenv("GPG_M15_COUNTER");
@@ -255,6 +262,68 @@ static int m15_replace_binary_program(const m15_fixture_t *fixture) {
     return 0;
 }
 
+static bool m20_capture_program(const char *path, char *canonical,
+                                size_t canonical_size,
+                                run_launch_witness_t *witness) {
+    char resolved[MAX_PATH_LEN];
+
+    if (!path || !canonical || canonical_size == 0 || !witness ||
+        !realpath(path, resolved) ||
+        safe_strncpy(canonical, resolved, canonical_size) != 0) {
+        return false;
+    }
+    return run_launch_witness_capture(canonical, witness);
+}
+
+static int m20_replace_interpreter(const char *source,
+                                   const char *interpreter) {
+    char replacement[MAX_PATH_LEN];
+
+    if (!source || !interpreter ||
+        safe_snprintf(replacement, sizeof(replacement), "%s.replacement",
+                      interpreter) != 0) {
+        errno = EINVAL;
+        return -1;
+    }
+    (void)unlink(replacement);
+    if (copy_file(source, replacement) != 0 ||
+        chmod(replacement, 0700) != 0 ||
+        rename(replacement, interpreter) != 0) {
+        int saved_errno = errno;
+
+        (void)unlink(replacement);
+        errno = saved_errno;
+        return -1;
+    }
+    return 0;
+}
+
+static void m20_mutate_opened_program_hook(const char *resolved_path) {
+    if (!resolved_path || strcmp(resolved_path, g_m20_mutate_path) != 0) {
+        return;
+    }
+    g_m20_mutate_hook_calls++;
+    g_m20_mutate_hook_result = chmod(resolved_path, 0600);
+}
+
+static int m20_injected_runner(const char *const argv[],
+                               const run_opts_t *opts,
+                               run_result_t *result) {
+    (void)argv;
+    if (opts && opts->out && opts->out_size > 0) opts->out[0] = '\0';
+    if (result) {
+        result->spawned = true;
+        result->exit_code = 0;
+        if (g_m20_injected_returns_witness) {
+            result->launch_witness = g_m20_injected_witness;
+            if (g_m20_injected_returns_mismatch) {
+                result->launch_witness.executable_identity.st_ino++;
+            }
+        }
+    }
+    return 0;
+}
+
 static int m15_create_deep_home(const m15_fixture_t *fixture,
                                 unsigned int depth) {
     char parent[MAX_PATH_LEN];
@@ -359,6 +428,11 @@ static int recording_listing_runner(const char *const argv[],
         memset(result, 0, sizeof(*result));
         result->spawned = true;
         result->exit_code = 0;
+        if (!argv || !argv[0] ||
+            !run_launch_witness_capture(
+                argv[0], &result->launch_witness)) {
+            return -1;
+        }
     }
     /* The switch may grow adjacent Git publication calls. They are outside
      * this test's boundary and must neither fail nor replace the observed GPG
@@ -834,6 +908,254 @@ TEST(unexpected_structured_listing_never_promotes_cache_entry) {
     m15_fixture_cleanup(&fixture);
 }
 
+TEST(expected_launch_rejects_binary_replacement_before_fork) {
+    m15_fixture_t fixture;
+    saved_environment_t helper_environment;
+    run_launch_witness_t expected;
+    run_launch_witness_t replacement;
+    run_result_t result;
+    char canonical[MAX_PATH_LEN];
+    const char *argv[2];
+    bool helper_saved = false;
+
+    if (!g_m15_self_path[0]) {
+        TS_SKIP("exec", "cannot resolve the compiled binary fixture");
+    }
+    if (!m15_fixture_setup(&fixture, "gitswitch-ar14-m20-binary")) {
+        CHECK(!"failed to prepare M20 binary fixture");
+        return;
+    }
+    if (save_environment("GITSWITCH_TEST_M15_BINARY_HELPER",
+                         &helper_environment) != 0) {
+        CHECK(!"failed to save binary-helper environment");
+        m15_fixture_cleanup(&fixture);
+        return;
+    }
+    helper_saved = true;
+    if (setenv("GITSWITCH_TEST_M15_BINARY_HELPER", "1", 1) != 0 ||
+        m15_install_binary_program(g_m15_self_path, fixture.program) != 0 ||
+        !m20_capture_program(fixture.program, canonical,
+                             sizeof(canonical), &expected) ||
+        m15_replace_binary_program(&fixture) != 0 ||
+        !run_launch_witness_capture(canonical, &replacement)) {
+        CHECK(!"failed to prepare M20 binary replacement");
+        goto cleanup;
+    }
+
+    CHECK(!run_launch_witness_matches(&expected, &replacement));
+    argv[0] = canonical;
+    argv[1] = NULL;
+    memset(&result, 0xa5, sizeof(result));
+    clear_error();
+    CHECK_EQ_INT(run_argv_with_expected_launch(
+                     argv, NULL, &expected, &result), -1);
+    CHECK_EQ_INT(get_last_error()->code, ERR_PERMISSION_DENIED);
+    CHECK(!result.spawned);
+    CHECK_EQ_INT((int)m15_listing_call_count(&fixture), 0);
+
+cleanup:
+    if (helper_saved) {
+        CHECK_EQ_INT(restore_environment(
+                         "GITSWITCH_TEST_M15_BINARY_HELPER",
+                         &helper_environment), 0);
+    }
+    m15_fixture_cleanup(&fixture);
+}
+
+TEST(expected_launch_rejects_script_replacement_before_fork) {
+    m15_fixture_t fixture;
+    run_launch_witness_t expected;
+    run_launch_witness_t replacement;
+    run_result_t result;
+    char canonical[MAX_PATH_LEN];
+    const char *argv[2];
+
+    if (!m15_fixture_setup(&fixture, "gitswitch-ar14-m20-script")) {
+        CHECK(!"failed to prepare M20 script fixture");
+        return;
+    }
+    if (m15_write_program_at(fixture.program, "/bin/sh", NULL,
+                             "script-generation-a", true) != 0 ||
+        !m20_capture_program(fixture.program, canonical,
+                             sizeof(canonical), &expected) ||
+        m15_replace_program(&fixture, "/bin/sh", NULL,
+                            "script-generation-b", true) != 0 ||
+        !run_launch_witness_capture(canonical, &replacement)) {
+        CHECK(!"failed to prepare M20 script replacement");
+        m15_fixture_cleanup(&fixture);
+        return;
+    }
+
+    CHECK(expected.is_script);
+    CHECK(!run_launch_witness_matches(&expected, &replacement));
+    errno = 0;
+    CHECK(!run_launch_witness_revalidate(canonical, &expected));
+    CHECK_EQ_INT(errno, ESTALE);
+    argv[0] = canonical;
+    argv[1] = NULL;
+    memset(&result, 0xa5, sizeof(result));
+    clear_error();
+    CHECK_EQ_INT(run_argv_with_expected_launch(
+                     argv, NULL, &expected, &result), -1);
+    CHECK_EQ_INT(get_last_error()->code, ERR_PERMISSION_DENIED);
+    CHECK(!result.spawned);
+    CHECK_EQ_INT((int)m15_listing_call_count(&fixture), 0);
+    m15_fixture_cleanup(&fixture);
+}
+
+TEST(expected_launch_rejects_interpreter_replacement_before_fork) {
+    m15_fixture_t fixture;
+    run_launch_witness_t expected;
+    run_launch_witness_t replacement;
+    run_result_t result;
+    char shell[MAX_PATH_LEN];
+    char interpreter[MAX_PATH_LEN];
+    char canonical[MAX_PATH_LEN];
+    const char *argv[2];
+
+    if (!m15_fixture_setup(&fixture,
+                           "gitswitch-ar14-m20-interpreter")) {
+        CHECK(!"failed to prepare M20 interpreter fixture");
+        return;
+    }
+    if (find_command_path("/bin/sh", shell, sizeof(shell)) != 0 ||
+        safe_snprintf(interpreter, sizeof(interpreter), "%s/interpreter",
+                      fixture.bin) != 0 ||
+        strlen(interpreter) >= 240U) {
+        m15_fixture_cleanup(&fixture);
+        TS_SKIP("exec", "trusted interpreter fixture is unavailable");
+    }
+    if (copy_file(shell, interpreter) != 0 ||
+        chmod(interpreter, 0700) != 0 ||
+        m15_write_program_at(fixture.program, interpreter, "-e",
+                             "interpreter-generation", true) != 0 ||
+        !m20_capture_program(fixture.program, canonical,
+                             sizeof(canonical), &expected) ||
+        m20_replace_interpreter(shell, interpreter) != 0 ||
+        !run_launch_witness_capture(canonical, &replacement)) {
+        CHECK(!"failed to prepare M20 interpreter replacement");
+        m15_fixture_cleanup(&fixture);
+        return;
+    }
+
+    CHECK(expected.is_script);
+    CHECK(expected.has_interpreter_arg);
+    CHECK_STR_EQ(expected.interpreter_arg, "-e");
+    CHECK(!run_launch_witness_matches(&expected, &replacement));
+    argv[0] = canonical;
+    argv[1] = NULL;
+    memset(&result, 0xa5, sizeof(result));
+    clear_error();
+    CHECK_EQ_INT(run_argv_with_expected_launch(
+                     argv, NULL, &expected, &result), -1);
+    CHECK_EQ_INT(get_last_error()->code, ERR_PERMISSION_DENIED);
+    CHECK(!result.spawned);
+    CHECK_EQ_INT((int)m15_listing_call_count(&fixture), 0);
+    m15_fixture_cleanup(&fixture);
+}
+
+TEST(expected_launch_rechecks_opened_generation_before_fork) {
+    m15_fixture_t fixture;
+    run_launch_witness_t expected;
+    run_result_t result;
+    char canonical[MAX_PATH_LEN];
+    const char *argv[2];
+    int run_rc;
+
+    if (!m15_fixture_setup(&fixture, "gitswitch-ar14-m20-opened")) {
+        CHECK(!"failed to prepare M20 opened-generation fixture");
+        return;
+    }
+    if (m15_write_program_at(fixture.program, "/bin/sh", NULL,
+                             "opened-generation", true) != 0 ||
+        !m20_capture_program(fixture.program, canonical,
+                             sizeof(canonical), &expected) ||
+        safe_strncpy(g_m20_mutate_path, canonical,
+                     sizeof(g_m20_mutate_path)) != 0) {
+        CHECK(!"failed to prepare M20 opened-generation witness");
+        m15_fixture_cleanup(&fixture);
+        return;
+    }
+
+    g_m20_mutate_hook_calls = 0;
+    g_m20_mutate_hook_result = -1;
+    argv[0] = canonical;
+    argv[1] = NULL;
+    memset(&result, 0xa5, sizeof(result));
+    clear_error();
+    run_test_set_exec_resolved_hook(m20_mutate_opened_program_hook);
+    run_rc = run_argv_with_expected_launch(
+        argv, NULL, &expected, &result);
+    run_test_set_exec_resolved_hook(NULL);
+
+    CHECK_EQ_INT(g_m20_mutate_hook_calls, 1);
+    CHECK_EQ_INT(g_m20_mutate_hook_result, 0);
+    CHECK_EQ_INT(run_rc, -1);
+    CHECK_EQ_INT(get_last_error()->code, ERR_PERMISSION_DENIED);
+    CHECK(!result.spawned);
+    CHECK_EQ_INT((int)m15_listing_call_count(&fixture), 0);
+    m15_fixture_cleanup(&fixture);
+}
+
+TEST(injected_expected_launch_requires_matching_witness) {
+    m15_fixture_t fixture;
+    run_launch_witness_t expected;
+    run_result_t result;
+    command_runner_fn previous_runner;
+    char canonical[MAX_PATH_LEN];
+    const char *argv[2];
+
+    if (!m15_fixture_setup(&fixture, "gitswitch-ar14-m20-injected")) {
+        CHECK(!"failed to prepare M20 injected-runner fixture");
+        return;
+    }
+    if (m15_write_program_at(fixture.program, "/bin/sh", NULL,
+                             "injected-runner", true) != 0 ||
+        !m20_capture_program(fixture.program, canonical,
+                             sizeof(canonical), &expected)) {
+        CHECK(!"failed to capture M20 injected-runner witness");
+        m15_fixture_cleanup(&fixture);
+        return;
+    }
+
+    argv[0] = canonical;
+    argv[1] = NULL;
+    g_m20_injected_witness = expected;
+    g_m20_injected_returns_witness = false;
+    g_m20_injected_returns_mismatch = false;
+    previous_runner = run_set_runner(m20_injected_runner);
+
+    memset(&result, 0, sizeof(result));
+    CHECK_EQ_INT(run_argv(argv, NULL, &result), 0);
+    CHECK(!result.launch_witness.valid);
+
+    memset(&result, 0, sizeof(result));
+    clear_error();
+    CHECK_EQ_INT(run_argv_with_expected_launch(
+                     argv, NULL, &expected, &result), -1);
+    CHECK_EQ_INT(get_last_error()->code, ERR_PERMISSION_DENIED);
+
+    g_m20_injected_returns_witness = true;
+    g_m20_injected_returns_mismatch = true;
+    memset(&result, 0, sizeof(result));
+    clear_error();
+    CHECK_EQ_INT(run_argv_with_expected_launch(
+                     argv, NULL, &expected, &result), -1);
+    CHECK_EQ_INT(get_last_error()->code, ERR_PERMISSION_DENIED);
+
+    g_m20_injected_returns_mismatch = false;
+    memset(&result, 0, sizeof(result));
+    CHECK_EQ_INT(run_argv_with_expected_launch(
+                     argv, NULL, &expected, &result), 0);
+    CHECK(run_launch_witness_matches(
+        &expected, &result.launch_witness));
+    CHECK_EQ_INT(run_argv_with_expected_launch(
+                     argv, NULL, &expected, NULL), 0);
+
+    run_set_runner(previous_runner);
+    m15_fixture_cleanup(&fixture);
+}
+
 TEST(script_cache_binds_same_path_interpreter_generation) {
     m15_fixture_t fixture;
     char shell[MAX_PATH_LEN];
@@ -1065,6 +1387,11 @@ int main(int argc, char *argv[]) {
     RUN_TEST(signing_capability_requires_its_own_proof);
     RUN_TEST(failed_listing_never_promotes_cache_entry);
     RUN_TEST(unexpected_structured_listing_never_promotes_cache_entry);
+    RUN_TEST(expected_launch_rejects_binary_replacement_before_fork);
+    RUN_TEST(expected_launch_rejects_script_replacement_before_fork);
+    RUN_TEST(expected_launch_rejects_interpreter_replacement_before_fork);
+    RUN_TEST(expected_launch_rechecks_opened_generation_before_fork);
+    RUN_TEST(injected_expected_launch_requires_matching_witness);
     RUN_TEST(script_cache_binds_same_path_interpreter_generation);
     RUN_TEST(selector_only_note_never_authorizes_production_cache);
     RUN_TEST(cache_hit_revalidates_public_source_binding_after_final_scan);

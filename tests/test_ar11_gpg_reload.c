@@ -11,6 +11,7 @@
 #include "error.h"
 #include "gitswitch.h"
 #include "gpg_manager.h"
+#include "runner_internal.h"
 #include "utils.h"
 
 #include <errno.h>
@@ -50,8 +51,8 @@ typedef struct {
 typedef struct {
     char root[MAX_PATH_LEN];
     char tools[MAX_PATH_LEN];
+    char gpg[MAX_PATH_LEN];
     char gpgconf[MAX_PATH_LEN];
-    char gpg_connect_agent[MAX_PATH_LEN];
     char base[MAX_PATH_LEN];
     char home[MAX_PATH_LEN];
     char current[MAX_PATH_LEN];
@@ -64,12 +65,26 @@ typedef struct {
 
 static char g_self_executable[MAX_PATH_LEN];
 static char g_expected_home[MAX_PATH_LEN];
+static char g_expected_gpg[MAX_PATH_LEN];
+static char g_expected_gpgconf[MAX_PATH_LEN];
 static const char *g_expected_reload_config;
 static int g_reload_calls;
 static int g_reload_protocol_errors;
 static int g_gpg_listing_calls;
 static int g_config_commits;
 static bool g_fail_reload;
+typedef enum {
+    M20_COMPONENT_METADATA_VALID = 0,
+    M20_COMPONENT_METADATA_MISMATCHED_GPG,
+    M20_COMPONENT_METADATA_DUPLICATE_GPG,
+    M20_COMPONENT_METADATA_MISSING_GPG,
+    M20_COMPONENT_METADATA_MALFORMED_ESCAPE,
+    M20_COMPONENT_METADATA_EXTRA_FIELD,
+    M20_COMPONENT_METADATA_NONABSOLUTE_PATH
+} m20_component_metadata_t;
+static m20_component_metadata_t g_component_metadata;
+static bool g_replace_gpgconf_after_components;
+static bool g_replace_toolchain_after_reload;
 static int g_live_reload_calls;
 static int g_sync_file_calls;
 static int g_sync_directory_calls;
@@ -165,9 +180,23 @@ static int m20_read_config_at(int home_fd, char *output, size_t output_size) {
 static bool m20_reload_shape_is_exact(const char *const argv[]) {
     return argv && argv[0] && argv[1] && argv[2] && !argv[3] &&
            argv[0][0] == '/' &&
-           ts_command_is(argv[0], "gpgconf") &&
+           strcmp(argv[0], g_expected_gpgconf) == 0 &&
            strcmp(argv[1], "--reload") == 0 &&
            strcmp(argv[2], "gpg-agent") == 0;
+}
+
+static int m20_replace_gpgconf(const char *path) {
+    char replacement[MAX_PATH_LEN];
+
+    if (!path ||
+        safe_snprintf(replacement, sizeof(replacement), "%s.new", path) != 0 ||
+        copy_file(g_self_executable, replacement) != 0 ||
+        chmod(replacement, 0755) != 0 ||
+        rename(replacement, path) != 0) {
+        (void)unlink(replacement);
+        return -1;
+    }
+    return 0;
 }
 
 static bool m20_same_ctime(const struct stat *left,
@@ -230,6 +259,10 @@ static int m20_runner(const char *const argv[], const run_opts_t *opts,
         memset(result, 0, sizeof(*result));
         result->spawned = true;
         result->exit_code = 0;
+        if (argv && argv[0]) {
+            CHECK(run_launch_witness_capture(
+                argv[0], &result->launch_witness));
+        }
     }
     if (opts && opts->out && opts->out_size > 0) opts->out[0] = '\0';
     if (argv && argv[0] &&
@@ -237,44 +270,106 @@ static int m20_runner(const char *const argv[], const run_opts_t *opts,
          ts_command_is(argv[0], "gpg2") ||
          ts_command_is(argv[0], "gpgconf"))) {
         CHECK(m20_unsets_env(opts, "GPG_AGENT_INFO"));
+        CHECK(m20_unsets_env(opts, "GNUPG_BUILDDIR"));
+        CHECK(m20_unsets_env(opts, "GNUPG_BUILD_ROOT"));
     }
 
     if (argv && argv[0] && ts_command_is(argv[0], "gpgconf")) {
-        char installed[512];
-        struct stat expected;
-        struct stat pinned;
-        const char *gnupg_home = m20_extra_env(opts, "GNUPGHOME=");
+        if (argv[1] && strcmp(argv[1], "--list-components") == 0 &&
+            !argv[2]) {
+            int written;
 
-        g_reload_calls++;
-        if (!m20_reload_shape_is_exact(argv) || !opts ||
-            !opts->use_cwd_fd || opts->cwd_fd < 0 ||
-            !gnupg_home || strcmp(gnupg_home, ".") != 0 ||
-            stat(g_expected_home, &expected) != 0 ||
-            fstat(opts->cwd_fd, &pinned) != 0 ||
-            expected.st_dev != pinned.st_dev ||
-            expected.st_ino != pinned.st_ino ||
-            m20_read_config_at(opts->cwd_fd, installed,
-                               sizeof(installed)) != 0 ||
-            !g_expected_reload_config ||
-            strcmp(installed, g_expected_reload_config) != 0) {
-            g_reload_protocol_errors++;
-            if (result) result->exit_code = 8;
-            return -1;
+            switch (g_component_metadata) {
+                case M20_COMPONENT_METADATA_MISMATCHED_GPG:
+                    written = snprintf(opts->out, opts->out_size,
+                                       "gpg:OpenPGP:%s:\n", argv[0]);
+                    break;
+                case M20_COMPONENT_METADATA_DUPLICATE_GPG:
+                    written = snprintf(opts->out, opts->out_size,
+                                       "gpg:OpenPGP:%s:\n"
+                                       "gpg:OpenPGP:%s:\n",
+                                       g_expected_gpg, g_expected_gpg);
+                    break;
+                case M20_COMPONENT_METADATA_MISSING_GPG:
+                    written = snprintf(opts->out, opts->out_size,
+                                       "gpgsm:S/MIME:%s:\n",
+                                       g_expected_gpg);
+                    break;
+                case M20_COMPONENT_METADATA_MALFORMED_ESCAPE:
+                    written = snprintf(opts->out, opts->out_size,
+                                       "gpg:OpenPGP:%s%%Q0:\n",
+                                       g_expected_gpg);
+                    break;
+                case M20_COMPONENT_METADATA_EXTRA_FIELD:
+                    written = snprintf(opts->out, opts->out_size,
+                                       "gpg:OpenPGP:%s:unexpected:\n",
+                                       g_expected_gpg);
+                    break;
+                case M20_COMPONENT_METADATA_NONABSOLUTE_PATH:
+                    written = snprintf(opts->out, opts->out_size,
+                                       "gpg:OpenPGP:relative-gpg:\n");
+                    break;
+                case M20_COMPONENT_METADATA_VALID:
+                default:
+                    written = snprintf(opts->out, opts->out_size,
+                                       "gpg:OpenPGP:%s:\n",
+                                       g_expected_gpg);
+                    break;
+            }
+            if (written < 0 || (size_t)written >= opts->out_size) {
+                if (result) result->out_truncated = true;
+                return -1;
+            }
+            if (result) result->out_len = (size_t)written;
+            if (g_replace_gpgconf_after_components) {
+                g_replace_gpgconf_after_components = false;
+                CHECK_EQ_INT(m20_replace_gpgconf(argv[0]), 0);
+            }
+            return 0;
         }
-        if (g_reload_mutation != M20_RELOAD_MUTATION_NONE) {
-            m20_reload_mutation_t mutation = g_reload_mutation;
-            g_reload_mutation = M20_RELOAD_MUTATION_NONE;
-            if (m20_mutate_config_during_reload(mutation) != 0) {
+        if (m20_reload_shape_is_exact(argv)) {
+            char installed[512];
+            struct stat expected;
+            struct stat pinned;
+            const char *gnupg_home = m20_extra_env(opts, "GNUPGHOME=");
+
+            g_reload_calls++;
+            if (!opts || !opts->use_cwd_fd || opts->cwd_fd < 0 ||
+                !gnupg_home || strcmp(gnupg_home, ".") != 0 ||
+                stat(g_expected_home, &expected) != 0 ||
+                fstat(opts->cwd_fd, &pinned) != 0 ||
+                expected.st_dev != pinned.st_dev ||
+                expected.st_ino != pinned.st_ino ||
+                m20_read_config_at(opts->cwd_fd, installed,
+                                   sizeof(installed)) != 0 ||
+                !g_expected_reload_config ||
+                strcmp(installed, g_expected_reload_config) != 0) {
                 g_reload_protocol_errors++;
                 if (result) result->exit_code = 8;
                 return -1;
             }
+            if (g_reload_mutation != M20_RELOAD_MUTATION_NONE) {
+                m20_reload_mutation_t mutation = g_reload_mutation;
+                g_reload_mutation = M20_RELOAD_MUTATION_NONE;
+                if (m20_mutate_config_during_reload(mutation) != 0) {
+                    g_reload_protocol_errors++;
+                    if (result) result->exit_code = 8;
+                    return -1;
+                }
+            }
+            if (g_fail_reload) {
+                if (result) result->exit_code = 9;
+                return -1;
+            }
+            if (g_replace_toolchain_after_reload) {
+                g_replace_toolchain_after_reload = false;
+                CHECK_EQ_INT(m20_replace_gpgconf(g_expected_gpg), 0);
+                CHECK_EQ_INT(m20_replace_gpgconf(g_expected_gpgconf), 0);
+            }
+            return 0;
         }
-        if (g_fail_reload) {
-            if (result) result->exit_code = 9;
-            return -1;
-        }
-        return 0;
+        if (result) result->exit_code = 8;
+        return -1;
     }
 
     if (argv && argv[0] &&
@@ -395,15 +490,24 @@ static void m20_reset_observation(const m20_fixture_t *fixture,
                                   const char *expected_config,
                                   bool fail_reload) {
     g_expected_home[0] = '\0';
+    g_expected_gpg[0] = '\0';
+    g_expected_gpgconf[0] = '\0';
     if (fixture) {
         (void)safe_strncpy(g_expected_home, fixture->home,
                            sizeof(g_expected_home));
+        (void)safe_strncpy(g_expected_gpg, fixture->gpg,
+                           sizeof(g_expected_gpg));
+        (void)safe_strncpy(g_expected_gpgconf, fixture->gpgconf,
+                           sizeof(g_expected_gpgconf));
     }
     g_expected_reload_config = expected_config;
     g_reload_calls = 0;
     g_reload_protocol_errors = 0;
     g_gpg_listing_calls = 0;
     g_fail_reload = fail_reload;
+    g_component_metadata = M20_COMPONENT_METADATA_VALID;
+    g_replace_gpgconf_after_components = false;
+    g_replace_toolchain_after_reload = false;
     g_reload_mutation = M20_RELOAD_MUTATION_NONE;
 }
 
@@ -411,41 +515,27 @@ static void m20_remove_private_tools(m20_fixture_t *fixture) {
     if (!fixture || fixture->tools[0] == '\0') return;
     ts_rm_rf(fixture->tools);
     fixture->tools[0] = '\0';
+    fixture->gpg[0] = '\0';
     fixture->gpgconf[0] = '\0';
-    fixture->gpg_connect_agent[0] = '\0';
 }
 
 static int m20_create_private_tool_copies(
-    m20_fixture_t *fixture, const char *gpgconf_source,
-    const char *gpg_connect_agent_source) {
-    const char *leaf;
-    size_t parent_len;
-
-    if (!fixture || !gpgconf_source || !gpg_connect_agent_source ||
-        g_self_executable[0] != '/') {
+    m20_fixture_t *fixture, const char *gpgconf_source) {
+    if (!fixture || !gpgconf_source || g_self_executable[0] != '/') {
         errno = EINVAL;
         return -1;
     }
-    leaf = strrchr(g_self_executable, '/');
-    if (!leaf || leaf == g_self_executable) return -1;
-    parent_len = (size_t)(leaf - g_self_executable);
-    if (parent_len + sizeof("/.gitswitch-ar11-reload-tools.XXXXXX") >
-            sizeof(fixture->tools) ||
-        snprintf(fixture->tools, sizeof(fixture->tools),
-                 "%.*s/.gitswitch-ar11-reload-tools.XXXXXX",
-                 (int)parent_len, g_self_executable) < 0 ||
-        !ts_mkdtemp(fixture->tools) ||
+    if (!ts_mkdtemp_trusted(fixture->tools, sizeof(fixture->tools),
+                            "gitswitch-ar11-reload-tools") ||
         chmod(fixture->tools, 0700) != 0 ||
         safe_snprintf(fixture->gpgconf, sizeof(fixture->gpgconf),
                       "%s/gpgconf", fixture->tools) != 0 ||
-        safe_snprintf(fixture->gpg_connect_agent,
-                      sizeof(fixture->gpg_connect_agent),
-                      "%s/gpg-connect-agent", fixture->tools) != 0 ||
+        safe_snprintf(fixture->gpg, sizeof(fixture->gpg),
+                      "%s/gpg", fixture->tools) != 0 ||
         copy_file(gpgconf_source, fixture->gpgconf) != 0 ||
-        chmod(fixture->gpgconf, 0700) != 0 ||
-        copy_file(gpg_connect_agent_source,
-                  fixture->gpg_connect_agent) != 0 ||
-        chmod(fixture->gpg_connect_agent, 0700) != 0) {
+        chmod(fixture->gpgconf, 0755) != 0 ||
+        copy_file(gpgconf_source, fixture->gpg) != 0 ||
+        chmod(fixture->gpg, 0755) != 0) {
         int saved_errno = errno ? errno : EIO;
 
         m20_remove_private_tools(fixture);
@@ -487,8 +577,7 @@ static int m20_use_private_tools_path(const m20_fixture_t *fixture,
 }
 
 static int m20_install_private_tools(m20_fixture_t *fixture) {
-    if (m20_create_private_tool_copies(
-            fixture, g_self_executable, g_self_executable) != 0) {
+    if (m20_create_private_tool_copies(fixture, g_self_executable) != 0) {
         return -1;
     }
     if (m20_use_private_tools_path(fixture, false) != 0) {
@@ -501,90 +590,19 @@ static int m20_install_private_tools(m20_fixture_t *fixture) {
     return 0;
 }
 
-/* Homebrew intentionally lives below a group-writable prefix that production
- * must reject. For the one test that exercises a real retained GPG agent,
- * locate the provisioned bytes without executing them; private copies are
- * then resolved and launched through the normal production trust boundary. */
-static int m20_find_provisioned_tool(const char *name, char *output,
-                                     size_t output_size) {
-    const char *path = getenv("PATH");
-    const char *cursor;
-    size_t name_len;
-
-    if (!name || !*name || !output || output_size == 0U) {
-        errno = EINVAL;
-        return -1;
-    }
-    if (!path) {
-        errno = ENOENT;
-        return -1;
-    }
-    name_len = strlen(name);
-    cursor = path;
-    while (true) {
-        const char *separator = strchr(cursor, ':');
-        size_t directory_len = separator
-                                   ? (size_t)(separator - cursor)
-                                   : strlen(cursor);
-
-        if (directory_len > 0U &&
-            directory_len <= SIZE_MAX - name_len - 2U &&
-            directory_len + name_len + 2U <= output_size &&
-            directory_len + name_len + 2U <= MAX_PATH_LEN) {
-            char candidate[MAX_PATH_LEN];
-            char resolved[MAX_PATH_LEN];
-            struct stat st;
-
-            memcpy(candidate, cursor, directory_len);
-            candidate[directory_len] = '/';
-            memcpy(candidate + directory_len + 1U, name, name_len + 1U);
-            if (realpath(candidate, resolved) &&
-                stat(resolved, &st) == 0 && S_ISREG(st.st_mode) &&
-                (st.st_mode & (S_IXUSR | S_IXGRP | S_IXOTH)) != 0 &&
-                access(resolved, X_OK) == 0 &&
-                safe_strncpy(output, resolved, output_size) == 0) {
-                return 0;
-            }
-        }
-        if (!separator) break;
-        cursor = separator + 1;
-    }
-    errno = ENOENT;
-    return -1;
-}
-
-/* Return 0 when real tools are ready, 1 when the host has none, and -1 for a
- * fixture failure. The caller owns PATH restoration and fixture cleanup. */
+/* Return 0 when one installed GnuPG suite is available and 1 otherwise. */
 static int m20_prepare_live_tools(m20_fixture_t *fixture) {
-    char gpgconf_source[MAX_PATH_LEN];
-    char connect_source[MAX_PATH_LEN];
-    char resolved[MAX_PATH_LEN];
+    char connect[MAX_PATH_LEN];
 
-    if (find_command_path("gpgconf", resolved, sizeof(resolved)) == 0 &&
-        find_command_path("gpg-connect-agent", resolved,
-                          sizeof(resolved)) == 0) {
+    if (find_command_path("gpg", fixture->gpg,
+                          sizeof(fixture->gpg)) == 0 &&
+        find_command_path("gpgconf", fixture->gpgconf,
+                          sizeof(fixture->gpgconf)) == 0 &&
+        find_command_path("gpg-connect-agent", connect,
+                          sizeof(connect)) == 0) {
         return 0;
     }
-    if (m20_find_provisioned_tool("gpgconf", gpgconf_source,
-                                  sizeof(gpgconf_source)) != 0 ||
-        m20_find_provisioned_tool("gpg-connect-agent", connect_source,
-                                  sizeof(connect_source)) != 0) {
-        return 1;
-    }
-    if (m20_create_private_tool_copies(
-            fixture, gpgconf_source, connect_source) != 0 ||
-        m20_use_private_tools_path(fixture, true) != 0) {
-        return -1;
-    }
-    if (find_command_path("gpgconf", resolved, sizeof(resolved)) != 0 ||
-        strcmp(resolved, fixture->gpgconf) != 0 ||
-        find_command_path("gpg-connect-agent", resolved,
-                          sizeof(resolved)) != 0 ||
-        strcmp(resolved, fixture->gpg_connect_agent) != 0) {
-        errno = errno ? errno : ENOEXEC;
-        return -1;
-    }
-    return 0;
+    return 1;
 }
 
 static int m20_make_fixture(m20_fixture_t *fixture,
@@ -638,13 +656,20 @@ static int m20_make_fixture(m20_fixture_t *fixture,
     return 0;
 }
 
-static void m20_prepare_config(gpg_config_t *config) {
+static void m20_prepare_config(gpg_config_t *config,
+                               const m20_fixture_t *fixture) {
     memset(config, 0, sizeof(*config));
     config->mode = GPG_MODE_ISOLATED;
     /* The runner models the child, so a pre-bound absolute test spelling
      * avoids coupling these deterministic tests to the host's key tools. */
-    safe_strncpy(config->executable_path, "/test/gpg",
-                 sizeof(config->executable_path));
+    if (fixture && fixture->gpg[0] == '/') {
+        safe_strncpy(config->executable_path, fixture->gpg,
+                     sizeof(config->executable_path));
+        CHECK(run_launch_witness_capture(
+            config->executable_path, &config->executable_witness));
+    } else {
+        CHECK_EQ_INT(gpg_manager_init(config, GPG_MODE_ISOLATED), 0);
+    }
 }
 
 static bool m20_identity_is_unpublished(const gpg_config_t *config,
@@ -677,7 +702,7 @@ TEST(changed_and_unchanged_config_reload_exactly_once) {
     int third_rc;
 
     CHECK_EQ_INT(m20_make_fixture(&fixture, m20_config_a, true), 0);
-    m20_prepare_config(&config);
+    m20_prepare_config(&config, &fixture);
     g_config_commits = 0;
     m20_reset_observation(&fixture, m20_config_a, false);
     old_commit = gpg_manager_set_agent_conf_precommit_fn(
@@ -730,7 +755,7 @@ TEST(reload_failure_prevents_activation_and_identity_publication) {
     int switch_rc;
 
     CHECK_EQ_INT(m20_make_fixture(&fixture, m20_config_a, true), 0);
-    m20_prepare_config(&config);
+    m20_prepare_config(&config, &fixture);
     m20_reset_observation(&fixture, m20_config_a, true);
     old_runner = run_set_runner(m20_runner);
     switch_rc = gpg_switch_account(&config, &fixture.account);
@@ -767,7 +792,7 @@ TEST(config_write_failure_prevents_activation_and_identity_publication) {
     int switch_rc;
 
     CHECK_EQ_INT(m20_make_fixture(&fixture, m20_config_a, true), 0);
-    m20_prepare_config(&config);
+    m20_prepare_config(&config, &fixture);
     m20_reset_observation(&fixture, m20_config_a, false);
     m20_reset_sync_faults(1, 0);
     old_sync = gpg_manager_set_agent_conf_sync_fn(m20_selective_sync);
@@ -810,7 +835,7 @@ TEST(post_rename_sync_failure_is_retried_without_rewriting_config) {
     int retry_rc;
 
     CHECK_EQ_INT(m20_make_fixture(&fixture, m20_config_a, true), 0);
-    m20_prepare_config(&first);
+    m20_prepare_config(&first, &fixture);
     g_config_commits = 0;
     m20_reset_observation(&fixture, m20_config_a, false);
     m20_reset_sync_faults(0, 2);
@@ -830,7 +855,7 @@ TEST(post_rename_sync_failure_is_retried_without_rewriting_config) {
     CHECK(m20_identity_is_unpublished(&first, &fixture));
     CHECK_EQ_INT(stat(fixture.installed_config, &before), 0);
 
-    m20_prepare_config(&retry);
+    m20_prepare_config(&retry, &fixture);
     g_config_commits = 0;
     m20_reset_observation(&fixture, m20_config_a, false);
     m20_reset_sync_faults(0, 0);
@@ -876,7 +901,7 @@ TEST(clean_state_sync_failure_blocks_publication_and_retries_safely) {
     int retry_rc;
 
     CHECK_EQ_INT(m20_make_fixture(&fixture, m20_config_a, true), 0);
-    m20_prepare_config(&first);
+    m20_prepare_config(&first, &fixture);
     g_config_commits = 0;
     m20_reset_observation(&fixture, m20_config_a, false);
     /* Config temp, pending obligation, then completed-state persistence. */
@@ -899,7 +924,7 @@ TEST(clean_state_sync_failure_blocks_publication_and_retries_safely) {
     CHECK(m20_identity_is_unpublished(&first, &fixture));
     CHECK_EQ_INT(stat(fixture.installed_config, &before), 0);
 
-    m20_prepare_config(&retry);
+    m20_prepare_config(&retry, &fixture);
     g_config_commits = 0;
     m20_reset_observation(&fixture, m20_config_a, false);
     m20_reset_sync_faults(0, 0);
@@ -935,7 +960,7 @@ static int m20_failed_attempt_in_child(const m20_fixture_t *fixture) {
     gpg_config_t config;
     int rc;
 
-    m20_prepare_config(&config);
+    m20_prepare_config(&config, fixture);
     g_config_commits = 0;
     m20_reset_observation(fixture, m20_config_a, true);
     old_runner = run_set_runner(m20_runner);
@@ -985,7 +1010,7 @@ TEST(reload_failure_is_durably_retried_without_rewriting_config) {
     CHECK_EQ_INT(stat(fixture.installed_config, &before), 0);
     CHECK(m20_identity_is_unpublished(&(gpg_config_t){0}, &fixture));
 
-    m20_prepare_config(&retry);
+    m20_prepare_config(&retry, &fixture);
     g_config_commits = 0;
     m20_reset_observation(&fixture, m20_config_a, false);
     old_runner = run_set_runner(m20_runner);
@@ -1040,7 +1065,7 @@ TEST(missing_reload_state_for_matching_config_forces_one_migration_reload) {
     errno = 0;
     CHECK(lstat(fixture.reload_state, &state) != 0 && errno == ENOENT);
 
-    m20_prepare_config(&config);
+    m20_prepare_config(&config, &fixture);
     g_config_commits = 0;
     m20_reset_observation(&fixture, m20_config_a, false);
     old_commit = gpg_manager_set_agent_conf_precommit_fn(
@@ -1083,7 +1108,7 @@ TEST(corrupt_clean_state_for_matching_config_forces_one_reload) {
     int clean_rc;
 
     CHECK_EQ_INT(m20_make_fixture(&fixture, m20_config_a, true), 0);
-    m20_prepare_config(&config);
+    m20_prepare_config(&config, &fixture);
     g_config_commits = 0;
     m20_reset_observation(&fixture, m20_config_a, false);
     old_commit = gpg_manager_set_agent_conf_precommit_fn(
@@ -1134,7 +1159,7 @@ TEST(stale_clean_state_after_identical_config_replacement_forces_reload) {
     int clean_rc;
 
     CHECK_EQ_INT(m20_make_fixture(&fixture, m20_config_a, true), 0);
-    m20_prepare_config(&config);
+    m20_prepare_config(&config, &fixture);
     g_config_commits = 0;
     m20_reset_observation(&fixture, m20_config_a, false);
     old_commit = gpg_manager_set_agent_conf_precommit_fn(
@@ -1187,7 +1212,7 @@ TEST(exact_ctime_drift_during_reload_is_byte_proved_once) {
     int second_rc;
 
     CHECK_EQ_INT(m20_make_fixture(&fixture, m20_config_a, true), 0);
-    m20_prepare_config(&config);
+    m20_prepare_config(&config, &fixture);
     g_config_commits = 0;
     m20_reset_observation(&fixture, m20_config_a, false);
     g_reload_mutation = M20_RELOAD_MUTATION_EXACT_CTIME;
@@ -1229,7 +1254,7 @@ TEST(changed_bytes_with_restored_mtime_fail_then_retry) {
     int retry_rc;
 
     CHECK_EQ_INT(m20_make_fixture(&fixture, m20_config_a, true), 0);
-    m20_prepare_config(&config);
+    m20_prepare_config(&config, &fixture);
     g_config_commits = 0;
     m20_reset_observation(&fixture, m20_config_a, false);
     g_reload_mutation = M20_RELOAD_MUTATION_DIFFERENT_BYTES;
@@ -1260,6 +1285,203 @@ TEST(changed_bytes_with_restored_mtime_fail_then_retry) {
     CHECK_EQ_INT(m20_restore_env("XDG_RUNTIME_DIR", &runtime), 0);
 }
 
+static void m20_expect_component_metadata_failure(
+    m20_component_metadata_t metadata) {
+    m20_saved_env_t runtime = m20_save_env("XDG_RUNTIME_DIR");
+    m20_saved_env_t optin = m20_save_env("GITSWITCH_ALLOW_TMP_GPG");
+    m20_saved_env_t gnupg = m20_save_env("GNUPGHOME");
+    m20_saved_env_t path = m20_save_env("PATH");
+    m20_fixture_t fixture;
+    command_runner_fn old_runner;
+    gpg_config_t config;
+    struct stat st;
+
+    CHECK_EQ_INT(m20_make_fixture(&fixture, m20_config_a, true), 0);
+    m20_prepare_config(&config, &fixture);
+    m20_reset_observation(&fixture, m20_config_a, false);
+    g_component_metadata = metadata;
+    old_runner = run_set_runner(m20_runner);
+    CHECK_EQ_INT(gpg_create_isolated_home(&config, &fixture.account), -1);
+    run_set_runner(old_runner);
+    CHECK_EQ_INT(g_reload_calls, 0);
+    CHECK_EQ_INT(g_gpg_listing_calls, 0);
+    errno = 0;
+    CHECK(lstat(fixture.current, &st) != 0 && errno == ENOENT);
+    errno = 0;
+    CHECK(lstat(fixture.installed_config, &st) != 0 && errno == ENOENT);
+    CHECK_EQ_INT(m20_restore_env("PATH", &path), 0);
+    CHECK_EQ_INT(m20_restore_env("GNUPGHOME", &gnupg), 0);
+    CHECK_EQ_INT(m20_restore_env("GITSWITCH_ALLOW_TMP_GPG", &optin), 0);
+    CHECK_EQ_INT(m20_restore_env("XDG_RUNTIME_DIR", &runtime), 0);
+}
+
+TEST(unrelated_gpgconf_suite_is_rejected_before_publication) {
+    m20_expect_component_metadata_failure(
+        M20_COMPONENT_METADATA_MISMATCHED_GPG);
+}
+
+TEST(duplicate_gpg_component_metadata_is_rejected_before_reload) {
+    m20_expect_component_metadata_failure(
+        M20_COMPONENT_METADATA_DUPLICATE_GPG);
+}
+
+TEST(missing_gpg_component_metadata_is_rejected_before_reload) {
+    m20_expect_component_metadata_failure(
+        M20_COMPONENT_METADATA_MISSING_GPG);
+}
+
+TEST(malformed_percent_escape_in_component_metadata_is_rejected_before_reload) {
+    m20_expect_component_metadata_failure(
+        M20_COMPONENT_METADATA_MALFORMED_ESCAPE);
+}
+
+TEST(extra_component_metadata_field_is_rejected_before_reload) {
+    m20_expect_component_metadata_failure(
+        M20_COMPONENT_METADATA_EXTRA_FIELD);
+}
+
+TEST(nonabsolute_gpg_component_path_is_rejected_before_reload) {
+    m20_expect_component_metadata_failure(
+        M20_COMPONENT_METADATA_NONABSOLUTE_PATH);
+}
+
+TEST(same_path_gpgconf_replacement_is_rejected_before_reload) {
+    m20_saved_env_t runtime = m20_save_env("XDG_RUNTIME_DIR");
+    m20_saved_env_t optin = m20_save_env("GITSWITCH_ALLOW_TMP_GPG");
+    m20_saved_env_t gnupg = m20_save_env("GNUPGHOME");
+    m20_saved_env_t path = m20_save_env("PATH");
+    m20_fixture_t fixture;
+    command_runner_fn old_runner;
+    gpg_config_t config;
+    struct stat st;
+
+    CHECK_EQ_INT(m20_make_fixture(&fixture, m20_config_a, true), 0);
+    m20_prepare_config(&config, &fixture);
+    m20_reset_observation(&fixture, m20_config_a, false);
+    g_replace_gpgconf_after_components = true;
+    old_runner = run_set_runner(m20_runner);
+    CHECK_EQ_INT(gpg_create_isolated_home(&config, &fixture.account), -1);
+    run_set_runner(old_runner);
+    CHECK_EQ_INT(g_reload_calls, 0);
+    CHECK_EQ_INT(stat(fixture.reload_state, &st), 0);
+    CHECK_EQ_INT(st.st_size, 0);
+    errno = 0;
+    CHECK(lstat(fixture.current, &st) != 0 && errno == ENOENT);
+    CHECK_EQ_INT(m20_restore_env("PATH", &path), 0);
+    CHECK_EQ_INT(m20_restore_env("GNUPGHOME", &gnupg), 0);
+    CHECK_EQ_INT(m20_restore_env("GITSWITCH_ALLOW_TMP_GPG", &optin), 0);
+    CHECK_EQ_INT(m20_restore_env("XDG_RUNTIME_DIR", &runtime), 0);
+}
+
+TEST(clean_state_is_invalidated_by_gpgconf_generation_change) {
+    m20_saved_env_t runtime = m20_save_env("XDG_RUNTIME_DIR");
+    m20_saved_env_t optin = m20_save_env("GITSWITCH_ALLOW_TMP_GPG");
+    m20_saved_env_t gnupg = m20_save_env("GNUPGHOME");
+    m20_saved_env_t path = m20_save_env("PATH");
+    m20_fixture_t fixture;
+    command_runner_fn old_runner;
+    gpg_config_t config;
+    struct stat before;
+    struct stat after;
+
+    CHECK_EQ_INT(m20_make_fixture(&fixture, m20_config_a, true), 0);
+    m20_prepare_config(&config, &fixture);
+    m20_reset_observation(&fixture, m20_config_a, false);
+    old_runner = run_set_runner(m20_runner);
+    CHECK_EQ_INT(gpg_create_isolated_home(&config, &fixture.account), 0);
+    run_set_runner(old_runner);
+    CHECK_EQ_INT(g_reload_calls, 1);
+    CHECK_EQ_INT(stat(fixture.gpgconf, &before), 0);
+
+    CHECK_EQ_INT(m20_replace_gpgconf(fixture.gpgconf), 0);
+    CHECK_EQ_INT(stat(fixture.gpgconf, &after), 0);
+    CHECK(before.st_dev != after.st_dev || before.st_ino != after.st_ino);
+    m20_reset_observation(&fixture, m20_config_a, false);
+    old_runner = run_set_runner(m20_runner);
+    CHECK_EQ_INT(gpg_create_isolated_home(&config, &fixture.account), 0);
+    run_set_runner(old_runner);
+    CHECK_EQ_INT(g_reload_calls, 1);
+    CHECK_EQ_INT(g_reload_protocol_errors, 0);
+    CHECK_EQ_INT(m20_restore_env("PATH", &path), 0);
+    CHECK_EQ_INT(m20_restore_env("GNUPGHOME", &gnupg), 0);
+    CHECK_EQ_INT(m20_restore_env("GITSWITCH_ALLOW_TMP_GPG", &optin), 0);
+    CHECK_EQ_INT(m20_restore_env("XDG_RUNTIME_DIR", &runtime), 0);
+}
+
+TEST(clean_state_is_invalidated_by_transaction_gpg_generation_change) {
+    m20_saved_env_t runtime = m20_save_env("XDG_RUNTIME_DIR");
+    m20_saved_env_t optin = m20_save_env("GITSWITCH_ALLOW_TMP_GPG");
+    m20_saved_env_t gnupg = m20_save_env("GNUPGHOME");
+    m20_saved_env_t path = m20_save_env("PATH");
+    m20_fixture_t fixture;
+    command_runner_fn old_runner;
+    gpg_config_t first;
+    gpg_config_t next_transaction;
+    struct stat before;
+    struct stat after;
+
+    CHECK_EQ_INT(m20_make_fixture(&fixture, m20_config_a, true), 0);
+    m20_prepare_config(&first, &fixture);
+    m20_reset_observation(&fixture, m20_config_a, false);
+    old_runner = run_set_runner(m20_runner);
+    CHECK_EQ_INT(gpg_create_isolated_home(&first, &fixture.account), 0);
+    run_set_runner(old_runner);
+    CHECK_EQ_INT(g_reload_calls, 1);
+    CHECK_EQ_INT(stat(fixture.gpg, &before), 0);
+
+    CHECK_EQ_INT(m20_replace_gpgconf(fixture.gpg), 0);
+    CHECK_EQ_INT(stat(fixture.gpg, &after), 0);
+    CHECK(before.st_dev != after.st_dev || before.st_ino != after.st_ino);
+    m20_prepare_config(&next_transaction, &fixture);
+    m20_reset_observation(&fixture, m20_config_a, false);
+    old_runner = run_set_runner(m20_runner);
+    CHECK_EQ_INT(gpg_create_isolated_home(
+                     &next_transaction, &fixture.account), 0);
+    CHECK_EQ_INT(gpg_create_isolated_home(
+                     &next_transaction, &fixture.account), 0);
+    run_set_runner(old_runner);
+    CHECK_EQ_INT(g_reload_calls, 1);
+    CHECK_EQ_INT(g_reload_protocol_errors, 0);
+    CHECK_EQ_INT(m20_restore_env("PATH", &path), 0);
+    CHECK_EQ_INT(m20_restore_env("GNUPGHOME", &gnupg), 0);
+    CHECK_EQ_INT(m20_restore_env("GITSWITCH_ALLOW_TMP_GPG", &optin), 0);
+    CHECK_EQ_INT(m20_restore_env("XDG_RUNTIME_DIR", &runtime), 0);
+}
+
+TEST(paired_toolchain_swap_after_reload_is_rejected_before_publication) {
+    m20_saved_env_t runtime = m20_save_env("XDG_RUNTIME_DIR");
+    m20_saved_env_t optin = m20_save_env("GITSWITCH_ALLOW_TMP_GPG");
+    m20_saved_env_t gnupg = m20_save_env("GNUPGHOME");
+    m20_saved_env_t path = m20_save_env("PATH");
+    m20_fixture_t fixture;
+    command_runner_fn old_runner;
+    gpg_config_t config;
+    struct stat state;
+    int switch_rc;
+
+    CHECK_EQ_INT(m20_make_fixture(&fixture, m20_config_a, true), 0);
+    m20_prepare_config(&config, &fixture);
+    m20_reset_observation(&fixture, m20_config_a, false);
+    g_replace_toolchain_after_reload = true;
+    old_runner = run_set_runner(m20_runner);
+    switch_rc = gpg_switch_account(&config, &fixture.account);
+    run_set_runner(old_runner);
+
+    CHECK_EQ_INT(switch_rc, -1);
+    CHECK_EQ_INT(g_reload_calls, 1);
+    CHECK_EQ_INT(g_reload_protocol_errors, 0);
+    CHECK_EQ_INT(g_gpg_listing_calls, 0);
+    CHECK(m20_identity_is_unpublished(&config, &fixture));
+    CHECK_EQ_INT(stat(fixture.reload_state, &state), 0);
+    CHECK_EQ_INT(state.st_size, 0);
+
+    CHECK_EQ_INT(gpg_manager_cleanup(&config), 0);
+    CHECK_EQ_INT(m20_restore_env("PATH", &path), 0);
+    CHECK_EQ_INT(m20_restore_env("GNUPGHOME", &gnupg), 0);
+    CHECK_EQ_INT(m20_restore_env("GITSWITCH_ALLOW_TMP_GPG", &optin), 0);
+    CHECK_EQ_INT(m20_restore_env("XDG_RUNTIME_DIR", &runtime), 0);
+}
+
 TEST(changed_config_is_observed_by_the_retained_live_agent) {
     m20_saved_env_t runtime = m20_save_env("XDG_RUNTIME_DIR");
     m20_saved_env_t optin = m20_save_env("GITSWITCH_ALLOW_TMP_GPG");
@@ -1282,7 +1504,7 @@ TEST(changed_config_is_observed_by_the_retained_live_agent) {
         CHECK_EQ_INT(m20_restore_env("GITSWITCH_ALLOW_TMP_GPG", &optin), 0);
         CHECK_EQ_INT(m20_restore_env("XDG_RUNTIME_DIR", &runtime), 0);
         CHECK_EQ_INT(m20_restore_env("PATH", &path), 0);
-        TS_SKIP("gpg", "trusted gpgconf/gpg-connect-agent unavailable");
+        TS_SKIP("gpg", "trusted GnuPG suite unavailable");
     }
     if (tools_rc < 0) {
         CHECK_EQ_INT(tools_rc, 0);
@@ -1293,9 +1515,10 @@ TEST(changed_config_is_observed_by_the_retained_live_agent) {
         m20_remove_private_tools(&fixture);
         return;
     }
-    m20_prepare_config(&config);
+    m20_prepare_config(&config, &fixture);
 
     g_live_reload_calls = 0;
+    m20_reset_observation(&fixture, m20_live_config_a, false);
     old_runner = run_set_runner(m20_real_recording_runner);
     CHECK_EQ_INT(gpg_create_isolated_home(&config, &fixture.account), 0);
     run_set_runner(old_runner);
@@ -1317,6 +1540,7 @@ TEST(changed_config_is_observed_by_the_retained_live_agent) {
     CHECK_EQ_INT(write_string_to_file(fixture.source_config,
                                       m20_live_config_b, 0600), 0);
     g_live_reload_calls = 0;
+    m20_reset_observation(&fixture, m20_live_config_b, false);
     old_runner = run_set_runner(m20_real_recording_runner);
     CHECK_EQ_INT(gpg_create_isolated_home(&config, &fixture.account), 0);
     run_set_runner(old_runner);
@@ -1355,6 +1579,16 @@ int main(int argc, char **argv) {
     RUN_TEST(stale_clean_state_after_identical_config_replacement_forces_reload);
     RUN_TEST(exact_ctime_drift_during_reload_is_byte_proved_once);
     RUN_TEST(changed_bytes_with_restored_mtime_fail_then_retry);
+    RUN_TEST(unrelated_gpgconf_suite_is_rejected_before_publication);
+    RUN_TEST(duplicate_gpg_component_metadata_is_rejected_before_reload);
+    RUN_TEST(missing_gpg_component_metadata_is_rejected_before_reload);
+    RUN_TEST(malformed_percent_escape_in_component_metadata_is_rejected_before_reload);
+    RUN_TEST(extra_component_metadata_field_is_rejected_before_reload);
+    RUN_TEST(nonabsolute_gpg_component_path_is_rejected_before_reload);
+    RUN_TEST(same_path_gpgconf_replacement_is_rejected_before_reload);
+    RUN_TEST(clean_state_is_invalidated_by_gpgconf_generation_change);
+    RUN_TEST(clean_state_is_invalidated_by_transaction_gpg_generation_change);
+    RUN_TEST(paired_toolchain_swap_after_reload_is_rejected_before_publication);
     RUN_TEST(changed_config_is_observed_by_the_retained_live_agent);
     return ts_test_finish();
 }

@@ -2638,6 +2638,49 @@ static bool exec_stat_identity_matches(const struct stat *expected,
 #endif
 }
 
+static bool run_launch_witness_is_well_formed(
+    const run_launch_witness_t *witness) {
+    if (!witness || !witness->valid ||
+        witness->executable_path[0] != '/' ||
+        !memchr(witness->executable_path, '\0',
+                sizeof(witness->executable_path))) {
+        return false;
+    }
+    if (!witness->is_script) {
+        return !witness->has_interpreter_arg &&
+               witness->interpreter_argv0[0] == '\0' &&
+               witness->interpreter_arg[0] == '\0';
+    }
+    if (witness->interpreter_argv0[0] != '/' ||
+        !memchr(witness->interpreter_argv0, '\0',
+                sizeof(witness->interpreter_argv0)) ||
+        !memchr(witness->interpreter_arg, '\0',
+                sizeof(witness->interpreter_arg))) {
+        return false;
+    }
+    return witness->has_interpreter_arg
+               ? witness->interpreter_arg[0] != '\0'
+               : witness->interpreter_arg[0] == '\0';
+}
+
+bool run_launch_witness_matches(
+    const run_launch_witness_t *a, const run_launch_witness_t *b) {
+    if (!run_launch_witness_is_well_formed(a) ||
+        !run_launch_witness_is_well_formed(b) ||
+        a->is_script != b->is_script ||
+        a->has_interpreter_arg != b->has_interpreter_arg ||
+        strcmp(a->executable_path, b->executable_path) != 0 ||
+        !exec_stat_identity_matches(&a->executable_identity,
+                                    &b->executable_identity)) {
+        return false;
+    }
+    if (!a->is_script) return true;
+    return strcmp(a->interpreter_argv0, b->interpreter_argv0) == 0 &&
+           strcmp(a->interpreter_arg, b->interpreter_arg) == 0 &&
+           exec_stat_identity_matches(&a->interpreter_identity,
+                                      &b->interpreter_identity);
+}
+
 /* Reserve low child slots for status (3), the executable/script (4), and a
  * script interpreter (5). Parent launch pins live at >=6 so stdio repair and
  * the final dup2 layout cannot clobber them. */
@@ -2908,6 +2951,53 @@ static int prepare_trusted_script_launch(
     }
     launch->script_argv[out] = NULL;
     launch->is_script = true;
+    return 0;
+}
+
+static int run_launch_witness_from_opened(
+    const char *resolved_path, int exec_fd,
+    const struct stat *opened_executable_identity,
+    const trusted_script_launch_t *launch, run_launch_witness_t *out) {
+    struct stat current_executable_identity;
+
+    if (!resolved_path || resolved_path[0] != '/' || exec_fd < 0 ||
+        !opened_executable_identity || !launch || !out ||
+        strlen(resolved_path) >= sizeof(out->executable_path)) {
+        errno = EINVAL;
+        return -1;
+    }
+    memset(out, 0, sizeof(*out));
+    if (fstat(exec_fd, &current_executable_identity) != 0) return -1;
+    if (!exec_stat_identity_matches(opened_executable_identity,
+                                    &current_executable_identity)) {
+        errno = ESTALE;
+        return -1;
+    }
+    if (launch->is_script) {
+        struct stat current_interpreter_identity;
+
+        if (launch->interpreter_fd < 0 ||
+            fstat(launch->interpreter_fd,
+                  &current_interpreter_identity) != 0) {
+            return -1;
+        }
+        if (!exec_stat_identity_matches(&launch->interpreter_identity,
+                                        &current_interpreter_identity)) {
+            errno = ESTALE;
+            return -1;
+        }
+        out->interpreter_identity = current_interpreter_identity;
+        out->has_interpreter_arg = launch->has_interpreter_arg;
+        memcpy(out->interpreter_argv0, launch->interpreter_argv0,
+               sizeof(out->interpreter_argv0));
+        memcpy(out->interpreter_arg, launch->interpreter_arg,
+               sizeof(out->interpreter_arg));
+    }
+    out->executable_identity = current_executable_identity;
+    memcpy(out->executable_path, resolved_path,
+           strlen(resolved_path) + 1U);
+    out->is_script = launch->is_script;
+    out->valid = true;
     return 0;
 }
 
@@ -3515,7 +3605,9 @@ static int64_t monotonic_millis(void) {
 #define RUNNER_CAPTURE_GRACE_MS 250
 #define RUNNER_DRAIN_CHUNKS_PER_POLL 16
 
-int run_argv_real(const char *const argv[], const run_opts_t *opts, run_result_t *result) {
+static int run_argv_real_impl(
+    const char *const argv[], const run_opts_t *opts,
+    const run_launch_witness_t *expected, run_result_t *result) {
     run_opts_t no_opts;
     run_result_t local;
     memset(&no_opts, 0, sizeof(no_opts));
@@ -3537,6 +3629,20 @@ int run_argv_real(const char *const argv[], const run_opts_t *opts, run_result_t
 
     if (!argv || !argv[0]) {
         set_error(ERR_INVALID_ARGS, "run_argv: empty argv");
+        return -1;
+    }
+    if (expected && !run_launch_witness_is_well_formed(expected)) {
+        set_error(ERR_INVALID_ARGS,
+                  "run_argv: invalid expected launch witness");
+        return -1;
+    }
+    if (expected &&
+        strcmp(argv[0], expected->executable_path) != 0) {
+        errno = ESTALE;
+        set_system_error(
+            ERR_PERMISSION_DENIED,
+            "run_argv: executable invocation does not match the expected launch");
+        errno = ESTALE;
         return -1;
     }
 
@@ -3656,6 +3762,42 @@ int run_argv_real(const char *const argv[], const run_opts_t *opts, run_result_t
         script_launch.interpreter_fd = reserved_interpreter_fd;
     }
     if (g_test_exec_resolved_hook) g_test_exec_resolved_hook(exec_path);
+
+    run_launch_witness_t opened_witness;
+    if (run_launch_witness_from_opened(
+            exec_path, exec_fd, &exec_identity, &script_launch,
+            &opened_witness) != 0) {
+        int witness_errno = errno ? errno : ESTALE;
+
+        close(exec_fd);
+        trusted_script_launch_cleanup(&script_launch);
+        errno = witness_errno;
+        if (witness_errno == ESTALE || witness_errno == EACCES) {
+            set_system_error(
+                ERR_PERMISSION_DENIED,
+                "run_argv: executable or interpreter changed before launch for '%s'",
+                exec_path);
+        } else {
+            set_system_error(
+                ERR_SYSTEM_CALL,
+                "run_argv: cannot certify the opened launch generation for '%s'",
+                exec_path);
+        }
+        errno = witness_errno;
+        return -1;
+    }
+    if (expected &&
+        !run_launch_witness_matches(expected, &opened_witness)) {
+        close(exec_fd);
+        trusted_script_launch_cleanup(&script_launch);
+        errno = ESTALE;
+        set_system_error(
+            ERR_PERMISSION_DENIED,
+            "run_argv: executable generation or invocation changed before launch for '%s'",
+            exec_path);
+        errno = ESTALE;
+        return -1;
+    }
 
     bool pipe_input = opts->input != NULL;
     bool fd_input = opts->use_stdin_fd;
@@ -4628,22 +4770,13 @@ int run_argv_real(const char *const argv[], const run_opts_t *opts, run_result_t
         }
         return -1;
     }
-    result->launch_witness.valid = true;
-    result->launch_witness.is_script = script_launch.is_script;
-    result->launch_witness.executable_identity = exec_identity;
-    if (script_launch.is_script) {
-        result->launch_witness.has_interpreter_arg =
-            script_launch.has_interpreter_arg;
-        result->launch_witness.interpreter_identity =
-            script_launch.interpreter_identity;
-        memcpy(result->launch_witness.interpreter_argv0,
-               script_launch.interpreter_argv0,
-               sizeof(result->launch_witness.interpreter_argv0));
-        memcpy(result->launch_witness.interpreter_arg,
-               script_launch.interpreter_arg,
-               sizeof(result->launch_witness.interpreter_arg));
-    }
+    result->launch_witness = opened_witness;
     return 0;
+}
+
+int run_argv_real(const char *const argv[], const run_opts_t *opts,
+                  run_result_t *result) {
+    return run_argv_real_impl(argv, opts, NULL, result);
 }
 
 static command_runner_fn g_runner = run_argv_real;
@@ -4660,6 +4793,50 @@ bool run_uses_default_runner(void) {
 
 int run_argv(const char *const argv[], const run_opts_t *opts, run_result_t *result) {
     return g_runner(argv, opts, result);
+}
+
+int run_argv_with_expected_launch(
+    const char *const argv[], const run_opts_t *opts,
+    const run_launch_witness_t *expected, run_result_t *result) {
+    run_result_t local_result;
+    run_result_t *observed = result ? result : &local_result;
+    int rc;
+
+    memset(observed, 0, sizeof(*observed));
+    observed->exit_code = -1;
+    if (opts && opts->out && opts->out_size > 0) opts->out[0] = '\0';
+    if (!expected || !run_launch_witness_is_well_formed(expected)) {
+        set_error(ERR_INVALID_ARGS,
+                  "run_argv: invalid expected launch witness");
+        return -1;
+    }
+    if (!argv || !argv[0]) {
+        set_error(ERR_INVALID_ARGS, "run_argv: empty argv");
+        return -1;
+    }
+    if (strcmp(argv[0], expected->executable_path) != 0) {
+        errno = ESTALE;
+        set_system_error(
+            ERR_PERMISSION_DENIED,
+            "run_argv: executable invocation does not match the expected launch");
+        errno = ESTALE;
+        return -1;
+    }
+    if (g_runner == run_argv_real) {
+        return run_argv_real_impl(argv, opts, expected, result);
+    }
+    rc = g_runner(argv, opts, observed);
+    if (rc != 0) return rc;
+    if (!run_launch_witness_matches(
+            expected, &observed->launch_witness)) {
+        errno = ESTALE;
+        set_system_error(
+            ERR_PERMISSION_DENIED,
+            "run_argv: injected runner did not certify the expected launch");
+        errno = ESTALE;
+        return -1;
+    }
+    return 0;
 }
 
 /* AR-07 M28/M29 executable trust.  A helper is trusted only when every
@@ -5416,17 +5593,16 @@ int find_command_path(const char *name, char *buf, size_t size) {
     return 0;
 }
 
-bool run_launch_witness_revalidate(
-    const char *program_path, const run_launch_witness_t *witness) {
+bool run_launch_witness_capture(
+    const char *program_path, run_launch_witness_t *out) {
     const char *probe_argv[] = {program_path, NULL};
     char resolved[MAX_PATH_LEN];
     struct stat executable_identity;
     trusted_script_launch_t launch;
     int fd;
-    bool matches;
 
-    if (!program_path || program_path[0] != '/' || !witness ||
-        !witness->valid) {
+    if (out) memset(out, 0, sizeof(*out));
+    if (!program_path || program_path[0] != '/' || !out) {
         errno = EINVAL;
         return false;
     }
@@ -5435,10 +5611,12 @@ bool run_launch_witness_revalidate(
     fd = open_trusted_command(program_path, resolved, sizeof(resolved),
                               &executable_identity);
     if (fd < 0) return false;
-    if (strcmp(resolved, program_path) != 0 ||
-        !exec_stat_identity_matches(&witness->executable_identity,
-                                    &executable_identity) ||
-        prepare_trusted_script_launch(fd, probe_argv, &launch) != 0) {
+    if (strcmp(resolved, program_path) != 0) {
+        close(fd);
+        errno = ESTALE;
+        return false;
+    }
+    if (prepare_trusted_script_launch(fd, probe_argv, &launch) != 0) {
         int saved_errno = errno ? errno : ESTALE;
 
         close(fd);
@@ -5446,19 +5624,36 @@ bool run_launch_witness_revalidate(
         errno = saved_errno;
         return false;
     }
-    matches =
-        launch.is_script == witness->is_script &&
-        (!launch.is_script ||
-         (launch.has_interpreter_arg == witness->has_interpreter_arg &&
-          strcmp(launch.interpreter_argv0,
-                 witness->interpreter_argv0) == 0 &&
-          strcmp(launch.interpreter_arg, witness->interpreter_arg) == 0 &&
-          exec_stat_identity_matches(&witness->interpreter_identity,
-                                     &launch.interpreter_identity)));
+    if (run_launch_witness_from_opened(
+            resolved, fd, &executable_identity, &launch, out) != 0) {
+        int saved_errno = errno ? errno : ESTALE;
+
+        close(fd);
+        trusted_script_launch_cleanup(&launch);
+        memset(out, 0, sizeof(*out));
+        errno = saved_errno;
+        return false;
+    }
     close(fd);
     trusted_script_launch_cleanup(&launch);
-    if (!matches) errno = ESTALE;
-    return matches;
+    return true;
+}
+
+bool run_launch_witness_revalidate(
+    const char *program_path, const run_launch_witness_t *witness) {
+    run_launch_witness_t current;
+
+    if (!program_path || program_path[0] != '/' ||
+        !run_launch_witness_is_well_formed(witness)) {
+        errno = EINVAL;
+        return false;
+    }
+    if (!run_launch_witness_capture(program_path, &current)) return false;
+    if (!run_launch_witness_matches(witness, &current)) {
+        errno = ESTALE;
+        return false;
+    }
+    return true;
 }
 
 bool command_exists(const char *command) {

@@ -10,6 +10,9 @@
 #include "utils.h"
 #include "error.h"
 #include "git_ops.h"
+#define GITSWITCH_INTERNAL_API
+#include "git_ops_internal.h"
+#undef GITSWITCH_INTERNAL_API
 #include "gpg_manager.h"
 #include <stdio.h>
 #include <string.h>
@@ -38,6 +41,10 @@ static int fk_effective_reads; /* atomic merged managed-key listing reads */
 static int fk_non_git_execs;
 static char fk_last_non_git_program[MAX_PATH_LEN];
 static const char *fk_allowed_gpg_program;
+static const run_launch_witness_t *fk_gpg_launch_witness;
+static bool fk_gpg_mismatch_witness;
+static int fk_gpg_reported_exit;
+static bool fk_gpg_env_hardened;
 static bool fk_is_repo;        /* what `git rev-parse --git-dir` reports */
 static const char *fk_repo_root_output;
 static int fk_repo_root_exit;
@@ -58,6 +65,10 @@ static void fk_reset(void) {
     fk_non_git_execs = 0;
     fk_last_non_git_program[0] = '\0';
     fk_allowed_gpg_program = NULL;
+    fk_gpg_launch_witness = NULL;
+    fk_gpg_mismatch_witness = false;
+    fk_gpg_reported_exit = 0;
+    fk_gpg_env_hardened = false;
     fk_is_repo = false;
     fk_repo_root_output = NULL;
     fk_repo_root_exit = 1;
@@ -210,6 +221,34 @@ static int fake_git_runner(const char *const argv[], const run_opts_t *opts,
         if (fk_allowed_gpg_program &&
             strcmp(argv[0], fk_allowed_gpg_program) == 0 && argv[1] &&
             strcmp(argv[1], "--list-secret-keys") == 0) {
+            bool saw_agent_info = false;
+            bool saw_builddir = false;
+            bool saw_build_root = false;
+            if (opts && opts->unset_env) {
+                for (size_t i = 0U; opts->unset_env[i]; i++) {
+                    if (strcmp(opts->unset_env[i], "GPG_AGENT_INFO") == 0)
+                        saw_agent_info = true;
+                    if (strcmp(opts->unset_env[i], "GNUPG_BUILDDIR") == 0)
+                        saw_builddir = true;
+                    if (strcmp(opts->unset_env[i], "GNUPG_BUILD_ROOT") == 0)
+                        saw_build_root = true;
+                }
+            }
+            fk_gpg_env_hardened =
+                saw_agent_info && saw_builddir && saw_build_root;
+            if (result && fk_gpg_launch_witness) {
+                result->launch_witness = *fk_gpg_launch_witness;
+                if (fk_gpg_mismatch_witness) {
+                    safe_strncpy(
+                        result->launch_witness.executable_path,
+                        "/mismatched/ar14/gpg",
+                        sizeof(result->launch_witness.executable_path));
+                }
+            }
+            if (fk_gpg_reported_exit != 0) {
+                if (result) result->exit_code = fk_gpg_reported_exit;
+                return 0;
+            }
             return fk_ret(result, 0);
         }
         return fk_ret(result, 1);
@@ -1428,6 +1467,76 @@ TEST(git_test_config_probes_with_exact_absolute_program) {
                                  expected_program), 0);
     CHECK_EQ_INT(fk_non_git_execs, 1);
     CHECK_STR_EQ(fk_last_non_git_program, expected_program);
+
+    run_set_runner(prev);
+}
+
+TEST(git_test_config_bound_probe_requires_exact_certified_launch) {
+    static const char expected_program[] = "/trusted/ar14/bound-gpg";
+    account_t acct;
+    run_launch_witness_t expected;
+    run_launch_witness_t wrong_path;
+    command_runner_fn prev;
+    int execs_before;
+
+    git_ops_test_reset_caches();
+    fk_reset();
+    memset(&acct, 0, sizeof(acct));
+    safe_strncpy(acct.name, "AR14 Bound Probe User", sizeof(acct.name));
+    safe_strncpy(acct.email, "ar14-bound-probe@example.test",
+                 sizeof(acct.email));
+    acct.gpg_enabled = true;
+    acct.gpg_signing_enabled = true;
+    safe_strncpy(acct.gpg_key_id, "A14000000000BEEF",
+                 sizeof(acct.gpg_key_id));
+
+    memset(&expected, 0, sizeof(expected));
+    expected.valid = true;
+    safe_strncpy(expected.executable_path, expected_program,
+                 sizeof(expected.executable_path));
+    wrong_path = expected;
+    safe_strncpy(wrong_path.executable_path, "/trusted/ar14/other-gpg",
+                 sizeof(wrong_path.executable_path));
+
+    prev = run_set_runner(fake_git_runner);
+    CHECK_EQ_INT(git_set_config(&acct, GIT_SCOPE_GLOBAL), 0);
+    CHECK_EQ_INT(git_set_config_value(GIT_CONFIG_GPG_OPENPGP_PROGRAM,
+                                      expected_program,
+                                      GIT_SCOPE_GLOBAL), 0);
+    fk_allowed_gpg_program = expected_program;
+
+    /* The transaction-only entry point refuses an absent witness and a
+     * witness for a different executable spelling before launching GPG. */
+    execs_before = fk_execs;
+    CHECK_EQ_INT(git_test_config_with_gpg_witness(
+                     &acct, GIT_SCOPE_GLOBAL, expected_program, NULL), -1);
+    CHECK_EQ_INT(get_last_error()->code, ERR_INVALID_ARGS);
+    CHECK_EQ_INT(fk_execs, execs_before);
+    CHECK_EQ_INT(git_test_config_with_gpg_witness(
+                     &acct, GIT_SCOPE_GLOBAL, expected_program,
+                     &wrong_path), -1);
+    CHECK_EQ_INT(get_last_error()->code, ERR_INVALID_ARGS);
+    CHECK_EQ_INT(fk_execs, execs_before);
+
+    /* Injected runners must positively return the exact witness; an absent or
+     * altered certification is rejected even when the fake reports success. */
+    fk_gpg_launch_witness = NULL;
+    CHECK_EQ_INT(git_test_config_with_gpg_witness(
+                     &acct, GIT_SCOPE_GLOBAL, expected_program, &expected), -1);
+    fk_gpg_launch_witness = &expected;
+    fk_gpg_mismatch_witness = true;
+    CHECK_EQ_INT(git_test_config_with_gpg_witness(
+                     &acct, GIT_SCOPE_GLOBAL, expected_program, &expected), -1);
+    fk_gpg_mismatch_witness = false;
+    CHECK_EQ_INT(git_test_config_with_gpg_witness(
+                     &acct, GIT_SCOPE_GLOBAL, expected_program, &expected), 0);
+    CHECK(fk_gpg_env_hardened);
+
+    /* A runner return value alone is not success: the observed child status
+     * remains part of the transaction proof. */
+    fk_gpg_reported_exit = 17;
+    CHECK_EQ_INT(git_test_config_with_gpg_witness(
+                     &acct, GIT_SCOPE_GLOBAL, expected_program, &expected), -1);
 
     run_set_runner(prev);
 }
@@ -2686,6 +2795,7 @@ TEST_MAIN_BEGIN()
     RUN_TEST(v5_fingerprint_survives_git_current_config_snapshot);
     RUN_TEST(git_test_config_selector_note_never_skips_raw_probe);
     RUN_TEST(git_test_config_probes_with_exact_absolute_program);
+    RUN_TEST(git_test_config_bound_probe_requires_exact_certified_launch);
     RUN_TEST(git_test_config_rejects_invalid_program_contract_before_exec);
     RUN_TEST(retire_global_publication_ignores_environment_but_checks_generation);
     RUN_TEST(retire_without_publication_record_preserves_signing_leg);

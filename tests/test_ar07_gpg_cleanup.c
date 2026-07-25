@@ -109,14 +109,24 @@ static int restore_gpgconf_fixture(void) {
     return rc;
 }
 
-/* These tests inject command results but intentionally exercise production's
- * trusted gpgconf resolution and reload bookkeeping. Homebrew's prefix is not
- * a production-trusted executable location, so give every host the same
- * private, runnable gpgconf fixture instead of depending on its package
- * manager layout. */
+/* These tests exercise production's paired GPG/gpgconf reload binding.
+ * Homebrew's prefix is not a production-trusted executable location, so give
+ * every host the same private, coherent pair rather than depending on its
+ * package-manager layout. */
 static int install_gpgconf_fixture(void) {
-    static const char program[] = "#!/bin/sh\nexit 0\n";
-    char executable[MAX_PATH_LEN];
+    static const char gpgconf_program[] =
+        "#!/bin/sh\n"
+        "dir=${PATH%%:*}\n"
+        "case \"$1:$2\" in\n"
+        "  --list-components:)\n"
+        "    printf 'gpg:OpenPGP:%s/gpg\\n' \"$dir\"\n"
+        "    ;;\n"
+        "  --reload:gpg-agent) exit 0 ;;\n"
+        "  *) exit 64 ;;\n"
+        "esac\n";
+    static const char inert_program[] = "#!/bin/sh\nexit 0\n";
+    char gpg[MAX_PATH_LEN];
+    char gpgconf[MAX_PATH_LEN];
     char resolved[MAX_PATH_LEN];
     const char *path = getenv("PATH");
     char *saved_path = path ? strdup(path) : NULL;
@@ -133,10 +143,13 @@ static int install_gpgconf_fixture(void) {
     if (!ts_mkdtemp_trusted(g_gpgconf_fixture_dir,
                             sizeof(g_gpgconf_fixture_dir),
                             "gsw-ar11-gpgconf") ||
-        safe_snprintf(executable, sizeof(executable), "%s/gpgconf",
+        safe_snprintf(gpg, sizeof(gpg), "%s/gpg",
                       g_gpgconf_fixture_dir) != 0 ||
-        write_string_to_file(executable, program, 0700) != 0 ||
-        chmod(executable, 0700) != 0) {
+        safe_snprintf(gpgconf, sizeof(gpgconf), "%s/gpgconf",
+                      g_gpgconf_fixture_dir) != 0 ||
+        write_string_to_file(gpg, inert_program, 0700) != 0 ||
+        write_string_to_file(gpgconf, gpgconf_program, 0700) != 0 ||
+        chmod(gpg, 0700) != 0 || chmod(gpgconf, 0700) != 0) {
         free(saved_path);
         remove_gpgconf_fixture();
         return -1;
@@ -174,8 +187,10 @@ static int install_gpgconf_fixture(void) {
     g_gpgconf_saved_path = saved_path;
     g_gpgconf_saved_path_present = path != NULL;
     g_gpgconf_fixture_active = true;
-    if (find_command_path("gpgconf", resolved, sizeof(resolved)) != 0 ||
-        strcmp(resolved, executable) != 0) {
+    if (find_command_path("gpg", resolved, sizeof(resolved)) != 0 ||
+        strcmp(resolved, gpg) != 0 ||
+        find_command_path("gpgconf", resolved, sizeof(resolved)) != 0 ||
+        strcmp(resolved, gpgconf) != 0) {
         int saved_errno = errno;
 
         (void)restore_gpgconf_fixture();

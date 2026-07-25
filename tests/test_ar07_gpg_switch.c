@@ -10,6 +10,7 @@
 #include "git_ops.h"
 #include "gitswitch.h"
 #include "gpg_manager.h"
+#include "runner_internal.h"
 #include "utils.h"
 #include "trusted_command_fixture.h"
 
@@ -59,9 +60,13 @@
     "[GNUPG:] FAILURE gpg-exit 33554433\n"
 
 #ifdef __linux__
-/* AR-10 L31: see the twin helper in test_ar07_gpg_cleanup.c — user-namespace
- * fallback so the bind-mount security regression runs unprivileged instead
- * of green-skipping on every non-root host. */
+/* Enter a private mount namespace directly when the helper has mount
+ * authority. A user-namespace fallback preserves coverage for containerized
+ * root processes that may create a user namespace but not a bare mount
+ * namespace. */
+#define BIND_ALIAS_ROOT_HELPER_ENV \
+    "GITSWITCH_TEST_AR14_BIND_ALIAS_ROOT_HELPER"
+
 static int write_exact(const char *path, const char *text) {
     int fd = open(path, O_WRONLY);
     ssize_t length = (ssize_t)strlen(text);
@@ -87,6 +92,77 @@ static int enter_private_mount_namespace(void) {
     snprintf(map, sizeof(map), "%u %u 1", (unsigned)gid, (unsigned)gid);
     if (write_exact("/proc/self/gid_map", map) != 0) return -1;
     return 0;
+}
+
+static int wait_for_test_child(pid_t child) {
+    int status;
+
+    while (waitpid(child, &status, 0) < 0) {
+        if (errno != EINTR) return -1;
+    }
+    return WIFEXITED(status) ? WEXITSTATUS(status) : -1;
+}
+
+static int run_test_command(const char *path, char *const argv[]) {
+    pid_t child = fork();
+
+    if (child < 0) return -1;
+    if (child == 0) {
+        execv(path, argv);
+        _exit(127);
+    }
+    return wait_for_test_child(child);
+}
+
+/* An unprivileged user namespace cannot represent the host-root ownership of
+ * absolute executable ancestors: they appear as the overflow UID, which the
+ * production trust walk must reject. Run this privileged mount regression in
+ * a narrow root helper when passwordless sudo is available, just as the
+ * FreeBSD nullfs twin uses sudo for its mount operations. */
+static int run_bind_alias_root_helper(void) {
+    static char helper_assignment[] =
+        BIND_ALIAS_ROOT_HELPER_ENV "=1";
+    char self_executable[MAX_PATH_LEN];
+    char *probe_argv[4];
+    char *helper_argv[7];
+    const char *sudo_path;
+    const char *true_path;
+    const char *env_path;
+    ssize_t self_length;
+    int probe_rc;
+
+    sudo_path = access("/usr/bin/sudo", X_OK) == 0
+                    ? "/usr/bin/sudo"
+                    : access("/bin/sudo", X_OK) == 0 ? "/bin/sudo" : NULL;
+    true_path = access("/usr/bin/true", X_OK) == 0
+                    ? "/usr/bin/true"
+                    : access("/bin/true", X_OK) == 0 ? "/bin/true" : NULL;
+    env_path = access("/usr/bin/env", X_OK) == 0
+                   ? "/usr/bin/env"
+                   : access("/bin/env", X_OK) == 0 ? "/bin/env" : NULL;
+    self_length = readlink("/proc/self/exe", self_executable,
+                           sizeof(self_executable) - 1U);
+    if (!sudo_path || !true_path || !env_path || self_length <= 0 ||
+        (size_t)self_length >= sizeof(self_executable) - 1U) {
+        return 77;
+    }
+    self_executable[self_length] = '\0';
+
+    probe_argv[0] = (char *)sudo_path;
+    probe_argv[1] = (char *)"-n";
+    probe_argv[2] = (char *)true_path;
+    probe_argv[3] = NULL;
+    probe_rc = run_test_command(sudo_path, probe_argv);
+    if (probe_rc != 0) return 77;
+
+    helper_argv[0] = (char *)sudo_path;
+    helper_argv[1] = (char *)"-n";
+    helper_argv[2] = (char *)"-H";
+    helper_argv[3] = (char *)env_path;
+    helper_argv[4] = helper_assignment;
+    helper_argv[5] = self_executable;
+    helper_argv[6] = NULL;
+    return run_test_command(sudo_path, helper_argv);
 }
 #endif
 
@@ -283,6 +359,7 @@ enum fake_git_failure {
     FAKE_GIT_FAIL_OPENPGP_PROGRAM_SET
 };
 static enum fake_git_failure g_fake_git_failure;
+static char g_fake_gpg_path[MAX_PATH_LEN];
 
 void git_ops_test_reset_caches(void);
 
@@ -292,6 +369,53 @@ static bool argv_has(const char *const argv[], const char *needle) {
         if (strcmp(argv[i], needle) == 0) return true;
     }
     return false;
+}
+
+/* Successful injected launches must certify the exact executable generation.
+ * gpgconf also describes the same private fixture suite selected for GPG so
+ * production's toolchain binding remains exercised by these mocked children. */
+static int prepare_fake_launch(const char *const argv[],
+                               const run_opts_t *opts,
+                               run_result_t *result, bool *handled) {
+    char metadata[MAX_PATH_LEN + 32U] = "";
+    bool metadata_call = false;
+
+    if (handled) *handled = false;
+    if (result) {
+        memset(result, 0, sizeof(*result));
+        result->spawned = true;
+        if (argv && argv[0] && argv[0][0] == '/' &&
+            !run_launch_witness_capture(
+                argv[0], &result->launch_witness)) {
+            return -1;
+        }
+    }
+    if (opts && opts->out && opts->out_size > 0) opts->out[0] = '\0';
+    if (!argv || !argv[0] || !ts_command_is(argv[0], "gpgconf")) return 0;
+
+    if (argv_has(argv, "--list-components")) {
+        metadata_call = true;
+        if (safe_snprintf(
+                metadata, sizeof(metadata),
+                "gpg:OpenPGP:%s:\n", g_fake_gpg_path) != 0) {
+            return -1;
+        }
+    } else if (argv[1] && argv[2] && !argv[3] &&
+               strcmp(argv[1], "--reload") == 0 &&
+               strcmp(argv[2], "gpg-agent") == 0) {
+        if (handled) *handled = true;
+        return 0;
+    } else {
+        return 0;
+    }
+    if (!metadata_call || !opts || !opts->out ||
+        opts->out_size <= strlen(metadata)) {
+        return -1;
+    }
+    memcpy(opts->out, metadata, strlen(metadata) + 1U);
+    if (result) result->out_len = strlen(metadata);
+    if (handled) *handled = true;
+    return 0;
 }
 
 static bool opts_unsets_environment(const run_opts_t *opts,
@@ -426,13 +550,10 @@ static int listing_result_runner(const char *const argv[],
     bool listing = argv_has(argv, "--list-secret-keys");
     bool export_key = argv_has(argv, "--export-secret-keys");
     bool import_key = argv_has(argv, "--import");
+    bool handled;
 
-    if (result) {
-        memset(result, 0, sizeof(*result));
-        result->spawned = true;
-        result->exit_code = 0;
-    }
-    if (opts && opts->out && opts->out_size > 0) opts->out[0] = '\0';
+    if (prepare_fake_launch(argv, opts, result, &handled) != 0) return -1;
+    if (handled) return 0;
 
     if (listing) {
         g_listing_result_calls++;
@@ -917,12 +1038,10 @@ static int source_swap_runner(const char *const argv[],
     struct stat after;
     struct stat moved;
     bool dot_home = false;
+    bool handled;
 
-    if (result) {
-        memset(result, 0, sizeof(*result));
-        result->spawned = true;
-    }
-    if (opts && opts->out && opts->out_size > 0) opts->out[0] = '\0';
+    if (prepare_fake_launch(argv, opts, result, &handled) != 0) return -1;
+    if (handled) return 0;
     if (!argv_has(argv, "--list-secret-keys")) return 0;
 
     for (env = opts ? opts->extra_env : NULL; env && *env; env++) {
@@ -985,20 +1104,28 @@ TEST(bind_alias_of_managed_home_is_rejected_before_helper_launch) {
     char nested[MAX_PATH_LEN], overlay[MAX_PATH_LEN];
     char external[MAX_PATH_LEN];
     char alias[MAX_PATH_LEN];
-    char trusted_program_dir[MAX_PATH_LEN];
-    char trusted_gpg[MAX_PATH_LEN];
-    char self_executable[MAX_PATH_LEN];
-    const char *inherited_path;
-    char *saved_path = NULL;
-    bool saved_path_present;
-    ssize_t self_length;
-    int init_rc;
-    int restore_path_rc;
+    const char *root_helper = getenv(BIND_ALIAS_ROOT_HELPER_ENV);
     gpg_config_t config;
     account_t account;
     pid_t child;
     int status = 0;
     bool mount_namespace_unavailable = false;
+
+    if (geteuid() != 0) {
+        int helper_rc;
+
+        if (root_helper) {
+            CHECK(!"bind-alias root helper did not acquire root");
+            return;
+        }
+        helper_rc = run_bind_alias_root_helper();
+        if (helper_rc == 77) {
+            TS_SKIP("mount-namespace",
+                    "root mount-namespace helper unavailable");
+        }
+        CHECK_EQ_INT(helper_rc, 0);
+        return;
+    }
 
     CHECK_EQ_INT(make_runtime(xdg, sizeof(xdg)), 0);
     CHECK_EQ_INT(safe_snprintf(base, sizeof(base),
@@ -1020,48 +1147,8 @@ TEST(bind_alias_of_managed_home_is_rejected_before_helper_launch) {
     CHECK_EQ_INT(mkdir(external, 0700), 0);
     CHECK_EQ_INT(mkdir(alias, 0700), 0);
 
-    /* A user-namespace fallback maps host root-owned executables to the
-     * overflow uid, which the hardened resolver correctly rejects. Give this
-     * source-home test a self-owned native GPG stand-in; the fake runner below
-     * prevents execution, while the resolver still proves real ELF shape and
-     * trusted ancestry inside either namespace form. */
-    self_length = readlink("/proc/self/exe", self_executable,
-                           sizeof(self_executable) - 1U);
-    if (self_length <= 0 || (size_t)self_length >= sizeof(self_executable) - 1U ||
-        !ts_mkdtemp_trusted(trusted_program_dir,
-                            sizeof(trusted_program_dir),
-                            "gitswitch-ar11-bind-gpg") ||
-        safe_snprintf(trusted_gpg, sizeof(trusted_gpg), "%s/gpg",
-                      trusted_program_dir) != 0) {
-        CHECK(!"failed to prepare trusted bind-alias GPG fixture");
-        return;
-    }
-    self_executable[self_length] = '\0';
-    if (copy_file(self_executable, trusted_gpg) != 0 ||
-        chmod(trusted_gpg, 0700) != 0) {
-        CHECK(!"failed to install trusted bind-alias GPG fixture");
-        return;
-    }
-    inherited_path = getenv("PATH");
-    saved_path_present = inherited_path != NULL;
-    if (inherited_path) {
-        saved_path = strdup(inherited_path);
-        if (!saved_path) {
-            CHECK(!"failed to retain PATH for bind-alias fixture");
-            return;
-        }
-    }
     memset(&config, 0, sizeof(config));
-    if (setenv("PATH", trusted_program_dir, 1) != 0) {
-        free(saved_path);
-        CHECK(!"failed to select trusted bind-alias PATH");
-        return;
-    }
-    init_rc = gpg_manager_init(&config, GPG_MODE_SYSTEM);
-    restore_path_rc = saved_path_present ? setenv("PATH", saved_path, 1)
-                                         : unsetenv("PATH");
-    free(saved_path);
-    if (init_rc != 0 || restore_path_rc != 0) {
+    if (gpg_manager_init(&config, GPG_MODE_SYSTEM) != 0) {
         CHECK(!"failed to bind trusted GPG before namespace entry");
         return;
     }
@@ -1219,12 +1306,9 @@ static int strict_key_runner(const char *const argv[], const run_opts_t *opts,
     bool listing = argv_has(argv, "--list-secret-keys");
     bool export_key = argv_has(argv, "--export-secret-keys");
     bool import_key = argv_has(argv, "--import");
+    bool handled;
 
-    if (result) {
-        memset(result, 0, sizeof(*result));
-        result->spawned = true;
-    }
-    if (opts && opts->out && opts->out_size > 0) opts->out[0] = '\0';
+    if (prepare_fake_launch(argv, opts, result, &handled) != 0) return -1;
 
     if (argv && argv[0] &&
         (ts_command_is(argv[0], "gpg") ||
@@ -1232,6 +1316,7 @@ static int strict_key_runner(const char *const argv[], const run_opts_t *opts,
          ts_command_is(argv[0], "gpgconf"))) {
         CHECK(opts_unsets_environment(opts, "GPG_AGENT_INFO"));
     }
+    if (handled) return 0;
 
     if (argv && argv[0] && argv[1] && argv[2] &&
         strcmp(argv[0], "git") == 0 && strcmp(argv[1], "config") == 0 &&
@@ -1495,7 +1580,6 @@ TEST(full_v5_fingerprint_selector_survives_switch_and_git_publication) {
 }
 
 TEST(disabled_signing_keeps_canonical_identity_and_all_writes_are_fatal) {
-    static const char bound_program[] = "/trusted/ar11/gpg";
     gpg_config_t config = { .mode = GPG_MODE_ISOLATED };
     account_t account;
     command_runner_fn previous;
@@ -1504,8 +1588,10 @@ TEST(disabled_signing_keeps_canonical_identity_and_all_writes_are_fatal) {
     prepare_fake_git_model(&account);
     CHECK_EQ_INT(safe_strncpy(config.current_key_id, PRIMARY_FPR,
                               sizeof(config.current_key_id)), 0);
-    CHECK_EQ_INT(safe_strncpy(config.executable_path, bound_program,
+    CHECK_EQ_INT(safe_strncpy(config.executable_path, g_fake_gpg_path,
                               sizeof(config.executable_path)), 0);
+    CHECK(run_launch_witness_capture(config.executable_path,
+                                     &config.executable_witness));
     g_fake_git_failure = FAKE_GIT_OK;
     git_ops_test_reset_caches();
     previous = run_set_runner(strict_key_runner);
@@ -1517,7 +1603,7 @@ TEST(disabled_signing_keeps_canonical_identity_and_all_writes_are_fatal) {
     CHECK(g_fake_git_program_unset);
     CHECK(g_fake_git_x509_program_unset);
     CHECK(g_fake_git_ssh_program_unset);
-    CHECK_STR_EQ(g_fake_git_openpgp_program, bound_program);
+    CHECK_STR_EQ(g_fake_git_openpgp_program, g_fake_gpg_path);
 
     g_fake_git_failure = FAKE_GIT_FAIL_SIGNINGKEY;
     git_ops_test_reset_caches();
@@ -1575,12 +1661,10 @@ static int source_identity_runner(const char *const argv[],
     const char *const *env;
     struct stat actual;
     bool dot_home = false;
+    bool handled;
 
-    if (result) {
-        memset(result, 0, sizeof(*result));
-        result->spawned = true;
-    }
-    if (opts && opts->out && opts->out_size > 0) opts->out[0] = '\0';
+    if (prepare_fake_launch(argv, opts, result, &handled) != 0) return -1;
+    if (handled) return 0;
     if (!argv_has(argv, "--list-secret-keys")) return 0;
 
     g_source_identity_calls++;
@@ -1613,11 +1697,10 @@ static int g_source_proof_mutation_rc;
 static int source_proof_mutation_runner(const char *const argv[],
                                         const run_opts_t *opts,
                                         run_result_t *result) {
-    if (result) {
-        memset(result, 0, sizeof(*result));
-        result->spawned = true;
-    }
-    if (opts && opts->out && opts->out_size > 0) opts->out[0] = '\0';
+    bool handled;
+
+    if (prepare_fake_launch(argv, opts, result, &handled) != 0) return -1;
+    if (handled) return 0;
     if (!argv_has(argv, "--list-secret-keys")) return 0;
 
     g_source_proof_mutation_calls++;
@@ -3307,6 +3390,28 @@ TEST_MAIN_BEGIN()
                 "HARNESS FAIL: cannot install trusted GPG command fixtures\n");
         return 1;
     }
+    if (safe_snprintf(g_fake_gpg_path, sizeof(g_fake_gpg_path), "%s/gpg",
+                      command_fixture.directory) != 0) {
+        fprintf(stderr,
+                "HARNESS FAIL: cannot bind trusted GPG command fixture\n");
+        (void)ts_trusted_command_fixture_restore(&command_fixture);
+        return 1;
+    }
+#ifdef __linux__
+    if (getenv(BIND_ALIAS_ROOT_HELPER_ENV)) {
+        int helper_result;
+
+        RUN_TEST(bind_alias_of_managed_home_is_rejected_before_helper_launch);
+        if (ts_trusted_command_fixture_restore(&command_fixture) != 0) {
+            fprintf(stderr,
+                    "HARNESS FAIL: cannot restore PATH after root helper\n");
+            return 1;
+        }
+        helper_result = ts_test_finish();
+        if (helper_result != 0) return helper_result;
+        return ts_tests_skipped != 0 ? 77 : 0;
+    }
+#endif
     RUN_TEST(strict_capability_parser_rejects_unusable_keys);
     RUN_TEST(selector_inventory_is_exact_and_canonical);
     RUN_TEST(secret_listing_result_matrix_is_causal_and_exact);

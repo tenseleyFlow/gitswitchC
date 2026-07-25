@@ -22,6 +22,7 @@
 #include "test.h"
 #include "gitswitch.h"
 #include "gpg_manager.h"
+#include "runner_internal.h"
 #include "utils.h"
 #include "error.h"
 #include "trusted_command_fixture.h"
@@ -53,15 +54,51 @@ static bool unsets_environment(const run_opts_t *opts, const char *name) {
     return false;
 }
 
-/* Swallow gpgconf --kill (and anything else) without executing it. */
+/* Swallow GnuPG commands without executing them, while modeling the exact
+ * launch/toolchain evidence required when isolated homes are created. */
 static int null_runner(const char *const argv[], const run_opts_t *opts,
                        run_result_t *result) {
-    (void)argv;
+    const char *output = "";
+    char metadata[MAX_PATH_LEN + 32U];
+
     CHECK(unsets_environment(opts, "GPG_AGENT_INFO"));
-    if (opts && opts->out && opts->out_size > 0) opts->out[0] = '\0';
     if (result) {
         memset(result, 0, sizeof(*result));
         result->spawned = true;
+        if (argv && argv[0] && argv[0][0] == '/') {
+            CHECK(run_launch_witness_capture(
+                argv[0], &result->launch_witness));
+        }
+    }
+    if (argv && argv[0] && ts_command_is(argv[0], "gpgconf") &&
+        argv[1] && strcmp(argv[1], "--list-components") == 0 &&
+        !argv[2]) {
+        const char *slash = strrchr(argv[0], '/');
+        CHECK(slash != NULL);
+        if (slash) {
+            int written = snprintf(
+                metadata, sizeof(metadata),
+                "gpg:OpenPGP:%.*s/gpg:\n",
+                (int)(slash - argv[0]), argv[0]);
+            CHECK(written > 0 && (size_t)written < sizeof(metadata));
+            if (written > 0 && (size_t)written < sizeof(metadata)) {
+                output = metadata;
+            }
+        }
+    } else if (argv && argv[0] &&
+               ts_command_is(argv[0], "gpgconf") &&
+               argv[1] && argv[2] &&
+               strcmp(argv[1], "--reload") == 0 &&
+               strcmp(argv[2], "gpg-agent") == 0 && !argv[3]) {
+        output = "";
+    }
+    if (opts && opts->out && opts->out_size > 0) {
+        size_t output_len = strlen(output);
+        CHECK(output_len < opts->out_size);
+        if (output_len < opts->out_size) {
+            memcpy(opts->out, output, output_len + 1U);
+            if (result) result->out_len = output_len;
+        }
     }
     return 0;
 }
@@ -1648,14 +1685,16 @@ TEST(create_isolated_home_refuses_persistent_xdg_base) {
 }
 
 TEST_MAIN_BEGIN()
-    static const char *const trusted_commands[] = {"gpgconf", NULL};
+    static const char *const trusted_commands[] = {
+        "gpg", "gpgconf", NULL
+    };
     ts_trusted_command_fixture_t command_fixture = {0};
 
     error_init(LOG_LEVEL_ERROR, NULL);
     if (ts_trusted_command_fixture_install(
             &command_fixture, "gsw-ar11-gpg-reset", trusted_commands) != 0) {
         fprintf(stderr,
-                "HARNESS FAIL: cannot install trusted gpgconf fixture\n");
+                "HARNESS FAIL: cannot install trusted GnuPG fixture\n");
         return 1;
     }
     RUN_TEST(gpg_manager_reset_rejects_empty_selector_without_mutation);

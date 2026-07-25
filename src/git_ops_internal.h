@@ -2,10 +2,20 @@
 #define GIT_OPS_INTERNAL_H
 
 #include "git_ops.h"
+#include "utils.h"
 
 #ifdef GITSWITCH_INTERNAL_API
 typedef struct git_config_finalization git_config_finalization_t;
 typedef struct git_retirement_recovery git_retirement_recovery_t;
+
+/* Validate the effective Git account model and require the raw OpenPGP key
+ * probe to execute through the exact launch generation retained by the active
+ * GPG switch transaction. A GPG-enabled account requires a valid witness
+ * whose canonical invocation path equals expected_gpg_program. */
+int git_test_config_with_gpg_witness(
+    const account_t *account, git_scope_t scope,
+    const char *expected_gpg_program,
+    const run_launch_witness_t *expected_gpg_witness);
 
 /* Acquire the canonical Git lock names for every distinct config destination
  * tracked by the active sealed switch, then re-prove its exact namespace,

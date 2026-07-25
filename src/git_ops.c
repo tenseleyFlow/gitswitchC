@@ -38,6 +38,7 @@
 #undef GITSWITCH_INTERNAL_API
 #include "error.h"
 #include "utils.h"
+#include "runner_internal.h"
 #include "display.h"
 #include "toml_parser.h"
 
@@ -9792,9 +9793,11 @@ int git_retire_account_identity_publications(
  * code, and git_get_config_scope's system-scope arm implied a scope model the
  * rest of git_ops does not use). */
 
-/* Validate the account model Git will actually consume. */
-int git_test_config(const account_t *account, git_scope_t scope,
-                    const char *expected_gpg_program) {
+static int git_test_config_impl(
+    const account_t *account, git_scope_t scope,
+    const char *expected_gpg_program,
+    const run_launch_witness_t *expected_gpg_witness,
+    bool require_gpg_witness) {
     bool gpg_expected;
 
     if (!account) {
@@ -9813,9 +9816,25 @@ int git_test_config(const account_t *account, git_scope_t scope,
                       "GPG-enabled Git validation requires the bound absolute OpenPGP program");
             return -1;
         }
+        if (require_gpg_witness &&
+            (!expected_gpg_witness ||
+             !run_launch_witness_matches(expected_gpg_witness,
+                                         expected_gpg_witness) ||
+             strcmp(expected_gpg_witness->executable_path,
+                    expected_gpg_program) != 0)) {
+            set_error(
+                ERR_INVALID_ARGS,
+                "GPG-enabled Git validation requires the matching bound OpenPGP launch witness");
+            return -1;
+        }
     } else if (expected_gpg_program && expected_gpg_program[0] != '\0') {
         set_error(ERR_INVALID_ARGS,
                   "Git validation received a GPG program for an account without GPG");
+        return -1;
+    } else if (expected_gpg_witness) {
+        set_error(
+            ERR_INVALID_ARGS,
+            "Git validation received a GPG launch witness for an account without GPG");
         return -1;
     }
 
@@ -9840,6 +9859,8 @@ int git_test_config(const account_t *account, git_scope_t scope,
     if (gpg_expected) {
         const char *const gpg_unset_env[] = {
             "GPG_AGENT_INFO",
+            "GNUPG_BUILDDIR",
+            "GNUPG_BUILD_ROOT",
             NULL
         };
         const char *gpg_argv[] = {
@@ -9847,10 +9868,32 @@ int git_test_config(const account_t *account, git_scope_t scope,
             account->gpg_key_id, NULL
         };
         run_opts_t gpg_opts;
+        run_result_t gpg_result;
+        int run_result;
         memset(&gpg_opts, 0, sizeof(gpg_opts));
+        memset(&gpg_result, 0, sizeof(gpg_result));
+        gpg_result.exit_code = -1;
         gpg_opts.stderr_to_devnull = true;
         gpg_opts.unset_env = gpg_unset_env;
-        if (run_argv(gpg_argv, &gpg_opts, NULL) != 0) {
+        if (require_gpg_witness) {
+            run_result = run_argv_with_expected_launch(
+                gpg_argv, &gpg_opts, expected_gpg_witness, &gpg_result);
+        } else {
+            /* Preserve the public API's established custom-runner contract:
+             * run_argv's return value is authoritative when no transaction
+             * witness was requested. */
+            run_result = run_argv(gpg_argv, &gpg_opts, NULL);
+        }
+        if (require_gpg_witness && run_result != 0) {
+            /* The bound runner already classified a pre-spawn trust or
+             * generation failure. Preserve that causal diagnostic instead of
+             * misreporting executable replacement as an absent key. */
+            return -1;
+        }
+        if (run_result != 0 ||
+            (require_gpg_witness &&
+             (!gpg_result.spawned || gpg_result.exit_code != 0 ||
+              gpg_result.term_signal != 0))) {
             set_error(ERR_GPG_KEY_NOT_FOUND, "GPG key not available: %s",
                       account->gpg_key_id);
             return -1;
@@ -9859,6 +9902,23 @@ int git_test_config(const account_t *account, git_scope_t scope,
 
     log_info("Git configuration test passed for %s", account->name);
     return 0;
+}
+
+/* Validate the account model Git will actually consume. The public entry point
+ * retains its established path-only contract for compatibility; switch
+ * transactions call the internal witness-bound entry point below. */
+int git_test_config(const account_t *account, git_scope_t scope,
+                    const char *expected_gpg_program) {
+    return git_test_config_impl(account, scope, expected_gpg_program, NULL,
+                                false);
+}
+
+int git_test_config_with_gpg_witness(
+    const account_t *account, git_scope_t scope,
+    const char *expected_gpg_program,
+    const run_launch_witness_t *expected_gpg_witness) {
+    return git_test_config_impl(
+        account, scope, expected_gpg_program, expected_gpg_witness, true);
 }
 
 /* Set single git configuration value */

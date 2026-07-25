@@ -1050,14 +1050,23 @@ static void finish_switch_success(gitswitch_ctx_t *ctx, account_t *account,
         }
     }
 
-    if (!ctx->config.dry_run && write_git &&
-        git_test_config(
-            switch_target, scope,
-            switch_target->gpg_enabled && switch_target->gpg_key_id[0] != '\0'
-                ? g_session.gpg_config.executable_path
-                : NULL) != 0) {
-        log_warning("Git configuration validation failed: %s",
-                    get_last_error()->message);
+    if (!ctx->config.dry_run && write_git) {
+        int validation_rc;
+
+        if (switch_target->gpg_enabled &&
+            switch_target->gpg_key_id[0] != '\0') {
+            validation_rc = git_test_config_with_gpg_witness(
+                switch_target, scope,
+                g_session.gpg_config.executable_path,
+                &g_session.gpg_config.executable_witness);
+        } else {
+            validation_rc =
+                git_test_config(switch_target, scope, NULL);
+        }
+        if (validation_rc != 0) {
+            log_warning("Git configuration validation failed: %s",
+                        get_last_error()->message);
+        }
     }
 
     if (!ctx->config.resuming) {

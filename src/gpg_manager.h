@@ -4,6 +4,7 @@
 #define GPG_MANAGER_H
 
 #include "gitswitch.h"
+#include "utils.h"
 #include <dirent.h>
 #include <sys/stat.h>
 
@@ -51,6 +52,7 @@ typedef struct {
     /* Canonical absolute OpenPGP executable selected by the hardened resolver.
      * One manager transaction keeps this binding even if PATH changes. */
     char executable_path[MAX_PATH_LEN];
+    run_launch_witness_t executable_witness;
     char gnupg_home[MAX_PATH_LEN];    /* GNUPGHOME path */
     char current_key_id[GPG_FINGERPRINT_BUFSIZE];
     bool signing_enabled;

@@ -202,16 +202,19 @@ typedef struct {
 } run_opts_t;
 
 /* Exact launch generation retained by the production runner after a clean
- * invocation. The caller supplies the canonical program pathname when
- * revalidating this witness; scripts additionally bind the exact direct
+ * invocation. The canonical executable path is part of the witness so a
+ * matching inode reached through a different multicall/hard-link spelling is
+ * not the same invocation. Scripts additionally bind the exact direct
  * interpreter spelling, optional shebang argument, and interpreter
- * generation. Custom runners leave this structure invalid. */
+ * generation. Custom runners leave this structure invalid unless they can
+ * certify the same launch contract. */
 typedef struct {
     bool valid;
     bool is_script;
     bool has_interpreter_arg;
     struct stat executable_identity;
     struct stat interpreter_identity;
+    char executable_path[MAX_PATH_LEN];
     char interpreter_argv0[256];
     char interpreter_arg[256];
 } run_launch_witness_t;
