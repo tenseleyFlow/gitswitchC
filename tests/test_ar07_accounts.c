@@ -55,6 +55,7 @@ static int null_runner(const char *const argv[], const run_opts_t *opts,
 
 static int g_source_probe_count;
 static bool g_source_probe_pinned;
+static int g_gpg_retirement_attempts;
 
 #define ACCOUNT_SYSTEM_FPR "BBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBB"
 static const char account_system_listing[] =
@@ -299,6 +300,13 @@ static int health_retained_probe_runner(const char *const argv[],
 
 static int fail_predelete(int home_fd) {
     (void)home_fd;
+    errno = EIO;
+    return -1;
+}
+
+static int count_and_reject_predelete(int home_fd) {
+    (void)home_fd;
+    g_gpg_retirement_attempts++;
     errno = EIO;
     return -1;
 }
@@ -936,6 +944,223 @@ static int make_gpg_home(const char *root, const char *name,
     return write_mode(marker, "secret\n", 0600);
 }
 
+TEST(inactive_invalid_gpg_selector_repair_preserves_causal_error_state) {
+    static const char invalid_selector[] = "not-a-gpg-selector";
+    char root[256], key_one[512], key_two[512], source_home[512];
+    gitswitch_ctx_t ctx;
+    account_t original, changed;
+    command_runner_fn old_runner;
+    error_context_t retained_error;
+    error_context_t observed_error;
+    uint64_t retained_generation;
+    int prepare_rc;
+    int observed_errno;
+
+    CHECK_EQ_INT(make_sandbox(root, sizeof(root), key_one, sizeof(key_one),
+                              key_two, sizeof(key_two)), 0);
+    CHECK((size_t)snprintf(source_home, sizeof(source_home), "%s/.gnupg",
+                           root) < sizeof(source_home));
+    CHECK_EQ_INT(mkdir(source_home, 0700), 0);
+    memset(&ctx, 0, sizeof(ctx));
+    fill_account(&original, 1, "one", "one@example.com", NULL, NULL);
+    original.gpg_enabled = true;
+    CHECK_EQ_INT(safe_strncpy(original.gpg_key_id, ACCOUNT_SYSTEM_FPR,
+                              sizeof(original.gpg_key_id)), 0);
+    CHECK_EQ_INT(config_add_account(&ctx, &original), 0);
+
+    /* Model a hand-built or previously corrupted inactive context. Admission
+     * rejects this spelling on new input, but an edit must still be able to
+     * repair it without turning an internal semantic comparison into the
+     * caller-visible cause of an otherwise successful transaction. */
+    CHECK_EQ_INT(safe_strncpy(ctx.accounts[0].gpg_key_id, invalid_selector,
+                              sizeof(ctx.accounts[0].gpg_key_id)), 0);
+    changed = ctx.accounts[0];
+    CHECK_EQ_INT(safe_strncpy(changed.gpg_key_id, ACCOUNT_SYSTEM_FPR,
+                              sizeof(changed.gpg_key_id)), 0);
+
+    old_runner = run_set_runner(present_system_gpg_key_runner);
+    g_source_probe_count = 0;
+    g_source_probe_pinned = false;
+    (void)set_error(ERR_NETWORK_ERROR,
+                    "retained error across selector repair comparison");
+    retained_error = *get_last_error();
+    retained_generation = error_report_generation();
+    /* Missing managed homes are a successful first-run condition and may
+     * leave ENOENT ambient. Seed that exact caller value so the full repair
+     * path can prove it did not replace the caller's errno contract. */
+    errno = ENOENT;
+
+    prepare_rc = accounts_edit_candidate_prepare(&ctx, &changed);
+    observed_errno = errno;
+    observed_error = *get_last_error();
+
+    CHECK_EQ_INT(prepare_rc, 0);
+    CHECK(memcmp(&observed_error, &retained_error,
+                 sizeof(retained_error)) == 0);
+    CHECK(error_report_generation() == retained_generation);
+    CHECK_EQ_INT(observed_errno, ENOENT);
+    CHECK_EQ_INT(g_source_probe_count, 1);
+    CHECK(g_source_probe_pinned);
+    CHECK_STR_EQ(ctx.accounts[0].gpg_key_id, ACCOUNT_SYSTEM_FPR);
+
+    if (prepare_rc == 0) {
+        CHECK_EQ_INT(accounts_edit_commit(&ctx), 0);
+    }
+    end_edit_guard();
+    run_set_runner(old_runner);
+}
+
+TEST(inactive_equivalent_gpg_selector_edit_preserves_runtime_and_spelling) {
+    static const char original_selector[] = "A1B2C3D4E5F60708";
+    static const char equivalent_selector[] = "0xa1b2c3d4e5f60708";
+    static const char different_length_selector[] =
+        "0xa1b2c3d4e5f6070809";
+    char root[256], key_one[512], key_two[512], home[512], marker[768];
+    char config_path[512], persisted[8192];
+    gitswitch_ctx_t ctx;
+    account_t original, changed;
+    command_runner_fn old_runner;
+    gpg_cleanup_predelete_fn old_hook;
+    bool installed = false;
+
+    CHECK_EQ_INT(make_sandbox(root, sizeof(root), key_one, sizeof(key_one),
+                              key_two, sizeof(key_two)), 0);
+    CHECK_EQ_INT(make_gpg_home(root, "one", home, sizeof(home), marker,
+                               sizeof(marker)), 0);
+    CHECK((size_t)snprintf(config_path, sizeof(config_path),
+                           "%s/accounts.toml", root) < sizeof(config_path));
+    memset(&ctx, 0, sizeof(ctx));
+    fill_account(&original, 1, "one", "one@example.com", NULL, NULL);
+    original.gpg_enabled = true;
+    CHECK_EQ_INT(safe_strncpy(original.gpg_key_id, original_selector,
+                              sizeof(original.gpg_key_id)), 0);
+    CHECK_EQ_INT(config_add_account(&ctx, &original), 0);
+    CHECK_EQ_INT(config_save(&ctx, config_path), 0);
+
+    old_runner = run_set_runner(missing_system_gpg_key_runner);
+    old_hook =
+        gpg_manager_set_cleanup_predelete_fn(count_and_reject_predelete);
+    g_source_probe_count = 0;
+    g_source_probe_pinned = false;
+    g_gpg_retirement_attempts = 0;
+
+    changed = ctx.accounts[0];
+    CHECK_EQ_INT(safe_strncpy(changed.gpg_key_id, equivalent_selector,
+                              sizeof(changed.gpg_key_id)), 0);
+    CHECK_EQ_INT(accounts_edit_candidate_prepare(&ctx, &changed), 0);
+    CHECK_EQ_INT(g_source_probe_count, 0);
+    CHECK(!g_source_probe_pinned);
+    CHECK_EQ_INT(g_gpg_retirement_attempts, 0);
+    CHECK(path_exists(marker));
+    CHECK_STR_EQ(ctx.accounts[0].gpg_key_id, equivalent_selector);
+    CHECK_EQ_INT(config_save_transactional(&ctx, config_path, &installed), 0);
+    CHECK(installed);
+    CHECK_EQ_INT(accounts_edit_commit(&ctx), 0);
+    end_edit_guard();
+
+    CHECK(path_exists(home));
+    CHECK(path_exists(marker));
+    CHECK_STR_EQ(ctx.accounts[0].gpg_key_id, equivalent_selector);
+    CHECK(read_text(config_path, persisted, sizeof(persisted)) > 0);
+    CHECK(strstr(persisted, equivalent_selector) != NULL);
+    CHECK(strstr(persisted, original_selector) == NULL);
+
+    /* A selector with a different normalized length is not equivalent. The
+     * inactive edit must still enter the destructive-identity path and stop
+     * at the retained-home gate before probing or retiring anything. */
+    changed = ctx.accounts[0];
+    CHECK_EQ_INT(safe_strncpy(changed.gpg_key_id,
+                              different_length_selector,
+                              sizeof(changed.gpg_key_id)), 0);
+    CHECK_EQ_INT(accounts_edit_candidate_prepare(&ctx, &changed), -1);
+    CHECK(strstr(get_last_error()->message, "isolated GPG home") != NULL);
+    CHECK_EQ_INT(g_source_probe_count, 0);
+    CHECK_EQ_INT(g_gpg_retirement_attempts, 0);
+    CHECK(path_exists(marker));
+    CHECK_STR_EQ(ctx.accounts[0].gpg_key_id, equivalent_selector);
+
+    gpg_manager_set_cleanup_predelete_fn(old_hook);
+    run_set_runner(old_runner);
+}
+
+TEST(active_equivalent_gpg_selector_edit_preserves_runtime_and_spelling) {
+    static const char original_selector[] = "A1B2C3D4E5F60708";
+    static const char equivalent_selector[] = "0Xa1b2c3d4e5f60708";
+    static const char different_length_selector[] =
+        "0Xa1b2c3d4e5f6070809";
+    char root[256], key_one[512], key_two[512], home[512], marker[768];
+    char config_path[512], persisted[8192];
+    gitswitch_ctx_t ctx;
+    account_t original, changed;
+    command_runner_fn old_runner;
+    gpg_cleanup_predelete_fn old_hook;
+    bool installed = false;
+
+    CHECK_EQ_INT(make_sandbox(root, sizeof(root), key_one, sizeof(key_one),
+                              key_two, sizeof(key_two)), 0);
+    CHECK_EQ_INT(make_gpg_home(root, "one", home, sizeof(home), marker,
+                               sizeof(marker)), 0);
+    CHECK((size_t)snprintf(config_path, sizeof(config_path),
+                           "%s/accounts.toml", root) < sizeof(config_path));
+    memset(&ctx, 0, sizeof(ctx));
+    fill_account(&original, 1, "one", "one@example.com", NULL, NULL);
+    original.gpg_enabled = true;
+    CHECK_EQ_INT(safe_strncpy(original.gpg_key_id, original_selector,
+                              sizeof(original.gpg_key_id)), 0);
+    CHECK_EQ_INT(config_add_account(&ctx, &original), 0);
+    ctx.current_account = &ctx.accounts[0];
+    CHECK_EQ_INT(safe_strncpy(ctx.config.active_account, "one",
+                              sizeof(ctx.config.active_account)), 0);
+    CHECK_EQ_INT(config_save(&ctx, config_path), 0);
+
+    old_runner = run_set_runner(missing_system_gpg_key_runner);
+    old_hook =
+        gpg_manager_set_cleanup_predelete_fn(count_and_reject_predelete);
+    g_source_probe_count = 0;
+    g_source_probe_pinned = false;
+    g_gpg_retirement_attempts = 0;
+
+    changed = ctx.accounts[0];
+    CHECK_EQ_INT(safe_strncpy(changed.gpg_key_id, equivalent_selector,
+                              sizeof(changed.gpg_key_id)), 0);
+    CHECK_EQ_INT(accounts_edit_candidate_prepare(&ctx, &changed), 0);
+    CHECK_EQ_INT(g_source_probe_count, 0);
+    CHECK(!g_source_probe_pinned);
+    CHECK_EQ_INT(g_gpg_retirement_attempts, 0);
+    CHECK(path_exists(marker));
+    CHECK_STR_EQ(ctx.accounts[0].gpg_key_id, equivalent_selector);
+    CHECK_EQ_INT(config_save_transactional(&ctx, config_path, &installed), 0);
+    CHECK(installed);
+    CHECK_EQ_INT(accounts_edit_commit(&ctx), 0);
+    end_edit_guard();
+
+    CHECK(ctx.current_account == &ctx.accounts[0]);
+    CHECK(path_exists(home));
+    CHECK(path_exists(marker));
+    CHECK_STR_EQ(ctx.accounts[0].gpg_key_id, equivalent_selector);
+    CHECK(read_text(config_path, persisted, sizeof(persisted)) > 0);
+    CHECK(strstr(persisted, equivalent_selector) != NULL);
+    CHECK(strstr(persisted, original_selector) == NULL);
+
+    /* The semantic relaxation is exact: a different normalized selector
+     * remains a live-field mutation and is rejected before any source probe,
+     * reset, or in-memory candidate installation. */
+    changed = ctx.accounts[0];
+    CHECK_EQ_INT(safe_strncpy(changed.gpg_key_id,
+                              different_length_selector,
+                              sizeof(changed.gpg_key_id)), 0);
+    CHECK_EQ_INT(accounts_edit_candidate_prepare(&ctx, &changed), -1);
+    CHECK(strstr(get_last_error()->message, "Cannot change live fields") !=
+          NULL);
+    CHECK_EQ_INT(g_source_probe_count, 0);
+    CHECK_EQ_INT(g_gpg_retirement_attempts, 0);
+    CHECK(path_exists(marker));
+    CHECK_STR_EQ(ctx.accounts[0].gpg_key_id, equivalent_selector);
+
+    gpg_manager_set_cleanup_predelete_fn(old_hook);
+    run_set_runner(old_runner);
+}
+
 TEST(gpg_identity_edit_rejects_an_existing_isolated_home_without_mutation) {
     char root[256], key_one[512], key_two[512], home[512], marker[768];
     gitswitch_ctx_t ctx;
@@ -1395,6 +1620,12 @@ TEST_MAIN_BEGIN()
     RUN_TEST(key_only_edit_rolls_back_before_install);
     RUN_TEST(key_only_edit_stays_consistent_after_uncertain_install);
     RUN_TEST(private_key_admission_rejects_public_content);
+    RUN_TEST(
+        inactive_invalid_gpg_selector_repair_preserves_causal_error_state);
+    RUN_TEST(
+        inactive_equivalent_gpg_selector_edit_preserves_runtime_and_spelling);
+    RUN_TEST(
+        active_equivalent_gpg_selector_edit_preserves_runtime_and_spelling);
     RUN_TEST(gpg_identity_edit_rejects_an_existing_isolated_home_without_mutation);
     RUN_TEST(gpg_rename_rejects_an_orphaned_candidate_home_without_deleting_it);
     RUN_TEST(targeted_gpg_reset_failure_preserves_the_edit_retry_handle);

@@ -2798,6 +2798,35 @@ int accounts_switch_abort(gitswitch_ctx_t *ctx,
 /* Fields whose persisted value must agree with the live Git/SSH/GPG state.
  * Description is intentionally excluded: it is metadata-only and safe to
  * update while the account is active. */
+typedef struct {
+    const char *left;
+    const char *right;
+} gpg_selector_comparison_t;
+
+static int compare_gpg_selectors_observational(void *context) {
+    const gpg_selector_comparison_t *comparison = context;
+    char normalized_left[MAX_GPG_SELECTOR_LEN];
+    char normalized_right[MAX_GPG_SELECTOR_LEN];
+
+    if (!comparison) return 0;
+    return publication_normalize_gpg_selector(
+               comparison->left, normalized_left) == 0 &&
+           publication_normalize_gpg_selector(
+               comparison->right, normalized_right) == 0 &&
+           strcmp(normalized_left, normalized_right) == 0;
+}
+
+static bool gpg_selectors_semantically_equal(const char *a, const char *b) {
+    gpg_selector_comparison_t comparison;
+
+    if (!a || !b) return false;
+    if (strcmp(a, b) == 0) return true;
+    comparison.left = a;
+    comparison.right = b;
+    return error_run_observational(compare_gpg_selectors_observational,
+                                   &comparison) == 1;
+}
+
 static bool account_live_fields_equal(const account_t *a, const account_t *b) {
     return a && b &&
            strcmp(a->name, b->name) == 0 &&
@@ -2809,7 +2838,8 @@ static bool account_live_fields_equal(const account_t *a, const account_t *b) {
            strcmp(a->ssh_hostname, b->ssh_hostname) == 0 &&
            a->gpg_enabled == b->gpg_enabled &&
            a->gpg_signing_enabled == b->gpg_signing_enabled &&
-           strcmp(a->gpg_key_id, b->gpg_key_id) == 0;
+           gpg_selectors_semantically_equal(a->gpg_key_id,
+                                            b->gpg_key_id);
 }
 
 static account_t *account_by_id(gitswitch_ctx_t *ctx, uint32_t id) {
@@ -2863,7 +2893,8 @@ static bool account_gpg_runtime_identity_equal(const account_t *a,
     if (!a || !b || a->gpg_enabled != b->gpg_enabled) return false;
     if (!a->gpg_enabled) return true;
     return strcmp(a->name, b->name) == 0 &&
-           strcmp(a->gpg_key_id, b->gpg_key_id) == 0;
+           gpg_selectors_semantically_equal(a->gpg_key_id,
+                                            b->gpg_key_id);
 }
 
 static int restore_pending_edit_alias(void) {
