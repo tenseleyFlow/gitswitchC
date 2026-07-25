@@ -255,7 +255,8 @@ typedef enum {
     GIT_RETIREMENT_TEST_CLEANUP_UNLINK,
     GIT_RETIREMENT_TEST_AFTER_EXCHANGE,
     GIT_RETIREMENT_TEST_BEFORE_MARKER_PUBLISH,
-    GIT_RETIREMENT_TEST_RESTORED_WITNESS_AFTER_CLOSE
+    GIT_RETIREMENT_TEST_RESTORED_WITNESS_AFTER_CLOSE,
+    GIT_RETIREMENT_TEST_BEFORE_ABSENT_REVALIDATE
 } git_retirement_test_stage_t;
 typedef bool (*git_retirement_test_hook_fn)(
     git_retirement_test_stage_t stage, const char *path,
@@ -7452,71 +7453,6 @@ static bool git_retirement_directory_identity_matches(
                ((uintmax_t)st->st_mode & (uintmax_t)S_IFMT);
 }
 
-/* AR-12 M4 / AR-13 R1: prove a recorded config path is *definitively* absent —
- * genuinely deleted from a still-live directory — as distinct from merely
- * unreachable (an unmounted removable/network volume, or a parent renamed
- * away). A bare stat()==ENOENT conflates the two: POSIX returns ENOENT
- * identically for a deleted leaf and for a leaf whose ancestor is temporarily
- * gone, so the old oracle vacuously retired a leg while its private-key
- * sshCommand / signing-key residue sat intact on an unmounted volume, then
- * flipped the ledger record to a non-authorizing RETIRING tombstone that no
- * later command could ever retire once the volume returned.
- *
- * Two changes make the ENOENT proof sound:
- *   1. lstat, not stat, on the leaf — a dangling symlink at the recorded path
- *      must read as present (fail closed), not chase a missing target to a
- *      spurious "absent".
- *   2. On leaf ENOENT, walk up to the deepest still-existing ancestor and
- *      require it to be a directory on the SAME filesystem the record was
- *      published against (config_parent.device is the recorded .git dir's
- *      st_dev). `rm -rf repo` on the still-mounted fs — the case M4 targets —
- *      leaves that ancestor sharing the recorded device, so absence is proven.
- *      An unmounted/renamed-away volume leaves the deepest existing ancestor
- *      above the old mountpoint on a *different* device, so it stays
- *      indeterminate and fails closed, preserving the guard/retry handle so a
- *      remount + retry retires exactly. Note config_parent itself is destroyed
- *      by `rm -rf repo` (it removes .git too), so it cannot be the anchor — the
- *      surviving-ancestor device is what discriminates deletion from unmount.
- * Any non-ENOENT errno (permission, loop) stays indeterminate. */
-static bool git_retirement_destination_provably_absent(
-    const publication_record_t *publication) {
-    struct stat st;
-    char path[MAX_PATH_LEN];
-
-    if (!publication || publication->config_path[0] != '/') return false;
-    if (!publication->config_parent.present) return false;
-
-    errno = 0;
-    if (lstat(publication->config_path, &st) == 0) return false; /* present */
-    if (errno != ENOENT) return false; /* indeterminate -> fail closed */
-
-    if (safe_strncpy(path, publication->config_path, sizeof(path)) != 0) {
-        return false;
-    }
-    for (;;) {
-        char *slash = strrchr(path, '/');
-
-        if (!slash) return false;
-        if (slash == path) {
-            path[1] = '\0'; /* probe "/" */
-        } else {
-            *slash = '\0';
-        }
-        errno = 0;
-        /* stat, not lstat, on ANCESTORS: a symlinked ancestor (e.g. /tmp ->
-         * /private/tmp on macOS) is a normal path component and must resolve
-         * to the real directory it names — only the leaf needs lstat (dangling-
-         * symlink-is-present). Absence is proven only if the deepest existing
-         * ancestor resolves to a directory on the recorded filesystem. */
-        if (stat(path, &st) == 0) {
-            return S_ISDIR(st.st_mode) &&
-                   (uintmax_t)st.st_dev == publication->config_parent.device;
-        }
-        if (errno != ENOENT) return false; /* indeterminate -> fail closed */
-        if (slash == path) return false;   /* nothing down to root existed */
-    }
-}
-
 /* A completed atomic retirement necessarily changes the config generation.
  * For retry/idempotence, retain the durable namespace and repository proof
  * while allowing the caller to inspect whether every exact owned value is
@@ -7644,6 +7580,7 @@ typedef struct {
     bool restored;
     bool restored_witness_ready;
     bool settled;
+    bool absent_destination;
 } git_retirement_group_t;
 
 typedef struct {
@@ -7651,6 +7588,7 @@ typedef struct {
     publication_record_t publication;
     bool ready;
     bool namespace_ready;
+    bool absence_candidate;
 } git_retirement_item_t;
 
 typedef enum {
@@ -7678,6 +7616,268 @@ struct git_retirement_transaction {
 struct git_retirement_recovery {
     git_retirement_transaction_t *transaction;
 };
+
+/* AR-14 H3/H4: absence is transaction state, not a scalar path observation.
+ * Resolve only the immutable recorded path, pin its exact recorded parent,
+ * and occupy Git's canonical lock name before ENOENT can authorize progress.
+ * This intentionally does not broaden git_scope_lock_acquire(): ordinary
+ * rollback/write locking still requires a live canonical source generation. */
+static int git_retirement_resolve_absent_destination(
+    const publication_record_t *publication, git_scope_lock_t *lock) {
+    const char *slash;
+
+    if (!publication || !lock || publication->config_path[0] != '/') {
+        errno = EINVAL;
+        set_error(ERR_INVALID_ARGS,
+                  "Invalid absent Git retirement destination");
+        return -1;
+    }
+    memset(lock, 0, sizeof(*lock));
+    lock->dir_fd = -1;
+    lock->lock_fd = -1;
+    lock->stage_fd = -1;
+    lock->original_fd = -1;
+    lock->published_fd = -1;
+    if (safe_strncpy(lock->logical_path, publication->config_path,
+                     sizeof(lock->logical_path)) != 0 ||
+        safe_strncpy(lock->path, publication->config_path,
+                     sizeof(lock->path)) != 0) {
+        return -1;
+    }
+    slash = strrchr(publication->config_path, '/');
+    if (!slash || !slash[1] || strlen(slash + 1U) > NAME_MAX) {
+        errno = EINVAL;
+        set_error(ERR_GIT_CONFIG_FAILED,
+                  "Invalid recorded Git configuration path: %s",
+                  publication->config_path);
+        return -1;
+    }
+    if (slash == publication->config_path) {
+        if (safe_strncpy(lock->parent, "/", sizeof(lock->parent)) != 0 ||
+            safe_strncpy(lock->logical_parent, "/",
+                         sizeof(lock->logical_parent)) != 0) {
+            return -1;
+        }
+    } else {
+        size_t parent_length =
+            (size_t)(slash - publication->config_path);
+
+        if (parent_length >= sizeof(lock->parent)) {
+            errno = ENAMETOOLONG;
+            set_error(ERR_GIT_CONFIG_FAILED,
+                      "Recorded Git configuration parent path is too long");
+            return -1;
+        }
+        memcpy(lock->parent, publication->config_path, parent_length);
+        lock->parent[parent_length] = '\0';
+        memcpy(lock->logical_parent, publication->config_path,
+               parent_length);
+        lock->logical_parent[parent_length] = '\0';
+    }
+    if (safe_strncpy(lock->leaf, slash + 1U, sizeof(lock->leaf)) != 0 ||
+        (size_t)snprintf(lock->lock_leaf, sizeof(lock->lock_leaf),
+                         "%s.lock", lock->leaf) >=
+            sizeof(lock->lock_leaf) ||
+        (size_t)snprintf(lock->lock_path, sizeof(lock->lock_path),
+                         "%s/%s", lock->parent, lock->lock_leaf) >=
+            sizeof(lock->lock_path)) {
+        errno = ENAMETOOLONG;
+        set_error(ERR_GIT_CONFIG_FAILED,
+                  "Recorded Git configuration lock path is too long");
+        return -1;
+    }
+    lock->logical_present = false;
+    return 0;
+}
+
+static bool git_retirement_absent_namespace_matches(
+    const publication_record_t *publication,
+    const git_retirement_group_t *group) {
+    struct stat pinned_parent;
+    struct stat live_parent;
+    struct stat leaf;
+    int live_parent_fd = -1;
+    bool matches = false;
+
+    if (!publication || !group || !group->absent_destination ||
+        !group->lock_ready || group->lock.dir_fd < 0 ||
+        group->lock.lock_fd < 0 || !group->lock.lock_created ||
+        !group->lock.lock_witness_valid) {
+        errno = EINVAL;
+        return false;
+    }
+    if (fstat(group->lock.dir_fd, &pinned_parent) != 0 ||
+        !git_same_object_identity(&group->lock.parent_stat,
+                                  &pinned_parent) ||
+        !git_retirement_directory_identity_matches(
+            &publication->config_parent, &pinned_parent)) {
+        errno = errno ? errno : ESTALE;
+        goto done;
+    }
+    live_parent_fd = open(group->lock.parent,
+                          O_RDONLY | O_DIRECTORY | O_CLOEXEC |
+                              O_NOFOLLOW);
+    if (live_parent_fd < 0 ||
+        fstat(live_parent_fd, &live_parent) != 0 ||
+        !git_same_object_identity(&pinned_parent, &live_parent) ||
+        !git_retirement_directory_identity_matches(
+            &publication->config_parent, &live_parent) ||
+        !git_file_at_matches_witness(
+            group->lock.dir_fd, group->lock.lock_leaf,
+            group->lock.lock_fd, &group->lock.lock_stat,
+            NULL, 0U, NULL)) {
+        errno = errno ? errno : ESTALE;
+        goto done;
+    }
+    errno = 0;
+    if (fstatat(group->lock.dir_fd, group->lock.leaf, &leaf,
+                AT_SYMLINK_NOFOLLOW) == 0) {
+        errno = EEXIST;
+        goto done;
+    }
+    if (errno != ENOENT) goto done;
+    matches = true;
+
+done:
+    if (live_parent_fd >= 0) (void)close(live_parent_fd);
+    return matches;
+}
+
+static int git_retirement_revalidate_absent_group(
+    const publication_record_t *publication,
+    git_retirement_group_t *group, bool invoke_test_hook) {
+    error_context_t entry_error = *get_last_error();
+    int entry_errno = errno;
+    int saved_errno;
+
+    if (!publication || !group || !group->absent_destination ||
+        !group->prepared || !group->lock_ready) {
+        errno = EINVAL;
+        set_error(ERR_INVALID_ARGS,
+                  "Invalid absent Git retirement revalidation");
+        return -1;
+    }
+    if (invoke_test_hook && g_retirement_test_hook &&
+        g_retirement_test_hook(
+            GIT_RETIREMENT_TEST_BEFORE_ABSENT_REVALIDATE,
+            publication->config_path, NULL, NULL)) {
+        errno = EIO;
+        set_error(
+            ERR_GIT_CONFIG_FAILED,
+            "Injected Git retirement absent-destination revalidation failure");
+        return -1;
+    }
+    if (!git_retirement_absent_namespace_matches(publication, group) ||
+        fsync(group->lock.dir_fd) != 0 ||
+        !git_retirement_absent_namespace_matches(publication, group)) {
+        saved_errno = errno ? errno : ESTALE;
+        errno = saved_errno;
+        set_system_error(
+            ERR_GIT_CONFIG_FAILED,
+            "Recorded Git retirement destination reappeared or its exact parent moved: %s",
+            publication->config_path);
+        errno = saved_errno;
+        return -1;
+    }
+    g_last_error = entry_error;
+    errno = entry_errno;
+    return 0;
+}
+
+static int git_retirement_prepare_absent_group_atomic(
+    const publication_record_t *const publications[],
+    size_t publication_count, git_retirement_group_t *group) {
+    const publication_record_t *publication;
+    error_accumulator_t failures;
+    int lock_fd = -1;
+    int result = -1;
+
+    if (!publications || !group ||
+        group->representative >= publication_count ||
+        !group->absent_destination) {
+        errno = EINVAL;
+        set_error(ERR_INVALID_ARGS,
+                  "Invalid absent Git retirement group preparation");
+        return -1;
+    }
+    publication = publications[group->representative];
+    error_accumulator_init(&failures);
+    if (git_retirement_resolve_absent_destination(
+            publication, &group->lock) != 0) {
+        return -1;
+    }
+    group->lock.dir_fd = open(
+        group->lock.parent,
+        O_RDONLY | O_DIRECTORY | O_CLOEXEC | O_NOFOLLOW);
+    if (group->lock.dir_fd < 0 ||
+        fstat(group->lock.dir_fd, &group->lock.parent_stat) != 0 ||
+        !git_retirement_directory_identity_matches(
+            &publication->config_parent, &group->lock.parent_stat)) {
+        errno = errno ? errno : ESTALE;
+        set_system_error(
+            ERR_GIT_CONFIG_FAILED,
+            "Cannot pin the exact recorded Git configuration parent: %s",
+            group->lock.parent);
+        goto done;
+    }
+    lock_fd = openat(group->lock.dir_fd, group->lock.lock_leaf,
+                     O_RDWR | O_CREAT | O_EXCL | O_CLOEXEC, 0666);
+    if (lock_fd < 0 && errno == EEXIST &&
+        git_scope_lock_recover_marker(&group->lock) == 0) {
+        lock_fd = openat(group->lock.dir_fd, group->lock.lock_leaf,
+                         O_RDWR | O_CREAT | O_EXCL | O_CLOEXEC, 0666);
+    }
+    if (lock_fd < 0) {
+        set_system_error(ERR_GIT_CONFIG_FAILED,
+                         "Cannot acquire Git configuration lock: %s",
+                         group->lock.lock_path);
+        goto done;
+    }
+    group->lock.lock_created = true;
+    group->lock.lock_fd = lock_fd;
+    lock_fd = -1;
+    if (git_scope_lock_claim_fd(group->lock.lock_fd) != 0 ||
+        fstat(group->lock.lock_fd, &group->lock.lock_stat) != 0 ||
+        !S_ISREG(group->lock.lock_stat.st_mode) ||
+        group->lock.lock_stat.st_nlink != 1 ||
+        git_scope_lock_capture_empty_lock_witness(&group->lock) != 0) {
+        errno = errno ? errno : EAGAIN;
+        set_system_error(ERR_GIT_CONFIG_FAILED,
+                         "Cannot pin Git configuration lock: %s",
+                         group->lock.lock_path);
+        goto done;
+    }
+    group->lock_ready = true;
+    group->prepared = true;
+    group->planned = 0U;
+    if (git_retirement_revalidate_absent_group(
+            publication, group, false) != 0) {
+        goto done;
+    }
+    result = 0;
+
+done:
+    if (lock_fd >= 0) (void)close(lock_fd);
+    if (result != 0) {
+        (void)error_accumulator_add_last(
+            &failures, "absent Git retirement preparation");
+    }
+    if (result != 0 && group->lock.lock_created &&
+        !group->lock.lock_witness_valid) {
+        (void)git_scope_lock_capture_empty_lock_witness(&group->lock);
+    }
+    if (result != 0 && group->lock.dir_fd >= 0 &&
+        git_scope_lock_discard_checked(&group->lock, true) != 0) {
+        (void)error_accumulator_add_last(
+            &failures, "absent Git retirement cleanup");
+    }
+    if (result != 0) {
+        group->lock_ready = false;
+        group->prepared = false;
+    }
+    if (failures.active) (void)error_accumulator_publish(&failures);
+    return result;
+}
 
 static const git_snapshot_key_t *git_snapshot_key_by_name(
     const git_scope_snapshot_t *snapshot, const char *name) {
@@ -8235,6 +8435,10 @@ static int git_retirement_publish_group_atomic(
         return -1;
     }
     config_path = publications[group->representative]->config_path;
+    if (group->absent_destination) {
+        return git_retirement_revalidate_absent_group(
+            publications[group->representative], group, true);
+    }
     for (size_t i = 0U; i < publication_count; i++) {
         if (ready[i] &&
             publication_record_same_config_destination(
@@ -8385,10 +8589,15 @@ static int git_retirement_transaction_prepare_internal(
 
     /* Preflight every repository witness before the first Git subprocess. A
      * linked-worktree record may use the current generation sealed by another
-     * record for the same stable physical config namespace. */
+     * record for the same stable physical config namespace. Ordinary
+     * unresolved records are classified only after their stable destination
+     * group has acquired a transaction-bound absence proof below. */
     for (size_t i = 0U; i < item_count; i++) {
         git_scope_t scope = GIT_SCOPE_GLOBAL;
         char label[MAX_NAME_LEN + 96U];
+        error_context_t namespace_error;
+        int namespace_errno;
+        struct stat ignored;
 
         (void)git_scope_from_publication(
             transaction->publication_refs[i]->scope, &scope);
@@ -8412,23 +8621,23 @@ static int git_retirement_transaction_prepare_internal(
             clear_error();
             continue;
         }
-        /* AR-12 M4: a recorded config file that provably no longer exists
-         * (deleted repository, removed global config) carries none of the
-         * published values, so this leg is vacuously retired: nothing
-         * attributable is live and no mutation is needed. Failing instead
-         * would strand the durable retirement guard forever — no retry can
-         * re-verify a namespace that is gone. Indeterminate probes (EACCES,
-         * ELOOP, changed identity) keep the fail-closed path. */
-        if (!transaction->recovery_proof_only &&
-            git_retirement_destination_provably_absent(
-                transaction->publication_refs[i])) {
-            log_warning(
-                "Recorded Git destination %s no longer exists; treating "
-                "account '%s' retirement leg as already retired",
-                transaction->publication_refs[i]->config_path,
-                transaction->items[i].account.name);
-            clear_error();
-            continue;
+        if (!transaction->recovery_proof_only) {
+            namespace_error = *get_last_error();
+            namespace_errno = errno ? errno : ESTALE;
+            errno = 0;
+            if (lstat(transaction->publication_refs[i]->config_path,
+                      &ignored) != 0 &&
+                errno == ENOENT) {
+                /* H3/H4: this is only an absence candidate. Grouping below
+                 * must still pin the exact recorded parent, acquire the
+                 * canonical config lock, and reprove ENOENT before it gains
+                 * any settlement authority. */
+                transaction->items[i].absence_candidate = true;
+                clear_error();
+                continue;
+            }
+            g_last_error = namespace_error;
+            errno = namespace_errno;
         }
         (void)snprintf(label, sizeof(label),
                        "account '%s' destination %zu (%s)",
@@ -8437,11 +8646,13 @@ static int git_retirement_transaction_prepare_internal(
         git_retirement_transaction_add_failure(transaction, label);
     }
 
-    /* Form stable physical groups, then capture every readable group before
-     * the first unset. Any indeterminate read blocks the complete mutation
-     * phase: no destination may be changed from a partial preflight image. */
+    /* Form stable physical groups, including zero-mutation absent groups,
+     * then capture every readable group before the first unset. Any
+     * indeterminate read blocks the complete mutation phase: no destination
+     * may be changed from a partial preflight image. */
     for (size_t i = 0U; i < item_count; i++) {
         size_t representative = SIZE_MAX;
+        size_t absent_representative = SIZE_MAX;
         git_retirement_group_t *group;
 
         if (processed[i]) continue;
@@ -8454,9 +8665,19 @@ static int git_retirement_transaction_prepare_internal(
                     representative == SIZE_MAX) {
                     representative = j;
                 }
+                if (transaction->items[j].absence_candidate &&
+                    absent_representative == SIZE_MAX) {
+                    absent_representative = j;
+                }
             }
         }
-        if (representative == SIZE_MAX) continue;
+        if (representative == SIZE_MAX) {
+            if (transaction->recovery_proof_only ||
+                absent_representative == SIZE_MAX) {
+                continue;
+            }
+            representative = absent_representative;
+        }
         group = &transaction->groups[transaction->group_count++];
         group->lock.dir_fd = -1;
         group->lock.lock_fd = -1;
@@ -8467,13 +8688,16 @@ static int git_retirement_transaction_prepare_internal(
         (void)git_scope_from_publication(
             transaction->publication_refs[representative]->scope,
             &group->scope);
+        group->absent_destination =
+            transaction->items[representative].absence_candidate;
         for (size_t j = 0U; j < item_count; j++) {
-            if (!ready[j] ||
-                !publication_record_same_config_destination(
+            if (!publication_record_same_config_destination(
                     transaction->publication_refs[representative],
                     transaction->publication_refs[j])) {
                 continue;
             }
+            if (!ready[j] ||
+                group->absent_destination) continue;
             if (!group->live_generation) {
                 group->live_generation = live_generations[j];
             } else if (!live_generations[j] ||
@@ -8493,6 +8717,27 @@ static int git_retirement_transaction_prepare_internal(
         char context[128];
         char label[MAX_NAME_LEN + 96U];
 
+        if (group->absent_destination) {
+            if (git_retirement_prepare_absent_group_atomic(
+                    transaction->publication_refs, item_count,
+                    group) != 0) {
+                (void)snprintf(
+                    label, sizeof(label),
+                    "account '%s' destination %zu absence proof (%s)",
+                    transaction->items[
+                        group->representative].account.name,
+                    group->representative + 1U,
+                    git_scope_diagnostic_label(group->scope));
+                git_retirement_transaction_add_failure(transaction, label);
+            } else {
+                log_warning(
+                    "Recorded Git destination %s is absent under its exact "
+                    "parent and canonical lock; retaining the proof through "
+                    "retirement settlement",
+                    publication->config_path);
+            }
+            continue;
+        }
         (void)snprintf(context, sizeof(context),
                        "Could not read recorded destination %zu Git configuration",
                        group->representative + 1U);
@@ -8525,6 +8770,7 @@ static int git_retirement_transaction_prepare_internal(
             char label[MAX_NAME_LEN + 96U];
             int prepare_result;
 
+            if (group->absent_destination) continue;
             if (!group->snapshot_ready) continue;
             if (group->attribution_conflict) {
                 set_error(
@@ -8630,6 +8876,7 @@ int git_retirement_transaction_publish(
 
             if (!group->prepared) continue;
             if (transaction->command_runner &&
+                !group->absent_destination &&
                 !group->stale_generation) {
                 publish_result = git_retirement_execute_group_command(
                     account, transaction->publication_refs, group,
@@ -8849,7 +9096,7 @@ static bool git_retirement_group_is_abort_reconciled(
     const git_retirement_group_t *group) {
     bool restored;
 
-    if (!group || !group->prepared) {
+    if (!group || !group->prepared || group->absent_destination) {
         return false;
     }
     restored = group->published ? group->restored : group->planned == 0U;
@@ -9103,6 +9350,19 @@ int git_retirement_transaction_commit(
         git_retirement_group_t *group = &transaction->groups[i];
         char label[96];
 
+        if (group->absent_destination &&
+            group->lock_ready && !group->settled &&
+            git_retirement_revalidate_absent_group(
+                transaction->publication_refs[group->representative],
+                group, true) != 0) {
+            (void)snprintf(
+                label, sizeof(label),
+                "destination %zu absent-settlement proof (%s)",
+                group->representative + 1U,
+                git_scope_diagnostic_label(group->scope));
+            (void)error_accumulator_add_last(&failures, label);
+            result = -1;
+        }
         if (group->restored_witness_ready) {
             struct stat refreshed;
 

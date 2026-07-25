@@ -5084,9 +5084,9 @@ static int pending_retirement_publish_failure(
 }
 
 /* Copy and validate the complete aligned retirement set before any canonical
- * Git mutation.  Preparation owns private stages and canonical locks; the
- * durable guard is installed only after all malformed/provenance failures
- * have been ruled out. */
+ * Git mutation. Once the complete immutable owner/provenance set is known,
+ * publish or adopt the durable guard before Git classifies any destination
+ * as absent. Preparation then owns private stages and canonical locks. */
 static int pending_retirement_prepare(
     const gitswitch_ctx_t *ctx, config_retirement_kind_t kind,
     const account_t *const targets[], size_t target_count,
@@ -5203,28 +5203,14 @@ static int pending_retirement_prepare(
         result = 0;
         goto done;
     }
-    if (git_retirement_transaction_prepare(
-            account_refs, publication_refs, item_count,
-            &retirement->git) != 0) {
-        goto done;
-    }
     if (config_retirement_guard_install_or_adopt(
             ctx->config.config_path, kind, retirement->owners,
             retirement->owner_count, &retirement->guard) != 0) {
-        error_context_t guard_error = *get_last_error();
-        int guard_errno = errno ? errno : EIO;
-        error_accumulator_t failures;
-
-        error_accumulator_init(&failures);
-        errno = guard_errno;
-        (void)error_accumulator_add(&failures,
-                                    "retirement guard publication",
-                                    &guard_error);
-        if (git_retirement_transaction_commit(&retirement->git) != 0) {
-            (void)error_accumulator_add_last(
-                &failures, "prepared Git retirement cleanup");
-        }
-        (void)error_accumulator_publish(&failures);
+        goto done;
+    }
+    if (git_retirement_transaction_prepare(
+            account_refs, publication_refs, item_count,
+            &retirement->git) != 0) {
         goto done;
     }
     retirement->phase = PENDING_RETIREMENT_PREPARED;
