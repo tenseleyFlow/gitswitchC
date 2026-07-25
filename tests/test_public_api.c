@@ -256,8 +256,10 @@ TEST(all_retained_public_apis_compile_and_link) {
     REQUIRE_PUBLIC_API(gpg_manager_set_agent_conf_precommit_fn);
     REQUIRE_PUBLIC_API(gpg_manager_set_agent_conf_preopen_fn);
     REQUIRE_PUBLIC_API(gpg_manager_set_agent_conf_sync_fn);
+    REQUIRE_PUBLIC_API(gpg_manager_set_base_warning_probe_fn);
     REQUIRE_PUBLIC_API(gpg_manager_set_cleanup_predelete_fn);
     REQUIRE_PUBLIC_API(gpg_manager_set_key_cache_post_scan_hook_fn);
+    REQUIRE_PUBLIC_API(gpg_manager_set_memory_backed_probe_fn);
     REQUIRE_PUBLIC_API(gpg_manager_set_mount_identity_probe_fn);
     REQUIRE_PUBLIC_API(gpg_manager_set_readdir_fn);
     REQUIRE_PUBLIC_API(gpg_manager_set_rename_noreplace_fn);

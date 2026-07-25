@@ -143,6 +143,9 @@ static int gpg_resolve_pinned_key(const gpg_config_t *gpg_config,
                                   size_t fingerprint_size);
 static int gpg_open_base_dir(char *base, size_t size, bool create,
                              bool *absent);
+static int gpg_default_memory_backed_probe(int base_fd,
+                                           bool *memory_backed);
+static bool base_is_memory_backed(const char *base);
 static int lock_gpg_dir(int base_fd);
 static void unlock_gpg_dir(int base_fd, int lock_fd);
 static int gpg_native_rename_noreplace(int old_dir_fd, const char *old_name,
@@ -172,6 +175,13 @@ static gpg_reset_quarantine_hook_fn g_reset_quarantine_hook;
 static gpg_mount_identity_probe_fn g_mount_identity_probe;
 static gpg_agent_conf_sync_fn g_agent_conf_sync =
     gpg_default_agent_conf_sync;
+static gpg_memory_backed_probe_fn g_memory_backed_probe =
+    gpg_default_memory_backed_probe;
+static gpg_base_warning_probe_fn g_base_warning_probe =
+    base_is_memory_backed;
+static bool g_base_warning_probe_checked;
+static bool g_base_warning_memory_backed;
+static bool g_base_warning_emitted;
 static gpg_key_cache_post_scan_hook_fn g_key_cache_post_scan_hook;
 
 static void gpg_agent_config_update_init(gpg_agent_config_update_t *update) {
@@ -310,6 +320,24 @@ gpg_agent_conf_sync_fn
 gpg_manager_set_agent_conf_sync_fn(gpg_agent_conf_sync_fn fn) {
     gpg_agent_conf_sync_fn previous = g_agent_conf_sync;
     g_agent_conf_sync = fn ? fn : gpg_default_agent_conf_sync;
+    return previous;
+}
+
+gpg_memory_backed_probe_fn
+gpg_manager_set_memory_backed_probe_fn(gpg_memory_backed_probe_fn fn) {
+    gpg_memory_backed_probe_fn previous = g_memory_backed_probe;
+    g_memory_backed_probe = fn ? fn : gpg_default_memory_backed_probe;
+    return previous;
+}
+
+gpg_base_warning_probe_fn
+gpg_manager_set_base_warning_probe_fn(gpg_base_warning_probe_fn fn) {
+    gpg_base_warning_probe_fn previous = g_base_warning_probe;
+
+    g_base_warning_probe = fn ? fn : base_is_memory_backed;
+    g_base_warning_probe_checked = false;
+    g_base_warning_memory_backed = false;
+    g_base_warning_emitted = false;
     return previous;
 }
 
@@ -1241,14 +1269,11 @@ int gpg_switch_account(gpg_config_t *gpg_config, const account_t *account) {
              * import and the retarget, leaving a dangling `current` behind a
              * switch that reported success. Fail closed if the lock cannot be
              * taken: proceeding unlocked would reopen exactly that window. */
-            if (gpg_prepare_base_dir(locked_base, sizeof(locked_base)) != 0) {
+            base_fd = gpg_prepare_base_dir(locked_base,
+                                           sizeof(locked_base));
+            if (base_fd < 0) {
                 set_error(ERR_GPG_KEY_FAILED, "Failed to create isolated GPG environment: %s",
                          get_last_error()->message);
-                goto out;
-            }
-            base_fd = gpg_open_base_dir(locked_base, sizeof(locked_base),
-                                        false, NULL);
-            if (base_fd < 0) {
                 goto out;
             }
             lock_fd = lock_gpg_dir(base_fd);
@@ -1424,32 +1449,6 @@ static bool base_is_memory_backed(const char *base) {
     }
 }
 
-/* Process-lifetime memo of base_is_memory_backed(), keyed by the base path
- * (AR-03 L20). The probe walks statfs over the base's nearest existing
- * ancestor, and gpg_get_base_dir + gpg_create_isolated_home together re-ran it
- * on every call — 4-6 ancestor walks per GPG switch — because the old
- * warn-once latch only latched when the answer was BAD; the good/tmpfs path
- * re-probed forever. A mount's memory-backed-ness cannot change under us for
- * a fixed path within one short-lived invocation (the base, once created by
- * ensure_private_dir, stays on the mount the first probe saw), so one answer
- * per base path is authoritative. Keyed rather than a bare boolean because
- * the base path itself CAN change within a process when XDG_RUNTIME_DIR
- * changes (the test suite does exactly that); a stale answer for a different
- * base would defeat the no-persistent-disk fail-closed guard. Same
- * single-threaded, process-lifetime caching assumptions as g_seen_keys. */
-static bool base_memory_backed_cached(const char *base) {
-    static int cached = -1; /* -1 unknown; else the 0/1 answer for cached_base */
-    static char cached_base[MAX_PATH_LEN];
-
-    if (cached < 0 || strcmp(cached_base, base) != 0) {
-        if (safe_strncpy(cached_base, base, sizeof(cached_base)) != 0) {
-            return base_is_memory_backed(base); /* unkeyable: answer uncached */
-        }
-        cached = base_is_memory_backed(base) ? 1 : 0;
-    }
-    return cached == 1;
-}
-
 /* Compute the base directory that holds per-account isolated GNUPGHOMEs and the
  * stable `current` symlink. Two-way like the SSH side: use a configured,
  * valid XDG_RUNTIME_DIR, or /tmp/gitswitch-gpg-<uid> only when that variable
@@ -1487,13 +1486,9 @@ static int gpg_get_base_dir(char *buf, size_t size) {
          * export XDG_RUNTIME_DIR or accept the risk knowingly. Probes the
          * actual base (nearest existing ancestor when absent), not a hardcoded
          * "/tmp": the base could be a distinct persistent mount under a tmpfs
-         * /tmp (AR-02 #22). The probe result is memoized per base path
-         * (AR-03 L20): this function runs 4-6 times per switch, and the
-         * statfs ancestor walk used to repeat on every call whenever the
-         * answer was GOOD (the warn latch below only stops repeat WARNINGS).
-         * The create path (gpg_prepare_base_dir) additionally refuses to
-         * write secret material to any non-memory-backed base unless the
-         * user opts in, sharing the same memoized answer. */
+         * /tmp (AR-02 #22). This pathname probe is diagnostic only. The
+         * create path separately enforces policy from the exact retained base
+         * descriptor and never treats this warning latch as authorization. */
         written = snprintf(child, sizeof(child), "gitswitch-gpg-%d", getuid());
     }
     if (written < 0 || (size_t)written >= sizeof(child)) {
@@ -1502,10 +1497,16 @@ static int gpg_get_base_dir(char *buf, size_t size) {
     }
     written = snprintf(buf, size, "%s/%s", runtime_parent, child);
     if (strcmp(runtime_parent, "/tmp") == 0) {
-        static bool warned = false;
-        if (!warned && !g_gpg_suppress_base_warning && written > 0 &&
-            (size_t)written < size && !base_memory_backed_cached(buf)) {
-            warned = true;
+        if (!g_gpg_suppress_base_warning && written > 0 &&
+            (size_t)written < size && !g_base_warning_probe_checked) {
+            g_base_warning_memory_backed = g_base_warning_probe(buf);
+            g_base_warning_probe_checked = true;
+        }
+        if (!g_gpg_suppress_base_warning &&
+            g_base_warning_probe_checked &&
+            !g_base_warning_memory_backed &&
+            !g_base_warning_emitted) {
+            g_base_warning_emitted = true;
             display_warning("XDG_RUNTIME_DIR is unset; isolated GPG homes will use "
                             "%s, which is not memory-backed. Exported "
                             "secret keys could remain recoverable on disk after exit. Set "
@@ -1547,6 +1548,41 @@ static int gpg_open_base_dir(char *base, size_t size, bool create,
     base_fd = open_private_subdir_at(parent_fd, child, create, absent);
     close(parent_fd);
     return base_fd;
+}
+
+/* Determine the storage type of the exact directory descriptor that will
+ * contain isolated secret-key material. Unknown platforms and syscall errors
+ * fail closed; pathname observations are intentionally not accepted here. */
+static int gpg_default_memory_backed_probe(int base_fd,
+                                           bool *memory_backed) {
+    struct statfs mounted;
+
+    if (base_fd < 0 || !memory_backed) {
+        errno = EINVAL;
+        return -1;
+    }
+    *memory_backed = false;
+    if (fstatfs(base_fd, &mounted) != 0) {
+        return -1;
+    }
+#ifdef __linux__
+    {
+        unsigned long type = (unsigned long)mounted.f_type;
+        *memory_backed =
+            type == 0x01021994UL /* TMPFS_MAGIC */ ||
+            type == 0x858458f6UL /* RAMFS_MAGIC */;
+    }
+#elif defined(__APPLE__) || defined(__FreeBSD__)
+    *memory_backed =
+        memchr(mounted.f_fstypename, '\0',
+               sizeof(mounted.f_fstypename)) != NULL &&
+        strcmp(mounted.f_fstypename, "tmpfs") == 0;
+#else
+    (void)mounted;
+    errno = ENOTSUP;
+    return -1;
+#endif
+    return 0;
 }
 
 /* Public: compute the stable GNUPGHOME path that `gitswitch init` exports and
@@ -4710,31 +4746,54 @@ int gpg_manager_isolated_home_present(const char *account, bool *present) {
     return 0;
 }
 
-/* Compute, policy-check, and create the base directory for isolated
- * GNUPGHOMEs (shared with the stable `current` symlink path so the two never
- * disagree). Split out of gpg_create_isolated_home so gpg_switch_account can
- * establish the base — and take its lock — BEFORE the create+import sequence
- * that lock must cover (AR-03 L12); the create path below then re-runs it
- * idempotently (the memory-backed probe is memoized, ensure_private_dir is a
- * create-or-verify). Returns 0 with the base path in `base`. */
+/* Create/open, policy-check, and retain the exact base directory for isolated
+ * GNUPGHOMEs. The memory-backed decision is made from this descriptor, then
+ * its public name is rebound before any account home is created. Returns the
+ * retained descriptor and base path; callers lock and mutate through this
+ * same descriptor without reopening it. */
 static int gpg_prepare_base_dir(char *base, size_t size) {
-    if (gpg_get_base_dir(base, size) != 0) {
+    struct stat opened;
+    struct stat named;
+    bool memory_backed = false;
+    int base_fd;
+
+    base_fd = gpg_open_base_dir(base, size, true, NULL);
+    if (base_fd < 0) {
+        return -1;
+    }
+    if (g_memory_backed_probe(base_fd, &memory_backed) != 0) {
+        int saved_errno = errno ? errno : EIO;
+
+        close(base_fd);
+        errno = saved_errno;
+        set_system_error(
+            ERR_PERMISSION_DENIED,
+            "Cannot prove isolated GPG base is memory-backed: %s", base);
+        return -1;
+    }
+    errno = 0;
+    if (fstat(base_fd, &opened) != 0 || lstat(base, &named) != 0 ||
+        !S_ISDIR(opened.st_mode) || !S_ISDIR(named.st_mode) ||
+        opened.st_uid != getuid() || (opened.st_mode & 077) != 0 ||
+        named.st_dev != opened.st_dev || named.st_ino != opened.st_ino) {
+        int saved_errno = errno ? errno : ESTALE;
+
+        close(base_fd);
+        errno = saved_errno;
+        set_system_error(
+            ERR_PERMISSION_DENIED,
+            "GPG base pathname no longer names the probed directory: %s",
+            base);
         return -1;
     }
 
-    /* Refuse to export secret-key material onto persistent disk, wherever the
-     * base came from. XDG_RUNTIME_DIR is only USUALLY a tmpfs — rootless
-     * containers, NFS-homed logins, or a hand-exported disk path are not — and
-     * the /tmp fallback (or even a bind/quota mount at exactly the base path
-     * under a tmpfs /tmp) can be persistent too, so probe the actual computed
-     * base rather than trusting its source or a hardcoded parent (AR-02 #3,
-     * #22; probe memoized per base path — AR-03 L20). Fail closed unless the
-     * user explicitly opts in with GITSWITCH_ALLOW_TMP_GPG=1 (or, better,
-     * points XDG_RUNTIME_DIR at a tmpfs); on opt-in, remind them once per
-     * process what they accepted. */
-    if (!base_memory_backed_cached(base)) {
+    /* Refuse persistent storage unless the user knowingly opts in. The
+     * process-wide warning latch is diagnostic only; every prepare call
+     * independently re-probes its exact retained descriptor. */
+    if (!memory_backed) {
         const char *optin = getenv("GITSWITCH_ALLOW_TMP_GPG");
         if (!optin || strcmp(optin, "1") != 0) {
+            close(base_fd);
             set_error(ERR_PERMISSION_DENIED,
                       "Refusing to write GPG secret keys to non-memory-backed %s. "
                       "Set XDG_RUNTIME_DIR to a tmpfs, or GITSWITCH_ALLOW_TMP_GPG=1 "
@@ -4749,13 +4808,7 @@ static int gpg_prepare_base_dir(char *base, size_t size) {
                             "disk after deletion.", base);
         }
     }
-
-    /* Create + verify the base directory (real, user-owned, 0700; not a
-     * symlink or a dir pre-created by another user in a shared /tmp). */
-    if (ensure_private_dir(base) != 0) {
-        return -1;
-    }
-    return 0;
+    return base_fd;
 }
 
 /* Create and pin one account home relative to an already-opened, locked base.
@@ -4847,10 +4900,7 @@ int gpg_create_isolated_home(gpg_config_t *gpg_config, const account_t *account)
                   "Invalid arguments to gpg_create_isolated_home");
         return -1;
     }
-    if (gpg_prepare_base_dir(base, sizeof(base)) != 0) {
-        return -1;
-    }
-    base_fd = gpg_open_base_dir(base, sizeof(base), false, NULL);
+    base_fd = gpg_prepare_base_dir(base, sizeof(base));
     if (base_fd < 0) {
         return -1;
     }

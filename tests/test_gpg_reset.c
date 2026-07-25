@@ -172,6 +172,75 @@ static int causal_mount_identity(int fd, uint64_t *identity) {
     return 0;
 }
 
+static const char *g_memory_probe_expected_base;
+static const char *g_memory_probe_moved_base;
+static size_t g_memory_probe_calls;
+static bool g_memory_probe_exact_fd;
+static const char *g_warning_probe_expected_base;
+static size_t g_warning_probe_calls;
+static bool g_warning_probe_exact_path;
+
+static bool positive_base_warning_probe(const char *base_path) {
+    g_warning_probe_calls++;
+    if (!base_path || !g_warning_probe_expected_base ||
+        strcmp(base_path, g_warning_probe_expected_base) != 0) {
+        g_warning_probe_exact_path = false;
+    }
+    return true;
+}
+
+static bool memory_probe_fd_names_expected_base(int base_fd) {
+    struct stat opened;
+    struct stat named;
+
+    return base_fd >= 0 && g_memory_probe_expected_base &&
+           fstat(base_fd, &opened) == 0 &&
+           lstat(g_memory_probe_expected_base, &named) == 0 &&
+           S_ISDIR(opened.st_mode) && S_ISDIR(named.st_mode) &&
+           opened.st_dev == named.st_dev && opened.st_ino == named.st_ino;
+}
+
+static int sequential_memory_backed_probe(int base_fd,
+                                           bool *memory_backed) {
+    bool exact = memory_probe_fd_names_expected_base(base_fd);
+
+    g_memory_probe_exact_fd = g_memory_probe_exact_fd && exact;
+    if (!memory_backed || g_memory_probe_calls >= 2U) {
+        errno = EINVAL;
+        return -1;
+    }
+    *memory_backed = g_memory_probe_calls == 0U;
+    g_memory_probe_calls++;
+    return 0;
+}
+
+static int replacing_memory_backed_probe(int base_fd,
+                                         bool *memory_backed) {
+    bool exact = memory_probe_fd_names_expected_base(base_fd);
+
+    g_memory_probe_exact_fd = g_memory_probe_exact_fd && exact;
+    g_memory_probe_calls++;
+    if (!memory_backed || !exact || !g_memory_probe_moved_base ||
+        rename(g_memory_probe_expected_base, g_memory_probe_moved_base) != 0 ||
+        mkdir(g_memory_probe_expected_base, 0700) != 0) {
+        errno = EIO;
+        return -1;
+    }
+    *memory_backed = true;
+    return 0;
+}
+
+static int failing_memory_backed_probe(int base_fd,
+                                       bool *memory_backed) {
+    bool exact = memory_probe_fd_names_expected_base(base_fd);
+
+    (void)memory_backed;
+    g_memory_probe_exact_fd = g_memory_probe_exact_fd && exact;
+    g_memory_probe_calls++;
+    errno = EIO;
+    return -1;
+}
+
 /* Fresh scratch XDG_RUNTIME_DIR; returns 0 on success. */
 static int make_xdg(char *dir, size_t size) {
     snprintf(dir, size, "/tmp/gswgpgrst_XXXXXX");
@@ -1031,6 +1100,156 @@ static bool test_dir_is_tmpfs(const char *path) {
 #endif
 }
 
+TEST(create_isolated_home_reprobes_exact_base_fd_each_time) {
+    char xdg[128], base[256], alpha[320], beta[320];
+    gpg_config_t alpha_config;
+    gpg_config_t beta_config;
+    account_t alpha_account;
+    account_t beta_account;
+    gpg_memory_backed_probe_fn old_probe;
+    command_runner_fn old_runner;
+
+    CHECK_EQ_INT(make_xdg(xdg, sizeof(xdg)), 0);
+    snprintf(base, sizeof(base), "%s/gitswitch-gpg", xdg);
+    snprintf(alpha, sizeof(alpha), "%s/alpha", base);
+    snprintf(beta, sizeof(beta), "%s/beta", base);
+    unsetenv("GITSWITCH_ALLOW_TMP_GPG");
+    memset(&alpha_config, 0, sizeof(alpha_config));
+    memset(&beta_config, 0, sizeof(beta_config));
+    memset(&alpha_account, 0, sizeof(alpha_account));
+    memset(&beta_account, 0, sizeof(beta_account));
+    alpha_config.mode = GPG_MODE_ISOLATED;
+    beta_config.mode = GPG_MODE_ISOLATED;
+    snprintf(alpha_account.name, sizeof(alpha_account.name), "alpha");
+    snprintf(beta_account.name, sizeof(beta_account.name), "beta");
+
+    g_memory_probe_expected_base = base;
+    g_memory_probe_calls = 0U;
+    g_memory_probe_exact_fd = true;
+    old_probe = gpg_manager_set_memory_backed_probe_fn(
+        sequential_memory_backed_probe);
+    old_runner = run_set_runner(null_runner);
+
+    CHECK_EQ_INT(gpg_create_isolated_home(&alpha_config, &alpha_account), 0);
+    CHECK(path_exists(alpha));
+    CHECK_EQ_INT(gpg_create_isolated_home(&beta_config, &beta_account), -1);
+    CHECK_EQ_INT(get_last_error()->code, ERR_PERMISSION_DENIED);
+    CHECK(!path_exists(beta));
+    CHECK_EQ_INT((int)g_memory_probe_calls, 2);
+    CHECK(g_memory_probe_exact_fd);
+
+    gpg_manager_set_memory_backed_probe_fn(old_probe);
+    CHECK_EQ_INT(gpg_manager_reset(NULL), 0);
+    run_set_runner(old_runner);
+    g_memory_probe_expected_base = NULL;
+}
+
+TEST(repeated_home_getters_probe_fallback_warning_path_once) {
+    char expected[MAX_PATH_LEN];
+    char quiet[MAX_PATH_LEN];
+    char first[MAX_PATH_LEN];
+    char second[MAX_PATH_LEN];
+    gpg_base_warning_probe_fn old_probe;
+
+    CHECK_EQ_INT(unsetenv("XDG_RUNTIME_DIR"), 0);
+    CHECK_EQ_INT(safe_snprintf(expected, sizeof(expected),
+                               "/tmp/gitswitch-gpg-%d", getuid()), 0);
+    g_warning_probe_expected_base = expected;
+    g_warning_probe_calls = 0U;
+    g_warning_probe_exact_path = true;
+    old_probe = gpg_manager_set_base_warning_probe_fn(
+        positive_base_warning_probe);
+
+    CHECK_EQ_INT(gpg_manager_get_home_path_quiet(quiet, sizeof(quiet)), 0);
+    CHECK_EQ_INT((int)g_warning_probe_calls, 0);
+    CHECK_EQ_INT(gpg_manager_get_home_path(first, sizeof(first)), 0);
+    CHECK_EQ_INT(gpg_manager_get_home_path(second, sizeof(second)), 0);
+    CHECK_STR_EQ(first, second);
+    CHECK_EQ_INT((int)g_warning_probe_calls, 1);
+    CHECK(g_warning_probe_exact_path);
+
+    gpg_manager_set_base_warning_probe_fn(old_probe);
+    g_warning_probe_expected_base = NULL;
+}
+
+TEST(create_isolated_home_rejects_base_replaced_during_fd_probe) {
+    char xdg[128], base[256], moved[256];
+    char replacement_home[320], moved_home[320];
+    gpg_config_t config;
+    account_t account;
+    gpg_memory_backed_probe_fn old_probe;
+
+    CHECK_EQ_INT(make_xdg(xdg, sizeof(xdg)), 0);
+    snprintf(base, sizeof(base), "%s/gitswitch-gpg", xdg);
+    snprintf(moved, sizeof(moved), "%s/gitswitch-gpg.probed", xdg);
+    snprintf(replacement_home, sizeof(replacement_home), "%s/work", base);
+    snprintf(moved_home, sizeof(moved_home), "%s/work", moved);
+    unsetenv("GITSWITCH_ALLOW_TMP_GPG");
+    memset(&config, 0, sizeof(config));
+    memset(&account, 0, sizeof(account));
+    config.mode = GPG_MODE_ISOLATED;
+    snprintf(account.name, sizeof(account.name), "work");
+
+    g_memory_probe_expected_base = base;
+    g_memory_probe_moved_base = moved;
+    g_memory_probe_calls = 0U;
+    g_memory_probe_exact_fd = true;
+    old_probe = gpg_manager_set_memory_backed_probe_fn(
+        replacing_memory_backed_probe);
+
+    CHECK_EQ_INT(gpg_create_isolated_home(&config, &account), -1);
+    CHECK_EQ_INT(get_last_error()->code, ERR_PERMISSION_DENIED);
+    CHECK(strstr(get_last_error()->message,
+                 "no longer names the probed directory") != NULL);
+    CHECK_EQ_INT((int)g_memory_probe_calls, 1);
+    CHECK(g_memory_probe_exact_fd);
+    CHECK(!path_exists(replacement_home));
+    CHECK(!path_exists(moved_home));
+
+    gpg_manager_set_memory_backed_probe_fn(old_probe);
+    CHECK_EQ_INT(rmdir(base), 0);
+    CHECK_EQ_INT(rmdir(moved), 0);
+    CHECK_EQ_INT(rmdir(xdg), 0);
+    g_memory_probe_expected_base = NULL;
+    g_memory_probe_moved_base = NULL;
+}
+
+TEST(create_isolated_home_fails_closed_on_fd_probe_error) {
+    char xdg[128], base[256], home[320];
+    gpg_config_t config;
+    account_t account;
+    gpg_memory_backed_probe_fn old_probe;
+
+    CHECK_EQ_INT(make_xdg(xdg, sizeof(xdg)), 0);
+    snprintf(base, sizeof(base), "%s/gitswitch-gpg", xdg);
+    snprintf(home, sizeof(home), "%s/work", base);
+    unsetenv("GITSWITCH_ALLOW_TMP_GPG");
+    memset(&config, 0, sizeof(config));
+    memset(&account, 0, sizeof(account));
+    config.mode = GPG_MODE_ISOLATED;
+    snprintf(account.name, sizeof(account.name), "work");
+
+    g_memory_probe_expected_base = base;
+    g_memory_probe_calls = 0U;
+    g_memory_probe_exact_fd = true;
+    old_probe = gpg_manager_set_memory_backed_probe_fn(
+        failing_memory_backed_probe);
+
+    CHECK_EQ_INT(gpg_create_isolated_home(&config, &account), -1);
+    CHECK_EQ_INT(get_last_error()->code, ERR_PERMISSION_DENIED);
+    CHECK_EQ_INT(get_last_error()->system_errno, EIO);
+    CHECK(strstr(get_last_error()->message,
+                 "Cannot prove isolated GPG base is memory-backed") != NULL);
+    CHECK_EQ_INT((int)g_memory_probe_calls, 1);
+    CHECK(g_memory_probe_exact_fd);
+    CHECK(!path_exists(home));
+
+    gpg_manager_set_memory_backed_probe_fn(old_probe);
+    CHECK_EQ_INT(rmdir(base), 0);
+    CHECK_EQ_INT(rmdir(xdg), 0);
+    g_memory_probe_expected_base = NULL;
+}
+
 /* AR-02 #3/#22: the no-persistent-disk guard must fire on the ACTUAL computed
  * base dir — including one under XDG_RUNTIME_DIR, which used to bypass the
  * check entirely — failing closed without the GITSWITCH_ALLOW_TMP_GPG opt-in
@@ -1112,6 +1331,10 @@ TEST_MAIN_BEGIN()
     RUN_TEST(targeted_reset_sync_failure_is_retryable);
     RUN_TEST(full_reset_sync_failure_is_retryable);
     RUN_TEST(targeted_reset_restores_current_replaced_after_capture);
+    RUN_TEST(create_isolated_home_reprobes_exact_base_fd_each_time);
+    RUN_TEST(repeated_home_getters_probe_fallback_warning_path_once);
+    RUN_TEST(create_isolated_home_rejects_base_replaced_during_fd_probe);
+    RUN_TEST(create_isolated_home_fails_closed_on_fd_probe_error);
     RUN_TEST(create_isolated_home_refuses_persistent_xdg_base);
     if (ts_trusted_command_fixture_restore(&command_fixture) != 0) {
         fprintf(stderr,
