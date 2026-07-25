@@ -768,9 +768,10 @@ TEST(reset_other_account_keeps_current_sock) {
 
 /* Mutating commands must fail fast on cross-process config-lock contention;
  * waiting is unbounded because the holder may be stopped at an interactive
- * prompt. `resume` is launched implicitly by shell startup, so contention is
- * instead a silent successful no-op. Genuinely read-only commands still skip
- * the lock, while `config` must take it because it can create accounts.toml.
+ * prompt. A contended `resume` also fails truthfully because the raw lock
+ * provides no proof that its holder will restore the requested account.
+ * Genuinely read-only commands still skip the lock, while `config` must take
+ * it because it can create accounts.toml.
  *
  * The child releases early when the parent writes `release`; the timeout keeps
  * this test from deadlocking against the pre-L10 blocking implementation and
@@ -833,16 +834,18 @@ TEST(mutating_commands_fail_fast_on_config_lock_readonly_dont) {
     CHECK_EQ_INT(rc, 0);
     CHECK(access(done, F_OK) != 0); /* returned before the holder released */
 
-    /* Shell-startup resume: contention is a silent successful no-op. */
+    /* Resume must not claim success while an unclassified lock holder is
+     * still active. It reports the same immediate, retryable contention as
+     * every other mutation. */
     snprintf(cmd, sizeof(cmd),
              "HOME='%s' XDG_RUNTIME_DIR='%s' '%s' resume >'%s' 2>&1",
              home, rt, g_bin, out_path);
     rc = run_shell(cmd);
-    CHECK_EQ_INT(rc, 0);
+    CHECK(rc > 0 && rc < 126);
     CHECK(access(done, F_OK) != 0);
-    /* Debug builds emit their normal logger-init line; "silent" here means no
-     * user-facing contention diagnostic. Release builds emit nothing. */
-    CHECK(strstr(slurp(out_path, out, sizeof(out)), "config lock") == NULL);
+    slurp(out_path, out, sizeof(out));
+    CHECK(strstr(out, "Another gitswitch holds the config lock") != NULL);
+    CHECK(strstr(out, "try again after that command finishes") != NULL);
 
     /* Ordinary mutating commands report contention and return immediately. */
     snprintf(cmd, sizeof(cmd),

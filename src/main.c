@@ -1274,15 +1274,11 @@ int main(int argc, char *argv[]) {
                 contended = contended || lock_errno == EAGAIN;
 #endif
 
-                /* Shell integration invokes resume during login. A concurrent
-                 * switch already owns serialization and will leave a coherent
-                 * result, so this redundant restore is a successful no-op and
-                 * must not delay or alarm every newly opened shell. */
-                if (contended && c && strcmp(c, "resume") == 0 &&
-                    !switch_recovery_pending) {
-                    exit_code = EXIT_SUCCESS;
-                    goto cleanup;
-                }
+                /* Contention carries no typed proof of which command owns the
+                 * lock or which account/runtime state it will publish. Resume
+                 * therefore cannot safely treat an unknown holder as having
+                 * completed its work; report the retryable failure immediately
+                 * like every other mutation. */
                 if (contended) {
                     display_error("Another gitswitch holds the config lock",
                                   "try again after that command finishes");
