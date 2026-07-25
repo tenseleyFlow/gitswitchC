@@ -168,11 +168,14 @@ int config_revalidate_loaded_source(const gitswitch_ctx_t *ctx);
  * explicitly bounded to the last check-to-rename interval.
  */
 int config_save(gitswitch_ctx_t *ctx, const char *config_path);
-/* Full-document transactional save. `config_installed` becomes true once the
- * new accounts.toml inode is renamed into place, including a later directory-
- * sync failure whose visible result must be treated as installed/uncertain.
- * On complete durable success, the mutable context is rebound to the exact
- * installed source generation so another save from that context is admitted. */
+/* Full-document transactional save. `config_installed` becomes true after the
+ * accounts.toml rename and is cleared when canonical reproof establishes that
+ * the parent or exact leaf generation is missing, substituted, or different.
+ * A directory-sync failure with an exact canonical generation, or a
+ * non-namespace proof I/O failure that cannot disprove it, retains true as an
+ * installed/uncertain result. On complete durable success, the mutable context
+ * is rebound to the exact installed source generation so another save from
+ * that context is admitted. */
 int config_save_transactional(gitswitch_ctx_t *ctx,
                               const char *config_path,
                               bool *config_installed);

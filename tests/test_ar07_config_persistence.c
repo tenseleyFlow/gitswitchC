@@ -1206,7 +1206,7 @@ TEST(full_save_rechecks_absence_across_state_publication) {
     }
 }
 
-TEST(full_save_does_not_adopt_post_install_in_place_rewrite) {
+TEST(full_save_rejects_post_install_in_place_rewrite_and_restores_state) {
     char dir[128];
     char path[256];
     char hint[256];
@@ -1235,7 +1235,7 @@ TEST(full_save_does_not_adopt_post_install_in_place_rewrite) {
 
     CHECK_EQ_INT(document_rewrite_error, 0);
     CHECK(document_rewrite_path[0] == '\0');
-    CHECK(installed);
+    CHECK(!installed);
     CHECK_EQ_INT(get_last_error()->code, ERR_FILE_IO);
     CHECK_EQ_INT(get_last_error()->system_errno, ESTALE);
     CHECK(memcmp(&ctx, &ctx_before, sizeof(ctx)) == 0);
@@ -1243,8 +1243,8 @@ TEST(full_save_does_not_adopt_post_install_in_place_rewrite) {
     CHECK(document_rewrite_before.st_ino == document_rewrite_after.st_ino);
     CHECK(read_text(path, text, sizeof(text)) > 0);
     CHECK_STR_EQ(text, replacement_account);
-    CHECK(read_text(hint, text, sizeof(text)) > 0);
-    CHECK_STR_EQ(text, "none\ninactive=v1\n");
+    CHECK_EQ_INT(access(hint, F_OK), -1);
+    CHECK_EQ_INT(errno, ENOENT);
     CHECK_EQ_INT(count_prefix(dir, "accounts.toml.backup."), 0);
     CHECK_EQ_INT(count_prefix(dir, "accounts.toml.tmp."), 0);
     CHECK_EQ_INT(count_prefix(dir, ".resume-hint.tmp."), 0);
@@ -1758,7 +1758,7 @@ TEST_MAIN_BEGIN()
     RUN_TEST(full_save_rejects_stale_absent_and_generationless_sources_early);
     RUN_TEST(full_save_rechecks_loaded_generation_across_state_publication);
     RUN_TEST(full_save_rechecks_absence_across_state_publication);
-    RUN_TEST(full_save_does_not_adopt_post_install_in_place_rewrite);
+    RUN_TEST(full_save_rejects_post_install_in_place_rewrite_and_restores_state);
     RUN_TEST(active_state_only_save_preserves_accounts_and_is_idempotent);
     RUN_TEST(active_state_case_variants_normalize_and_publish_canonical_name);
     RUN_TEST(active_state_save_is_bound_to_loaded_config_generation);

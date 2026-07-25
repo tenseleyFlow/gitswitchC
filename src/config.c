@@ -2209,6 +2209,74 @@ static bool config_named_directory_matches(const char *path,
     return true;
 }
 
+/* Re-open the canonical parent after publication and prove that it still
+ * selects both the pinned directory and the exact generation installed
+ * through that directory. A descriptor-pinned rename can succeed after the
+ * parent pathname is detached; proving only through the original descriptor
+ * would then misreport a file that is no longer canonical as installed. */
+static int config_reprove_canonical_publication(
+    const char *dir_path, const struct stat *pinned_dir,
+    const char *target_name, const struct stat *installed_generation,
+    const unsigned char *document_bytes, size_t document_length,
+    struct stat *canonical_generation) {
+    struct stat reopened_dir;
+    int canonical_dir_fd = -1;
+    int failure_errno = ESTALE;
+
+    errno = 0;
+    canonical_dir_fd = open(dir_path, O_RDONLY | O_CLOEXEC | O_DIRECTORY |
+                                          O_NOFOLLOW);
+    if (canonical_dir_fd < 0) {
+        failure_errno = config_is_namespace_change_errno(errno)
+                            ? ESTALE
+                            : (errno ? errno : EIO);
+        goto canonical_fail;
+    }
+    if (fstat(canonical_dir_fd, &reopened_dir) != 0) {
+        failure_errno = errno ? errno : EIO;
+        goto canonical_fail;
+    }
+    if (!config_metadata_dir_is_safe(&reopened_dir) ||
+        !config_metadata_same_file(pinned_dir, &reopened_dir)) {
+        failure_errno = ESTALE;
+        goto canonical_fail;
+    }
+
+    errno = 0;
+    if (!config_named_directory_matches(dir_path, &reopened_dir)) {
+        failure_errno = errno ? errno : ESTALE;
+        if (config_is_namespace_change_errno(failure_errno)) {
+            failure_errno = ESTALE;
+        }
+        goto canonical_fail;
+    }
+    if (config_reprove_published_file_at(
+            canonical_dir_fd, target_name, installed_generation,
+            document_bytes, document_length, canonical_generation) != 0) {
+        failure_errno = errno ? errno : EIO;
+        goto canonical_fail;
+    }
+    errno = 0;
+    if (!config_named_directory_matches(dir_path, &reopened_dir)) {
+        failure_errno = errno ? errno : ESTALE;
+        if (config_is_namespace_change_errno(failure_errno)) {
+            failure_errno = ESTALE;
+        }
+        goto canonical_fail;
+    }
+    if (close(canonical_dir_fd) != 0) {
+        canonical_dir_fd = -1;
+        failure_errno = errno ? errno : EIO;
+        goto canonical_fail;
+    }
+    return 0;
+
+canonical_fail:
+    if (canonical_dir_fd >= 0) close(canonical_dir_fd);
+    errno = failure_errno;
+    return -1;
+}
+
 /* Build a collision-resistant scratch name inside the already-pinned parent.
  * openat()+O_EXCL is the authoritative creation step: a pathname replacement
  * of the parent cannot redirect the descriptor we later write or publish. */
@@ -8774,6 +8842,8 @@ static int config_write_document_atomic(gitswitch_ctx_t *ctx,
     bool temp_exists = false;
     bool temp_registered = false;
     bool have_temp_identity = false;
+    bool directory_sync_failed = false;
+    int directory_sync_errno = 0;
     int dir_fd = -1;
     int temp_fd = -1;
 
@@ -9063,7 +9133,14 @@ static int config_write_document_atomic(gitswitch_ctx_t *ctx,
                 AT_SYMLINK_NOFOLLOW) != 0 ||
         !config_metadata_file_is_safe(&destination_now, true) ||
         !config_metadata_same_file(&temp_identity, &destination_now)) {
-        errno = errno ? errno : ESTALE;
+        int proof_errno = errno ? errno : ESTALE;
+        if (config_is_namespace_change_errno(proof_errno)) {
+            proof_errno = ESTALE;
+        }
+        if (proof_errno == ESTALE && config_installed) {
+            *config_installed = false;
+        }
+        errno = proof_errno;
         set_system_error(ERR_CONFIG_WRITE_FAILED,
                          "Installed config failed identity verification: %s",
                          config_path);
@@ -9072,17 +9149,48 @@ static int config_write_document_atomic(gitswitch_ctx_t *ctx,
     installed_generation = destination_now;
 
     /* AR-05 L11: per POSIX a rename() is only durable once the directory
-     * holding the new entry is itself fsynced. toml_write_fd already fsyncs
-     * the payload, but without this a crash right after a
-     * reported-successful save could silently revert the directory entry to
-     * the pre-rename config (lost-but-acknowledged update; never a torn
-     * file). It is a required commit now: a caller must not print success for
-     * an update the filesystem has not made durable. O_NOFOLLOW matches the
-     * directory validation above. */
-    if (!config_named_directory_matches(dir_path, &pinned_dir) ||
-        config_io_fault(CONFIG_IO_DOCUMENT_BEFORE_DIR_SYNC,
-                        "config document directory sync") ||
-        fsync(dir_fd) != 0) {
+     * holding the new entry is itself fsynced. Keep the sync result separate
+     * from the final canonical proof: even when fsync fails, callers need to
+     * know whether the exact renamed generation remains selected at
+     * config_path. */
+    if (config_io_fault(CONFIG_IO_DOCUMENT_BEFORE_DIR_SYNC,
+                        "config document directory sync")) {
+        directory_sync_failed = true;
+        directory_sync_errno = errno ? errno : EIO;
+    } else if (fsync(dir_fd) != 0) {
+        directory_sync_failed = true;
+        directory_sync_errno = errno ? errno : EIO;
+    }
+
+    /* The original descriptor may now name a detached directory. Re-open the
+     * canonical parent and prove that it still selects the pinned parent and
+     * the exact installed file generation. A proved namespace mismatch means
+     * this invocation did not install config_path, even though renameat()
+     * succeeded in the detached directory. */
+    errno = 0;
+    if (config_reprove_canonical_publication(
+            dir_path, &pinned_dir, target_name, &installed_generation,
+            document_bytes, document_length, &destination_now) != 0) {
+        int proof_errno = errno ? errno : EIO;
+        /* ESTALE proves that this generation is not the canonical install.
+         * Other proof I/O leaves the post-rename disposition uncertain, so
+         * outer settlement must conservatively retain installed=true. */
+        if (proof_errno == ESTALE && config_installed) {
+            *config_installed = false;
+        }
+        errno = proof_errno;
+        set_system_error(
+            proof_errno == ESTALE ? ERR_FILE_IO : ERR_CONFIG_WRITE_FAILED,
+            "Canonical config generation changed before context refresh: %s",
+            config_path);
+        goto document_fail;
+    }
+
+    /* A pure sync failure leaves an exact canonical generation visible but
+     * with uncertain crash durability. Preserve installed=true so outer
+     * settlement retains the matching state and requires a reload/retry. */
+    if (directory_sync_failed) {
+        errno = directory_sync_errno;
         set_system_error(ERR_CONFIG_WRITE_FAILED,
                          "Could not durably commit config directory: %s",
                          dir_path);
@@ -9090,21 +9198,10 @@ static int config_write_document_atomic(gitswitch_ctx_t *ctx,
     }
 
     /* Capture the context's next admission generation only after the payload
-     * and directory entry are both durable. A post-rename failure remains an
-     * installed-but-uncertain result and deliberately leaves the caller bound
-     * to its old generation until it reloads. */
-    errno = 0;
-    if (config_reprove_published_file_at(
-            dir_fd, target_name, &installed_generation, document_bytes,
-            document_length, &destination_now) != 0) {
-        int proof_errno = errno ? errno : EIO;
-        errno = proof_errno;
-        set_system_error(
-            proof_errno == ESTALE ? ERR_FILE_IO : ERR_CONFIG_WRITE_FAILED,
-            "Durable config generation changed before context refresh: %s",
-            config_path);
-        goto document_fail;
-    }
+     * and directory entry are both durable and canonically selected. A pure
+     * sync failure remains installed-but-uncertain; a canonical mismatch
+     * clears that disposition. Either failure deliberately leaves the caller
+     * bound to its old generation until it reloads. */
     if (committed_generation) {
         *committed_generation = destination_now;
     }
