@@ -8358,6 +8358,34 @@ static int config_apply_retirement_publication_refresh(
     return 0;
 }
 
+/* Active-state publication admission retains the caller-selected
+ * accounts.toml generation policy, then re-proves the exact active-state
+ * before-image. The replacement path uses this shared contract at its final
+ * pre-rename boundary; the byte-identical durability retry invokes it on both
+ * sides of its directory sync so that no-op can report success only for the
+ * same source and state generations it admitted. */
+static int config_require_resume_hint_generations(
+    const gitswitch_ctx_t *ctx, const char *config_path,
+    config_source_generation_requirement_t generation_requirement,
+    const char *hint, const config_active_state_generation_t *state_before) {
+    if (generation_requirement == CONFIG_SOURCE_GENERATION_REQUIRE_LOADED) {
+        if (config_require_loaded_source_generation(
+                ctx, config_path, NULL) != 0) {
+            return -1;
+        }
+    } else if (generation_requirement ==
+               CONFIG_SOURCE_GENERATION_REQUIRE_FULL_SAVE) {
+        if (config_admit_full_save_generation(ctx, config_path) != 0) {
+            return -1;
+        }
+    } else if (generation_requirement != CONFIG_SOURCE_GENERATION_UNBOUND) {
+        set_error(ERR_INVALID_ARGS,
+                  "Invalid source-generation requirement for active-state commit");
+        return -1;
+    }
+    return config_require_active_state_generation(hint, state_before);
+}
+
 /* Atomically replace the consolidated active-state artifact. Its first line
  * keeps the exact legacy runtime-needs contract consumed by generated shell
  * code; its second line records either active=<name> or the versioned inactive
@@ -8640,7 +8668,14 @@ static int config_update_resume_hint(const gitswitch_ctx_t *ctx,
          * Returning success here without re-proving durability would convert
          * that uncertain state into a reported-durable success on retry. Re-sync
          * the parent directory (the same commit the mutation path performs)
-         * before treating the no-op as committed. */
+         * before treating the no-op as committed. Re-prove both retained
+         * generations on each side of the sync because the public fault
+         * boundary may expose a later writer. */
+        if (config_require_resume_hint_generations(
+                ctx, config_path, generation_requirement, hint,
+                &state_before) != 0) {
+            goto state_cleanup;
+        }
         int dir_fd = open(dir, O_RDONLY | O_CLOEXEC | O_DIRECTORY | O_NOFOLLOW);
         if (dir_fd < 0 ||
             config_io_fault(CONFIG_IO_STATE_BEFORE_DIR_SYNC,
@@ -8654,6 +8689,11 @@ static int config_update_resume_hint(const gitswitch_ctx_t *ctx,
             goto state_cleanup;
         }
         close(dir_fd);
+        if (config_require_resume_hint_generations(
+                ctx, config_path, generation_requirement, hint,
+                &state_before) != 0) {
+            goto state_cleanup;
+        }
         result = 0;
         goto state_cleanup;
     }
@@ -8755,17 +8795,9 @@ static int config_update_resume_hint(const gitswitch_ctx_t *ctx,
                          "Cannot install resume hint atomically: %s", hint);
         goto hint_fail;
     }
-    if (generation_requirement == CONFIG_SOURCE_GENERATION_REQUIRE_LOADED) {
-        if (config_require_loaded_source_generation(
-                ctx, config_path, NULL) != 0) {
-            goto hint_fail;
-        }
-    } else if (generation_requirement ==
-                   CONFIG_SOURCE_GENERATION_REQUIRE_FULL_SAVE &&
-               config_admit_full_save_generation(ctx, config_path) != 0) {
-        goto hint_fail;
-    }
-    if (config_require_active_state_generation(hint, &state_before) != 0) {
+    if (config_require_resume_hint_generations(
+            ctx, config_path, generation_requirement, hint,
+            &state_before) != 0) {
         goto hint_fail;
     }
     /* Every public config/state save holds the destination's internal lock

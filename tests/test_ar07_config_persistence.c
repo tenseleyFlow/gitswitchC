@@ -219,6 +219,12 @@ static const char *document_rewrite_content;
 static struct stat document_rewrite_before;
 static struct stat document_rewrite_after;
 static int document_rewrite_error;
+static size_t document_dir_observations;
+static char noop_state_rewrite_hint[256];
+static char noop_state_rewrite_content[64];
+static struct stat noop_state_rewrite_before;
+static struct stat noop_state_rewrite_after;
+static int noop_state_rewrite_error;
 
 static bool inject_fault(config_io_boundary_t boundary) {
     return boundary == fault_target;
@@ -232,6 +238,14 @@ static void *count_generation_document_malloc(size_t size) {
 static bool count_generation_io_boundary(config_io_boundary_t boundary) {
     (void)boundary;
     generation_io_boundary_calls++;
+    return false;
+}
+
+static bool count_document_dir_observation(
+    config_metadata_test_stage_t stage) {
+    if (stage == CONFIG_METADATA_TEST_DOCUMENT_DIR) {
+        document_dir_observations++;
+    }
     return false;
 }
 
@@ -343,6 +357,26 @@ static bool replace_source_at_state_publication(
             generation_swap_error = errno ? errno : EIO;
         }
         generation_swap_source[0] = '\0';
+    }
+    return false;
+}
+
+static bool rewrite_noop_state_before_directory_sync(
+    config_io_boundary_t boundary) {
+    if (boundary == CONFIG_IO_STATE_BEFORE_DIR_SYNC &&
+        noop_state_rewrite_hint[0] != '\0') {
+        if (lstat(noop_state_rewrite_hint,
+                  &noop_state_rewrite_before) != 0 ||
+            rewrite_private_in_place(noop_state_rewrite_hint,
+                                     noop_state_rewrite_content) != 0 ||
+            restore_file_times(noop_state_rewrite_hint,
+                               &noop_state_rewrite_before) != 0 ||
+            force_ctime_only_drift(noop_state_rewrite_hint,
+                                   &noop_state_rewrite_before,
+                                   &noop_state_rewrite_after) != 0) {
+            noop_state_rewrite_error = errno ? errno : EIO;
+        }
+        noop_state_rewrite_hint[0] = '\0';
     }
     return false;
 }
@@ -1455,6 +1489,180 @@ TEST(active_state_save_is_bound_to_loaded_config_generation) {
     CHECK_STR_EQ(text, "none\ninactive=v1\n");
 }
 
+static void exercise_byte_identical_source_race(bool full_save) {
+    char dir[128];
+    char path[256];
+    char hint[256];
+    char replacement[256];
+    char text[2048];
+    struct stat replacement_before;
+    struct stat source_after;
+    struct stat state_before;
+    struct stat state_after;
+    gitswitch_ctx_t ctx;
+    gitswitch_ctx_t ctx_before;
+    config_io_fault_fn previous_io;
+    config_metadata_test_hook_fn previous_metadata;
+    bool installed = true;
+    int save_result;
+
+    CHECK_EQ_INT(private_dir(dir, sizeof(dir)), 0);
+    snprintf(path, sizeof(path), "%s/accounts.toml", dir);
+    snprintf(hint, sizeof(hint), "%s/.resume-hint", dir);
+    snprintf(replacement, sizeof(replacement), "%s/later.toml", dir);
+    CHECK_EQ_INT(write_private(path, one_account), 0);
+    CHECK_EQ_INT(write_private(hint, "none\nactive=alice\n"), 0);
+    memset(&ctx, 0, sizeof(ctx));
+    CHECK_EQ_INT(config_load(&ctx, path), 0);
+    CHECK_STR_EQ(ctx.config.active_account, "alice");
+    ctx_before = ctx;
+    CHECK_EQ_INT(lstat(hint, &state_before), 0);
+
+    CHECK_EQ_INT(write_private(replacement, replacement_account), 0);
+    CHECK_EQ_INT(lstat(replacement, &replacement_before), 0);
+    snprintf(generation_swap_source, sizeof(generation_swap_source),
+             "%s", path);
+    snprintf(generation_swap_replacement,
+             sizeof(generation_swap_replacement), "%s", replacement);
+    generation_swap_boundary = CONFIG_IO_STATE_BEFORE_DIR_SYNC;
+    generation_swap_error = 0;
+    document_dir_observations = 0U;
+    previous_metadata = config_set_metadata_test_hook_fn(
+        count_document_dir_observation);
+    previous_io = config_set_io_fault_fn(
+        replace_source_at_state_publication);
+    clear_error();
+    if (full_save) {
+        save_result = config_save_transactional(&ctx, path, &installed);
+    } else {
+        save_result = config_save_active_account_transactional(
+            &ctx, path, &installed);
+    }
+    config_set_io_fault_fn(previous_io);
+    config_set_metadata_test_hook_fn(previous_metadata);
+
+    /* Active-only previously returned a false success here. Full-save
+     * happened to reject the source later, but only after it entered the
+     * document writer; the shared final proof must stop both selectors at the
+     * state commit boundary. */
+    CHECK_EQ_INT(save_result, -1);
+    CHECK_EQ_INT(generation_swap_error, 0);
+    CHECK(generation_swap_source[0] == '\0');
+    CHECK(!installed);
+    CHECK_EQ_INT(get_last_error()->code, ERR_FILE_IO);
+    CHECK_EQ_INT(get_last_error()->system_errno, ESTALE);
+    CHECK(strstr(get_last_error()->message,
+                 full_save
+                     ? "refusing full-document save"
+                     : "refusing active-state publication") != NULL);
+    CHECK(document_dir_observations == 0U);
+    CHECK(memcmp(&ctx, &ctx_before, sizeof(ctx)) == 0);
+
+    CHECK_EQ_INT(lstat(path, &source_after), 0);
+    CHECK(same_identity(&replacement_before, &source_after));
+    CHECK(read_text(path, text, sizeof(text)) > 0U);
+    CHECK_STR_EQ(text, replacement_account);
+    CHECK_EQ_INT(access(replacement, F_OK), -1);
+    CHECK_EQ_INT(errno, ENOENT);
+    CHECK_EQ_INT(lstat(hint, &state_after), 0);
+    CHECK(same_identity(&state_before, &state_after));
+    CHECK(read_text(hint, text, sizeof(text)) > 0U);
+    CHECK_STR_EQ(text, "none\nactive=alice\n");
+    CHECK_EQ_INT(count_prefix(dir, "accounts.toml.backup."), 0);
+    CHECK_EQ_INT(count_prefix(dir, "accounts.toml.tmp."), 0);
+    CHECK_EQ_INT(count_prefix(dir, ".resume-hint.tmp."), 0);
+    CHECK_EQ_INT(count_prefix(dir, ".resume-hint.restore."), 0);
+    ts_rm_rf(dir);
+}
+
+TEST(byte_identical_state_retry_reproves_both_source_selectors) {
+    exercise_byte_identical_source_race(false);
+    exercise_byte_identical_source_race(true);
+}
+
+TEST(byte_identical_state_retry_reproves_same_inode_state) {
+    char dir[128];
+    char path[256];
+    char hint[256];
+    char text[256];
+    struct stat canonical;
+    struct stat after_noop;
+    gitswitch_ctx_t ctx;
+    gitswitch_ctx_t ctx_before;
+    config_io_fault_fn previous_io;
+    bool installed = true;
+
+    CHECK_EQ_INT(private_dir(dir, sizeof(dir)), 0);
+    snprintf(path, sizeof(path), "%s/accounts.toml", dir);
+    snprintf(hint, sizeof(hint), "%s/.resume-hint", dir);
+    CHECK_EQ_INT(write_private(path, one_account), 0);
+    CHECK_EQ_INT(write_private(hint, "none\nactive=alice\n"), 0);
+    memset(&ctx, 0, sizeof(ctx));
+    CHECK_EQ_INT(config_load(&ctx, path), 0);
+    CHECK_STR_EQ(ctx.config.active_account, "alice");
+    ctx_before = ctx;
+
+    CHECK_EQ_INT((long)strlen("none\nactive=alice\n"),
+                 (long)strlen("none\nactive=ALICE\n"));
+    snprintf(noop_state_rewrite_hint,
+             sizeof(noop_state_rewrite_hint), "%s", hint);
+    snprintf(noop_state_rewrite_content,
+             sizeof(noop_state_rewrite_content), "%s",
+             "none\nactive=ALICE\n");
+    memset(&noop_state_rewrite_before, 0,
+           sizeof(noop_state_rewrite_before));
+    memset(&noop_state_rewrite_after, 0,
+           sizeof(noop_state_rewrite_after));
+    noop_state_rewrite_error = 0;
+    previous_io = config_set_io_fault_fn(
+        rewrite_noop_state_before_directory_sync);
+    clear_error();
+    CHECK_EQ_INT(config_save_active_account_transactional(
+                     &ctx, path, &installed), -1); /* pre-fix: 0 */
+    config_set_io_fault_fn(previous_io);
+
+    CHECK_EQ_INT(noop_state_rewrite_error, 0);
+    CHECK(noop_state_rewrite_hint[0] == '\0');
+    CHECK(!installed);
+    CHECK_EQ_INT(get_last_error()->code, ERR_FILE_IO);
+    CHECK_EQ_INT(get_last_error()->system_errno, ESTALE);
+    CHECK(strstr(get_last_error()->message,
+                 "Resume hint changed before update") != NULL);
+    CHECK(memcmp(&ctx, &ctx_before, sizeof(ctx)) == 0);
+    CHECK(noop_state_rewrite_before.st_dev ==
+          noop_state_rewrite_after.st_dev);
+    CHECK(noop_state_rewrite_before.st_ino ==
+          noop_state_rewrite_after.st_ino);
+    CHECK_EQ_INT(noop_state_rewrite_before.st_size,
+                 noop_state_rewrite_after.st_size);
+    CHECK(same_mtime(&noop_state_rewrite_before,
+                     &noop_state_rewrite_after));
+    CHECK(!same_ctime(&noop_state_rewrite_before,
+                      &noop_state_rewrite_after));
+    CHECK(read_text(hint, text, sizeof(text)) > 0U);
+    CHECK_STR_EQ(text, "none\nactive=ALICE\n");
+    CHECK_EQ_INT(count_prefix(dir, ".resume-hint.tmp."), 0);
+    CHECK_EQ_INT(count_prefix(dir, ".resume-hint.restore."), 0);
+
+    installed = false;
+    CHECK_EQ_INT(config_save_active_account_transactional(
+                     &ctx, path, &installed), 0);
+    CHECK(installed);
+    CHECK(read_text(hint, text, sizeof(text)) > 0U);
+    CHECK_STR_EQ(text, "none\nactive=alice\n");
+    CHECK_EQ_INT(lstat(hint, &canonical), 0);
+
+    installed = true;
+    CHECK_EQ_INT(config_save_active_account_transactional(
+                     &ctx, path, &installed), 0);
+    CHECK(!installed);
+    CHECK_EQ_INT(lstat(hint, &after_noop), 0);
+    CHECK(same_identity(&canonical, &after_noop));
+    CHECK_EQ_INT(count_prefix(dir, ".resume-hint.tmp."), 0);
+    CHECK_EQ_INT(count_prefix(dir, ".resume-hint.restore."), 0);
+    ts_rm_rf(dir);
+}
+
 TEST(active_state_publish_reproves_exact_before_image_after_hook) {
     char dir[128];
     char path[256];
@@ -1793,6 +2001,8 @@ TEST_MAIN_BEGIN()
     RUN_TEST(active_state_only_save_preserves_accounts_and_is_idempotent);
     RUN_TEST(active_state_case_variants_normalize_and_publish_canonical_name);
     RUN_TEST(active_state_save_is_bound_to_loaded_config_generation);
+    RUN_TEST(byte_identical_state_retry_reproves_both_source_selectors);
+    RUN_TEST(byte_identical_state_retry_reproves_same_inode_state);
     RUN_TEST(active_state_publish_reproves_exact_before_image_after_hook);
     RUN_TEST(active_state_exact_witness_admits_ctime_only_drift);
     RUN_TEST(historical_active_state_migrates_without_reset_resurrection);
