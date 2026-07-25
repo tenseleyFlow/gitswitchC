@@ -13,6 +13,7 @@
 #include "config.h"
 #include "error.h"
 #include "git_ops.h"
+#include "gpg_manager.h"
 #include "signals.h"
 #include "ssh_manager.h"
 #include "utils.h"
@@ -64,6 +65,16 @@ typedef struct {
     pid_t pid;
     int release_fd;
 } runtime_holder_t;
+
+typedef struct {
+    cli_owner_fixture_t cli;
+    char key_path[PATH_MAX];
+    char source_home[PATH_MAX];
+    char tools[PATH_MAX];
+    char gpg_base[PATH_MAX];
+    char gpg_home[PATH_MAX];
+    char gpg_current[PATH_MAX];
+} h5_fixture_t;
 
 static runtime_holder_t g_runtime_holder = { -1, -1 };
 static bool g_hook_should_hold_runtime;
@@ -166,6 +177,37 @@ static const char h1_old_gitconfig[] =
     "2222222222222222222222222222222222222222222222222222222222222222"
 #define H1_NUMERIC_NAME_INCARNATION \
     "8888888888888888888888888888888888888888888888888888888888888888"
+#define H5_GPG_FINGERPRINT \
+    "0123456789ABCDEF01234567ABCDEF0123456789"
+
+static const char h5_fake_gpg[] =
+    "#!/bin/sh\n"
+    "list_secret=\n"
+    "show_version=\n"
+    "export_secret=\n"
+    "for arg in \"$@\"; do\n"
+    "    case \"$arg\" in\n"
+    "        --list-secret-keys) list_secret=1 ;;\n"
+    "        --version) show_version=1 ;;\n"
+    "        --export-secret-keys) export_secret=1 ;;\n"
+    "    esac\n"
+    "done\n"
+    "if [ \"$show_version\" = 1 ]; then\n"
+    "    printf '%s\\n' 'gpg (GnuPG) 2.4.0'\n"
+    "elif [ \"$list_secret\" = 1 ]; then\n"
+    "    printf '%s\\n' "
+    "'sec:u:4096:1:ABCDEF0123456789:1700000000:::-:::scESC:::+:::23::0:' "
+    "'fpr:::::::::" H5_GPG_FINGERPRINT ":'\n"
+    "elif [ \"$export_secret\" = 1 ]; then\n"
+    "    printf '%s\\n' 'AR14-H5-LOCAL-FIXTURE-BYTES'\n"
+    "fi\n"
+    "exit 0\n";
+
+static const char h5_fake_gpgconf[] =
+    "#!/bin/sh\n"
+    "exit 0\n";
+
+static int redirect_output(const char *path);
 
 static int write_private(const char *path, const char *text) {
     int fd = open(path, O_WRONLY | O_CREAT | O_TRUNC | O_CLOEXEC, 0600);
@@ -655,6 +697,245 @@ static int h1_ssh_fixture_setup(
         key_path);
     if (written < 0 || (size_t)written >= sizeof(config_body)) return -1;
     return write_private(fixture->config, config_body);
+}
+
+static int h5_fixture_setup(h5_fixture_t *fixture) {
+    char config_body[PATH_MAX + 3072U];
+    char gpg_path[PATH_MAX];
+    char gpgconf_path[PATH_MAX];
+    int written;
+
+    if (!fixture) {
+        errno = EINVAL;
+        return -1;
+    }
+    memset(fixture, 0, sizeof(*fixture));
+    if (h1_ssh_fixture_setup(
+            &fixture->cli, fixture->key_path,
+            sizeof(fixture->key_path)) != 0 ||
+        (size_t)snprintf(
+            fixture->source_home, sizeof(fixture->source_home),
+            "%s/.gnupg", fixture->cli.home) >=
+            sizeof(fixture->source_home) ||
+        mkdir(fixture->source_home, 0700) != 0 ||
+        !ts_mkdtemp_trusted(
+            fixture->tools, sizeof(fixture->tools),
+            "gitswitch-ar14-h5-tools") ||
+        (size_t)snprintf(
+            gpg_path, sizeof(gpg_path), "%s/gpg",
+            fixture->tools) >= sizeof(gpg_path) ||
+        (size_t)snprintf(
+            gpgconf_path, sizeof(gpgconf_path), "%s/gpgconf",
+            fixture->tools) >= sizeof(gpgconf_path) ||
+        write_private(gpg_path, h5_fake_gpg) != 0 ||
+        chmod(gpg_path, 0700) != 0 ||
+        write_private(gpgconf_path, h5_fake_gpgconf) != 0 ||
+        chmod(gpgconf_path, 0700) != 0 ||
+        (size_t)snprintf(
+            fixture->gpg_base, sizeof(fixture->gpg_base),
+            "%s/gitswitch-gpg", fixture->cli.runtime) >=
+            sizeof(fixture->gpg_base) ||
+        (size_t)snprintf(
+            fixture->gpg_home, sizeof(fixture->gpg_home),
+            "%s/work", fixture->gpg_base) >=
+            sizeof(fixture->gpg_home) ||
+        (size_t)snprintf(
+            fixture->gpg_current, sizeof(fixture->gpg_current),
+            "%s/current", fixture->gpg_base) >=
+            sizeof(fixture->gpg_current)) {
+        return -1;
+    }
+
+    written = snprintf(
+        config_body, sizeof(config_body),
+        "[settings]\n"
+        "default_scope = \"global\"\n"
+        "\n"
+        "[accounts.1]\n"
+        "incarnation = \"1111111111111111111111111111111111111111111111111111111111111111\"\n"
+        "name = \"old\"\n"
+        "email = \"old@example.test\"\n"
+        "description = \"H5 prior identity\"\n"
+        "preferred_scope = \"global\"\n"
+        "\n"
+        "[accounts.2]\n"
+        "incarnation = \"2222222222222222222222222222222222222222222222222222222222222222\"\n"
+        "name = \"work\"\n"
+        "email = \"work@example.test\"\n"
+        "description = \"H5 durable runtime recovery identity\"\n"
+        "preferred_scope = \"global\"\n"
+        "ssh_key = \"%s\"\n"
+        "gpg_key = \"" H5_GPG_FINGERPRINT "\"\n"
+        "gpg_signing_enabled = true\n",
+        fixture->key_path);
+    if (written < 0 || (size_t)written >= sizeof(config_body)) return -1;
+    return write_private(fixture->cli.config, config_body);
+}
+
+static int h5_set_child_environment(
+    const h5_fixture_t *fixture, const char *output_name) {
+    static const char fallback_path[] =
+        "/usr/local/bin:/usr/bin:/bin";
+    const char *inherited_path;
+    char output[PATH_MAX];
+    char *command_path;
+    size_t tools_length;
+    size_t inherited_length;
+    size_t command_path_length;
+    int result = -1;
+
+    if (!fixture || !output_name || output_name[0] == '\0' ||
+        (size_t)snprintf(
+            output, sizeof(output), "%s/%s",
+            fixture->cli.root, output_name) >= sizeof(output)) {
+        errno = EINVAL;
+        return -1;
+    }
+    inherited_path = getenv("PATH");
+    if (!inherited_path || inherited_path[0] == '\0') {
+        inherited_path = fallback_path;
+    }
+    tools_length = strlen(fixture->tools);
+    inherited_length = strlen(inherited_path);
+    if (inherited_length > SIZE_MAX - tools_length - 2U) {
+        errno = EOVERFLOW;
+        return -1;
+    }
+    command_path_length = tools_length + inherited_length + 2U;
+    command_path = malloc(command_path_length);
+    if (!command_path) return -1;
+    if ((size_t)snprintf(
+            command_path, command_path_length, "%s:%s",
+            fixture->tools, inherited_path) >= command_path_length) {
+        errno = EOVERFLOW;
+        goto cleanup;
+    }
+
+    if (setenv("HOME", fixture->cli.home, 1) != 0 ||
+        setenv("XDG_RUNTIME_DIR", fixture->cli.runtime, 1) != 0 ||
+        setenv("GIT_CONFIG_GLOBAL", fixture->cli.gitconfig, 1) != 0 ||
+        setenv("GIT_CONFIG_NOSYSTEM", "1", 1) != 0 ||
+        setenv("GITSWITCH_ALLOW_TMP_GPG", "1", 1) != 0 ||
+        setenv("GNUPGHOME", fixture->source_home, 1) != 0 ||
+        setenv("PATH", command_path, 1) != 0 ||
+        unsetenv("XDG_CONFIG_HOME") != 0 ||
+        unsetenv("GPG_AGENT_INFO") != 0 ||
+        unsetenv("SSH_AUTH_SOCK") != 0 ||
+        unsetenv("SSH_AGENT_PID") != 0 ||
+        unsetenv("GIT_CONFIG_COUNT") != 0 ||
+        unsetenv("GIT_DIR") != 0 ||
+        unsetenv("GIT_WORK_TREE") != 0 ||
+        chdir(fixture->cli.root) != 0 ||
+        redirect_output(output) != 0) {
+        goto cleanup;
+    }
+    result = 0;
+
+cleanup:
+    free(command_path);
+    return result;
+}
+
+static int h5_wait_child(pid_t child) {
+    int status = 0;
+    pid_t waited;
+
+    do {
+        waited = waitpid(child, &status, 0);
+    } while (waited < 0 && errno == EINTR);
+    return waited == child ? status : -1;
+}
+
+static int h5_exit_after_durable_runtime_publish(int base_fd) {
+    (void)base_fd;
+    _exit(77);
+}
+
+static int run_h5_publish_stop_case(const h5_fixture_t *fixture) {
+    pid_t child = fork();
+
+    if (child < 0) return -1;
+    if (child == 0) {
+        char program[] = "gitswitch";
+        char no_color[] = "-C";
+        char force_global[] = "-g";
+        char account[] = "work";
+        char *argv[] = {
+            program, no_color, force_global, account, NULL
+        };
+
+        if (h5_set_child_environment(
+                fixture, "h5-publish-stop-output") != 0) {
+            _exit(240);
+        }
+        (void)gpg_manager_set_retarget_commit_hook_fn(
+            h5_exit_after_durable_runtime_publish);
+        optind = 1;
+        (void)gitswitch_cli_main(4, argv);
+        _exit(241);
+    }
+    return h5_wait_child(child);
+}
+
+typedef enum {
+    H5_CLI_RESUME_HINT = 0,
+    H5_CLI_RESUME_CHECK,
+    H5_CLI_RESUME
+} h5_cli_case_t;
+
+static int run_h5_fresh_cli_case(
+    const h5_fixture_t *fixture, h5_cli_case_t cli_case,
+    const char *output_name, int expected_exit) {
+    pid_t child;
+
+    if (fflush(NULL) != 0) return -1;
+    child = fork();
+    if (child < 0) return -1;
+    if (child == 0) {
+        char program[] = "gitswitch";
+        char no_color[] = "-C";
+        char resume_hint[] = "--resume-hint-probe";
+        char resume_check[] = "--resume-check";
+        char resume[] = "resume";
+        char *hint_argv[] = { program, resume_hint, NULL };
+        char *check_argv[] = { program, resume_check, NULL };
+        char *resume_argv[] = { program, no_color, resume, NULL };
+        char **argv;
+        int argc;
+        int rc;
+
+        if (h5_set_child_environment(fixture, output_name) != 0) {
+            _exit(245);
+        }
+        if (cli_case == H5_CLI_RESUME_HINT) {
+            argv = hint_argv;
+            argc = 2;
+        } else if (cli_case == H5_CLI_RESUME_CHECK) {
+            argv = check_argv;
+            argc = 2;
+        } else {
+            argv = resume_argv;
+            argc = 3;
+        }
+        optind = 1;
+        rc = gitswitch_cli_main(argc, argv);
+        if (rc != expected_exit) _exit(246);
+        if (fflush(NULL) != 0) _exit(247);
+        _exit(0);
+    }
+    return h5_wait_child(child);
+}
+
+static bool h5_symlink_targets(
+    const char *link_path, const char *expected_target) {
+    char target[PATH_MAX];
+    ssize_t length;
+
+    if (!link_path || !expected_target) return false;
+    length = readlink(link_path, target, sizeof(target) - 1U);
+    if (length <= 0 || (size_t)length >= sizeof(target)) return false;
+    target[length] = '\0';
+    return strcmp(target, expected_target) == 0;
 }
 
 static int redirect_output(const char *path) {
@@ -2375,6 +2656,171 @@ TEST(restart_resume_reconstructs_enabled_ssh_identity) {
     }
 }
 
+TEST(durable_gpg_publication_stop_is_reconciled_by_fresh_resume) {
+    h5_fixture_t fixture;
+    char gitconfig[8192];
+    char hint[512];
+    char output[16384];
+    char output_path[PATH_MAX];
+    char expected_program[PATH_MAX + 32U];
+    struct stat state;
+    int setup_rc;
+    int status;
+
+    if (!command_exists("ssh-agent") ||
+        !command_exists("ssh-add") ||
+        !command_exists("ssh-keygen")) {
+        TS_SKIP("openssh", "OpenSSH agent tools are unavailable");
+    }
+    setup_rc = h5_fixture_setup(&fixture);
+    CHECK_EQ_INT(setup_rc, 0);
+    if (setup_rc != 0) return;
+
+    /* Stop at the manager's existing post-sync callback: `current` is now a
+     * durable target publication, while the later Git and active-state phases
+     * have not run. A normal return here would make the fixture invalid. */
+    status = run_h5_publish_stop_case(&fixture);
+    CHECK(status >= 0);
+    if (status >= 0) {
+        CHECK(WIFEXITED(status));
+        if (WIFEXITED(status)) CHECK_EQ_INT(WEXITSTATUS(status), 77);
+    }
+    CHECK_EQ_INT(lstat(fixture.cli.switch_fence, &state), 0);
+    CHECK(S_ISREG(state.st_mode));
+    CHECK_EQ_INT(state.st_mode & 0777, 0600);
+    CHECK_EQ_INT(state.st_uid, geteuid());
+    CHECK(state.st_size > 0);
+    CHECK(h5_symlink_targets(
+        fixture.gpg_current, fixture.gpg_home));
+    CHECK_EQ_INT(stat(fixture.gpg_home, &state), 0);
+    CHECK(S_ISDIR(state.st_mode));
+
+    /* The stop point is observably before both later durable identity phases. */
+    CHECK(read_text(
+              fixture.cli.gitconfig, gitconfig,
+              sizeof(gitconfig)) > 0);
+    CHECK_STR_EQ(gitconfig, h1_old_gitconfig);
+    CHECK(read_text(fixture.cli.hint, hint, sizeof(hint)) > 0);
+    CHECK_STR_EQ(hint, "none\nactive=old\n");
+
+    /* The durable owner, rather than the stale active-state token, drives the
+     * shell probe. Without that owner the old core would report "none" and
+     * accept readiness for the still-old persisted account. */
+    status = run_h5_fresh_cli_case(
+        &fixture, H5_CLI_RESUME_HINT,
+        "h5-resume-hint-output", EXIT_SUCCESS);
+    CHECK(status >= 0);
+    if (status >= 0) {
+        CHECK(WIFEXITED(status));
+        if (WIFEXITED(status)) CHECK_EQ_INT(WEXITSTATUS(status), 0);
+    }
+    CHECK((size_t)snprintf(
+              output_path, sizeof(output_path), "%s/%s",
+              fixture.cli.root, "h5-resume-hint-output") <
+          sizeof(output_path));
+    {
+        static const char expected_probe[] = "ssh gpg\n";
+        size_t output_length =
+            read_text(output_path, output, sizeof(output));
+
+        CHECK(output_length >= sizeof(expected_probe) - 1U);
+        if (output_length >= sizeof(expected_probe) - 1U) {
+            CHECK(memcmp(
+                      output + output_length -
+                          (sizeof(expected_probe) - 1U),
+                      expected_probe,
+                      sizeof(expected_probe) - 1U) == 0);
+        }
+    }
+
+    status = run_h5_fresh_cli_case(
+        &fixture, H5_CLI_RESUME_CHECK,
+        "h5-blocked-readiness-output", EXIT_FAILURE);
+    CHECK(status >= 0);
+    if (status >= 0) {
+        CHECK(WIFEXITED(status));
+        if (WIFEXITED(status)) CHECK_EQ_INT(WEXITSTATUS(status), 0);
+    }
+
+    /* A hook-free process has no in-memory transaction. It must adopt the
+     * exact local marker and converge the complete fixture forward. */
+    status = run_h5_fresh_cli_case(
+        &fixture, H5_CLI_RESUME,
+        "h5-fresh-resume-output", EXIT_SUCCESS);
+    CHECK(status >= 0);
+    if (status >= 0) {
+        CHECK(WIFEXITED(status));
+        if (WIFEXITED(status)) CHECK_EQ_INT(WEXITSTATUS(status), 0);
+    }
+    if (status < 0 || !WIFEXITED(status) ||
+        WEXITSTATUS(status) != 0) {
+        CHECK((size_t)snprintf(
+                  output_path, sizeof(output_path), "%s/%s",
+                  fixture.cli.root, "h5-fresh-resume-output") <
+              sizeof(output_path));
+        if (read_text(output_path, output, sizeof(output)) > 0) {
+            fprintf(stderr,
+                    "AR-14 H5 fresh resume output:\n%s\n", output);
+        }
+    }
+
+    CHECK(read_text(fixture.cli.hint, hint, sizeof(hint)) > 0);
+    CHECK(strncmp(
+              hint, "ssh gpg\nactive=work\n",
+              strlen("ssh gpg\nactive=work\n")) == 0);
+    CHECK(read_text(
+              fixture.cli.gitconfig, gitconfig,
+              sizeof(gitconfig)) > 0);
+    CHECK(strstr(gitconfig, "name = work\n") != NULL);
+    CHECK(strstr(gitconfig, "email = work@example.test\n") != NULL);
+    CHECK(strstr(gitconfig, "old@example.test") == NULL);
+    CHECK(strstr(
+              gitconfig,
+              "signingkey = " H5_GPG_FINGERPRINT "\n") != NULL);
+    CHECK(strstr(gitconfig, "gpgsign = true\n") != NULL);
+    CHECK(strstr(gitconfig, "format = openpgp\n") != NULL);
+    CHECK((size_t)snprintf(
+              expected_program, sizeof(expected_program),
+              "program = %s/gpg\n", fixture.tools) <
+          sizeof(expected_program));
+    CHECK(strstr(gitconfig, expected_program) != NULL);
+    CHECK(h5_symlink_targets(
+        fixture.gpg_current, fixture.gpg_home));
+    errno = 0;
+    CHECK(lstat(fixture.cli.switch_fence, &state) != 0 &&
+          errno == ENOENT);
+    errno = 0;
+    CHECK(lstat(fixture.cli.switch_stage, &state) != 0 &&
+          errno == ENOENT);
+
+    /* The final readiness success is an end-to-end witness for both runtime
+     * managers; check the SSH manager directly as a clearer local diagnostic. */
+    status = run_h5_fresh_cli_case(
+        &fixture, H5_CLI_RESUME_CHECK,
+        "h5-ready-output", EXIT_SUCCESS);
+    CHECK(status >= 0);
+    if (status >= 0) {
+        CHECK(WIFEXITED(status));
+        if (WIFEXITED(status)) CHECK_EQ_INT(WEXITSTATUS(status), 0);
+    }
+    status = run_h1_ssh_runtime_case(
+        &fixture.cli, fixture.key_path, false, true);
+    CHECK(status >= 0);
+    if (status >= 0) {
+        CHECK(WIFEXITED(status));
+        if (WIFEXITED(status)) CHECK_EQ_INT(WEXITSTATUS(status), 0);
+    }
+
+    /* Do not leave the fixture's local agent behind after the suite exits. */
+    status = run_h1_ssh_runtime_case(
+        &fixture.cli, fixture.key_path, true, false);
+    CHECK(status >= 0);
+    if (status >= 0) {
+        CHECK(WIFEXITED(status));
+        if (WIFEXITED(status)) CHECK_EQ_INT(WEXITSTATUS(status), 0);
+    }
+}
+
 TEST(finalization_git_replacement_retains_fence_until_fresh_resume) {
     cli_owner_fixture_t fixture;
     char gitconfig[4096];
@@ -2955,6 +3401,7 @@ TEST_MAIN_BEGIN()
     RUN_TEST(restart_resume_converges_after_active_state_restore_conflict);
     RUN_TEST(unresolved_switch_fence_survives_restart_and_resume_reconciles_forward);
     RUN_TEST(restart_resume_reconstructs_enabled_ssh_identity);
+    RUN_TEST(durable_gpg_publication_stop_is_reconciled_by_fresh_resume);
     RUN_TEST(finalization_git_replacement_retains_fence_until_fresh_resume);
     RUN_TEST(fresh_switch_stage_failure_cleans_exact_preintent_before_mutation);
     RUN_TEST(switch_guard_clear_retries_after_unlink_and_preserves_foreign_name);
