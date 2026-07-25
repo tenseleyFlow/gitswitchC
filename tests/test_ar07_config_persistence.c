@@ -1604,6 +1604,31 @@ TEST(historical_active_state_migrates_without_reset_resurrection) {
     CHECK(same_identity(&state_before, &state_after));
 }
 
+TEST(one_line_active_state_mismatch_degrades_without_observational_rewrite) {
+    char dir[128], path[256], hint[256], text[1024];
+    gitswitch_ctx_t ctx;
+
+    CHECK_EQ_INT(private_dir(dir, sizeof(dir)), 0);
+    snprintf(path, sizeof(path), "%s/accounts.toml", dir);
+    snprintf(hint, sizeof(hint), "%s/.resume-hint", dir);
+    CHECK_EQ_INT(write_private(path, two_accounts_legacy), 0);
+    CHECK_EQ_INT(write_private(hint, "ssh\n"), 0);
+
+    /* A one-line marker carries a real runtime-needs claim even though its
+     * account identity still migrates from settings.active_account. Treat a
+     * mismatch like the equivalent two-line crash window, but keep loading
+     * observational until a serialized state save owns the rewrite. */
+    memset(&ctx, 0, sizeof(ctx));
+    CHECK_EQ_INT(config_load(&ctx, path), 0);
+    CHECK_STR_EQ(ctx.config.active_account, "");
+    CHECK(read_text(hint, text, sizeof(text)) > 0);
+    CHECK_STR_EQ(text, "ssh\n");
+
+    CHECK_EQ_INT(config_save_active_account(&ctx, path), 0);
+    CHECK(read_text(hint, text, sizeof(text)) > 0);
+    CHECK_STR_EQ(text, "none\ninactive=v1\n");
+}
+
 TEST(active_state_rejects_corruption_and_crash_mismatches) {
     char dir[128], path[256], hint[256], text[1024];
     gitswitch_ctx_t ctx;
@@ -1612,6 +1637,12 @@ TEST(active_state_rejects_corruption_and_crash_mismatches) {
     snprintf(path, sizeof(path), "%s/accounts.toml", dir);
     snprintf(hint, sizeof(hint), "%s/.resume-hint", dir);
     CHECK_EQ_INT(write_private(path, one_account), 0);
+
+    CHECK_EQ_INT(write_private(hint, "none\n"), 0);
+    memset(&ctx, 0, sizeof(ctx));
+    CHECK_EQ_INT(config_load(&ctx, path), -1);
+    CHECK(strstr(get_last_error()->message,
+                 "has no settings.active_account migration source") != NULL);
 
     CHECK_EQ_INT(write_private(hint, "garbage\n"), 0);
     memset(&ctx, 0, sizeof(ctx));
@@ -1765,6 +1796,7 @@ TEST_MAIN_BEGIN()
     RUN_TEST(active_state_publish_reproves_exact_before_image_after_hook);
     RUN_TEST(active_state_exact_witness_admits_ctime_only_drift);
     RUN_TEST(historical_active_state_migrates_without_reset_resurrection);
+    RUN_TEST(one_line_active_state_mismatch_degrades_without_observational_rewrite);
     RUN_TEST(active_state_rejects_corruption_and_crash_mismatches);
     RUN_TEST(active_state_faults_report_install_boundary_and_do_not_leak_fds);
     RUN_TEST(active_state_registration_failure_is_atomic_and_retryable);

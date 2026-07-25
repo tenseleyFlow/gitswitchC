@@ -1326,7 +1326,7 @@ static int config_load_mode_inplace(gitswitch_ctx_t *ctx,
                 ctx->config.active_account[0] = '\0';
             }
         } else if (active_state.exists &&
-                   !active_state.legacy_needs_only &&
+                   active_state.needs[0] != '\0' &&
                    strcmp(active_state.needs,
                           config_account_runtime_needs(state_account)) != 0) {
             /* AR-12 M3: a stale needs token is repairable staleness, not
