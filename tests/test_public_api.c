@@ -56,6 +56,7 @@ TEST(all_retained_public_apis_compile_and_link) {
     REQUIRE_PUBLIC_API(accounts_remove_abort);
     REQUIRE_PUBLIC_API(accounts_remove_commit);
     REQUIRE_PUBLIC_API(accounts_remove_finalize);
+    REQUIRE_PUBLIC_API(accounts_remove_recover_incomplete);
     REQUIRE_PUBLIC_API(accounts_reset_retirement_cancel);
     REQUIRE_PUBLIC_API(accounts_reset_retirement_finalize);
     REQUIRE_PUBLIC_API(accounts_reset_retirement_prepare);
@@ -107,6 +108,7 @@ TEST(all_retained_public_apis_compile_and_link) {
     REQUIRE_PUBLIC_API(config_publication_preflight);
     REQUIRE_PUBLIC_API(config_publication_preflight_destination);
     REQUIRE_PUBLIC_API(config_refresh_retirement_publications_transactional);
+    REQUIRE_PUBLIC_API(config_revalidate_loaded_source);
     REQUIRE_PUBLIC_API(config_remove_account);
     REQUIRE_PUBLIC_API(config_remove_account_owned);
     REQUIRE_PUBLIC_API(config_restore_active_account);
@@ -124,9 +126,11 @@ TEST(all_retained_public_apis_compile_and_link) {
     REQUIRE_PUBLIC_API(config_switch_guard_reconcile_preintent);
     REQUIRE_PUBLIC_API(config_switch_guard_was_created);
     REQUIRE_PUBLIC_API(config_retirement_guard_abandon);
+    REQUIRE_PUBLIC_API(config_retirement_guard_adopt);
     REQUIRE_PUBLIC_API(config_retirement_guard_clear);
     REQUIRE_PUBLIC_API(config_retirement_guard_install_or_adopt);
     REQUIRE_PUBLIC_API(config_retirement_guard_probe);
+    REQUIRE_PUBLIC_API(config_retirement_guard_recovery_probe);
     REQUIRE_PUBLIC_API(config_retirement_guard_was_created);
     REQUIRE_PUBLIC_API(config_save);
     REQUIRE_PUBLIC_API(config_save_active_account);

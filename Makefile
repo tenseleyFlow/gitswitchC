@@ -1595,8 +1595,9 @@ $(BINDIR)/test_ar11_retirement_outcome: \
 $(BINDIR)/test_ar11_retirement_outer: \
 		$(OBJDIR)/test_ar11_retirement_outer.o \
 		$(AR07_RESET_MAIN_OBJECT) \
+		$(AR08_HINT_CONFIG_OBJECT) \
 		$(AR09_DISPATCH_SIGNALS_OBJECT) \
-		$(filter-out $(OBJDIR)/main.o $(OBJDIR)/signals.o,$(OBJECTS)) | $(BINDIR)
+		$(filter-out $(OBJDIR)/main.o $(OBJDIR)/config.o $(OBJDIR)/signals.o,$(OBJECTS)) | $(BINDIR)
 	@echo "Linking test $@..."
 	$(CC) $(LDFLAGS) $^ -o $@ $(LIBS) $(RELEASE_ENFORCED_LDFLAGS)
 

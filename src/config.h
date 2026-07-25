@@ -142,6 +142,12 @@ int config_init_names(gitswitch_ctx_t *ctx);
  */
 int config_load(gitswitch_ctx_t *ctx, const char *config_path);
 
+/* Re-prove that the path recorded in `ctx` still names the exact accounts
+ * document loaded into it. This is observational: it neither locks nor writes
+ * any path. Recovery callers that require serialization must hold the ordinary
+ * config write lock across this check and the operation it authorizes. */
+int config_revalidate_loaded_source(const gitswitch_ctx_t *ctx);
+
 /**
  * Save configuration to TOML file
  * - Creates backup of existing config
@@ -240,6 +246,16 @@ typedef struct {
 
 typedef struct config_retirement_guard config_retirement_guard_t;
 
+/* Token-free projection of one active retirement marker. `valid` is true
+ * only for a stable canonical incomplete generation; absent namespaces and
+ * exact completed marker/certificate pairs return a zeroed projection. */
+typedef struct {
+    bool valid;
+    config_retirement_kind_t kind;
+    config_retirement_owner_t owners[MAX_ACCOUNTS];
+    size_t owner_count;
+} config_retirement_recovery_t;
+
 /* Under an internally owned retirement lifecycle lock, install a fresh
  * incomplete generation or adopt an active generation only when its kind and
  * sorted owner set match exactly. Adoption first syncs the pinned directory,
@@ -253,6 +269,28 @@ typedef struct config_retirement_guard config_retirement_guard_t;
  * clear() or abandon().
  */
 int config_retirement_guard_install_or_adopt(
+    const char *config_path, config_retirement_kind_t kind,
+    const config_retirement_owner_t *owners, size_t owner_count,
+    config_retirement_guard_t **guard);
+
+/* Read one stable, token-free recovery projection without creating, locking,
+ * chmod'ing, synchronizing, or repairing any namespace object. An exact
+ * byte-identical transition copy remains projectable so adopt() can converge
+ * an interrupted clear; foreign/malformed stages, unsafe or unstable state,
+ * and legacy residue fail closed. */
+int config_retirement_guard_recovery_probe(
+    const char *config_path,
+    config_retirement_recovery_t *recovery);
+
+/* Adopt only an already-active canonical marker whose operation and complete
+ * canonical owner set match exactly. This entry point never creates or rotates
+ * a marker. Its only reconciliation is removing a jointly revalidated stage
+ * that is byte-identical to that exact marker under the existing lifecycle
+ * lock; foreign/malformed stages remain untouched. Absence, an already-settled
+ * pair without such a stage, legacy residue, mismatched state, or namespace
+ * replacement fails closed. The returned handle owns the lifecycle lock and
+ * must be passed to clear() or abandon(). */
+int config_retirement_guard_adopt(
     const char *config_path, config_retirement_kind_t kind,
     const config_retirement_owner_t *owners, size_t owner_count,
     config_retirement_guard_t **guard);

@@ -3989,6 +3989,268 @@ int accounts_remove_abort(gitswitch_ctx_t *ctx) {
         ctx, ACCOUNTS_RETIREMENT_SAVE_PREINSTALL_FAILED);
 }
 
+static bool accounts_parse_canonical_account_id(const char *identifier,
+                                                uint32_t *account_id) {
+    char *end = NULL;
+    unsigned long parsed;
+
+    if (!identifier || !account_id ||
+        identifier[0] < '1' || identifier[0] > '9') {
+        return false;
+    }
+    for (const char *cursor = identifier + 1U; *cursor; cursor++) {
+        if (!isdigit((unsigned char)*cursor)) return false;
+    }
+    errno = 0;
+    parsed = strtoul(identifier, &end, 10);
+    if (errno != 0 || !end || *end != '\0' ||
+        parsed > UINT32_MAX) {
+        return false;
+    }
+    *account_id = (uint32_t)parsed;
+    return true;
+}
+
+static int accounts_collect_retiring_owner_publications(
+    const publication_ledger_t *ledger,
+    const config_retirement_owner_t *owner,
+    const publication_record_t *records[PUBLICATION_LEDGER_MAX_RECORDS],
+    size_t *record_count) {
+    size_t count = 0U;
+    bool saw_id = false;
+
+    if (!ledger || !owner || !records || !record_count) {
+        errno = EINVAL;
+        set_error(ERR_INVALID_ARGS,
+                  "Invalid incomplete-remove publication recovery state");
+        return -1;
+    }
+    *record_count = 0U;
+    if (!ledger->present || ledger->version != PUBLICATION_LEDGER_VERSION) {
+        errno = ESTALE;
+        set_error(
+            ERR_GIT_CONFIG_FAILED,
+            "Incomplete removal has no canonical publication tombstone ledger");
+        return -1;
+    }
+    for (size_t i = 0U; i < ledger->count; i++) {
+        const publication_record_t *record = &ledger->records[i];
+
+        if (record->account_id != owner->account_id) continue;
+        saw_id = true;
+        if (strcmp(record->account_incarnation,
+                   owner->account_incarnation) != 0) {
+            errno = ESTALE;
+            set_error(
+                ERR_GIT_CONFIG_FAILED,
+                "Incomplete removal owner ID %u has conflicting durable incarnation provenance",
+                owner->account_id);
+            return -1;
+        }
+        if (publication_record_validate(record) != 0 ||
+            record->state != PUBLICATION_STATE_RETIRING ||
+            (record->capabilities &
+             (PUBLICATION_CAP_DESTINATION |
+              PUBLICATION_CAP_POST_GENERATION)) !=
+                (PUBLICATION_CAP_DESTINATION |
+                 PUBLICATION_CAP_POST_GENERATION)) {
+            errno = ESTALE;
+            set_error(
+                ERR_GIT_CONFIG_FAILED,
+                "Incomplete removal owner ID %u has incomplete or non-retiring publication provenance",
+                owner->account_id);
+            return -1;
+        }
+        if (count == PUBLICATION_LEDGER_MAX_RECORDS) {
+            errno = EOVERFLOW;
+            set_error(ERR_GIT_CONFIG_FAILED,
+                      "Incomplete removal publication set is too large");
+            return -1;
+        }
+        records[count++] = record;
+    }
+    if (!saw_id || count == 0U) {
+        errno = ESTALE;
+        set_error(
+            ERR_GIT_CONFIG_FAILED,
+            "Incomplete removal owner ID %u has no durable publication tombstones",
+            owner->account_id);
+        return -1;
+    }
+    *record_count = count;
+    return 0;
+}
+
+static int accounts_serialize_recovery_ledger(
+    const publication_ledger_t *ledger, unsigned char **serialized,
+    size_t *serialized_length) {
+    if (!ledger || !serialized || !serialized_length || *serialized) {
+        errno = EINVAL;
+        set_error(ERR_INVALID_ARGS,
+                  "Invalid publication-ledger recovery snapshot");
+        return -1;
+    }
+    if (publication_ledger_serialize(
+            ledger, serialized, serialized_length) != 0) {
+        return -1;
+    }
+    return 0;
+}
+
+int accounts_remove_recover_incomplete(gitswitch_ctx_t *ctx,
+                                       const char *identifier) {
+    config_retirement_recovery_t recovery;
+    config_retirement_guard_t *guard = NULL;
+    git_retirement_recovery_t *git_recovery = NULL;
+    publication_ledger_t ledger;
+    publication_ledger_t revalidated_ledger;
+    const publication_record_t *records[
+        PUBLICATION_LEDGER_MAX_RECORDS];
+    unsigned char *ledger_bytes = NULL;
+    unsigned char *revalidated_bytes = NULL;
+    size_t record_count = 0U;
+    size_t ledger_length = 0U;
+    size_t revalidated_length = 0U;
+    uint32_t requested_id = 0U;
+    error_accumulator_t failures;
+    int result = -1;
+    bool matching_absent_owner = false;
+
+    memset(&recovery, 0, sizeof(recovery));
+    memset(records, 0, sizeof(records));
+    publication_ledger_init(&ledger);
+    publication_ledger_init(&revalidated_ledger);
+    error_accumulator_init(&failures);
+    if (!ctx || !identifier) {
+        errno = EINVAL;
+        set_error(ERR_INVALID_ARGS,
+                  "Invalid incomplete account-removal recovery request");
+        goto done;
+    }
+    if (!accounts_parse_canonical_account_id(identifier, &requested_id)) {
+        result = 0;
+        goto done;
+    }
+    if (config_retirement_guard_recovery_probe(
+            ctx->config.config_path, &recovery) != 0) {
+        goto done;
+    }
+    if (!recovery.valid ||
+        recovery.kind != CONFIG_RETIREMENT_REMOVE ||
+        recovery.owner_count != 1U ||
+        recovery.owners[0].account_id != requested_id) {
+        result = 0;
+        goto done;
+    }
+
+    for (size_t i = 0U; i < ctx->account_count; i++) {
+        const account_t *account = &ctx->accounts[i];
+
+        if (account->id != requested_id) continue;
+        if (!account->incarnation_persisted ||
+            strcmp(account->incarnation,
+                   recovery.owners[0].account_incarnation) != 0) {
+            errno = ESTALE;
+            set_error(
+                ERR_GIT_CONFIG_FAILED,
+                "Cannot recover incomplete removal for account ID %u because the live account uses a different incarnation",
+                requested_id);
+            matching_absent_owner = true;
+            goto done;
+        }
+        /* The exact owner is still live. This is an ordinary retry, not the
+         * installed-but-uncertain missing-owner case handled here. */
+        result = 0;
+        goto done;
+    }
+    matching_absent_owner = true;
+
+    if (config_retirement_guard_adopt(
+            ctx->config.config_path, CONFIG_RETIREMENT_REMOVE,
+            recovery.owners, recovery.owner_count, &guard) != 0 ||
+        config_revalidate_loaded_source(ctx) != 0 ||
+        config_load_publication_ledger(
+            ctx->config.config_path, &ledger) != 0 ||
+        accounts_collect_retiring_owner_publications(
+            &ledger, &recovery.owners[0],
+            records, &record_count) != 0 ||
+        accounts_serialize_recovery_ledger(
+            &ledger, &ledger_bytes, &ledger_length) != 0 ||
+        git_retirement_recovery_begin(
+            records, record_count, &git_recovery) != 0) {
+        goto done;
+    }
+
+    /* Keep the loaded account document and complete active-state ledger
+     * byte-stable while the canonical Git destination locks remain held.
+     * Exact equality prevents a same-owner record replacement from being
+     * laundered through the earlier clean-destination proof. */
+    if (config_revalidate_loaded_source(ctx) != 0 ||
+        config_load_publication_ledger(
+            ctx->config.config_path, &revalidated_ledger) != 0 ||
+        accounts_serialize_recovery_ledger(
+            &revalidated_ledger, &revalidated_bytes,
+            &revalidated_length) != 0 ||
+        ledger_length != revalidated_length ||
+        memcmp(ledger_bytes, revalidated_bytes, ledger_length) != 0) {
+        if (get_last_error()->code == ERR_SUCCESS) {
+            errno = ESTALE;
+            set_error(
+                ERR_GIT_CONFIG_FAILED,
+                "Retirement publication tombstones changed during incomplete-remove recovery");
+        }
+        goto done;
+    }
+    if (git_retirement_recovery_verify(git_recovery) != 0 ||
+        config_retirement_guard_clear(&guard) != 0) {
+        goto done;
+    }
+    if (git_retirement_recovery_end(&git_recovery) != 0) {
+        goto done;
+    }
+    clear_error();
+    errno = 0;
+    result = 1;
+
+done:
+    if (result < 0) {
+        error_context_t primary = *get_last_error();
+        int primary_errno = errno ? errno : EIO;
+
+        errno = primary_errno;
+        (void)error_accumulator_add(
+            &failures, "incomplete account removal recovery", &primary);
+    }
+    if (git_recovery &&
+        git_retirement_recovery_end(&git_recovery) != 0) {
+        (void)error_accumulator_add_last(
+            &failures, "Git retirement recovery cleanup");
+        result = -1;
+    }
+    if (guard) config_retirement_guard_abandon(&guard);
+    if (ledger_bytes) {
+        secure_zero_memory(ledger_bytes, ledger_length);
+        free(ledger_bytes);
+    }
+    if (revalidated_bytes) {
+        secure_zero_memory(revalidated_bytes, revalidated_length);
+        free(revalidated_bytes);
+    }
+    publication_ledger_clear(&ledger);
+    publication_ledger_clear(&revalidated_ledger);
+    secure_zero_memory(&recovery, sizeof(recovery));
+    secure_zero_memory(records, sizeof(records));
+    if (failures.active) {
+        (void)error_accumulator_publish(&failures);
+    } else if (result == 0 && matching_absent_owner) {
+        errno = ESTALE;
+        set_error(ERR_GIT_CONFIG_FAILED,
+                  "Incomplete removal recovery did not settle");
+        result = -1;
+    }
+    return result;
+}
+
 /* Remove account with confirmation and cleanup. CLI callers prepare the
  * account/model deletion here and finalize its SSH alias only after main has
  * classified config_save_transactional() as pre- or post-install. */

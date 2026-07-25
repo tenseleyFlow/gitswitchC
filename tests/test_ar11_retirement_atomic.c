@@ -7,6 +7,9 @@
 #include "test.h"
 #include "error.h"
 #include "git_ops.h"
+#define GITSWITCH_INTERNAL_API
+#include "git_ops_internal.h"
+#undef GITSWITCH_INTERNAL_API
 #include "publication.h"
 #include "utils.h"
 
@@ -159,6 +162,23 @@ static int at_write_file(const char *path, const char *contents,
 
     if (!path || !contents) return -1;
     fd = open(path, O_WRONLY | O_CREAT | O_TRUNC | O_CLOEXEC, mode);
+    if (fd < 0) return -1;
+    if (at_write_all(fd, contents, strlen(contents)) != 0 ||
+        fsync(fd) != 0) {
+        saved_errno = errno;
+        (void)close(fd);
+        errno = saved_errno;
+        return -1;
+    }
+    return close(fd);
+}
+
+static int at_append_file(const char *path, const char *contents) {
+    int fd;
+    int saved_errno;
+
+    if (!path || !contents) return -1;
+    fd = open(path, O_WRONLY | O_APPEND | O_CLOEXEC | O_NOFOLLOW);
     if (fd < 0) return -1;
     if (at_write_all(fd, contents, strlen(contents)) != 0 ||
         fsync(fd) != 0) {
@@ -1014,6 +1034,89 @@ TEST(postpublication_directory_sync_failure_reconciles_on_retry) {
     CHECK(access(fixture.lock_path, F_OK) != 0 && errno == ENOENT);
 }
 
+TEST(retiring_recovery_rejects_live_values_without_forward_unsets) {
+    at_fixture_t fixture;
+    at_bytes_t before;
+    const publication_record_t *records[1];
+    git_retirement_recovery_t *recovery = NULL;
+
+    CHECK_EQ_INT(at_fixture_init(&fixture, PUBLICATION_SCOPE_GLOBAL,
+                                 false, 0600), 0);
+    fixture.publication.state = PUBLICATION_STATE_RETIRING;
+    records[0] = &fixture.publication;
+    CHECK_EQ_INT(at_read_bytes(fixture.config_path, &before), 0);
+    CHECK_EQ_INT(git_retirement_recovery_begin(
+                     records, 1U, &recovery), -1);
+    CHECK(recovery == NULL);
+    CHECK(at_file_equals_bytes(fixture.config_path, &before));
+    CHECK(access(fixture.lock_path, F_OK) != 0 && errno == ENOENT);
+    at_bytes_clear(&before);
+}
+
+TEST(retiring_recovery_holds_canonical_lock_through_clean_reproof) {
+    at_fixture_t fixture;
+    const publication_record_t *records[1];
+    git_retirement_recovery_t *recovery = NULL;
+    size_t cleared = 99U;
+
+    CHECK_EQ_INT(at_fixture_init(&fixture, PUBLICATION_SCOPE_GLOBAL,
+                                 false, 0600), 0);
+    CHECK_EQ_INT(at_retire(&fixture, &cleared), 0);
+    CHECK_EQ_INT((long)cleared, (long)AT_KEY_COUNT);
+    fixture.publication.state = PUBLICATION_STATE_RETIRING;
+    records[0] = &fixture.publication;
+    CHECK_EQ_INT(git_retirement_recovery_begin(
+                     records, 1U, &recovery), 0);
+    CHECK(recovery != NULL);
+    CHECK(access(fixture.lock_path, F_OK) == 0);
+    CHECK_EQ_INT(at_git_add(fixture.config_path,
+                            GIT_CONFIG_CORE_SSHCOMMAND,
+                            fixture.ssh_command), -1);
+    at_check_owned_absent(&fixture);
+    CHECK_EQ_INT(git_retirement_recovery_verify(recovery), 0);
+    CHECK(access(fixture.lock_path, F_OK) == 0);
+    CHECK_EQ_INT(git_retirement_recovery_end(&recovery), 0);
+    CHECK(recovery == NULL);
+    CHECK(access(fixture.lock_path, F_OK) != 0 && errno == ENOENT);
+}
+
+TEST(retiring_recovery_fails_closed_on_uncooperative_reintroduction) {
+    at_fixture_t fixture;
+    const publication_record_t *records[1];
+    git_retirement_recovery_t *recovery = NULL;
+    char reintroduced[PUBLICATION_SSH_COMMAND_MAX + 64U];
+    char observed[PUBLICATION_SSH_COMMAND_MAX * 2U];
+    char expected[PUBLICATION_SSH_COMMAND_MAX + 2U];
+    size_t cleared = 99U;
+
+    CHECK_EQ_INT(at_fixture_init(&fixture, PUBLICATION_SCOPE_GLOBAL,
+                                 false, 0600), 0);
+    CHECK_EQ_INT(at_retire(&fixture, &cleared), 0);
+    fixture.publication.state = PUBLICATION_STATE_RETIRING;
+    records[0] = &fixture.publication;
+    CHECK_EQ_INT(git_retirement_recovery_begin(
+                     records, 1U, &recovery), 0);
+    CHECK_EQ_INT(safe_snprintf(
+                     reintroduced, sizeof(reintroduced),
+                     "\n[core]\n\tsshCommand = %s\n",
+                     fixture.ssh_command), 0);
+    CHECK_EQ_INT(at_append_file(
+                     fixture.config_path, reintroduced), 0);
+    CHECK_EQ_INT(git_retirement_recovery_verify(recovery), -1);
+    CHECK(recovery != NULL);
+    CHECK(access(fixture.lock_path, F_OK) == 0);
+    CHECK_EQ_INT(git_retirement_recovery_end(&recovery), -1);
+    CHECK(recovery == NULL);
+    CHECK(access(fixture.lock_path, F_OK) != 0 && errno == ENOENT);
+    CHECK_EQ_INT(at_git_get_all(
+                     fixture.config_path, GIT_CONFIG_CORE_SSHCOMMAND,
+                     observed, sizeof(observed)), 0);
+    CHECK_EQ_INT(safe_snprintf(
+                     expected, sizeof(expected), "%s\n",
+                     fixture.ssh_command), 0);
+    CHECK_STR_EQ(observed, expected);
+}
+
 TEST(foreign_lock_survives_checked_ordinary_failure_cleanup) {
     at_fixture_t fixture;
     at_bytes_t before;
@@ -1421,6 +1524,9 @@ TEST_MAIN_BEGIN()
     RUN_TEST(late_generation_replacement_survives_exchange_in_every_scope);
     RUN_TEST(late_hardlink_race_is_reversed_without_publish_in_every_scope);
     RUN_TEST(postpublication_directory_sync_failure_reconciles_on_retry);
+    RUN_TEST(retiring_recovery_rejects_live_values_without_forward_unsets);
+    RUN_TEST(retiring_recovery_holds_canonical_lock_through_clean_reproof);
+    RUN_TEST(retiring_recovery_fails_closed_on_uncooperative_reintroduction);
     RUN_TEST(foreign_lock_survives_checked_ordinary_failure_cleanup);
     RUN_TEST(foreign_lock_survives_stale_reconciliation_cleanup_conflict);
     RUN_TEST(forced_unsupported_exchange_fallback_preserves_ordered_survivors);

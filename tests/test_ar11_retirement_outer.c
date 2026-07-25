@@ -45,7 +45,26 @@ git_retirement_test_hook_fn git_ops_test_set_retirement_hook(
     git_retirement_test_hook_fn fn);
 
 typedef enum {
+    RETIREMENT_GUARD_CLEAR_BEFORE_STAGE_CREATE = 0,
+    RETIREMENT_GUARD_CLEAR_AFTER_STAGE_WRITE,
+    RETIREMENT_GUARD_CLEAR_BEFORE_FILE_SYNC,
+    RETIREMENT_GUARD_CLEAR_BEFORE_PUBLISH,
+    RETIREMENT_GUARD_CLEAR_AFTER_PUBLISH,
+    RETIREMENT_GUARD_CLEAR_BEFORE_DIR_SYNC,
+    RETIREMENT_GUARD_CLEAR_AFTER_DIR_SYNC,
+    RETIREMENT_GUARD_PAIR_AFTER_MARKER_READ,
+    RETIREMENT_GUARD_INSTALL_BEFORE_DIR_SYNC
+} retirement_guard_clear_test_stage_t;
+typedef int (*retirement_guard_clear_test_hook_fn)(
+    retirement_guard_clear_test_stage_t stage, int descriptor,
+    const char *marker_name);
+retirement_guard_clear_test_hook_fn
+gitswitch_test_set_retirement_guard_clear_hook(
+    retirement_guard_clear_test_hook_fn hook);
+
+typedef enum {
     M18_COMMAND_REMOVE = 0,
+    M18_COMMAND_REMOVE_NUMERIC,
     M18_COMMAND_RESET,
     M18_COMMAND_RESET_ALL,
     M18_COMMAND_RESUME,
@@ -70,7 +89,10 @@ typedef struct {
     char accounts_path[MAX_PATH_LEN];
     char state_path[MAX_PATH_LEN];
     char guard_path[MAX_PATH_LEN];
+    char completion_path[MAX_PATH_LEN];
+    char transition_path[MAX_PATH_LEN];
     char output_path[MAX_PATH_LEN];
+    char git_trace_path[MAX_PATH_LEN];
     char git_path[MAX_PATH_LEN];
     char no_op_git_path[MAX_PATH_LEN];
     char shared_repository[MAX_PATH_LEN];
@@ -94,6 +116,8 @@ static size_t m18_faults_remaining;
 static size_t m18_fault_matches_to_skip;
 static size_t m18_witness_ctime_drifts_remaining;
 static int m18_witness_ctime_drift_error;
+static bool m18_clear_after_stage_write_fault;
+static bool m18_clear_after_stage_write_observed;
 
 static bool m18_config_fault(config_io_boundary_t boundary) {
     if (boundary != m18_fault_boundary) return false;
@@ -105,6 +129,21 @@ static bool m18_config_fault(config_io_boundary_t boundary) {
     m18_fault_observed = true;
     if (m18_faults_remaining != SIZE_MAX) m18_faults_remaining--;
     return true;
+}
+
+static int m18_retirement_clear_fault(
+    retirement_guard_clear_test_stage_t stage, int descriptor,
+    const char *marker_name) {
+    (void)descriptor;
+    (void)marker_name;
+    if (!m18_clear_after_stage_write_fault ||
+        stage != RETIREMENT_GUARD_CLEAR_AFTER_STAGE_WRITE) {
+        return 0;
+    }
+    m18_clear_after_stage_write_fault = false;
+    m18_clear_after_stage_write_observed = true;
+    errno = EIO;
+    return -1;
 }
 
 static bool m18_same_ctime(const struct stat *left,
@@ -334,7 +373,11 @@ static int m18_fixture_setup(m18_fixture_t *fixture) {
     static const char ssh_program_body[] = "#!/bin/sh\nexit 0\n";
     static const char git_program_body[] =
         "#!/bin/sh\nPATH=/usr/local/bin:/usr/bin:/bin\n"
-        "export PATH\nexec git \"$@\"\n";
+        "export PATH\n"
+        "if [ -n \"${GITSWITCH_TEST_GIT_TRACE:-}\" ]; then\n"
+        "  printf '%s\\n' \"$*\" >> \"$GITSWITCH_TEST_GIT_TRACE\"\n"
+        "fi\n"
+        "exec git \"$@\"\n";
     static const char key_body[] =
         "-----BEGIN OPENSSH PRIVATE KEY-----\nfixture\n";
     /* The real runner rejects executables below a world-writable /tmp ancestor.
@@ -370,8 +413,19 @@ static int m18_fixture_setup(m18_fixture_t *fixture) {
         safe_snprintf(fixture->guard_path, sizeof(fixture->guard_path),
                       "%s/.retirement-incomplete",
                       fixture->config_dir) != 0 ||
+        safe_snprintf(fixture->completion_path,
+                      sizeof(fixture->completion_path),
+                      "%s/.retirement-complete",
+                      fixture->config_dir) != 0 ||
+        safe_snprintf(fixture->transition_path,
+                      sizeof(fixture->transition_path),
+                      "%s/.retirement-transition",
+                      fixture->config_dir) != 0 ||
         safe_snprintf(fixture->output_path, sizeof(fixture->output_path),
                       "%s/output", fixture->root) != 0 ||
+        safe_snprintf(fixture->git_trace_path,
+                      sizeof(fixture->git_trace_path),
+                      "%s/git.trace", fixture->root) != 0 ||
         safe_snprintf(fixture->git_path, sizeof(fixture->git_path),
                       "%s/.gitconfig", fixture->home) != 0 ||
         safe_snprintf(fixture->git_program,
@@ -392,6 +446,7 @@ static int m18_fixture_setup(m18_fixture_t *fixture) {
                        sizeof(git_program_body) - 1U, 0700) != 0 ||
         m18_write_file(fixture->ssh_program, ssh_program_body,
                        sizeof(ssh_program_body) - 1U, 0700) != 0 ||
+        m18_write_file(fixture->git_trace_path, "", 0U, 0600) != 0 ||
         m18_write_file(fixture->ssh_key, key_body,
                        sizeof(key_body) - 1U, 0600) != 0 ||
         safe_snprintf(fixture->ssh_command,
@@ -545,6 +600,28 @@ static int m18_fixture_add_shared_and_no_op_destinations(
     return m18_write_state(fixture);
 }
 
+static int m18_fixture_reintroduce_id_with_new_incarnation(
+    const m18_fixture_t *fixture) {
+    char config_body[2U * MAX_PATH_LEN];
+    int written;
+
+    if (!fixture) return -1;
+    written = snprintf(
+        config_body, sizeof(config_body),
+        "[settings]\n"
+        "default_scope = \"global\"\n"
+        "[accounts.1]\n"
+        "incarnation = \"%s\"\n"
+        "name = \"replacement\"\n"
+        "email = \"replacement@example.test\"\n"
+        "preferred_scope = \"global\"\n"
+        "ssh_key = \"%s\"\n",
+        M18_SECOND_INCARNATION, fixture->ssh_key);
+    if (written < 0 || (size_t)written >= sizeof(config_body)) return -1;
+    return m18_write_file(fixture->accounts_path, config_body,
+                          (size_t)written, 0600);
+}
+
 static void m18_fixture_cleanup(m18_fixture_t *fixture) {
     if (!fixture) return;
     publication_record_init(&fixture->record);
@@ -600,8 +677,12 @@ static int m18_run_cli_after_matches(
         char resume[] = "resume";
         char switch_command[] = "switch";
         char work[] = "work";
+        char one[] = "1";
         char *remove_argv[] = {
             program, no_color, assume_yes, remove, work, NULL
+        };
+        char *remove_numeric_argv[] = {
+            program, no_color, assume_yes, remove, one, NULL
         };
         char *reset_argv[] = {
             program, no_color, assume_yes, reset, work, NULL
@@ -628,6 +709,8 @@ static int m18_run_cli_after_matches(
             setenv("GITSWITCH_ALLOW_TMP_GPG", "1", 1) != 0 ||
             setenv("GIT_CONFIG_GLOBAL", fixture->git_path, 1) != 0 ||
             setenv("GIT_CONFIG_NOSYSTEM", "1", 1) != 0 ||
+            setenv("GITSWITCH_TEST_GIT_TRACE",
+                   fixture->git_trace_path, 1) != 0 ||
             unsetenv("GIT_CONFIG_COUNT") != 0 ||
             m18_redirect_output(fixture->output_path) != 0) {
             _exit(120);
@@ -635,6 +718,10 @@ static int m18_run_cli_after_matches(
         switch (command) {
             case M18_COMMAND_REMOVE:
                 argv = remove_argv;
+                argc = 5;
+                break;
+            case M18_COMMAND_REMOVE_NUMERIC:
+                argv = remove_numeric_argv;
                 argc = 5;
                 break;
             case M18_COMMAND_RESET:
@@ -661,8 +748,13 @@ static int m18_run_cli_after_matches(
         m18_faults_remaining = fault_limit;
         m18_fault_matches_to_skip = fault_matches_to_skip;
         m18_witness_ctime_drift_error = 0;
+        m18_clear_after_stage_write_observed = false;
         if (fault_limit != M18_FAULT_NONE) {
             (void)config_set_io_fault_fn(m18_config_fault);
+        }
+        if (m18_clear_after_stage_write_fault) {
+            (void)gitswitch_test_set_retirement_guard_clear_hook(
+                m18_retirement_clear_fault);
         }
         if (m18_witness_ctime_drifts_remaining != 0U) {
             (void)git_ops_test_set_retirement_hook(
@@ -670,6 +762,7 @@ static int m18_run_cli_after_matches(
         }
         optind = 1;
         rc = gitswitch_cli_main(argc, argv);
+        (void)gitswitch_test_set_retirement_guard_clear_hook(NULL);
         if (m18_witness_ctime_drift_error != 0 ||
             m18_witness_ctime_drifts_remaining != 0U) {
             fprintf(stderr,
@@ -678,7 +771,10 @@ static int m18_run_cli_after_matches(
                     m18_witness_ctime_drift_error);
             _exit(124);
         }
-        if (m18_fault_observed) observed = '1';
+        if (m18_fault_observed ||
+            m18_clear_after_stage_write_observed) {
+            observed = '1';
+        }
         if (write(observed_pipe[1], &observed, 1U) != 1) _exit(121);
         (void)close(observed_pipe[1]);
         if (gitswitch_test_context_allocations() != 0) _exit(122);
@@ -719,6 +815,19 @@ static int m18_run_cli(const m18_fixture_t *fixture,
                        bool *fault_observed) {
     return m18_run_cli_after_matches(
         fixture, command, fault_limit, boundary, 0U, fault_observed);
+}
+
+static int m18_run_cli_with_clear_stage_failure(
+    const m18_fixture_t *fixture, m18_command_t command,
+    bool *fault_observed) {
+    int status;
+
+    m18_clear_after_stage_write_fault = true;
+    status = m18_run_cli(
+        fixture, command, M18_FAULT_NONE,
+        CONFIG_IO_DEFAULT_AFTER_TEMP, fault_observed);
+    m18_clear_after_stage_write_fault = false;
+    return status;
 }
 
 static int m18_run_cli_with_witness_ctime_drifts(
@@ -873,6 +982,21 @@ static bool m18_state_has_active_work_header(
     return matches;
 }
 
+static bool m18_state_has_inactive_header(
+    const m18_fixture_t *fixture) {
+    static const char expected[] = "none\ninactive=v1\n";
+    m18_bytes_t state = {0};
+    bool matches = false;
+
+    if (fixture && m18_read_bytes(fixture->state_path, &state) == 0) {
+        matches = state.length >= sizeof(expected) - 1U &&
+                  memcmp(state.data, expected,
+                         sizeof(expected) - 1U) == 0;
+    }
+    m18_bytes_clear(&state);
+    return matches;
+}
+
 static bool m18_record_equal_except_post_config(
     const publication_record_t *left,
     const publication_record_t *right) {
@@ -885,6 +1009,37 @@ static bool m18_record_equal_except_post_config(
     memset(&left_copy.post_config, 0, sizeof(left_copy.post_config));
     memset(&right_copy.post_config, 0, sizeof(right_copy.post_config));
     return memcmp(&left_copy, &right_copy, sizeof(left_copy)) == 0;
+}
+
+static bool m18_ledger_has_exact_retiring_work(
+    const m18_fixture_t *fixture) {
+    publication_ledger_t ledger;
+    publication_record_t expected;
+    const publication_record_t *record = NULL;
+    bool matches = false;
+
+    publication_ledger_init(&ledger);
+    if (!fixture ||
+        config_load_publication_ledger(
+            fixture->accounts_path, &ledger) != 0 ||
+        ledger.count != 1U ||
+        publication_ledger_find(
+            &ledger, UINT32_C(1), M18_INCARNATION,
+            PUBLICATION_SCOPE_GLOBAL, fixture->git_path, "",
+            &record) != PUBLICATION_LOOKUP_FOUND ||
+        !record) {
+        goto cleanup;
+    }
+    expected = fixture->record;
+    expected.state = PUBLICATION_STATE_RETIRING;
+    matches = record->state == PUBLICATION_STATE_RETIRING &&
+              publication_record_validate(record) == 0 &&
+              record->post_config.present &&
+              m18_record_equal_except_post_config(record, &expected);
+
+cleanup:
+    publication_ledger_clear(&ledger);
+    return matches;
 }
 
 static bool m18_ledger_matches_live_restored_git(
@@ -915,6 +1070,92 @@ static bool m18_ledger_matches_live_restored_git(
     }
     publication_ledger_clear(&ledger);
     return matches;
+}
+
+static bool m18_guard_has_exact_completion_pair(
+    const m18_fixture_t *fixture,
+    const m18_bytes_t *expected_marker) {
+    m18_bytes_t marker = {0};
+    m18_bytes_t completion = {0};
+    struct stat marker_stat;
+    struct stat completion_stat;
+    bool blocked = true;
+    bool matches = false;
+
+    if (!fixture || !expected_marker ||
+        lstat(fixture->guard_path, &marker_stat) != 0 ||
+        lstat(fixture->completion_path, &completion_stat) != 0 ||
+        !S_ISREG(marker_stat.st_mode) ||
+        !S_ISREG(completion_stat.st_mode) ||
+        (marker_stat.st_mode & 0777U) != 0600U ||
+        (completion_stat.st_mode & 0777U) != 0600U ||
+        marker_stat.st_uid != geteuid() ||
+        completion_stat.st_uid != geteuid() ||
+        marker_stat.st_nlink != 1 ||
+        completion_stat.st_nlink != 1 ||
+        m18_read_bytes(fixture->guard_path, &marker) != 0 ||
+        m18_read_bytes(fixture->completion_path, &completion) != 0 ||
+        marker.length != expected_marker->length ||
+        completion.length != expected_marker->length ||
+        memcmp(marker.data, expected_marker->data, marker.length) != 0 ||
+        memcmp(completion.data, expected_marker->data,
+               completion.length) != 0 ||
+        config_retirement_guard_probe(
+            fixture->accounts_path, &blocked) != 0 ||
+        blocked) {
+        goto cleanup;
+    }
+    matches = strstr(
+                  (const char *)marker.data,
+                  "gitswitch-retirement-incomplete-v1\n") != NULL &&
+              strstr((const char *)marker.data,
+                     "operation=remove\n") != NULL &&
+              strstr((const char *)marker.data, "owners=1\n") != NULL &&
+              strstr((const char *)marker.data,
+                     "owner=1:" M18_INCARNATION "\n") != NULL;
+
+cleanup:
+    m18_bytes_clear(&marker);
+    m18_bytes_clear(&completion);
+    return matches;
+}
+
+static bool m18_transition_is_exact_private_marker(
+    const m18_fixture_t *fixture,
+    const m18_bytes_t *expected_marker) {
+    m18_bytes_t transition = {0};
+    struct stat transition_stat;
+    bool matches = false;
+
+    if (!fixture || !expected_marker ||
+        lstat(fixture->transition_path, &transition_stat) != 0 ||
+        !S_ISREG(transition_stat.st_mode) ||
+        (transition_stat.st_mode & 0777U) != 0600U ||
+        transition_stat.st_uid != geteuid() ||
+        transition_stat.st_nlink != 1 ||
+        m18_read_bytes(fixture->transition_path, &transition) != 0) {
+        goto cleanup;
+    }
+    matches = transition.length == expected_marker->length &&
+              memcmp(transition.data, expected_marker->data,
+                     transition.length) == 0;
+
+cleanup:
+    m18_bytes_clear(&transition);
+    return matches;
+}
+
+static bool m18_git_trace_has_unset(
+    const m18_fixture_t *fixture) {
+    m18_bytes_t trace = {0};
+    bool found = false;
+
+    if (fixture &&
+        m18_read_bytes(fixture->git_trace_path, &trace) == 0) {
+        found = strstr((const char *)trace.data, "--unset") != NULL;
+    }
+    m18_bytes_clear(&trace);
+    return found;
 }
 
 static bool m18_shared_ledger_matches_all_live_destinations(
@@ -1032,6 +1273,15 @@ static bool m18_backup_absent(const m18_fixture_t *fixture) {
     scan_complete = entry != NULL || errno == 0;
     if (closedir(dir) != 0) return false;
     return scan_complete && absent;
+}
+
+static bool m18_completion_absent(const m18_fixture_t *fixture) {
+    struct stat st;
+
+    if (!fixture) return false;
+    errno = 0;
+    return lstat(fixture->completion_path, &st) == -1 &&
+           errno == ENOENT;
 }
 
 static bool m18_guard_is_private_and_blocking(
@@ -1318,6 +1568,355 @@ TEST(remove_save_boundary_matrix_preserves_outer_coherence) {
         "remove", true);
 }
 
+TEST(remove_uncertain_install_recovers_in_fresh_process) {
+    m18_fixture_t fixture;
+    m18_bytes_t accounts_after_failure = {0};
+    m18_bytes_t state_after_failure = {0};
+    m18_bytes_t git_after_failure = {0};
+    m18_bytes_t marker_after_failure = {0};
+    m18_bytes_t completion_after_recovery = {0};
+    m18_bytes_t output = {0};
+    struct stat marker_before_recovery;
+    struct stat marker_after_recovery;
+    bool observed = false;
+    int status;
+
+    CHECK_EQ_INT(m18_fixture_setup(&fixture), 0);
+
+    status = m18_run_cli(
+        &fixture, M18_COMMAND_REMOVE_NUMERIC, M18_FAULT_ONCE,
+        CONFIG_IO_DOCUMENT_BEFORE_DIR_SYNC, &observed);
+    CHECK(WIFEXITED(status));
+    if (WIFEXITED(status)) {
+        CHECK_EQ_INT(WEXITSTATUS(status), EXIT_FAILURE);
+    }
+    CHECK(observed);
+    CHECK(m18_accounts_omit_work(&fixture));
+    CHECK(m18_state_has_inactive_header(&fixture));
+    CHECK(m18_ledger_has_exact_retiring_work(&fixture));
+    CHECK(!m18_git_has_command(&fixture));
+    CHECK(m18_guard_is_private_and_blocking(&fixture, "remove"));
+    CHECK(m18_completion_absent(&fixture));
+    CHECK_EQ_INT(m18_read_bytes(fixture.accounts_path,
+                                &accounts_after_failure), 0);
+    CHECK_EQ_INT(m18_read_bytes(fixture.state_path,
+                                &state_after_failure), 0);
+    CHECK_EQ_INT(m18_read_bytes(fixture.git_path,
+                                &git_after_failure), 0);
+    CHECK_EQ_INT(m18_read_bytes(fixture.guard_path,
+                                &marker_after_failure), 0);
+    CHECK_EQ_INT(lstat(fixture.guard_path, &marker_before_recovery), 0);
+
+    /* This is a genuinely fresh process. The deleted account is no longer in
+     * the normal account array, so only the durable remove owner and its
+     * RETIRING publication tombstone can authorize exact settlement. */
+    status = m18_run_cli(
+        &fixture, M18_COMMAND_REMOVE_NUMERIC, M18_FAULT_NONE,
+        CONFIG_IO_DEFAULT_AFTER_TEMP, NULL);
+    CHECK(WIFEXITED(status));
+    if (WIFEXITED(status)) {
+        CHECK_EQ_INT(WEXITSTATUS(status), EXIT_SUCCESS);
+    }
+    CHECK(m18_file_equals(fixture.accounts_path,
+                          &accounts_after_failure));
+    CHECK(m18_file_equals(fixture.state_path, &state_after_failure));
+    CHECK(m18_file_equals(fixture.git_path, &git_after_failure));
+    CHECK(m18_file_equals(fixture.guard_path, &marker_after_failure));
+    CHECK(m18_accounts_omit_work(&fixture));
+    CHECK(m18_state_has_inactive_header(&fixture));
+    CHECK(m18_ledger_has_exact_retiring_work(&fixture));
+    CHECK(!m18_git_has_command(&fixture));
+    CHECK_EQ_INT(lstat(fixture.guard_path, &marker_after_recovery), 0);
+    CHECK(m18_same_without_ctime(&marker_before_recovery,
+                                 &marker_after_recovery));
+    CHECK(m18_same_ctime(&marker_before_recovery,
+                         &marker_after_recovery));
+    CHECK(m18_guard_has_exact_completion_pair(
+        &fixture, &marker_after_failure));
+    CHECK(m18_guard_is_unblocked_and_bounded(&fixture));
+    CHECK_EQ_INT(m18_read_bytes(fixture.completion_path,
+                                &completion_after_recovery), 0);
+    CHECK_EQ_INT(m18_read_bytes(fixture.output_path, &output), 0);
+    CHECK(m18_output_contains(
+        &output, "Completed interrupted removal for account ID 1."));
+    m18_bytes_clear(&output);
+
+    /* Prove the exact pair really released the global retirement gate. An
+     * activation command still fails because the requested account is gone,
+     * but dispatch reaches that ordinary error instead of the fence. */
+    status = m18_run_cli(
+        &fixture, M18_COMMAND_SWITCH, M18_FAULT_NONE,
+        CONFIG_IO_DEFAULT_AFTER_TEMP, NULL);
+    CHECK(WIFEXITED(status));
+    if (WIFEXITED(status)) {
+        CHECK_EQ_INT(WEXITSTATUS(status), EXIT_FAILURE);
+    }
+    CHECK(m18_file_equals(fixture.accounts_path,
+                          &accounts_after_failure));
+    CHECK(m18_file_equals(fixture.state_path, &state_after_failure));
+    CHECK(m18_file_equals(fixture.git_path, &git_after_failure));
+    CHECK(m18_file_equals(fixture.guard_path, &marker_after_failure));
+    CHECK(m18_file_equals(fixture.completion_path,
+                          &completion_after_recovery));
+    CHECK(m18_ledger_has_exact_retiring_work(&fixture));
+    CHECK(m18_guard_is_unblocked_and_bounded(&fixture));
+    CHECK_EQ_INT(m18_read_bytes(fixture.output_path, &output), 0);
+    CHECK(!m18_output_contains(
+        &output, "Git retirement is incomplete"));
+    CHECK(m18_output_contains(&output, "Failed to switch account"));
+
+    m18_bytes_clear(&accounts_after_failure);
+    m18_bytes_clear(&state_after_failure);
+    m18_bytes_clear(&git_after_failure);
+    m18_bytes_clear(&marker_after_failure);
+    m18_bytes_clear(&completion_after_recovery);
+    m18_bytes_clear(&output);
+    m18_fixture_cleanup(&fixture);
+}
+
+TEST(remove_recovery_reconciles_interrupted_completion_stage) {
+    m18_fixture_t fixture;
+    m18_bytes_t accounts_after_failure = {0};
+    m18_bytes_t state_after_failure = {0};
+    m18_bytes_t git_after_failure = {0};
+    m18_bytes_t marker_after_failure = {0};
+    struct stat marker_before_recovery;
+    struct stat marker_after_recovery;
+    bool observed = false;
+    int status;
+
+    CHECK_EQ_INT(m18_fixture_setup(&fixture), 0);
+    status = m18_run_cli(
+        &fixture, M18_COMMAND_REMOVE_NUMERIC, M18_FAULT_ONCE,
+        CONFIG_IO_DOCUMENT_BEFORE_DIR_SYNC, &observed);
+    CHECK(WIFEXITED(status));
+    if (WIFEXITED(status)) {
+        CHECK_EQ_INT(WEXITSTATUS(status), EXIT_FAILURE);
+    }
+    CHECK(observed);
+    CHECK(m18_accounts_omit_work(&fixture));
+    CHECK(m18_state_has_inactive_header(&fixture));
+    CHECK(m18_ledger_has_exact_retiring_work(&fixture));
+    CHECK(!m18_git_has_command(&fixture));
+    CHECK(m18_guard_is_private_and_blocking(&fixture, "remove"));
+    CHECK(m18_completion_absent(&fixture));
+    CHECK_EQ_INT(m18_read_bytes(fixture.accounts_path,
+                                &accounts_after_failure), 0);
+    CHECK_EQ_INT(m18_read_bytes(fixture.state_path,
+                                &state_after_failure), 0);
+    CHECK_EQ_INT(m18_read_bytes(fixture.git_path,
+                                &git_after_failure), 0);
+    CHECK_EQ_INT(m18_read_bytes(fixture.guard_path,
+                                &marker_after_failure), 0);
+    CHECK_EQ_INT(lstat(fixture.guard_path, &marker_before_recovery), 0);
+
+    /* Restart one reaches the completion transition's written-but-unpublished
+     * boundary. Its exact private stage must remain a blocker; losing or
+     * accepting it would respectively leak recovery or unblock ambiguity. */
+    observed = false;
+    status = m18_run_cli_with_clear_stage_failure(
+        &fixture, M18_COMMAND_REMOVE_NUMERIC, &observed);
+    CHECK(WIFEXITED(status));
+    if (WIFEXITED(status)) {
+        CHECK_EQ_INT(WEXITSTATUS(status), EXIT_FAILURE);
+    }
+    CHECK(observed);
+    CHECK(m18_file_equals(fixture.accounts_path,
+                          &accounts_after_failure));
+    CHECK(m18_file_equals(fixture.state_path, &state_after_failure));
+    CHECK(m18_file_equals(fixture.git_path, &git_after_failure));
+    CHECK(m18_file_equals(fixture.guard_path, &marker_after_failure));
+    CHECK(m18_ledger_has_exact_retiring_work(&fixture));
+    CHECK(!m18_git_has_command(&fixture));
+    CHECK(m18_guard_is_private_and_blocking(&fixture, "remove"));
+    CHECK(m18_completion_absent(&fixture));
+    CHECK(m18_transition_is_exact_private_marker(
+        &fixture, &marker_after_failure));
+
+    /* Restart two must reconcile only that exact stage, re-prove the clean
+     * Git tombstone, and publish its matching certificate. Trace the real Git
+     * subprocess calls so byte stability cannot hide an unset-and-restore. */
+    CHECK_EQ_INT(m18_write_file(
+                     fixture.git_trace_path, "", 0U, 0600), 0);
+    status = m18_run_cli(
+        &fixture, M18_COMMAND_REMOVE_NUMERIC, M18_FAULT_NONE,
+        CONFIG_IO_DEFAULT_AFTER_TEMP, NULL);
+    CHECK(WIFEXITED(status));
+    if (WIFEXITED(status)) {
+        CHECK_EQ_INT(WEXITSTATUS(status), EXIT_SUCCESS);
+    }
+    CHECK(m18_file_equals(fixture.accounts_path,
+                          &accounts_after_failure));
+    CHECK(m18_file_equals(fixture.state_path, &state_after_failure));
+    CHECK(m18_file_equals(fixture.git_path, &git_after_failure));
+    CHECK(m18_file_equals(fixture.guard_path, &marker_after_failure));
+    CHECK(m18_ledger_has_exact_retiring_work(&fixture));
+    CHECK(!m18_git_has_command(&fixture));
+    CHECK(m18_guard_has_exact_completion_pair(
+        &fixture, &marker_after_failure));
+    CHECK(m18_guard_is_unblocked_and_bounded(&fixture));
+    errno = 0;
+    CHECK(access(fixture.transition_path, F_OK) == -1 &&
+          errno == ENOENT);
+    CHECK(!m18_git_trace_has_unset(&fixture));
+    CHECK_EQ_INT(lstat(fixture.guard_path, &marker_after_recovery), 0);
+    CHECK(m18_same_without_ctime(&marker_before_recovery,
+                                 &marker_after_recovery));
+    CHECK(m18_same_ctime(&marker_before_recovery,
+                         &marker_after_recovery));
+
+    m18_bytes_clear(&accounts_after_failure);
+    m18_bytes_clear(&state_after_failure);
+    m18_bytes_clear(&git_after_failure);
+    m18_bytes_clear(&marker_after_failure);
+    m18_fixture_cleanup(&fixture);
+}
+
+TEST(remove_recovery_rejects_reintroduced_git_identity) {
+    m18_fixture_t fixture;
+    m18_bytes_t original_git = {0};
+    m18_bytes_t accounts_before_recovery = {0};
+    m18_bytes_t state_before_recovery = {0};
+    m18_bytes_t git_before_recovery = {0};
+    m18_bytes_t marker_before_recovery = {0};
+    m18_bytes_t output = {0};
+    bool observed = false;
+    int status;
+
+    CHECK_EQ_INT(m18_fixture_setup(&fixture), 0);
+    CHECK_EQ_INT(m18_read_bytes(fixture.git_path, &original_git), 0);
+    status = m18_run_cli(
+        &fixture, M18_COMMAND_REMOVE_NUMERIC, M18_FAULT_ONCE,
+        CONFIG_IO_DOCUMENT_BEFORE_DIR_SYNC, &observed);
+    CHECK(WIFEXITED(status));
+    if (WIFEXITED(status)) {
+        CHECK_EQ_INT(WEXITSTATUS(status), EXIT_FAILURE);
+    }
+    CHECK(observed);
+    CHECK(m18_accounts_omit_work(&fixture));
+    CHECK(m18_state_has_inactive_header(&fixture));
+    CHECK(m18_ledger_has_exact_retiring_work(&fixture));
+    CHECK(m18_guard_is_private_and_blocking(&fixture, "remove"));
+
+    /* Reintroduce the exact private-key route after its clean RETIRING
+     * tombstone was sealed. Recovery must re-prove the destination under its
+     * canonical Git lock; marker ownership alone cannot certify this residue. */
+    CHECK_EQ_INT(m18_write_file(
+                     fixture.git_path, original_git.data,
+                     original_git.length, 0600), 0);
+    CHECK(m18_git_has_command(&fixture));
+    CHECK_EQ_INT(m18_read_bytes(fixture.accounts_path,
+                                &accounts_before_recovery), 0);
+    CHECK_EQ_INT(m18_read_bytes(fixture.state_path,
+                                &state_before_recovery), 0);
+    CHECK_EQ_INT(m18_read_bytes(fixture.git_path,
+                                &git_before_recovery), 0);
+    CHECK_EQ_INT(m18_read_bytes(fixture.guard_path,
+                                &marker_before_recovery), 0);
+    CHECK(m18_completion_absent(&fixture));
+
+    status = m18_run_cli(
+        &fixture, M18_COMMAND_REMOVE_NUMERIC, M18_FAULT_NONE,
+        CONFIG_IO_DEFAULT_AFTER_TEMP, NULL);
+    CHECK(WIFEXITED(status));
+    if (WIFEXITED(status)) {
+        CHECK_EQ_INT(WEXITSTATUS(status), EXIT_FAILURE);
+    }
+    CHECK(m18_file_equals(fixture.accounts_path,
+                          &accounts_before_recovery));
+    CHECK(m18_file_equals(fixture.state_path, &state_before_recovery));
+    CHECK(m18_file_equals(fixture.git_path, &git_before_recovery));
+    CHECK(m18_file_equals(fixture.guard_path, &marker_before_recovery));
+    CHECK(m18_accounts_omit_work(&fixture));
+    CHECK(m18_state_has_inactive_header(&fixture));
+    CHECK(m18_ledger_has_exact_retiring_work(&fixture));
+    CHECK(m18_git_has_command(&fixture));
+    CHECK(m18_guard_is_private_and_blocking(&fixture, "remove"));
+    CHECK(m18_completion_absent(&fixture));
+    CHECK_EQ_INT(m18_read_bytes(fixture.output_path, &output), 0);
+    CHECK(m18_output_contains(
+        &output,
+        "Stale Git retirement destination still contains attributed values"));
+    CHECK(!m18_output_contains(&output, "Account removed successfully"));
+
+    m18_bytes_clear(&original_git);
+    m18_bytes_clear(&accounts_before_recovery);
+    m18_bytes_clear(&state_before_recovery);
+    m18_bytes_clear(&git_before_recovery);
+    m18_bytes_clear(&marker_before_recovery);
+    m18_bytes_clear(&output);
+    m18_fixture_cleanup(&fixture);
+}
+
+TEST(remove_recovery_rejects_reused_id_incarnation) {
+    m18_fixture_t fixture;
+    m18_bytes_t accounts_before_recovery = {0};
+    m18_bytes_t state_before_recovery = {0};
+    m18_bytes_t git_before_recovery = {0};
+    m18_bytes_t marker_before_recovery = {0};
+    m18_bytes_t output = {0};
+    bool observed = false;
+    int status;
+
+    CHECK_EQ_INT(m18_fixture_setup(&fixture), 0);
+    status = m18_run_cli(
+        &fixture, M18_COMMAND_REMOVE_NUMERIC, M18_FAULT_ONCE,
+        CONFIG_IO_DOCUMENT_BEFORE_DIR_SYNC, &observed);
+    CHECK(WIFEXITED(status));
+    if (WIFEXITED(status)) {
+        CHECK_EQ_INT(WEXITSTATUS(status), EXIT_FAILURE);
+    }
+    CHECK(observed);
+    CHECK(m18_accounts_omit_work(&fixture));
+    CHECK(m18_state_has_inactive_header(&fixture));
+    CHECK(m18_ledger_has_exact_retiring_work(&fixture));
+    CHECK(!m18_git_has_command(&fixture));
+    CHECK(m18_guard_is_private_and_blocking(&fixture, "remove"));
+
+    /* Integer IDs are reusable, incarnations are not. A live replacement at
+     * ID 1 must never be mistaken for the durable missing owner recorded by
+     * the incomplete remove. */
+    CHECK_EQ_INT(
+        m18_fixture_reintroduce_id_with_new_incarnation(&fixture), 0);
+    CHECK_EQ_INT(m18_read_bytes(fixture.accounts_path,
+                                &accounts_before_recovery), 0);
+    CHECK_EQ_INT(m18_read_bytes(fixture.state_path,
+                                &state_before_recovery), 0);
+    CHECK_EQ_INT(m18_read_bytes(fixture.git_path,
+                                &git_before_recovery), 0);
+    CHECK_EQ_INT(m18_read_bytes(fixture.guard_path,
+                                &marker_before_recovery), 0);
+    CHECK(m18_completion_absent(&fixture));
+
+    status = m18_run_cli(
+        &fixture, M18_COMMAND_REMOVE_NUMERIC, M18_FAULT_NONE,
+        CONFIG_IO_DEFAULT_AFTER_TEMP, NULL);
+    CHECK(WIFEXITED(status));
+    if (WIFEXITED(status)) {
+        CHECK_EQ_INT(WEXITSTATUS(status), EXIT_FAILURE);
+    }
+    CHECK(m18_file_equals(fixture.accounts_path,
+                          &accounts_before_recovery));
+    CHECK(m18_file_equals(fixture.state_path, &state_before_recovery));
+    CHECK(m18_file_equals(fixture.git_path, &git_before_recovery));
+    CHECK(m18_file_equals(fixture.guard_path, &marker_before_recovery));
+    CHECK(m18_state_has_inactive_header(&fixture));
+    CHECK(m18_ledger_has_exact_retiring_work(&fixture));
+    CHECK(!m18_git_has_command(&fixture));
+    CHECK(m18_guard_is_private_and_blocking(&fixture, "remove"));
+    CHECK(m18_completion_absent(&fixture));
+    CHECK_EQ_INT(m18_read_bytes(fixture.output_path, &output), 0);
+    CHECK(m18_output_contains(&output, "different incarnation"));
+    CHECK(!m18_output_contains(&output, "Account removed successfully"));
+
+    m18_bytes_clear(&accounts_before_recovery);
+    m18_bytes_clear(&state_before_recovery);
+    m18_bytes_clear(&git_before_recovery);
+    m18_bytes_clear(&marker_before_recovery);
+    m18_bytes_clear(&output);
+    m18_fixture_cleanup(&fixture);
+}
+
 TEST(remove_backup_verification_fault_restores_exact_outer_state) {
     /* The first prefix-read checkpoint belongs to initial accounts.toml load.
      * Let that read succeed, then fail the second occurrence while the
@@ -1495,6 +2094,10 @@ TEST(reset_retirement_phase_rejections_preserve_pending_owner) {
 TEST_MAIN_BEGIN()
     error_init(LOG_LEVEL_WARNING, NULL);
     RUN_TEST(remove_save_boundary_matrix_preserves_outer_coherence);
+    RUN_TEST(remove_uncertain_install_recovers_in_fresh_process);
+    RUN_TEST(remove_recovery_reconciles_interrupted_completion_stage);
+    RUN_TEST(remove_recovery_rejects_reintroduced_git_identity);
+    RUN_TEST(remove_recovery_rejects_reused_id_incarnation);
     RUN_TEST(remove_backup_verification_fault_restores_exact_outer_state);
     RUN_TEST(restored_witness_retries_multiple_delayed_ctime_steps);
     RUN_TEST(reset_state_boundary_matrix_preserves_outer_coherence);

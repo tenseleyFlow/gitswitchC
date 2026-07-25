@@ -635,6 +635,212 @@ TEST(abandon_after_failed_clear_never_reopens) {
     guard_fixture_cleanup(&fixture);
 }
 
+TEST(recovery_projection_adopts_only_the_exact_active_owner_set) {
+    guard_fixture_t fixture;
+    config_retirement_recovery_t recovery;
+    config_retirement_guard_t *adopted = NULL;
+    unsigned char observed[GUARD_MAX_BYTES];
+    struct stat after;
+    size_t observed_length;
+
+    CHECK_EQ_INT(guard_fixture_init(&fixture), 0);
+    config_retirement_guard_abandon(&fixture.guard);
+
+    memset(&recovery, 0xA5, sizeof(recovery));
+    CHECK_EQ_INT(config_retirement_guard_recovery_probe(
+                     fixture.config_path, &recovery), 0);
+    CHECK(recovery.valid);
+    CHECK_EQ_INT(recovery.kind, CONFIG_RETIREMENT_RESET);
+    CHECK_EQ_INT((long)recovery.owner_count, 1);
+    CHECK_EQ_INT(recovery.owners[0].account_id,
+                 fixture.owner.account_id);
+    CHECK(strcmp(recovery.owners[0].account_incarnation,
+                 fixture.owner.account_incarnation) == 0);
+
+    CHECK_EQ_INT(config_retirement_guard_adopt(
+                     fixture.config_path, CONFIG_RETIREMENT_REMOVE,
+                     &fixture.owner, 1U, &adopted), -1);
+    CHECK(adopted == NULL);
+    CHECK_EQ_INT(stat(fixture.marker_path, &after), 0);
+    CHECK(ts_same_identity(&fixture.marker_identity, &after));
+    observed_length = guard_read_file(
+        fixture.marker_path, observed, sizeof(observed));
+    CHECK_EQ_INT((long)observed_length,
+                 (long)fixture.marker_length);
+    CHECK(memcmp(observed, fixture.marker_data,
+                 fixture.marker_length) == 0);
+
+    CHECK_EQ_INT(config_retirement_guard_adopt(
+                     fixture.config_path, recovery.kind,
+                     recovery.owners, recovery.owner_count,
+                     &adopted), 0);
+    CHECK(adopted != NULL);
+    CHECK(!config_retirement_guard_was_created(adopted));
+    CHECK_EQ_INT(stat(fixture.marker_path, &after), 0);
+    CHECK(ts_same_identity(&fixture.marker_identity, &after));
+    CHECK_EQ_INT(config_retirement_guard_clear(&adopted), 0);
+    CHECK(adopted == NULL);
+
+    memset(&recovery, 0xA5, sizeof(recovery));
+    CHECK_EQ_INT(config_retirement_guard_recovery_probe(
+                     fixture.config_path, &recovery), 0);
+    CHECK(!recovery.valid);
+    CHECK_EQ_INT((long)recovery.owner_count, 0);
+    guard_fixture_cleanup(&fixture);
+}
+
+TEST(adopt_only_never_creates_or_rotates_a_marker) {
+    guard_fixture_t fixture;
+    config_retirement_recovery_t recovery;
+    config_retirement_guard_t *adopted = NULL;
+    unsigned char settled[GUARD_MAX_BYTES];
+    unsigned char observed[GUARD_MAX_BYTES];
+    struct stat settled_identity;
+    size_t settled_length;
+    int directory_fd;
+
+    CHECK_EQ_INT(guard_fixture_init(&fixture), 0);
+    config_retirement_guard_abandon(&fixture.guard);
+    CHECK_EQ_INT(unlink(fixture.marker_path), 0);
+    CHECK_EQ_INT(unlink(fixture.lock_path), 0);
+    directory_fd = open(
+        fixture.directory,
+        O_RDONLY | O_CLOEXEC | O_DIRECTORY | O_NOFOLLOW);
+    CHECK(directory_fd >= 0);
+    if (directory_fd >= 0) {
+        CHECK_EQ_INT(fsync(directory_fd), 0);
+        CHECK_EQ_INT(close(directory_fd), 0);
+    }
+
+    memset(&recovery, 0xA5, sizeof(recovery));
+    CHECK_EQ_INT(config_retirement_guard_recovery_probe(
+                     fixture.config_path, &recovery), 0);
+    CHECK(!recovery.valid);
+    CHECK_EQ_INT(config_retirement_guard_adopt(
+                     fixture.config_path, CONFIG_RETIREMENT_RESET,
+                     &fixture.owner, 1U, &adopted), -1);
+    CHECK(adopted == NULL);
+    CHECK(access(fixture.marker_path, F_OK) != 0 && errno == ENOENT);
+    CHECK(access(fixture.completion_path, F_OK) != 0 &&
+          errno == ENOENT);
+    CHECK(access(fixture.stage_path, F_OK) != 0 && errno == ENOENT);
+    CHECK(access(fixture.lock_path, F_OK) != 0 && errno == ENOENT);
+
+    CHECK_EQ_INT(config_retirement_guard_install_or_adopt(
+                     fixture.config_path, CONFIG_RETIREMENT_RESET,
+                     &fixture.owner, 1U, &fixture.guard), 0);
+    CHECK_EQ_INT(config_retirement_guard_clear(&fixture.guard), 0);
+    settled_length = guard_read_file(
+        fixture.marker_path, settled, sizeof(settled));
+    CHECK(settled_length > 0U);
+    CHECK_EQ_INT(stat(fixture.marker_path, &settled_identity), 0);
+    CHECK(guard_files_equal(
+        fixture.marker_path, fixture.completion_path));
+
+    CHECK_EQ_INT(config_retirement_guard_adopt(
+                     fixture.config_path, CONFIG_RETIREMENT_RESET,
+                     &fixture.owner, 1U, &adopted), -1);
+    CHECK(adopted == NULL);
+    CHECK_EQ_INT((long)guard_read_file(
+                     fixture.marker_path, observed, sizeof(observed)),
+                 (long)settled_length);
+    CHECK(memcmp(settled, observed, settled_length) == 0);
+    {
+        struct stat after;
+
+        CHECK_EQ_INT(stat(fixture.marker_path, &after), 0);
+        CHECK(ts_same_identity(&settled_identity, &after));
+    }
+    CHECK(guard_files_equal(
+        fixture.marker_path, fixture.completion_path));
+    guard_fixture_cleanup(&fixture);
+}
+
+TEST(exact_staged_clear_is_projected_adopted_and_settled) {
+    guard_fixture_t fixture;
+    config_retirement_recovery_t recovery;
+    config_retirement_guard_t *adopted = NULL;
+    unsigned char observed[GUARD_MAX_BYTES];
+    bool blocked = false;
+
+    CHECK_EQ_INT(guard_fixture_init(&fixture), 0);
+    guard_arm_hook(
+        RETIREMENT_GUARD_CLEAR_BEFORE_PUBLISH, HOOK_FAIL);
+    CHECK_EQ_INT(config_retirement_guard_clear(&fixture.guard), -1);
+    (void)gitswitch_test_set_retirement_guard_clear_hook(NULL);
+    CHECK(fixture.guard != NULL);
+    CHECK_EQ_INT(access(fixture.stage_path, F_OK), 0);
+    config_retirement_guard_abandon(&fixture.guard);
+
+    memset(&recovery, 0, sizeof(recovery));
+    CHECK_EQ_INT(config_retirement_guard_recovery_probe(
+                     fixture.config_path, &recovery), 0);
+    CHECK(recovery.valid);
+    CHECK_EQ_INT(recovery.kind, CONFIG_RETIREMENT_RESET);
+    CHECK_EQ_INT((long)recovery.owner_count, 1);
+    CHECK_EQ_INT(config_retirement_guard_adopt(
+                     fixture.config_path, recovery.kind,
+                     recovery.owners, recovery.owner_count,
+                     &adopted), 0);
+    CHECK(adopted != NULL);
+    CHECK(!config_retirement_guard_was_created(adopted));
+    CHECK(access(fixture.stage_path, F_OK) != 0 && errno == ENOENT);
+    CHECK_EQ_INT((long)guard_read_file(
+                     fixture.marker_path, observed, sizeof(observed)),
+                 (long)fixture.marker_length);
+    CHECK(memcmp(observed, fixture.marker_data,
+                 fixture.marker_length) == 0);
+
+    CHECK_EQ_INT(config_retirement_guard_clear(&adopted), 0);
+    CHECK(adopted == NULL);
+    CHECK(guard_probe(&fixture, &blocked));
+    CHECK(!blocked);
+    CHECK(guard_files_equal(
+        fixture.marker_path, fixture.completion_path));
+    guard_fixture_cleanup(&fixture);
+}
+
+TEST(foreign_staged_generation_remains_fail_closed_and_untouched) {
+    guard_fixture_t fixture;
+    config_retirement_recovery_t recovery;
+    config_retirement_guard_t *adopted = NULL;
+    unsigned char observed[GUARD_MAX_BYTES];
+    int directory_fd;
+
+    CHECK_EQ_INT(guard_fixture_init(&fixture), 0);
+    config_retirement_guard_abandon(&fixture.guard);
+    CHECK(guard_mutate_token(
+        fixture.marker_data, fixture.marker_length,
+        hook_replacement));
+    hook_replacement_length = fixture.marker_length;
+    directory_fd = open(
+        fixture.directory,
+        O_RDONLY | O_CLOEXEC | O_DIRECTORY | O_NOFOLLOW);
+    CHECK(directory_fd >= 0);
+    if (directory_fd >= 0) {
+        CHECK_EQ_INT(guard_atomic_replace_at(
+                         directory_fd, STAGE_NAME,
+                         hook_replacement,
+                         hook_replacement_length), 0);
+        CHECK_EQ_INT(close(directory_fd), 0);
+    }
+
+    memset(&recovery, 0xA5, sizeof(recovery));
+    CHECK_EQ_INT(config_retirement_guard_recovery_probe(
+                     fixture.config_path, &recovery), -1);
+    CHECK(!recovery.valid);
+    CHECK_EQ_INT(config_retirement_guard_adopt(
+                     fixture.config_path, CONFIG_RETIREMENT_RESET,
+                     &fixture.owner, 1U, &adopted), -1);
+    CHECK(adopted == NULL);
+    CHECK_EQ_INT((long)guard_read_file(
+                     fixture.stage_path, observed, sizeof(observed)),
+                 (long)hook_replacement_length);
+    CHECK(memcmp(observed, hook_replacement,
+                 hook_replacement_length) == 0);
+    guard_fixture_cleanup(&fixture);
+}
+
 TEST_MAIN_BEGIN()
     error_init(LOG_LEVEL_ERROR, NULL);
     RUN_TEST(completion_keeps_canonical_generation_and_unblocks);
@@ -647,4 +853,8 @@ TEST_MAIN_BEGIN()
     RUN_TEST(lifecycle_lock_serializes_guard_owners);
     RUN_TEST(unproven_install_is_not_adopted_until_directory_sync_succeeds);
     RUN_TEST(abandon_after_failed_clear_never_reopens);
+    RUN_TEST(recovery_projection_adopts_only_the_exact_active_owner_set);
+    RUN_TEST(adopt_only_never_creates_or_rotates_a_marker);
+    RUN_TEST(exact_staged_clear_is_projected_adopted_and_settled);
+    RUN_TEST(foreign_staged_generation_remains_fail_closed_and_untouched);
 TEST_MAIN_END()

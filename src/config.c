@@ -1495,6 +1495,17 @@ static int config_require_loaded_source_generation(
     return 0;
 }
 
+int config_revalidate_loaded_source(const gitswitch_ctx_t *ctx) {
+    if (!ctx) {
+        errno = EINVAL;
+        set_error(ERR_INVALID_ARGS,
+                  "Invalid loaded source revalidation context");
+        return -1;
+    }
+    return config_require_loaded_source_generation(
+        ctx, ctx->config.config_path, NULL);
+}
+
 static int config_require_full_save_generation_snapshot(
     const gitswitch_ctx_t *ctx, const char *config_path,
     bool destination_existed, const struct stat *destination) {
@@ -3026,6 +3037,215 @@ static bool config_retirement_owner_sets_equal(
     return true;
 }
 
+static bool config_retirement_guard_record_same(
+    bool left_absent, const struct stat *left_identity,
+    const unsigned char *left_data, size_t left_length,
+    bool right_absent, const struct stat *right_identity,
+    const unsigned char *right_data, size_t right_length) {
+    if (left_absent != right_absent) return false;
+    if (left_absent) return true;
+    return left_identity && right_identity && left_data && right_data &&
+           config_metadata_snapshot_same(
+               left_identity, right_identity) &&
+           left_length == right_length &&
+           memcmp(left_data, right_data, left_length) == 0;
+}
+
+static bool config_retirement_guard_pair_records_same(
+    const config_retirement_guard_pair_t *left,
+    const config_retirement_guard_pair_t *right) {
+    return left && right &&
+           config_retirement_guard_record_same(
+               left->marker_absent, &left->marker_identity,
+               left->marker_data, left->marker_length,
+               right->marker_absent, &right->marker_identity,
+               right->marker_data, right->marker_length) &&
+           config_retirement_guard_record_same(
+               left->completion_absent, &left->completion_identity,
+               left->completion_data, left->completion_length,
+               right->completion_absent, &right->completion_identity,
+               right->completion_data, right->completion_length);
+}
+
+static bool config_retirement_guard_pairs_same(
+    const config_retirement_guard_pair_t *left,
+    const config_retirement_guard_pair_t *right) {
+    return left && right &&
+           left->stage_present == right->stage_present &&
+           config_retirement_guard_pair_records_same(left, right);
+}
+
+/* A clear transition is recoverable only when the fixed stage is a complete
+ * byte-for-byte copy of the canonical marker. Parsing the stage independently
+ * also rejects a safe-looking but malformed or foreign generation. */
+static int config_retirement_guard_exact_stage_at(
+    int directory_fd, const config_retirement_guard_pair_t *pair,
+    struct stat *stage_identity) {
+    config_retirement_guard_model_t stage_model;
+    unsigned char *stage_data = NULL;
+    size_t stage_length = 0U;
+    struct stat identity;
+    bool absent = false;
+    int result = -1;
+    int saved_errno = EIO;
+
+    memset(&stage_model, 0, sizeof(stage_model));
+    memset(&identity, 0, sizeof(identity));
+    if (directory_fd < 0 || !pair || !pair->stage_present ||
+        pair->marker_absent || !pair->marker_data || !stage_identity) {
+        errno = EINVAL;
+        set_error(ERR_INVALID_ARGS,
+                  "Invalid retirement transition reconciliation state");
+        return -1;
+    }
+    if (config_retirement_guard_read_named_at(
+            directory_fd, CONFIG_RETIREMENT_STAGE_NAME,
+            &absent, &stage_data, &stage_length, &identity,
+            &stage_model) != 0) {
+        goto stage_done;
+    }
+    if (absent || stage_length != pair->marker_length ||
+        memcmp(stage_data, pair->marker_data, stage_length) != 0) {
+        errno = EBUSY;
+        set_error(
+            ERR_CONFIG_INVALID,
+            "Retirement transition stage is not the exact active marker generation");
+        goto stage_done;
+    }
+    *stage_identity = identity;
+    result = 0;
+
+stage_done:
+    if (result != 0) saved_errno = errno ? errno : EIO;
+    if (stage_data) {
+        secure_zero_memory(stage_data, stage_length);
+        free(stage_data);
+    }
+    secure_zero_memory(&stage_model, sizeof(stage_model));
+    if (result != 0) errno = saved_errno;
+    return result;
+}
+
+/* Remove only a jointly revalidated exact marker copy. This is the sole
+ * mutation admitted by adopt-only recovery: it cannot create or rotate a
+ * generation and leaves foreign/malformed stage residue untouched. */
+static int config_retirement_guard_reconcile_exact_stage_at(
+    int directory_fd, const char *directory,
+    const struct stat *directory_identity,
+    const config_retirement_guard_pair_t *observed,
+    config_retirement_guard_pair_t *after) {
+    config_retirement_guard_pair_t revalidated;
+    struct stat stage_identity;
+    int saved_errno = EIO;
+
+    memset(&revalidated, 0, sizeof(revalidated));
+    memset(&stage_identity, 0, sizeof(stage_identity));
+    if (directory_fd < 0 || !directory || !directory_identity ||
+        !observed || !after || !observed->stage_present ||
+        config_retirement_guard_exact_stage_at(
+            directory_fd, observed, &stage_identity) != 0) {
+        return -1;
+    }
+    if (config_retirement_guard_pair_read_at(
+            directory_fd, &revalidated) != 0 ||
+        !config_retirement_guard_pairs_same(
+            observed, &revalidated) ||
+        config_retirement_guard_name_stable_at(
+            directory_fd, CONFIG_RETIREMENT_STAGE_NAME,
+            false, &stage_identity) != 0 ||
+        !config_named_directory_matches(
+            directory, directory_identity)) {
+        saved_errno = errno ? errno : ESTALE;
+        set_system_error(
+            ERR_FILE_IO,
+            "Retirement transition changed during exact recovery proof");
+        goto reconcile_fail;
+    }
+    if (config_reprove_published_file_at(
+            directory_fd, CONFIG_RETIREMENT_STAGE_NAME,
+            &stage_identity, observed->marker_data,
+            observed->marker_length, &stage_identity) != 0 ||
+        unlinkat(directory_fd, CONFIG_RETIREMENT_STAGE_NAME, 0) != 0 ||
+        fsync(directory_fd) != 0) {
+        saved_errno = errno ? errno : EIO;
+        set_system_error(
+            ERR_FILE_IO,
+            "Cannot durably remove the exact retirement transition");
+        goto reconcile_fail;
+    }
+    if (config_retirement_guard_pair_read_at(
+            directory_fd, after) != 0 ||
+        after->stage_present ||
+        !config_retirement_guard_pair_records_same(
+            observed, after) ||
+        !config_named_directory_matches(
+            directory, directory_identity)) {
+        saved_errno = errno ? errno : ESTALE;
+        set_system_error(
+            ERR_FILE_IO,
+            "Retirement transition cleanup changed the guarded generation");
+        goto reconcile_fail;
+    }
+    config_retirement_guard_pair_clear(&revalidated);
+    return 0;
+
+reconcile_fail:
+    config_retirement_guard_pair_clear(&revalidated);
+    config_retirement_guard_pair_clear(after);
+    errno = saved_errno;
+    return -1;
+}
+
+/* Both install-or-adopt and strict recovery adoption use the same durability
+ * proof. The first pair remains pinned in memory while the directory is synced
+ * and the complete fixed namespace is jointly re-read. */
+static int config_retirement_guard_revalidate_adoption_at(
+    int directory_fd, const char *directory,
+    const struct stat *directory_identity,
+    config_retirement_kind_t kind,
+    const config_retirement_owner_t *owners, size_t owner_count,
+    const config_retirement_guard_pair_t *observed,
+    config_retirement_guard_pair_t *revalidated) {
+    if (directory_fd < 0 || !directory || !directory_identity ||
+        !owners || owner_count == 0U || !observed || !revalidated ||
+        observed->marker_absent || observed->stage_present ||
+        config_retirement_guard_pair_exact(observed) ||
+        !config_retirement_owner_sets_equal(
+            &observed->marker_model, kind, owners, owner_count)) {
+        errno = EBUSY;
+        set_error(
+            ERR_CONFIG_INVALID,
+            "No exact active retirement marker matches the requested recovery");
+        return -1;
+    }
+    if (RETIREMENT_GUARD_CLEAR_TEST_CHECKPOINT(
+            RETIREMENT_GUARD_INSTALL_BEFORE_DIR_SYNC,
+            directory_fd, CONFIG_RETIREMENT_GUARD_NAME) != 0 ||
+        fsync(directory_fd) != 0) {
+        set_system_error(
+            ERR_FILE_IO,
+            "Cannot prove the retained retirement guard generation durable");
+        return -1;
+    }
+    if (config_retirement_guard_pair_read_at(
+            directory_fd, revalidated) != 0 ||
+        revalidated->marker_absent ||
+        revalidated->stage_present ||
+        config_retirement_guard_pair_exact(revalidated) ||
+        !config_retirement_guard_pairs_same(observed, revalidated) ||
+        !config_retirement_owner_sets_equal(
+            &revalidated->marker_model, kind, owners, owner_count) ||
+        !config_named_directory_matches(
+            directory, directory_identity)) {
+        errno = errno ? errno : ESTALE;
+        set_system_error(
+            ERR_FILE_IO,
+            "Retained retirement guard changed during durability proof");
+        return -1;
+    }
+    return 0;
+}
+
 static int config_retirement_guard_stage_remove_at(int directory_fd) {
     struct stat before;
     struct stat opened;
@@ -3345,37 +3565,10 @@ int config_retirement_guard_install_or_adopt(
                 "A different retirement-incomplete operation already blocks configuration mutation");
             goto install_done;
         }
-        if (RETIREMENT_GUARD_CLEAR_TEST_CHECKPOINT(
-                RETIREMENT_GUARD_INSTALL_BEFORE_DIR_SYNC,
-                directory_fd, CONFIG_RETIREMENT_GUARD_NAME) != 0 ||
-            fsync(directory_fd) != 0) {
-            set_system_error(
-                ERR_FILE_IO,
-                "Cannot prove the retained retirement guard generation durable");
-            goto install_done;
-        }
-        if (config_retirement_guard_pair_read_at(
-                directory_fd, &revalidated_pair) != 0 ||
-            revalidated_pair.marker_absent ||
-            revalidated_pair.stage_present ||
-            config_retirement_guard_pair_exact(&revalidated_pair) ||
-            !config_metadata_snapshot_same(
-                &pair.marker_identity,
-                &revalidated_pair.marker_identity) ||
-            pair.marker_length != revalidated_pair.marker_length ||
-            memcmp(pair.marker_data, revalidated_pair.marker_data,
-                   pair.marker_length) != 0 ||
-            strcmp(pair.marker_model.token,
-                   revalidated_pair.marker_model.token) != 0 ||
-            !config_retirement_owner_sets_equal(
-                &revalidated_pair.marker_model, kind,
-                canonical, owner_count) ||
-            !config_named_directory_matches(
-                directory, &directory_identity)) {
-            errno = errno ? errno : ESTALE;
-            set_system_error(
-                ERR_FILE_IO,
-                "Retained retirement guard changed during durability proof");
+        if (config_retirement_guard_revalidate_adoption_at(
+                directory_fd, directory, &directory_identity,
+                kind, canonical, owner_count, &pair,
+                &revalidated_pair) != 0) {
             goto install_done;
         }
         memcpy(token, revalidated_pair.marker_model.token, sizeof(token));
@@ -3510,6 +3703,264 @@ install_done:
     if (result != 0) errno = saved_errno;
     return result;
 }
+
+int config_retirement_guard_recovery_probe(
+    const char *config_path,
+    config_retirement_recovery_t *recovery) {
+    config_retirement_guard_pair_t pair;
+    config_retirement_guard_pair_t stage_pair;
+    char directory[MAX_PATH_LEN];
+    struct stat directory_identity;
+    struct stat stage_identity;
+    int directory_fd = -1;
+    int result;
+    bool legacy_residue = false;
+
+    if (!config_path || !recovery) {
+        errno = EINVAL;
+        set_error(ERR_INVALID_ARGS,
+                  "Invalid retirement recovery probe arguments");
+        return -1;
+    }
+    memset(recovery, 0, sizeof(*recovery));
+    memset(&pair, 0, sizeof(pair));
+    memset(&stage_pair, 0, sizeof(stage_pair));
+    memset(&stage_identity, 0, sizeof(stage_identity));
+    result = config_retirement_open_directory(
+        config_path, true, directory, &directory_identity, &directory_fd);
+    if (result == 1) return 0;
+    if (result != 0) return -1;
+
+    if (config_retirement_guard_pair_read_at(
+            directory_fd, &pair) != 0 ||
+        config_retirement_guard_legacy_residue_present_at(
+            directory_fd, &legacy_residue) != 0 ||
+        !config_named_directory_matches(
+            directory, &directory_identity)) {
+        if (errno == 0) errno = ESTALE;
+        result = -1;
+        goto recovery_probe_done;
+    }
+    if (legacy_residue) {
+        errno = EBUSY;
+        set_error(
+            ERR_CONFIG_INVALID,
+            "Retirement recovery is blocked by legacy transition residue");
+        result = -1;
+        goto recovery_probe_done;
+    }
+    if (pair.stage_present) {
+        if (config_retirement_guard_exact_stage_at(
+                directory_fd, &pair, &stage_identity) != 0 ||
+            config_retirement_guard_pair_read_at(
+                directory_fd, &stage_pair) != 0 ||
+            !config_retirement_guard_pairs_same(
+                &pair, &stage_pair) ||
+            config_retirement_guard_name_stable_at(
+                directory_fd, CONFIG_RETIREMENT_STAGE_NAME,
+                false, &stage_identity) != 0 ||
+            !config_named_directory_matches(
+                directory, &directory_identity)) {
+            if (errno == 0) errno = ESTALE;
+            if (get_last_error()->message[0] == '\0') {
+                set_system_error(
+                    ERR_FILE_IO,
+                    "Cannot project an exact retirement transition");
+            }
+            result = -1;
+            goto recovery_probe_done;
+        }
+        config_retirement_guard_pair_clear(&pair);
+        pair = stage_pair;
+        memset(&stage_pair, 0, sizeof(stage_pair));
+    }
+    if (pair.marker_absent) {
+        if (!pair.completion_absent) {
+            errno = EBUSY;
+            set_error(
+                ERR_CONFIG_INVALID,
+                "A lone retirement completion certificate has no recoverable owner");
+            result = -1;
+            goto recovery_probe_done;
+        }
+        result = 0;
+        goto recovery_probe_done;
+    }
+    if (config_retirement_guard_pair_exact(&pair)) {
+        result = 0;
+        goto recovery_probe_done;
+    }
+
+    recovery->kind = pair.marker_model.kind;
+    recovery->owner_count = pair.marker_model.owner_count;
+    memcpy(recovery->owners, pair.marker_model.owners,
+           recovery->owner_count * sizeof(recovery->owners[0]));
+    recovery->valid = true;
+    result = 0;
+
+recovery_probe_done:
+    config_retirement_guard_pair_clear(&pair);
+    config_retirement_guard_pair_clear(&stage_pair);
+    close(directory_fd);
+    if (result != 0) {
+        secure_zero_memory(recovery, sizeof(*recovery));
+    }
+    return result;
+}
+
+int config_retirement_guard_adopt(
+    const char *config_path, config_retirement_kind_t kind,
+    const config_retirement_owner_t *owners, size_t owner_count,
+    config_retirement_guard_t **guard) {
+    config_retirement_owner_t canonical[MAX_ACCOUNTS];
+    config_retirement_guard_pair_t pair;
+    config_retirement_guard_pair_t reconciled_pair;
+    config_retirement_guard_pair_t revalidated_pair;
+    config_retirement_guard_pair_t *adopted_pair = NULL;
+    char directory[MAX_PATH_LEN];
+    char token[ACCOUNT_INCARNATION_LEN];
+    struct stat directory_identity;
+    int directory_fd = -1;
+    int lock_fd = -1;
+    int result = -1;
+    int saved_errno = EIO;
+    bool exact_stage_reconciled = false;
+    bool legacy_residue = false;
+
+    if (!guard || *guard || !config_path ||
+        !config_retirement_kind_name(kind)) {
+        errno = EINVAL;
+        set_error(ERR_INVALID_ARGS,
+                  "Invalid retirement guard adoption arguments");
+        return -1;
+    }
+    if (g_retirement_guard_owner_pid != 0) {
+        errno = EBUSY;
+        set_error(
+            ERR_CONFIG_INVALID,
+            "This process already owns a retirement lifecycle transaction");
+        return -1;
+    }
+    memset(canonical, 0, sizeof(canonical));
+    memset(&pair, 0, sizeof(pair));
+    memset(&reconciled_pair, 0, sizeof(reconciled_pair));
+    memset(&revalidated_pair, 0, sizeof(revalidated_pair));
+    memset(token, 0, sizeof(token));
+    if (config_retirement_canonicalize_owners(
+            owners, owner_count, canonical) != 0) {
+        goto adopt_done;
+    }
+    if (config_retirement_open_directory(
+            config_path, false, directory, &directory_identity,
+            &directory_fd) != 0) {
+        goto adopt_done;
+    }
+
+    /* A marker installed by this implementation always has the fixed lock
+     * inode beside it. Recovery opens that inode only; absence must not create
+     * even a lock file while proving there is nothing to adopt. */
+    lock_fd = try_lock_existing_private_file_at(
+        directory_fd, CONFIG_RETIREMENT_LOCK_NAME);
+    if (lock_fd < 0) {
+        set_system_error(
+            ERR_FILE_IO,
+            "Cannot acquire the existing retirement lifecycle lock");
+        goto adopt_done;
+    }
+    if (config_retirement_guard_legacy_residue_present_at(
+            directory_fd, &legacy_residue) != 0) {
+        set_system_error(
+            ERR_FILE_IO,
+            "Cannot inspect legacy retirement guard residue");
+        goto adopt_done;
+    }
+    if (legacy_residue) {
+        errno = EBUSY;
+        set_error(
+            ERR_CONFIG_INVALID,
+            "Legacy retirement guard residue cannot be adopted");
+        goto adopt_done;
+    }
+    if (config_retirement_guard_pair_read_at(
+            directory_fd, &pair) != 0 ||
+        !config_named_directory_matches(
+            directory, &directory_identity)) {
+        if (errno == 0) errno = ESTALE;
+        goto adopt_done;
+    }
+    if (pair.marker_absent) {
+        errno = EBUSY;
+        set_error(
+            ERR_CONFIG_INVALID,
+            "No active retirement marker is available for adoption");
+        goto adopt_done;
+    }
+    if (!config_retirement_owner_sets_equal(
+            &pair.marker_model, kind, canonical, owner_count)) {
+        errno = EBUSY;
+        set_error(
+            ERR_CONFIG_INVALID,
+            "The active retirement marker does not match the requested recovery");
+        goto adopt_done;
+    }
+    if (pair.stage_present) {
+        if (config_retirement_guard_reconcile_exact_stage_at(
+                directory_fd, directory, &directory_identity,
+                &pair, &reconciled_pair) != 0) {
+            goto adopt_done;
+        }
+        config_retirement_guard_pair_clear(&pair);
+        pair = reconciled_pair;
+        memset(&reconciled_pair, 0, sizeof(reconciled_pair));
+        exact_stage_reconciled = true;
+    }
+    if (config_retirement_guard_pair_exact(&pair)) {
+        if (!exact_stage_reconciled) {
+            errno = EBUSY;
+            set_error(
+                ERR_CONFIG_INVALID,
+                "No active retirement marker is available for adoption");
+            goto adopt_done;
+        }
+        adopted_pair = &pair;
+    } else {
+        if (config_retirement_guard_revalidate_adoption_at(
+                directory_fd, directory, &directory_identity,
+                kind, canonical, owner_count, &pair,
+                &revalidated_pair) != 0) {
+            goto adopt_done;
+        }
+        adopted_pair = &revalidated_pair;
+    }
+
+    memcpy(token, adopted_pair->marker_model.token, sizeof(token));
+    if (config_retirement_guard_make_handle(
+            directory_fd, lock_fd, directory, &directory_identity,
+            &adopted_pair->marker_identity,
+            adopted_pair->marker_data,
+            adopted_pair->marker_length,
+            token, false, guard) != 0) {
+        goto adopt_done;
+    }
+    adopted_pair->marker_data = NULL;
+    adopted_pair->marker_length = 0U;
+    directory_fd = -1;
+    lock_fd = -1;
+    result = 0;
+
+adopt_done:
+    if (result != 0) saved_errno = errno ? errno : EIO;
+    if (lock_fd >= 0) unlock_private_file(lock_fd);
+    if (directory_fd >= 0) close(directory_fd);
+    config_retirement_guard_pair_clear(&pair);
+    config_retirement_guard_pair_clear(&reconciled_pair);
+    config_retirement_guard_pair_clear(&revalidated_pair);
+    secure_zero_memory(canonical, sizeof(canonical));
+    secure_zero_memory(token, sizeof(token));
+    if (result != 0) errno = saved_errno;
+    return result;
+}
+
 int config_retirement_guard_probe(
     const char *config_path, bool *blocked) {
     config_retirement_guard_pair_t pair;

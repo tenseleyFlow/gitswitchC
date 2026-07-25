@@ -194,6 +194,14 @@ int accounts_remove_commit(gitswitch_ctx_t *ctx);
 int accounts_remove_abort(gitswitch_ctx_t *ctx);
 int accounts_remove_finalize(
     gitswitch_ctx_t *ctx, accounts_retirement_save_outcome_t outcome);
+/* Recover an installed-but-durability-uncertain remove whose immutable owner
+ * survives only in the durable retirement marker and RETIRING publication
+ * tombstones. Only an exact canonical numeric ID may select this path.
+ * Returns 1 after exact settlement, 0 when no matching absent-owner recovery
+ * exists (the caller should continue ordinary remove resolution), and -1 on a
+ * matching but unsafe/incomplete recovery while leaving the fence blocking. */
+int accounts_remove_recover_incomplete(gitswitch_ctx_t *ctx,
+                                       const char *identifier);
 
 /* Reset owns runtime teardown in main, but its Git retirement must survive
  * until main classifies the active-state save. `target == NULL` batches all

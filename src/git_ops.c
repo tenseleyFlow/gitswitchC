@@ -7595,9 +7595,9 @@ cleanup:
     return result;
 }
 
-static int git_retire_validate_publication(
+static int git_retire_validate_publication_state(
     const account_t *account, const publication_record_t *publication,
-    git_scope_t *scope) {
+    publication_state_t expected_state, git_scope_t *scope) {
     if (!account || !publication || !scope ||
         !account->incarnation_persisted) {
         set_error(ERR_GIT_CONFIG_FAILED,
@@ -7613,7 +7613,7 @@ static int git_retire_validate_publication(
           PUBLICATION_CAP_POST_GENERATION)) !=
             (PUBLICATION_CAP_DESTINATION |
              PUBLICATION_CAP_POST_GENERATION) ||
-        publication->state != PUBLICATION_STATE_PUBLISHED ||
+        publication->state != expected_state ||
         git_scope_from_publication(publication->scope, scope) != 0) {
         set_error(ERR_GIT_CONFIG_FAILED,
                   "Account has no exact durable Git publication provenance");
@@ -7672,6 +7672,11 @@ struct git_retirement_transaction {
     git_retirement_transaction_state_t state;
     bool snapshot_indeterminate;
     bool command_runner;
+    bool recovery_proof_only;
+};
+
+struct git_retirement_recovery {
+    git_retirement_transaction_t *transaction;
 };
 
 static const git_snapshot_key_t *git_snapshot_key_by_name(
@@ -8319,7 +8324,8 @@ static void git_retirement_transaction_add_failure(
 static int git_retirement_transaction_prepare_internal(
     const account_t *const accounts[],
     const publication_record_t *const publications[], size_t item_count,
-    bool allow_command_runner,
+    bool allow_command_runner, publication_state_t required_state,
+    bool recovery_proof_only,
     git_retirement_transaction_t **out) {
     git_retirement_transaction_t *transaction = NULL;
     bool ready[PUBLICATION_LEDGER_MAX_RECORDS] = {false};
@@ -8348,11 +8354,14 @@ static int git_retirement_transaction_prepare_internal(
     }
     transaction->item_count = item_count;
     transaction->command_runner = !run_uses_default_runner();
+    transaction->recovery_proof_only = recovery_proof_only;
     transaction->state = GIT_RETIREMENT_TRANSACTION_PREPARED;
     error_accumulator_init(&transaction->failures);
 
-    /* Reject every malformed, tombstoned, or differently owned record before
-     * any filesystem probe or Git subprocess can mutate a destination. */
+    /* Reject every malformed, differently owned, or wrong-lifecycle record
+     * before any filesystem probe or Git subprocess can mutate a
+     * destination. Ordinary retirement requires PUBLISHED; the proof-only
+     * restart path requires RETIRING and receives no mutation authority. */
     for (size_t i = 0U; i < item_count; i++) {
         git_scope_t ignored_scope;
 
@@ -8366,9 +8375,10 @@ static int git_retirement_transaction_prepare_internal(
         transaction->items[i].publication = *publications[i];
         transaction->publication_refs[i] =
             &transaction->items[i].publication;
-        if (git_retire_validate_publication(
+        if (git_retire_validate_publication_state(
                 &transaction->items[i].account,
-                transaction->publication_refs[i], &ignored_scope) != 0) {
+                transaction->publication_refs[i], required_state,
+                &ignored_scope) != 0) {
             goto fail;
         }
     }
@@ -8382,7 +8392,8 @@ static int git_retirement_transaction_prepare_internal(
 
         (void)git_scope_from_publication(
             transaction->publication_refs[i]->scope, &scope);
-        if (publication_record_verify_live_destination(
+        if (!transaction->recovery_proof_only &&
+            publication_record_verify_live_destination(
                 transaction->publication_refs[i],
                 transaction->publication_refs, item_count,
                 &live_generations[i]) == 0) {
@@ -8408,7 +8419,8 @@ static int git_retirement_transaction_prepare_internal(
          * would strand the durable retirement guard forever — no retry can
          * re-verify a namespace that is gone. Indeterminate probes (EACCES,
          * ELOOP, changed identity) keep the fail-closed path. */
-        if (git_retirement_destination_provably_absent(
+        if (!transaction->recovery_proof_only &&
+            git_retirement_destination_provably_absent(
                 transaction->publication_refs[i])) {
             log_warning(
                 "Recorded Git destination %s no longer exists; treating "
@@ -8561,7 +8573,8 @@ int git_retirement_transaction_prepare(
     const publication_record_t *const publications[], size_t item_count,
     git_retirement_transaction_t **transaction) {
     return git_retirement_transaction_prepare_internal(
-        accounts, publications, item_count, false, transaction);
+        accounts, publications, item_count, false,
+        PUBLICATION_STATE_PUBLISHED, false, transaction);
 }
 
 int git_retirement_transaction_publish(
@@ -8580,7 +8593,33 @@ int git_retirement_transaction_publish(
     for (size_t i = 0U; i < transaction->item_count; i++) {
         ready[i] = transaction->items[i].ready;
     }
-    if (!transaction->snapshot_indeterminate) {
+    if (transaction->recovery_proof_only &&
+        !transaction->snapshot_indeterminate) {
+        /* Recovery owns only a proof, never forward mutation authority.
+         * Preparation already acquired every canonical lock and ran the
+         * stale-clean reconciliation against RETIRING records. Do not call
+         * either publication backend here: this branch must remain incapable
+         * of issuing an unset even if later code changes a group's plan. */
+        for (size_t i = 0U; i < transaction->group_count; i++) {
+            git_retirement_group_t *group = &transaction->groups[i];
+            char label[MAX_NAME_LEN + 96U];
+
+            if (group->prepared && group->lock_ready &&
+                group->stale_generation && group->planned == 0U) {
+                continue;
+            }
+            errno = ESTALE;
+            set_error(
+                ERR_GIT_CONFIG_FAILED,
+                "Retirement recovery did not retain an exact clean Git destination proof");
+            (void)snprintf(
+                label, sizeof(label),
+                "destination %zu recovery proof (%s)",
+                group->representative + 1U,
+                git_scope_diagnostic_label(group->scope));
+            git_retirement_transaction_add_failure(transaction, label);
+        }
+    } else if (!transaction->snapshot_indeterminate) {
         for (size_t i = 0U; i < transaction->group_count; i++) {
             git_retirement_group_t *group = &transaction->groups[i];
             const account_t *account =
@@ -9108,6 +9147,292 @@ int git_retirement_transaction_commit(
     return result;
 }
 
+static int git_retirement_recovery_reprove_transaction(
+    git_retirement_transaction_t *transaction) {
+    error_accumulator_t failures;
+    size_t failure_count = 0U;
+
+    if (!transaction || !transaction->recovery_proof_only ||
+        transaction->state != GIT_RETIREMENT_TRANSACTION_PUBLISHED) {
+        errno = EINVAL;
+        set_error(ERR_INVALID_ARGS,
+                  "Invalid retained Git retirement recovery proof");
+        return -1;
+    }
+    error_accumulator_init(&failures);
+    for (size_t i = 0U; i < transaction->group_count; i++) {
+        git_retirement_group_t *group = &transaction->groups[i];
+        git_scope_snapshot_t current;
+        const publication_record_t *representative;
+        char context[128];
+        char label[160];
+        bool group_valid = true;
+
+        memset(&current, 0, sizeof(current));
+        if (!group->prepared || !group->stale_generation ||
+            group->planned != 0U || !group->lock_ready ||
+            group->settled || group->lock.dir_fd < 0 ||
+            group->representative >= transaction->item_count) {
+            errno = ESTALE;
+            set_error(
+                ERR_GIT_CONFIG_FAILED,
+                "Retirement recovery lost its canonical Git destination proof");
+            group_valid = false;
+            goto group_done;
+        }
+        representative =
+            transaction->publication_refs[group->representative];
+        if (!git_file_at_matches_witness(
+                group->lock.dir_fd, group->lock.leaf,
+                group->lock.original_fd, &group->lock.original_stat,
+                group->lock.original_data, group->lock.original_length,
+                NULL)) {
+            errno = errno ? errno : EAGAIN;
+            set_system_error(
+                ERR_GIT_CONFIG_FAILED,
+                "Retirement recovery Git destination changed while its canonical lock was held");
+            group_valid = false;
+            goto group_done;
+        }
+        (void)snprintf(
+            context, sizeof(context),
+            "Could not re-read retirement recovery destination %zu",
+            group->representative + 1U);
+        if (git_capture_file_snapshot(
+                group->lock.path, context, &current) != 0) {
+            group_valid = false;
+            goto group_done;
+        }
+        if (!git_retirement_stale_snapshot_is_clean(
+                group, &current, transaction->publication_refs,
+                transaction->item_count)) {
+            errno = ESTALE;
+            set_error(
+                ERR_GIT_CONFIG_FAILED,
+                "Retirement recovery destination contains a reintroduced attributed Git value");
+            group_valid = false;
+            goto group_done;
+        }
+        for (size_t j = 0U; j < transaction->item_count; j++) {
+            if (publication_record_same_config_destination(
+                    representative, transaction->publication_refs[j]) &&
+                git_retirement_verify_live_namespace(
+                    transaction->publication_refs[j]) != 0) {
+                group_valid = false;
+                goto group_done;
+            }
+        }
+        if (fsync(group->lock.dir_fd) != 0 ||
+            !git_file_at_matches_witness(
+                group->lock.dir_fd, group->lock.leaf,
+                group->lock.original_fd, &group->lock.original_stat,
+                group->lock.original_data, group->lock.original_length,
+                NULL)) {
+            errno = errno ? errno : EAGAIN;
+            set_system_error(
+                ERR_GIT_CONFIG_FAILED,
+                "Retirement recovery Git destination did not remain stable under its canonical lock");
+            group_valid = false;
+            goto group_done;
+        }
+        /* Repository/config-parent ownership is not represented by the file
+         * witness above. Re-prove it at the last retained-handle boundary as
+         * well, so a moved/replaced namespace cannot inherit a clean config
+         * proof. */
+        for (size_t j = 0U; j < transaction->item_count; j++) {
+            if (publication_record_same_config_destination(
+                    representative, transaction->publication_refs[j]) &&
+                git_retirement_verify_live_namespace(
+                    transaction->publication_refs[j]) != 0) {
+                group_valid = false;
+                goto group_done;
+            }
+        }
+
+group_done:
+        git_scope_snapshot_clear(&current);
+        if (!group_valid) {
+            (void)snprintf(
+                label, sizeof(label),
+                "destination %zu retained recovery proof (%s)",
+                group->representative + 1U,
+                git_scope_diagnostic_label(group->scope));
+            (void)error_accumulator_add_last(&failures, label);
+            failure_count++;
+        }
+    }
+    if (failure_count != 0U) {
+        error_context_t summary;
+
+        set_error(
+            ERR_GIT_CONFIG_FAILED,
+            "Git retirement recovery could not prove %zu destination(s) clean and stable",
+            failure_count);
+        summary = *get_last_error();
+        (void)error_accumulator_add(
+            &failures, "retirement recovery summary", &summary);
+        (void)error_accumulator_publish(&failures);
+        return -1;
+    }
+    clear_error();
+    return 0;
+}
+
+int git_retirement_recovery_begin(
+    const publication_record_t *const publications[],
+    size_t publication_count, git_retirement_recovery_t **recovery_ptr) {
+    git_retirement_recovery_t *recovery = NULL;
+    git_retirement_transaction_t *transaction = NULL;
+    account_t *accounts = NULL;
+    const account_t **account_refs = NULL;
+    error_accumulator_t failures;
+    int result = -1;
+
+    if (recovery_ptr) *recovery_ptr = NULL;
+    if (!recovery_ptr || !publications || publication_count == 0U ||
+        publication_count > PUBLICATION_LEDGER_MAX_RECORDS) {
+        errno = EINVAL;
+        set_error(ERR_INVALID_ARGS,
+                  "Invalid Git retirement recovery request");
+        return -1;
+    }
+    accounts = calloc(publication_count, sizeof(*accounts));
+    account_refs = calloc(publication_count, sizeof(*account_refs));
+    recovery = calloc(1U, sizeof(*recovery));
+    if (!accounts || !account_refs || !recovery) {
+        errno = ENOMEM;
+        set_error(ERR_MEMORY_ALLOCATION,
+                  "Out of memory preparing Git retirement recovery");
+        goto done;
+    }
+    for (size_t i = 0U; i < publication_count; i++) {
+        int written;
+
+        if (!publications[i]) {
+            errno = EINVAL;
+            set_error(ERR_INVALID_ARGS,
+                      "NULL record in Git retirement recovery set");
+            goto done;
+        }
+        accounts[i].id = publications[i]->account_id;
+        accounts[i].incarnation_persisted = true;
+        if (safe_strncpy(
+                accounts[i].incarnation,
+                publications[i]->account_incarnation,
+                sizeof(accounts[i].incarnation)) != 0) {
+            goto done;
+        }
+        written = snprintf(accounts[i].name, sizeof(accounts[i].name),
+                           "retiring account %" PRIu32,
+                           publications[i]->account_id);
+        if (written < 0 ||
+            (size_t)written >= sizeof(accounts[i].name)) {
+            errno = EOVERFLOW;
+            set_error(ERR_INVALID_ARGS,
+                      "Retiring account diagnostic identity is too large");
+            goto done;
+        }
+        account_refs[i] = &accounts[i];
+    }
+    if (git_retirement_transaction_prepare_internal(
+            account_refs, publications, publication_count, false,
+            PUBLICATION_STATE_RETIRING, true, &transaction) != 0) {
+        goto done;
+    }
+    if (git_retirement_transaction_publish(transaction, NULL) != 0) {
+        error_context_t proof_error = *get_last_error();
+        int proof_errno = errno ? errno : EIO;
+
+        error_accumulator_init(&failures);
+        errno = proof_errno;
+        (void)error_accumulator_add(
+            &failures, "retirement recovery preparation", &proof_error);
+        if (git_retirement_transaction_commit(&transaction) != 0) {
+            (void)error_accumulator_add_last(
+                &failures, "retirement recovery preparation cleanup");
+        }
+        (void)error_accumulator_publish(&failures);
+        goto done;
+    }
+    recovery->transaction = transaction;
+    transaction = NULL;
+    if (git_retirement_recovery_reprove_transaction(
+            recovery->transaction) != 0) {
+        error_context_t proof_error = *get_last_error();
+        int proof_errno = errno ? errno : EIO;
+
+        error_accumulator_init(&failures);
+        errno = proof_errno;
+        (void)error_accumulator_add(
+            &failures, "retirement recovery retained proof", &proof_error);
+        if (git_retirement_transaction_commit(
+                &recovery->transaction) != 0) {
+            (void)error_accumulator_add_last(
+                &failures, "retirement recovery proof cleanup");
+        }
+        (void)error_accumulator_publish(&failures);
+        goto done;
+    }
+    *recovery_ptr = recovery;
+    recovery = NULL;
+    result = 0;
+
+done:
+    if (transaction) {
+        (void)git_retirement_transaction_commit(&transaction);
+    }
+    if (accounts) {
+        secure_zero_memory(accounts,
+                           publication_count * sizeof(*accounts));
+        free(accounts);
+    }
+    free(account_refs);
+    if (recovery) {
+        secure_zero_memory(recovery, sizeof(*recovery));
+        free(recovery);
+    }
+    return result;
+}
+
+int git_retirement_recovery_verify(
+    git_retirement_recovery_t *recovery) {
+    if (!recovery || !recovery->transaction) {
+        errno = EINVAL;
+        set_error(ERR_INVALID_ARGS,
+                  "Invalid Git retirement recovery verification");
+        return -1;
+    }
+    return git_retirement_recovery_reprove_transaction(
+        recovery->transaction);
+}
+
+int git_retirement_recovery_end(
+    git_retirement_recovery_t **recovery_ptr) {
+    git_retirement_recovery_t *recovery;
+    error_accumulator_t failures;
+    int result = 0;
+
+    if (!recovery_ptr || !*recovery_ptr) return 0;
+    recovery = *recovery_ptr;
+    error_accumulator_init(&failures);
+    if (git_retirement_recovery_verify(recovery) != 0) {
+        (void)error_accumulator_add_last(
+            &failures, "retirement recovery final proof");
+        result = -1;
+    }
+    if (git_retirement_transaction_commit(
+            &recovery->transaction) != 0) {
+        (void)error_accumulator_add_last(
+            &failures, "retirement recovery release");
+        result = -1;
+    }
+    secure_zero_memory(recovery, sizeof(*recovery));
+    free(recovery);
+    *recovery_ptr = NULL;
+    if (failures.active) (void)error_accumulator_publish(&failures);
+    return result;
+}
+
 int git_retire_account_identity_published(
     const account_t *account, const publication_record_t *publication,
     size_t *cleared) {
@@ -9140,6 +9465,7 @@ int git_retire_account_identity_publications(
     }
     if (git_retirement_transaction_prepare_internal(
             accounts, publications, publication_count, true,
+            PUBLICATION_STATE_PUBLISHED, false,
             &transaction) != 0) {
         return -1;
     }

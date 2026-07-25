@@ -134,6 +134,7 @@ typedef enum {
     COMMAND_NOTICE_ADD,
     COMMAND_NOTICE_EDIT,
     COMMAND_NOTICE_REMOVE,
+    COMMAND_NOTICE_REMOVE_RECOVERED,
     COMMAND_NOTICE_SWITCH,
     COMMAND_NOTICE_RESET_ONE,
     COMMAND_NOTICE_RESET_ALL
@@ -894,6 +895,11 @@ static void emit_command_success(const gitswitch_ctx_t *ctx,
             break;
         case COMMAND_NOTICE_REMOVE:
             display_success("Account removed successfully.");
+            break;
+        case COMMAND_NOTICE_REMOVE_RECOVERED:
+            display_success(
+                "Completed interrupted removal for account ID %s.",
+                result->subject);
             break;
         case COMMAND_NOTICE_SWITCH:
             display_success("Switched to: %s", result->subject);
@@ -2253,6 +2259,7 @@ static int handle_list_names(gitswitch_ctx_t *ctx) {
 static command_result_t handle_remove_command(gitswitch_ctx_t *ctx,
                                               const char *identifier) {
     command_result_t result = command_result(EXIT_FAILURE);
+    int recovery_rc;
     size_t previous_count;
 
     if (!ctx || !identifier) return result;
@@ -2284,6 +2291,33 @@ static command_result_t handle_remove_command(gitswitch_ctx_t *ctx,
                "from %s.\n", acct->name, ctx->config.config_path);
         display_success("DRY RUN complete - no changes were made");
         result.status = EXIT_SUCCESS;
+        return result;
+    }
+
+    /* AR-14 H2: an installed-but-durability-uncertain remove has already
+     * deleted its live account, so ordinary name/email resolution no longer
+     * has a retry handle. The durable marker retains only immutable identity;
+     * accept its exact canonical numeric ID, prove every RETIRING Git
+     * destination clean under canonical locks, and settle the same marker.
+     * Nonmatching selectors continue through the historical remove path. */
+    recovery_rc = accounts_remove_recover_incomplete(ctx, identifier);
+    if (recovery_rc < 0) {
+        error_context_t recovery_error = *get_last_error();
+        int recovery_errno = errno;
+
+        result.failure_kind = COMMAND_FAILURE_REMOVE;
+        errno = recovery_errno;
+        (void)error_accumulator_add(
+            &result.failure_errors,
+            "interrupted removal recovery", &recovery_error);
+        errno = recovery_errno;
+        return result;
+    }
+    if (recovery_rc > 0) {
+        result.status = EXIT_SUCCESS;
+        result.notice_kind = COMMAND_NOTICE_REMOVE_RECOVERED;
+        (void)safe_strncpy(result.subject, identifier,
+                           sizeof(result.subject));
         return result;
     }
 
