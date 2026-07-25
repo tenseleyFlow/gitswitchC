@@ -443,6 +443,7 @@ static int account_incarnation_admits_publication(
 static bool prompt_host_alias_valid(const char *alias);
 static int validate_gpg_key_availability(const char *gpg_key_id);
 static int validate_gpg_key_availability_fresh(const char *gpg_key_id);
+static void print_terminal_safe(const char *text);
 static int check_ssh_key_local_file(const account_t *account);
 static int check_gpg_key_local_state(
     const account_t *account, gpg_account_key_readiness_t *readiness);
@@ -3628,8 +3629,25 @@ static int add_or_edit_account(gitswitch_ctx_t *ctx, account_t *existing,
             continue;
         }
         if (validate_gpg_key_availability(input) != 0) {
-            printf("[ERROR]: GPG key not found in keyring: %s (try again, or Enter to skip)\n", input);
-            continue;
+            error_context_t resolver_error = *get_last_error();
+            int resolver_errno = errno;
+            const char *diagnostic =
+                resolver_error.message[0] != '\0'
+                    ? resolver_error.message
+                    : error_code_to_string(resolver_error.code);
+
+            fputs("[ERROR]: GPG key validation failed: ", stdout);
+            print_terminal_safe(diagnostic);
+            if (resolver_error.code == ERR_GPG_KEY_NOT_FOUND) {
+                fputs(" (try again, or Enter to skip)\n", stdout);
+                g_last_error = resolver_error;
+                errno = resolver_errno;
+                continue;
+            }
+            putchar('\n');
+            g_last_error = resolver_error;
+            errno = resolver_errno;
+            return -1;
         }
         safe_strncpy(acct.gpg_key_id, input, sizeof(acct.gpg_key_id));
         acct.gpg_enabled = true;
