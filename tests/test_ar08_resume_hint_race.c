@@ -46,6 +46,7 @@ static int g_hook_error;
 static int g_pause_ready_fd = -1;
 static int g_pause_resume_fd = -1;
 static int g_io_rewrite_error;
+static int g_rollback_dirsync_faults;
 
 static int append_bytes(const char *path, size_t length) {
     char bytes[512];
@@ -176,6 +177,13 @@ static bool rewrite_state_during_directory_sync(
         g_io_rewrite_error = errno ? errno : EIO;
     }
     return false;
+}
+
+static bool fail_rollback_after_directory_sync(
+    config_io_boundary_t boundary) {
+    if (boundary != CONFIG_IO_STATE_ROLLBACK_AFTER_DIR_SYNC) return false;
+    g_rollback_dirsync_faults++;
+    return true;
 }
 
 static void replace_hint_at_checkpoint(int stage) {
@@ -492,7 +500,7 @@ TEST(guarded_snapshot_rejects_changed_bytes_under_ctime_only_drift) {
 #endif
     clear_error();
     CHECK_EQ_INT(config_resume_hint_snapshot_restore(&saved), -1);
-    CHECK(strstr(get_last_error()->message, "rollback conflict") != NULL);
+    CHECK(strstr(get_last_error()->message, "neither") != NULL);
     CHECK(read_private(g_hint, text, sizeof(text)) > 0);
     CHECK_STR_EQ(text, "none\nactive=later\n");
     config_resume_hint_snapshot_clear(&saved);
@@ -552,6 +560,169 @@ TEST(snapshot_restore_registration_failure_preserves_post_image_and_retries) {
     config_resume_hint_snapshot_clear(&saved);
 }
 
+TEST(durable_present_before_image_restore_retry_is_idempotent) {
+    static const char config_body[] =
+        "[settings]\n"
+        "default_scope=\"local\"\n"
+        "[accounts.1]\n"
+        "name=\"alice\"\n"
+        "email=\"alice@example.com\"\n";
+    config_resume_hint_snapshot_t saved = {0};
+    char config_path[PATH_MAX];
+    char text[64];
+    struct stat restored;
+    gitswitch_ctx_t ctx;
+    bool installed = false;
+    int first_errno;
+
+    CHECK((size_t)snprintf(config_path, sizeof(config_path),
+                           "%s/.config/gitswitch/accounts.toml", g_home) <
+          sizeof(config_path));
+    CHECK_EQ_INT(write_private(config_path, config_body), 0);
+    CHECK_EQ_INT(write_private(g_hint, "none\ninactive=v1\n"), 0);
+    CHECK_EQ_INT(chmod(g_hint, 0640), 0);
+    memset(&ctx, 0, sizeof(ctx));
+    CHECK_EQ_INT(config_load(&ctx, config_path), 0);
+    snprintf(ctx.config.active_account, sizeof(ctx.config.active_account),
+             "%s", "alice");
+    CHECK_EQ_INT(config_resume_hint_snapshot_capture(&saved), 0);
+    CHECK_EQ_INT(config_save_active_account_transactional_guarded(
+                     &ctx, config_path, &installed, &saved), 0);
+    CHECK(installed);
+
+    g_rollback_dirsync_faults = 0;
+    (void)config_set_io_fault_fn(fail_rollback_after_directory_sync);
+    clear_error();
+    CHECK_EQ_INT(config_resume_hint_snapshot_restore(&saved), -1);
+    first_errno = errno;
+    (void)config_set_io_fault_fn(NULL);
+    CHECK_EQ_INT(first_errno, EIO);
+    CHECK_EQ_INT(g_rollback_dirsync_faults, 1);
+    CHECK(strstr(get_last_error()->message,
+                 "Injected config persistence failure") != NULL);
+    CHECK(read_private(g_hint, text, sizeof(text)) > 0);
+    CHECK_STR_EQ(text, "none\ninactive=v1\n");
+    CHECK_EQ_INT(lstat(g_hint, &restored), 0);
+    CHECK_EQ_INT(restored.st_mode & 0777, 0640);
+    CHECK_EQ_INT(count_hint_temps(".resume-hint.restore."), 0);
+
+    clear_error();
+    CHECK_EQ_INT(config_resume_hint_snapshot_restore(&saved), 0);
+    CHECK(read_private(g_hint, text, sizeof(text)) > 0);
+    CHECK_STR_EQ(text, "none\ninactive=v1\n");
+    CHECK_EQ_INT(lstat(g_hint, &restored), 0);
+    CHECK_EQ_INT(restored.st_mode & 0777, 0640);
+    CHECK_EQ_INT(count_hint_temps(".resume-hint.restore."), 0);
+
+    clear_error();
+    CHECK_EQ_INT(config_resume_hint_snapshot_restore(&saved), 0);
+    CHECK(read_private(g_hint, text, sizeof(text)) > 0);
+    CHECK_STR_EQ(text, "none\ninactive=v1\n");
+    CHECK_EQ_INT(lstat(g_hint, &restored), 0);
+    CHECK_EQ_INT(restored.st_mode & 0777, 0640);
+    CHECK_EQ_INT(count_hint_temps(".resume-hint.restore."), 0);
+    config_resume_hint_snapshot_clear(&saved);
+}
+
+TEST(durable_absent_before_image_restore_retry_is_idempotent) {
+    static const char config_body[] =
+        "[settings]\n"
+        "default_scope=\"local\"\n"
+        "[accounts.1]\n"
+        "name=\"alice\"\n"
+        "email=\"alice@example.com\"\n";
+    config_resume_hint_snapshot_t saved = {0};
+    char config_path[PATH_MAX];
+    struct stat state;
+    gitswitch_ctx_t ctx;
+    bool installed = false;
+    int first_errno;
+
+    CHECK((size_t)snprintf(config_path, sizeof(config_path),
+                           "%s/.config/gitswitch/accounts.toml", g_home) <
+          sizeof(config_path));
+    CHECK_EQ_INT(write_private(config_path, config_body), 0);
+    CHECK_EQ_INT(unlink(g_hint), 0);
+    memset(&ctx, 0, sizeof(ctx));
+    CHECK_EQ_INT(config_load(&ctx, config_path), 0);
+    snprintf(ctx.config.active_account, sizeof(ctx.config.active_account),
+             "%s", "alice");
+    CHECK_EQ_INT(config_resume_hint_snapshot_capture(&saved), 0);
+    CHECK_EQ_INT(config_save_active_account_transactional_guarded(
+                     &ctx, config_path, &installed, &saved), 0);
+    CHECK(installed);
+
+    g_rollback_dirsync_faults = 0;
+    (void)config_set_io_fault_fn(fail_rollback_after_directory_sync);
+    clear_error();
+    CHECK_EQ_INT(config_resume_hint_snapshot_restore(&saved), -1);
+    first_errno = errno;
+    (void)config_set_io_fault_fn(NULL);
+    CHECK_EQ_INT(first_errno, EIO);
+    CHECK_EQ_INT(g_rollback_dirsync_faults, 1);
+    CHECK(strstr(get_last_error()->message,
+                 "Injected config persistence failure") != NULL);
+    errno = 0;
+    CHECK_EQ_INT(lstat(g_hint, &state), -1);
+    CHECK_EQ_INT(errno, ENOENT);
+    CHECK_EQ_INT(count_hint_temps(".resume-hint.restore."), 0);
+
+    clear_error();
+    CHECK_EQ_INT(config_resume_hint_snapshot_restore(&saved), 0);
+    errno = 0;
+    CHECK_EQ_INT(lstat(g_hint, &state), -1);
+    CHECK_EQ_INT(errno, ENOENT);
+    CHECK_EQ_INT(count_hint_temps(".resume-hint.restore."), 0);
+
+    clear_error();
+    CHECK_EQ_INT(config_resume_hint_snapshot_restore(&saved), 0);
+    errno = 0;
+    CHECK_EQ_INT(lstat(g_hint, &state), -1);
+    CHECK_EQ_INT(errno, ENOENT);
+    CHECK_EQ_INT(count_hint_temps(".resume-hint.restore."), 0);
+    config_resume_hint_snapshot_clear(&saved);
+}
+
+TEST(equivalent_post_image_replacement_is_not_a_completed_restore) {
+    static const char config_body[] =
+        "[settings]\n"
+        "default_scope=\"local\"\n"
+        "[accounts.1]\n"
+        "name=\"alice\"\n"
+        "email=\"alice@example.com\"\n";
+    config_resume_hint_snapshot_t saved = {0};
+    char config_path[PATH_MAX];
+    char text[64];
+    gitswitch_ctx_t ctx;
+    bool installed = false;
+
+    CHECK((size_t)snprintf(config_path, sizeof(config_path),
+                           "%s/.config/gitswitch/accounts.toml", g_home) <
+          sizeof(config_path));
+    CHECK_EQ_INT(write_private(config_path, config_body), 0);
+    CHECK_EQ_INT(write_private(g_hint, "none\ninactive=v1\n"), 0);
+    memset(&ctx, 0, sizeof(ctx));
+    CHECK_EQ_INT(config_load(&ctx, config_path), 0);
+    snprintf(ctx.config.active_account, sizeof(ctx.config.active_account),
+             "%s", "alice");
+    CHECK_EQ_INT(config_resume_hint_snapshot_capture(&saved), 0);
+    CHECK_EQ_INT(config_save_active_account_transactional_guarded(
+                     &ctx, config_path, &installed, &saved), 0);
+    CHECK(installed);
+
+    CHECK_EQ_INT(write_private(g_saved, "none\nactive=alice\n"), 0);
+    CHECK_EQ_INT(rename(g_saved, g_hint), 0);
+    clear_error();
+    CHECK_EQ_INT(config_resume_hint_snapshot_restore(&saved), -1);
+    CHECK_EQ_INT(errno, ESTALE);
+    CHECK(strstr(get_last_error()->message,
+                 "post-image still durable") != NULL);
+    CHECK(read_private(g_hint, text, sizeof(text)) > 0);
+    CHECK_STR_EQ(text, "none\nactive=alice\n");
+    CHECK_EQ_INT(count_hint_temps(".resume-hint.restore."), 0);
+    config_resume_hint_snapshot_clear(&saved);
+}
+
 TEST(guarded_save_does_not_adopt_an_in_place_rewrite) {
     static const char config_body[] =
         "[settings]\n"
@@ -589,7 +760,7 @@ TEST(guarded_save_does_not_adopt_an_in_place_rewrite) {
 
     clear_error();
     CHECK_EQ_INT(config_resume_hint_snapshot_restore(&saved), -1);
-    CHECK(strstr(get_last_error()->message, "rollback conflict") != NULL);
+    CHECK(strstr(get_last_error()->message, "neither") != NULL);
     CHECK(read_private(g_hint, text, sizeof(text)) > 0);
     CHECK_STR_EQ(text, "none\nactive=later\n");
     config_resume_hint_snapshot_clear(&saved);
@@ -747,6 +918,9 @@ int main(void) {
     RUN_TEST(guarded_snapshot_accepts_ctime_only_materialization);
     RUN_TEST(guarded_snapshot_rejects_changed_bytes_under_ctime_only_drift);
     RUN_TEST(snapshot_restore_registration_failure_preserves_post_image_and_retries);
+    RUN_TEST(durable_present_before_image_restore_retry_is_idempotent);
+    RUN_TEST(durable_absent_before_image_restore_retry_is_idempotent);
+    RUN_TEST(equivalent_post_image_replacement_is_not_a_completed_restore);
     RUN_TEST(guarded_save_does_not_adopt_an_in_place_rewrite);
     RUN_TEST(public_restore_serializes_its_final_compare_and_rename);
     RUN_TEST(guarded_noop_save_does_not_claim_a_state_generation);

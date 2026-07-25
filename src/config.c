@@ -302,6 +302,10 @@ static int config_require_full_save_generation_snapshot(
     bool destination_existed, const struct stat *destination);
 static bool config_metadata_ctime_only_change(const struct stat *before,
                                               const struct stat *after);
+static int config_resume_hint_snapshot_classify_at(
+    const char *config_path,
+    const config_resume_hint_snapshot_t *snapshot,
+    config_active_rollback_state_t *state);
 static bool config_refresh_publication_identity(
     const char *config_path, const char *backup_path,
     const struct stat *copied_source, const struct stat *backup_identity,
@@ -7748,12 +7752,26 @@ static int config_resume_hint_snapshot_restore_at(
         return -1;
     }
 
-    if (!snapshot->existed) {
-        if (config_resume_hint_snapshot_require_post_image(hint, snapshot) !=
-            0) {
-            close(dir_fd);
-            return -1;
+    if (config_resume_hint_snapshot_require_post_image(hint, snapshot) != 0) {
+        config_active_rollback_state_t state =
+            CONFIG_ACTIVE_ROLLBACK_UNRESOLVED;
+
+        close(dir_fd);
+        if (config_resume_hint_snapshot_classify_at(
+                config_path, snapshot, &state) == 0) {
+            if (state == CONFIG_ACTIVE_ROLLBACK_BEFORE_DURABLE) {
+                return 0;
+            }
+            errno = ESTALE;
+            set_system_error(
+                ERR_FILE_IO,
+                "Active-state rollback retry found the post-image still durable: %s",
+                hint);
         }
+        return -1;
+    }
+
+    if (!snapshot->existed) {
         if (unlink(hint) != 0 && errno != ENOENT) {
             close(dir_fd);
             set_system_error(ERR_FILE_IO,
@@ -7767,12 +7785,14 @@ static int config_resume_hint_snapshot_restore_at(
                              "Cannot durably restore prior resume-hint absence");
             return -1;
         }
+        if (config_io_fault(
+                CONFIG_IO_STATE_ROLLBACK_AFTER_DIR_SYNC,
+                "active-state rollback directory sync")) {
+            close(dir_fd);
+            return -1;
+        }
         close(dir_fd);
         return 0;
-    }
-    if (config_resume_hint_snapshot_require_post_image(hint, snapshot) != 0) {
-        close(dir_fd);
-        return -1;
     }
     if (lstat(hint, &current) == 0) {
         if (!config_metadata_file_is_safe(&current, false)) {
@@ -7847,7 +7867,9 @@ static int config_resume_hint_snapshot_restore_at(
     fd = -1;
     /* Recheck after preparing and syncing the before-image. The public save
      * lock makes this check plus rename one protocol for cooperating writers;
-     * bypassing same-uid writers retain only the documented final interval. */
+     * bypassing same-uid writers retain only the documented final interval.
+     * Unlike the entry proof above, a failure here is a namespace change
+     * during this call, not evidence that a prior retry already completed. */
     if (config_resume_hint_snapshot_require_post_image(hint, snapshot) != 0) {
         goto restore_fail;
     }
@@ -7859,7 +7881,19 @@ static int config_resume_hint_snapshot_restore_at(
     }
     signals_scratch_unregister(temp);
     temp_registered = false;
-    if (fsync(dir_fd) != 0 || lstat(hint, &installed) != 0 ||
+    if (fsync(dir_fd) != 0) {
+        close(dir_fd);
+        set_system_error(ERR_FILE_IO,
+                         "Cannot durably restore resume hint: %s", hint);
+        return -1;
+    }
+    if (config_io_fault(
+            CONFIG_IO_STATE_ROLLBACK_AFTER_DIR_SYNC,
+            "active-state rollback directory sync")) {
+        close(dir_fd);
+        return -1;
+    }
+    if (lstat(hint, &installed) != 0 ||
         !config_metadata_file_is_safe(&installed, false) ||
         (installed.st_mode & 0777) != (mode_t)snapshot->mode ||
         (size_t)installed.st_size != snapshot->length) {

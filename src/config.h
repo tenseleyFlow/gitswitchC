@@ -58,7 +58,10 @@ typedef enum {
     /* Exact-byte reproof checkpoint immediately before its final descriptor
      * generation observation. A test callback may expose a ctime-only step
      * and return false. */
-    CONFIG_IO_DOCUMENT_REPROOF_AFTER_BYTES
+    CONFIG_IO_DOCUMENT_REPROOF_AFTER_BYTES,
+    /* Rollback checkpoint after the before-image rename or unlink and the
+     * successful parent-directory sync, but before final verification. */
+    CONFIG_IO_STATE_ROLLBACK_AFTER_DIR_SYNC
 } config_io_boundary_t;
 
 typedef bool (*config_io_fault_fn)(config_io_boundary_t boundary);
