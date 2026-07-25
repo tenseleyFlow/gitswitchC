@@ -3300,169 +3300,147 @@ TEST(removed_account_publication_reserves_recycled_id_without_git_mutation) {
     ts_rm_rf(home);
 }
 
-/* AR-12 H2: only PUBLISHED records with provably dead destinations (ENOENT
- * or changed object identity on the recorded anchor) are reclaimable.
- * RETIRING residue and indeterminate probes must survive reclamation. */
-TEST(reclaim_absent_drops_only_provably_dead_published_records) {
+/* AR-14 M13: a v1 filesystem probe cannot distinguish permanent deletion
+ * from rename-away/restore. Exercise each anchor independently under one
+ * same-filesystem root and prove both PUBLISHED authority and a RETIRING
+ * settlement obligation remain byte-exact. */
+TEST(reclamation_keeps_renamed_published_and_retiring_destinations) {
     publication_ledger_t ledger;
     publication_record_t record;
-    publication_record_t dead_probe;
-    char dead_repo[] = "/tmp/ar12-h2-dead-XXXXXX";
-    char live_repo[] = "/tmp/ar12-h2-live-XXXXXX";
-    char mismatch_repo[] = "/tmp/ar12-h2-mismatch-XXXXXX";
-    char unmount_repo[] = "/tmp/ar12-h2-unmount-XXXXXX";
-    char retiring_repo[] = "/tmp/ar12-h2-retiring-XXXXXX";
+    publication_record_t probes[4];
+    unsigned char *before = NULL;
+    unsigned char *after = NULL;
+    size_t before_length = 0U;
+    size_t after_length = 0U;
+    char root[] = "/tmp/ar14-m13-rename-XXXXXX";
+    char shared_parent[MAX_PATH_LEN];
+    char repo_anchor[MAX_PATH_LEN];
+    char repo_away[MAX_PATH_LEN];
+    char live_repo[MAX_PATH_LEN];
+    char local_parent[MAX_PATH_LEN];
+    char local_parent_away[MAX_PATH_LEN];
+    char global_parent[MAX_PATH_LEN];
+    char global_parent_away[MAX_PATH_LEN];
+    char global_config[MAX_PATH_LEN];
+    char retiring_parent[MAX_PATH_LEN];
+    char retiring_parent_away[MAX_PATH_LEN];
+    char retiring_config[MAX_PATH_LEN];
     struct stat st;
 
-    CHECK(ts_mkdtemp(dead_repo) != NULL);
-    CHECK(ts_mkdtemp(live_repo) != NULL);
-    CHECK(ts_mkdtemp(mismatch_repo) != NULL);
-    CHECK(ts_mkdtemp(unmount_repo) != NULL);
-    CHECK(ts_mkdtemp(retiring_repo) != NULL);
+    CHECK(ts_mkdtemp(root) != NULL);
+    CHECK_EQ_INT(join_path(shared_parent, sizeof(shared_parent), root,
+                           "shared-parent"), 0);
+    CHECK_EQ_INT(join_path(repo_anchor, sizeof(repo_anchor), root,
+                           "repository-anchor"), 0);
+    CHECK_EQ_INT(join_path(repo_away, sizeof(repo_away), root,
+                           "repository-away"), 0);
+    CHECK_EQ_INT(join_path(live_repo, sizeof(live_repo), root,
+                           "live-repository"), 0);
+    CHECK_EQ_INT(join_path(local_parent, sizeof(local_parent), root,
+                           "local-parent"), 0);
+    CHECK_EQ_INT(join_path(local_parent_away,
+                           sizeof(local_parent_away), root,
+                           "local-parent-away"), 0);
+    CHECK_EQ_INT(join_path(global_parent, sizeof(global_parent), root,
+                           "global-parent"), 0);
+    CHECK_EQ_INT(join_path(global_parent_away,
+                           sizeof(global_parent_away), root,
+                           "global-parent-away"), 0);
+    CHECK_EQ_INT(join_path(retiring_parent, sizeof(retiring_parent), root,
+                           "retiring-parent"), 0);
+    CHECK_EQ_INT(join_path(retiring_parent_away,
+                           sizeof(retiring_parent_away), root,
+                           "retiring-parent-away"), 0);
+    CHECK_EQ_INT(mkdir(shared_parent, 0700), 0);
+    CHECK_EQ_INT(mkdir(repo_anchor, 0700), 0);
+    CHECK_EQ_INT(mkdir(live_repo, 0700), 0);
+    CHECK_EQ_INT(mkdir(local_parent, 0700), 0);
+    CHECK_EQ_INT(mkdir(global_parent, 0700), 0);
+    CHECK_EQ_INT(mkdir(retiring_parent, 0700), 0);
     publication_ledger_init(&ledger);
 
-    /* Dead destination: real identity captured, directory then removed. */
-    fill_gpg_record(&record, dead_repo, FINGERPRINT_A);
-    snprintf(record.config_path, sizeof(record.config_path),
-             "%s/.git/config", dead_repo);
-    CHECK_EQ_INT(stat(dead_repo, &st), 0);
+    /* Local repository anchor moves while its independently anchored config
+     * parent stays live. */
+    fill_gpg_record(&record, repo_anchor, FINGERPRINT_A);
+    CHECK_EQ_INT(safe_snprintf(record.config_path,
+                               sizeof(record.config_path),
+                               "%s/repository.gitconfig", shared_parent), 0);
+    CHECK_EQ_INT(stat(shared_parent, &st), 0);
+    publication_identity_from_stat(&record.config_parent, &st);
+    CHECK_EQ_INT(stat(repo_anchor, &st), 0);
     publication_identity_from_stat(&record.repository, &st);
     CHECK_EQ_INT(publication_ledger_upsert(&ledger, &record), 0);
-    dead_probe = record;
+    probes[0] = ledger.records[ledger.count - 1U];
 
-    /* Live destination with the real identity: must be kept. */
+    /* Local config parent moves while its repository anchor stays live. */
     fill_gpg_record(&record, live_repo, FINGERPRINT_A);
-    snprintf(record.config_path, sizeof(record.config_path),
-             "%s/.git/config", live_repo);
+    CHECK_EQ_INT(safe_snprintf(record.config_path,
+                               sizeof(record.config_path),
+                               "%s/config", local_parent), 0);
+    CHECK_EQ_INT(stat(local_parent, &st), 0);
+    publication_identity_from_stat(&record.config_parent, &st);
     CHECK_EQ_INT(stat(live_repo, &st), 0);
     publication_identity_from_stat(&record.repository, &st);
     CHECK_EQ_INT(publication_ledger_upsert(&ledger, &record), 0);
+    probes[1] = ledger.records[ledger.count - 1U];
 
-    /* AR-13 R1: live path whose recorded identity changed ON THE SAME
-     * filesystem (same st_dev, different inode) is an in-place replacement —
-     * provably non-matchable, so reclaimable. */
-    fill_gpg_record(&record, mismatch_repo, FINGERPRINT_A);
-    snprintf(record.config_path, sizeof(record.config_path),
-             "%s/.git/config", mismatch_repo);
-    CHECK_EQ_INT(stat(mismatch_repo, &st), 0);
-    publication_identity_from_stat(&record.repository, &st);
-    record.repository.inode ^= UINTMAX_C(1); /* same device, wrong inode */
+    /* Global publication: only the config-parent anchor exists. */
+    CHECK_EQ_INT(safe_snprintf(global_config, sizeof(global_config),
+                               "%s/config", global_parent), 0);
+    fill_global_gpg_record(&record, UINT32_C(41), global_config,
+                           FINGERPRINT_A);
+    CHECK_EQ_INT(stat(global_parent, &st), 0);
+    publication_identity_from_stat(&record.config_parent, &st);
     CHECK_EQ_INT(publication_ledger_upsert(&ledger, &record), 0);
+    probes[2] = ledger.records[ledger.count - 1U];
 
-    /* AR-13 R1: live path whose recorded identity differs on a DIFFERENT
-     * device is indeterminate — an unmounted volume presents its mountpoint
-     * with the parent filesystem's device — so it must be KEPT (fail closed),
-     * not silently reclaimed with its PUBLISHED provenance. */
-    fill_gpg_record(&record, unmount_repo, FINGERPRINT_A);
-    snprintf(record.config_path, sizeof(record.config_path),
-             "%s/.git/config", unmount_repo);
-    CHECK_EQ_INT(stat(unmount_repo, &st), 0);
-    publication_identity_from_stat(&record.repository, &st);
-    record.repository.device += UINTMAX_C(1); /* different device */
-    record.repository.inode ^= UINTMAX_C(1);
-    CHECK_EQ_INT(publication_ledger_upsert(&ledger, &record), 0);
-
-    /* Dead destination in RETIRING state: retirement recovery owns it. */
-    fill_gpg_record(&record, retiring_repo, FINGERPRINT_A);
-    snprintf(record.config_path, sizeof(record.config_path),
-             "%s/.git/config", retiring_repo);
-    CHECK_EQ_INT(stat(retiring_repo, &st), 0);
-    publication_identity_from_stat(&record.repository, &st);
+    /* A RETIRING global record is an explicit settlement obligation and must
+     * survive the same ambiguous observation. */
+    CHECK_EQ_INT(safe_snprintf(retiring_config, sizeof(retiring_config),
+                               "%s/config", retiring_parent), 0);
+    fill_global_gpg_record(&record, UINT32_C(41), retiring_config,
+                           FINGERPRINT_A);
+    CHECK_EQ_INT(stat(retiring_parent, &st), 0);
+    publication_identity_from_stat(&record.config_parent, &st);
     record.state = PUBLICATION_STATE_RETIRING;
     CHECK_EQ_INT(publication_ledger_upsert(&ledger, &record), 0);
+    probes[3] = ledger.records[ledger.count - 1U];
 
-    CHECK_EQ_INT(rmdir(dead_repo), 0);
-    CHECK_EQ_INT(rmdir(retiring_repo), 0);
+    CHECK_EQ_INT(publication_ledger_serialize(
+                     &ledger, &before, &before_length), 0);
+    CHECK_EQ_INT(rename(repo_anchor, repo_away), 0);
+    CHECK_EQ_INT(rename(local_parent, local_parent_away), 0);
+    CHECK_EQ_INT(rename(global_parent, global_parent_away), 0);
+    CHECK_EQ_INT(rename(retiring_parent, retiring_parent_away), 0);
+
     CHECK(!publication_record_destination_provably_absent(NULL));
-    CHECK(publication_record_destination_provably_absent(&dead_probe));
+    for (size_t i = 0U; i < ledger.count; i++) {
+        CHECK(!publication_record_destination_provably_absent(
+            &ledger.records[i]));
+    }
+    CHECK_EQ_INT((long)publication_ledger_reclaim_absent(&ledger), 0);
+    CHECK_EQ_INT((long)ledger.count, 4);
+    CHECK_EQ_INT(ledger.records[3].state, PUBLICATION_STATE_RETIRING);
+    CHECK_EQ_INT(publication_ledger_serialize(
+                     &ledger, &after, &after_length), 0);
+    CHECK_EQ_INT((long)after_length, (long)before_length);
+    CHECK(before && after &&
+          memcmp(before, after, before_length) == 0);
 
-    /* Reclaimed: dead (deleted on the recorded fs) + same-device mismatch.
-     * Kept: live, the different-device "unmount" mismatch, and RETIRING. */
-    CHECK_EQ_INT((long)publication_ledger_reclaim_absent(&ledger), 2);
-    CHECK_EQ_INT((long)ledger.count, 3);
-    CHECK(!publication_ledger_destination_present(&ledger, &dead_probe));
-    {
-        bool saw_unmount = false;
-        for (size_t i = 0U; i < ledger.count; i++) {
-            CHECK(strstr(ledger.records[i].repository_path,
-                         "ar12-h2-mismatch") == NULL);
-            if (strstr(ledger.records[i].repository_path,
-                       "ar12-h2-unmount") != NULL) {
-                saw_unmount = true;
-            }
-        }
-        CHECK(saw_unmount); /* different-device change failed closed */
+    CHECK_EQ_INT(rename(repo_away, repo_anchor), 0);
+    CHECK_EQ_INT(rename(local_parent_away, local_parent), 0);
+    CHECK_EQ_INT(rename(global_parent_away, global_parent), 0);
+    CHECK_EQ_INT(rename(retiring_parent_away, retiring_parent), 0);
+    for (size_t i = 0U; i < sizeof(probes) / sizeof(probes[0]); i++) {
+        CHECK(publication_ledger_destination_present(&ledger, &probes[i]));
     }
 
+    free(after);
+    free(before);
     publication_ledger_clear(&ledger);
-    (void)rmdir(live_repo);
-    (void)rmdir(mismatch_repo);
-    (void)rmdir(unmount_repo);
+    ts_rm_rf(root);
 }
 
-/* AR-13 L42: R1/R2 made the oracle probe the config_parent anchor too, but the
- * reclaim test above drives only the repository anchor (config_parent left
- * synthetic device=17), so the config_parent ENOENT walk-up had no real
- * coverage. Prove both directions with real captured identities on a
- * config-parent-only (global) record: a parent removed above a surviving
- * same-device ancestor directory is provably DEAD, while an ancestor replaced
- * by a regular file makes the leaf probe fail with ENOTDIR — indeterminate, so
- * the record must be KEPT (fail closed). ENOTDIR is not privilege-bypassable,
- * so this is deterministic on every CI platform including the root FreeBSD VM,
- * unlike a chmod/EACCES construction. */
-TEST(config_parent_anchor_is_dead_on_dir_ancestor_but_fails_closed_on_nondir) {
-    char root[] = "/tmp/ar13-l42-XXXXXX";
-    publication_record_t record;
-    char sub[MAX_PATH_LEN];
-    char leafdir[MAX_PATH_LEN];
-    struct stat st;
-    int fd;
-
-    CHECK(ts_mkdtemp(root) != NULL);
-    CHECK((size_t)snprintf(sub, sizeof(sub), "%s/sub", root) < sizeof(sub));
-    CHECK((size_t)snprintf(leafdir, sizeof(leafdir), "%s/leaf", sub) <
-          sizeof(leafdir));
-    CHECK_EQ_INT(mkdir(sub, 0700), 0);
-    CHECK_EQ_INT(mkdir(leafdir, 0700), 0);
-
-    /* Config-parent-only record: repository anchor cleared so the oracle's
-     * verdict is driven solely by the config_parent walk-up. */
-    fill_gpg_record(&record, "/unused", FINGERPRINT_A);
-    record.scope = PUBLICATION_SCOPE_GLOBAL;
-    record.repository_path[0] = '\0';
-    memset(&record.repository, 0, sizeof(record.repository));
-    CHECK((size_t)snprintf(record.config_path, sizeof(record.config_path),
-                           "%s/config", leafdir) < sizeof(record.config_path));
-    CHECK_EQ_INT(stat(leafdir, &st), 0);
-    publication_identity_from_stat(&record.config_parent, &st);
-
-    /* Parent gone, same-device ancestor directory survives: provably DEAD. */
-    CHECK_EQ_INT(rmdir(leafdir), 0);
-    CHECK(publication_record_destination_provably_absent(&record));
-
-    /* Recreate and re-capture, then replace the <root>/sub ancestor with a
-     * regular file: the leaf lstat now returns ENOTDIR (not ENOENT), which is
-     * indeterminate and must fail closed. */
-    CHECK_EQ_INT(mkdir(leafdir, 0700), 0);
-    CHECK_EQ_INT(stat(leafdir, &st), 0);
-    publication_identity_from_stat(&record.config_parent, &st);
-    CHECK_EQ_INT(rmdir(leafdir), 0);
-    CHECK_EQ_INT(rmdir(sub), 0);
-    fd = open(sub, O_WRONLY | O_CREAT | O_EXCL, 0600);
-    CHECK(fd >= 0);
-    if (fd >= 0) CHECK_EQ_INT(close(fd), 0);
-    CHECK(!publication_record_destination_provably_absent(&record));
-
-    (void)unlink(sub);
-    (void)rmdir(root);
-}
-
-/* AR-13 R2: an in-place .git rebuild (rm -rf .git && git init) changes the
- * .git directory's inode while the worktree root is untouched. The config
- * parent is one of the identities same_destination() compares, so the record
- * can never match again and must be reclaimable. The old oracle probed only
- * the repository anchor for local records, kept such records forever, and
- * would eventually exhaust the 128-slot ledger. */
 /* AR-13 L44: the AR-12 L16/L17 ledger-parse tightenings (named errors for the
  * capability-mask length and the count line; '-' as the ONLY canonical empty
  * spelling for gpg_fingerprint/gpg_selector) had zero coverage. Serialize a
@@ -3534,65 +3512,32 @@ TEST(ledger_parse_rejects_l16_l17_grammar_tightenings) {
     publication_ledger_clear(&source);
 }
 
-TEST(reclaim_absent_drops_local_record_after_in_place_git_rebuild) {
-    publication_ledger_t ledger;
-    publication_record_t record;
-    char repo[] = "/tmp/ar13-r2-repo-XXXXXX";
-    char gitdir[sizeof(repo) + 8];
-    struct stat st;
-
-    CHECK(ts_mkdtemp(repo) != NULL);
-    snprintf(gitdir, sizeof(gitdir), "%s/.git", repo);
-    CHECK_EQ_INT(mkdir(gitdir, 0700), 0);
-    publication_ledger_init(&ledger);
-
-    fill_gpg_record(&record, repo, FINGERPRINT_A);
-    snprintf(record.config_path, sizeof(record.config_path), "%s/.git/config",
-             repo);
-    CHECK_EQ_INT(stat(gitdir, &st), 0);
-    publication_identity_from_stat(&record.config_parent, &st);
-    CHECK_EQ_INT(stat(repo, &st), 0);
-    publication_identity_from_stat(&record.repository, &st);
-    CHECK_EQ_INT(publication_ledger_upsert(&ledger, &record), 0);
-
-    /* All anchors live and matching: not reclaimable. */
-    CHECK(!publication_record_destination_provably_absent(&ledger.records[0]));
-
-    /* An in-place `rm -rf .git && git init` leaves the worktree root untouched
-     * but gives .git a new inode on the SAME filesystem. Simulate that exact
-     * state deterministically by staling only the recorded config_parent inode
-     * (a real rmdir+mkdir can reuse the freed inode on ext4/UFS, leaving the
-     * identity unchanged). The live .git still exists, so the config-parent
-     * anchor reads present-but-different-object on the same device -> provably
-     * dead, while the repository anchor stays live. */
-    ledger.records[0].config_parent.inode ^= UINTMAX_C(1);
-
-    CHECK(publication_record_destination_provably_absent(&ledger.records[0]));
-    CHECK_EQ_INT((long)publication_ledger_reclaim_absent(&ledger), 1);
-    CHECK_EQ_INT((long)ledger.count, 0);
-
-    publication_ledger_clear(&ledger);
-    (void)rmdir(gitdir);
-    (void)rmdir(repo);
-}
-
-/* AR-12 H2: a full 128-record ledger must still admit a switch whose
- * destination already has a record (in-place replacement), and must reclaim
- * provably dead destinations rather than deterministically blocking every
- * new destination for the config's lifetime. */
-TEST(at_capacity_ledger_admits_replacement_and_reclaims_dead_destinations) {
+/* A full ledger still admits an exact destination replacement, but a
+ * genuinely new destination fails before active-state mutation even while a
+ * recorded repository is renamed away and later restored. */
+TEST(at_capacity_ledger_admits_replacement_and_rejects_renamed_reuse) {
     char home[MAX_PATH_LEN];
     char config_path[MAX_PATH_LEN];
     char state_path[MAX_PATH_LEN];
     char git_config_path[MAX_PATH_LEN];
-    char dead_repo[MAX_PATH_LEN];
+    char recorded_repo[MAX_PATH_LEN];
+    char recorded_repo_away[MAX_PATH_LEN];
     char *saved_home = NULL;
     const char *home_before = getenv("HOME");
     gitswitch_ctx_t ctx;
     publication_record_t record;
+    publication_record_t recorded_probe;
     publication_record_t probe;
     publication_ledger_t ledger;
     config_resume_hint_snapshot_t snapshot = {0};
+    unsigned char *before = NULL;
+    unsigned char *after = NULL;
+    unsigned char *model_before = NULL;
+    unsigned char *model_after = NULL;
+    size_t before_length = 0U;
+    size_t after_length = 0U;
+    size_t model_before_length = 0U;
+    size_t model_after_length = 0U;
     struct stat home_stat;
     struct stat repo_stat;
     bool installed = false;
@@ -3608,18 +3553,22 @@ TEST(at_capacity_ledger_admits_replacement_and_reclaims_dead_destinations) {
     fill_active_context(&ctx);
     CHECK_EQ_INT(config_save(&ctx, config_path), 0);
     CHECK_EQ_INT(stat(home, &home_stat), 0);
-    CHECK_EQ_INT(join_path(dead_repo, sizeof(dead_repo), home,
-                           "doomed-repository"), 0);
-    CHECK_EQ_INT(mkdir(dead_repo, 0700), 0);
-    CHECK_EQ_INT(stat(dead_repo, &repo_stat), 0);
+    CHECK_EQ_INT(join_path(recorded_repo, sizeof(recorded_repo), home,
+                           "recorded-repository"), 0);
+    CHECK_EQ_INT(join_path(recorded_repo_away,
+                           sizeof(recorded_repo_away), home,
+                           "recorded-repository-away"), 0);
+    CHECK_EQ_INT(mkdir(recorded_repo, 0700), 0);
+    CHECK_EQ_INT(stat(recorded_repo, &repo_stat), 0);
 
-    /* Record 0 is a local destination in a repository that will later be
-     * deleted; records 1..127 are live global destinations under HOME. */
-    fill_gpg_record(&record, dead_repo, FINGERPRINT_A);
+    /* Record 0 is a local destination whose repository will be renamed;
+     * records 1..127 are global destinations under HOME. */
+    fill_gpg_record(&record, recorded_repo, FINGERPRINT_A);
     CHECK_EQ_INT(safe_snprintf(record.config_path,
                                sizeof(record.config_path),
-                               "%s/.git/config", dead_repo), 0);
+                               "%s/.git/config", recorded_repo), 0);
     publication_identity_from_stat(&record.repository, &repo_stat);
+    recorded_probe = record;
     CHECK_EQ_INT(config_resume_hint_snapshot_capture(&snapshot), 0);
     installed = false;
     CHECK_EQ_INT(
@@ -3655,30 +3604,13 @@ TEST(at_capacity_ledger_admits_replacement_and_reclaims_dead_destinations) {
     CHECK_EQ_INT(config_publication_preflight(config_path), -1);
     CHECK_EQ_INT(errno, ENOSPC);
 
-    /* A destination that already has a record is a replacement. */
+    /* A destination that already has a record remains capacity-neutral through
+     * both preflight and durable save. */
     CHECK_EQ_INT(join_path(git_config_path, sizeof(git_config_path), home,
                            "global-005.gitconfig"), 0);
     fill_global_gpg_record(&probe, UINT32_C(41), git_config_path,
-                           FINGERPRINT_A);
+                           FINGERPRINT_B);
     publication_identity_from_stat(&probe.config_parent, &home_stat);
-    CHECK_EQ_INT(config_publication_preflight_destination(
-                     config_path, &probe), 0);
-
-    /* A genuinely new destination is still refused while every recorded
-     * destination remains alive... */
-    CHECK_EQ_INT(join_path(git_config_path, sizeof(git_config_path), home,
-                           "global-new.gitconfig"), 0);
-    fill_global_gpg_record(&probe, UINT32_C(41), git_config_path,
-                           FINGERPRINT_A);
-    publication_identity_from_stat(&probe.config_parent, &home_stat);
-    errno = 0;
-    CHECK_EQ_INT(config_publication_preflight_destination(
-                     config_path, &probe), -1);
-    CHECK_EQ_INT(errno, ENOSPC);
-
-    /* ...but once a recorded repository is provably gone, both the
-     * preflight and the durable save reclaim it. */
-    CHECK_EQ_INT(rmdir(dead_repo), 0);
     CHECK_EQ_INT(config_publication_preflight_destination(
                      config_path, &probe), 0);
     record = probe;
@@ -3693,12 +3625,67 @@ TEST(at_capacity_ledger_admits_replacement_and_reclaims_dead_destinations) {
     CHECK_EQ_INT(config_load_publication_ledger(config_path, &ledger), 0);
     CHECK_EQ_INT((long)ledger.count,
                  (long)PUBLICATION_LEDGER_MAX_RECORDS);
-    CHECK(publication_ledger_destination_present(&ledger, &probe));
-    for (size_t i = 0U; i < ledger.count; i++) {
-        CHECK(strstr(ledger.records[i].repository_path,
-                     "doomed-repository") == NULL);
-    }
     publication_ledger_clear(&ledger);
+
+    /* A genuinely new destination is still refused while every recorded
+     * destination remains alive... */
+    CHECK_EQ_INT(join_path(git_config_path, sizeof(git_config_path), home,
+                           "global-new.gitconfig"), 0);
+    fill_global_gpg_record(&probe, UINT32_C(41), git_config_path,
+                           FINGERPRINT_A);
+    publication_identity_from_stat(&probe.config_parent, &home_stat);
+    errno = 0;
+    CHECK_EQ_INT(config_publication_preflight_destination(
+                     config_path, &probe), -1);
+    CHECK_EQ_INT(errno, ENOSPC);
+
+    /* Rename-away is observationally identical to deletion. Capacity remains
+     * exhausted, and the durable save must preserve the exact state bytes. */
+    CHECK_EQ_INT(read_file_alloc(state_path, &before, &before_length), 0);
+    CHECK_EQ_INT(rename(recorded_repo, recorded_repo_away), 0);
+    errno = 0;
+    CHECK_EQ_INT(config_publication_preflight_destination(
+                     config_path, &probe), -1);
+    CHECK_EQ_INT(errno, ENOSPC);
+    record = probe;
+    CHECK_EQ_INT(config_resume_hint_snapshot_capture(&snapshot), 0);
+    installed = true;
+    errno = 0;
+    CHECK_EQ_INT(
+        config_save_active_account_publication_transactional_guarded(
+            &ctx, config_path, &record, &installed, &snapshot), -1);
+    CHECK(!installed);
+    CHECK_EQ_INT(errno, ENOSPC);
+    config_resume_hint_snapshot_clear(&snapshot);
+    CHECK_EQ_INT(read_file_alloc(state_path, &after, &after_length), 0);
+    CHECK_EQ_INT((long)after_length, (long)before_length);
+    CHECK(before && after &&
+          memcmp(before, after, before_length) == 0);
+    publication_ledger_init(&ledger);
+    CHECK_EQ_INT(config_load_publication_ledger(config_path, &ledger), 0);
+    CHECK_EQ_INT((long)ledger.count,
+                 (long)PUBLICATION_LEDGER_MAX_RECORDS);
+    CHECK(publication_ledger_destination_present(&ledger, &recorded_probe));
+    CHECK(!publication_ledger_destination_present(&ledger, &probe));
+    CHECK_EQ_INT(publication_ledger_serialize(
+                     &ledger, &model_before, &model_before_length), 0);
+    errno = 0;
+    CHECK_EQ_INT(publication_ledger_upsert(&ledger, &probe), -1);
+    CHECK_EQ_INT(errno, ENOSPC);
+    CHECK_EQ_INT((long)ledger.count,
+                 (long)PUBLICATION_LEDGER_MAX_RECORDS);
+    CHECK_EQ_INT(publication_ledger_serialize(
+                     &ledger, &model_after, &model_after_length), 0);
+    CHECK_EQ_INT((long)model_after_length, (long)model_before_length);
+    CHECK(model_before && model_after &&
+          memcmp(model_before, model_after, model_before_length) == 0);
+    publication_ledger_clear(&ledger);
+    CHECK_EQ_INT(rename(recorded_repo_away, recorded_repo), 0);
+
+    free(model_after);
+    free(model_before);
+    free(after);
+    free(before);
 
     if (saved_home) {
         CHECK_EQ_INT(setenv("HOME", saved_home, 1), 0);
@@ -3745,9 +3732,7 @@ TEST_MAIN_BEGIN()
     RUN_TEST(malformed_publication_never_falls_back_to_legacy_ssh_retirement);
     RUN_TEST(same_numeric_id_different_incarnation_is_never_live_publication_owner);
     RUN_TEST(removed_account_publication_reserves_recycled_id_without_git_mutation);
-    RUN_TEST(reclaim_absent_drops_only_provably_dead_published_records);
-    RUN_TEST(config_parent_anchor_is_dead_on_dir_ancestor_but_fails_closed_on_nondir);
+    RUN_TEST(reclamation_keeps_renamed_published_and_retiring_destinations);
     RUN_TEST(ledger_parse_rejects_l16_l17_grammar_tightenings);
-    RUN_TEST(reclaim_absent_drops_local_record_after_in_place_git_rebuild);
-    RUN_TEST(at_capacity_ledger_admits_replacement_and_reclaims_dead_destinations);
+    RUN_TEST(at_capacity_ledger_admits_replacement_and_rejects_renamed_reuse);
 TEST_MAIN_END()

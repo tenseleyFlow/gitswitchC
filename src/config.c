@@ -8601,15 +8601,16 @@ static int config_update_resume_hint(const gitswitch_ctx_t *ctx,
     }
 
     if (publication) {
-        /* AR-12 H2: an at-capacity ledger only blocks genuinely new
-         * destinations. A replacement never grows the ledger, and before an
-         * append is refused, provably-absent destinations are reclaimed. AR-13
-         * L1: this enforces the same RECORD-count cap the preflight
+        /* An at-capacity ledger blocks only genuinely new destinations. An
+         * exact destination replacement never grows the ledger.  v1 records
+         * are not automatically reclaimed from filesystem observations:
+         * rename-away/restore is indistinguishable from permanent removal.
+         * This enforces the same RECORD-count cap the preflight
          * (config_publication_preflight_check) admits against; it does not
          * re-run the preflight's byte-reserve check here, because the count cap
          * and PUBLICATION_LEDGER_MAX_BYTES are jointly satisfiable (the P4
          * dismissal), so an admitted count can always be serialized. The byte
-         * reserve is a reclamation trigger, not a second post-reclaim gate. */
+         * reserve remains a conservative capacity gate. */
         if (!publication_ledger_destination_present(&publications,
                                                     publication)) {
             bool exhausted =
@@ -8632,7 +8633,11 @@ static int config_update_resume_hint(const gitswitch_ctx_t *ctx,
                 free(trial);
             }
             if (exhausted) {
-                (void)publication_ledger_reclaim_absent(&publications);
+                errno = ENOSPC;
+                set_error(
+                    ERR_CONFIG_INVALID,
+                    "Publication ledger has no capacity for a new destination");
+                goto state_cleanup;
             }
         }
         if (publication_ledger_upsert(&publications, publication) != 0) {
@@ -9849,18 +9854,16 @@ int config_load_publication_ledger(const char *config_path,
                                     ledger);
 }
 
-/* One worst-case record must fit after the upsert. A destination that
- * already has a ledger record is replaced in place, so its existing record
- * is excluded from the simulation; when capacity is still exhausted, the
- * same provably-absent reclamation that the save path performs is simulated
- * before rejecting (AR-12 H2). */
+/* One worst-case record must fit after the upsert. A destination that already
+ * has a ledger record is replaced in place, so its existing record is excluded
+ * from the simulation. v1 records are never reclaimed from observational
+ * filesystem state; exhaustion therefore fails closed with ENOSPC. */
 static int config_publication_preflight_check(
     const char *config_path, const publication_record_t *destination) {
     config_active_state_t state;
     publication_ledger_t ledger;
     unsigned char *serialized = NULL;
     size_t serialized_length = 0U;
-    bool reclaim_attempted = false;
     int result = -1;
 
     if (!config_path) {
@@ -9894,26 +9897,14 @@ static int config_publication_preflight_check(
             ledger.count = kept;
         }
     }
-    for (;;) {
-        if (publication_ledger_serialize(&ledger, &serialized,
-                                         &serialized_length) != 0) {
-            goto cleanup;
-        }
-        if (ledger.count < PUBLICATION_LEDGER_MAX_RECORDS &&
-            CONFIG_PUBLICATION_RECORD_RESERVE <=
-                PUBLICATION_LEDGER_MAX_BYTES &&
-            serialized_length <= PUBLICATION_LEDGER_MAX_BYTES -
-                                     CONFIG_PUBLICATION_RECORD_RESERVE) {
-            break;
-        }
-        secure_zero_memory(serialized, serialized_length);
-        free(serialized);
-        serialized = NULL;
-        serialized_length = 0U;
-        if (!reclaim_attempted) {
-            reclaim_attempted = true;
-            if (publication_ledger_reclaim_absent(&ledger) != 0U) continue;
-        }
+    if (publication_ledger_serialize(&ledger, &serialized,
+                                     &serialized_length) != 0) {
+        goto cleanup;
+    }
+    if (ledger.count >= PUBLICATION_LEDGER_MAX_RECORDS ||
+        CONFIG_PUBLICATION_RECORD_RESERVE > PUBLICATION_LEDGER_MAX_BYTES ||
+        serialized_length > PUBLICATION_LEDGER_MAX_BYTES -
+                                CONFIG_PUBLICATION_RECORD_RESERVE) {
         errno = ENOSPC;
         set_error(ERR_CONFIG_INVALID,
                   "Publication ledger has no capacity for another worst-case record");

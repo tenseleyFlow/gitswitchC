@@ -121,8 +121,11 @@ int publication_record_verify_live_destination(
     const publication_record_t **live_generation);
 bool publication_record_same_destination(const publication_record_t *left,
                                          const publication_record_t *right);
-/* AR-12 H2: capacity reclamation for destinations that provably no longer
- * exist (ENOENT or changed object identity on the recorded anchor). */
+/* Retained for source compatibility with the v1 publication-ledger API.
+ * A live filesystem observation cannot prove that a recorded destination was
+ * permanently deleted: ENOENT and changed identity are both reproducible by
+ * rename-away/restore.  Consequently v1 records are never automatically
+ * classified as absent or reclaimed. */
 bool publication_record_destination_provably_absent(
     const publication_record_t *record);
 size_t publication_ledger_reclaim_absent(publication_ledger_t *ledger);
