@@ -1058,8 +1058,11 @@ static int gpg_bind_executable_if_needed(gpg_config_t *gpg_config) {
     }
     if (gpg_manager_resolve_executable(
             gpg_config->executable_path,
-            sizeof(gpg_config->executable_path)) != 0 ||
-        !run_launch_witness_capture(gpg_config->executable_path,
+            sizeof(gpg_config->executable_path)) != 0) {
+        gpg_config->executable_path[0] = '\0';
+        return -1;
+    }
+    if (!run_launch_witness_capture(gpg_config->executable_path,
                                     &gpg_config->executable_witness)) {
         gpg_config->executable_path[0] = '\0';
         set_error(ERR_GPG_NOT_FOUND,

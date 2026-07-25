@@ -6,6 +6,7 @@
 #include "test.h"
 #include "error.h"
 #include "gpg_manager.h"
+#include "runner_internal.h"
 #include "utils.h"
 
 #include <stdbool.h>
@@ -150,6 +151,10 @@ static int legacy_listing_runner(const char *const argv[],
         memset(result, 0, sizeof(*result));
         result->spawned = true;
         result->exit_code = 0;
+        if (argv && argv[0]) {
+            CHECK(run_launch_witness_capture(
+                argv[0], &result->launch_witness));
+        }
     }
     if (opts && opts->out && opts->out_size > 0) opts->out[0] = '\0';
     CHECK(opts_unsets_environment(opts, "GPG_AGENT_INFO"));

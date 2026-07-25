@@ -10,6 +10,7 @@
 #include "error.h"
 #include "gpg_manager.h"
 #include "publication.h"
+#include "runner_internal.h"
 #include "signals.h"
 #include "ssh_manager.h"
 #include "utils.h"
@@ -49,6 +50,10 @@ static int null_runner(const char *const argv[], const run_opts_t *opts,
     if (result) {
         memset(result, 0, sizeof(*result));
         result->spawned = true;
+        if (argv && argv[0] && argv[0][0] == '/') {
+            CHECK(run_launch_witness_capture(
+                argv[0], &result->launch_witness));
+        }
     }
     return 0;
 }
@@ -125,6 +130,10 @@ static int missing_system_gpg_key_runner(const char *const argv[],
         memset(result, 0, sizeof(*result));
         result->spawned = true;
         result->exit_code = list_secret ? 2 : 0;
+        if (argv && argv[0]) {
+            CHECK(run_launch_witness_capture(
+                argv[0], &result->launch_witness));
+        }
         if (list_secret && opts && opts->out) {
             result->out_len = strlen(opts->out);
         }
@@ -162,6 +171,10 @@ static int present_system_gpg_key_runner(const char *const argv[],
         memset(result, 0, sizeof(*result));
         result->spawned = true;
         result->out_len = strlen(account_system_listing);
+        if (argv && argv[0]) {
+            CHECK(run_launch_witness_capture(
+                argv[0], &result->launch_witness));
+        }
     }
     return 0;
 }
@@ -189,6 +202,10 @@ static int failed_system_gpg_setup_runner(const char *const argv[],
         memset(result, 0, sizeof(*result));
         result->spawned = true;
         result->exit_code = 126;
+        if (argv && argv[0]) {
+            CHECK(run_launch_witness_capture(
+                argv[0], &result->launch_witness));
+        }
     }
     return -1;
 }
@@ -228,6 +245,10 @@ static int health_local_probe_runner(const char *const argv[],
             result->spawned = true;
             result->out_len = copied;
             result->out_truncated = copied < length;
+            if (argv && argv[0]) {
+                CHECK(run_launch_witness_capture(
+                    argv[0], &result->launch_witness));
+            }
         }
     }
     return 0;
@@ -293,6 +314,10 @@ static int health_retained_probe_runner(const char *const argv[],
             result->exit_code = operational_error ? 126 : (missing ? 2 : 0);
             result->out_len = copied;
             result->out_truncated = copied < length;
+            if (argv && argv[0]) {
+                CHECK(run_launch_witness_capture(
+                    argv[0], &result->launch_witness));
+            }
         }
     }
     return missing || operational_error ? -1 : 0;

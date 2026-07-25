@@ -419,16 +419,15 @@ TEST(symlink_targets_and_lookup_to_exec_swap_are_descriptor_pinned) {
     g_hook_result = -1;
     run_test_set_exec_resolved_hook(replace_after_pin);
     const char *argv[] = {helper, "--ar07-exec-probe", NULL};
+    clear_error();
     int rc = run_argv(argv, NULL, &result);
     run_test_set_exec_resolved_hook(NULL);
     CHECK_EQ_INT(g_hook_result, 0);
-    CHECK(result.spawned);
-    /* A rename can update ctime and trigger the exact metadata seal (127), or
-     * descriptor platforms may execute the already-pinned original (0). The
-     * replacement `false` (1) is never an outcome. */
-    CHECK(rc == 0 || rc == -1);
-    CHECK(result.exit_code == 0 || result.exit_code == 127);
-    CHECK(result.exit_code != 1);
+    CHECK_EQ_INT(rc, -1);
+    CHECK(!result.spawned);
+    CHECK_EQ_INT(result.exit_code, -1);
+    CHECK(strstr(get_last_error()->message,
+                 "changed before launch") != NULL);
 
     CHECK_EQ_INT(unlink(helper), 0); /* replacement symlink */
     CHECK_EQ_INT(rename(g_swap_backup, helper), 0);
@@ -454,10 +453,10 @@ TEST(metadata_change_after_pin_fails_before_descriptor_exec) {
     CHECK_EQ_INT(run_argv(argv, NULL, &result), -1);
     run_test_set_exec_resolved_hook(NULL);
     CHECK_EQ_INT(g_hook_result, 0);
-    CHECK(result.spawned);
-    CHECK_EQ_INT(result.exit_code, 127);
+    CHECK(!result.spawned);
+    CHECK_EQ_INT(result.exit_code, -1);
     CHECK(strstr(get_last_error()->message,
-                 "verified descriptor execution failed") != NULL);
+                 "changed before launch") != NULL);
 }
 
 TEST(shebang_env_untrusted_and_recursive_interpreters_are_rejected) {
@@ -670,13 +669,15 @@ TEST(pinned_direct_interpreter_cannot_be_replaced_at_launch) {
     g_hook_result = -1;
     run_test_set_exec_resolved_hook(replace_interpreter_after_pin);
     const char *argv[] = {script, NULL};
+    clear_error();
     int rc = run_argv(argv, NULL, &result);
     run_test_set_exec_resolved_hook(NULL);
     CHECK_EQ_INT(g_hook_result, 0);
-    CHECK(result.spawned);
-    CHECK(rc == 0 || rc == -1);
-    CHECK(result.exit_code == 0 || result.exit_code == 127);
-    CHECK(result.exit_code != 1); /* replacement /bin/false never ran */
+    CHECK_EQ_INT(rc, -1);
+    CHECK(!result.spawned);
+    CHECK_EQ_INT(result.exit_code, -1);
+    CHECK(strstr(get_last_error()->message,
+                 "changed before launch") != NULL);
 
     CHECK_EQ_INT(unlink(interpreter), 0);
     CHECK_EQ_INT(rename(g_swap_backup, interpreter), 0);

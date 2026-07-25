@@ -973,11 +973,12 @@ TEST(post_write_command_override_fails_merged_proof_and_restores_exactly) {
 }
 
 TEST(all_gpg_format_and_program_keys_normalize_and_restore_exactly) {
-    static const char bound_program[] = "/trusted/ar11/transaction-gpg";
     static const char *const scopes[] = {
         "--global", "--local", "--worktree"
     };
     git_fixture_t fixture;
+    char trusted_directory[MAX_PATH_LEN] = "";
+    char bound_program[MAX_PATH_LEN];
     char expected[3][5][1024];
     char actual[1024];
     char value[256];
@@ -985,9 +986,19 @@ TEST(all_gpg_format_and_program_keys_normalize_and_restore_exactly) {
     gpg_config_t gpg_config;
     account_t account;
 
+    if (!ts_mkdtemp_trusted(trusted_directory, sizeof(trusted_directory),
+                            "gsw-ar08-git-transaction") ||
+        safe_snprintf(bound_program, sizeof(bound_program),
+                      "%s/transaction-gpg", trusted_directory) != 0 ||
+        write_text_file(bound_program, "#!/bin/sh\nexit 0\n", 0700) != 0) {
+        CHECK(false);
+        ts_rm_rf(trusted_directory);
+        return;
+    }
     if (!fixture_init(&fixture)) {
         CHECK(false);
         fixture_cleanup(&fixture);
+        ts_rm_rf(trusted_directory);
         return;
     }
     CHECK_EQ_INT(git_set("--local", "extensions.worktreeConfig", "true"), 0);
@@ -1080,6 +1091,7 @@ TEST(all_gpg_format_and_program_keys_normalize_and_restore_exactly) {
     CHECK(strstr(get_last_error()->message, "gpg.format") != NULL);
 
     fixture_cleanup(&fixture);
+    ts_rm_rf(trusted_directory);
 }
 
 TEST(large_unrelated_config_allows_snapshot_switch_status_and_rollback) {

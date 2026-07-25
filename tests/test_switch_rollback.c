@@ -30,6 +30,7 @@
 #include "signals.h"
 #include "ssh_manager.h"
 #include "gpg_manager.h"
+#include "runner_internal.h"
 #include "utils.h"
 #include "error.h"
 #include "scratch_registry_test.h"
@@ -3542,15 +3543,27 @@ static int gpg_git_runner(const char *const argv[], const run_opts_t *opts,
                           run_result_t *result) {
     if (strncmp(ts_command_basename(argv[0]), "gpg", 3) == 0) {
         bool listing = false;
+        bool list_components = false;
         if (result) {
             memset(result, 0, sizeof(*result));
             result->spawned = true;
+            if (!run_launch_witness_capture(
+                    argv[0], &result->launch_witness)) {
+                return -1;
+            }
         }
         if (opts && opts->out && opts->out_size > 0) opts->out[0] = '\0';
         for (int i = 1; argv[i]; i++) {
             if (strcmp(argv[i], "--list-secret-keys") == 0) listing = true;
+            if (strcmp(argv[i], "--list-components") == 0) {
+                list_components = true;
+            }
         }
-        if (listing && opts && opts->out) {
+        if (list_components && opts && opts->out) {
+            snprintf(opts->out, opts->out_size,
+                     "gpg:OpenPGP:%s/gpg:\n", g_gpg_command_dir);
+            if (result) result->out_len = strlen(opts->out);
+        } else if (listing && opts && opts->out) {
             snprintf(opts->out, opts->out_size, "%s", g_gpg_secret_listing);
             if (result) result->out_len = strlen(opts->out);
         }

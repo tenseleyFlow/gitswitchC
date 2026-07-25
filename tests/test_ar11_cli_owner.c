@@ -206,7 +206,14 @@ static const char h5_fake_gpg[] =
 
 static const char h5_fake_gpgconf[] =
     "#!/bin/sh\n"
-    "exit 0\n";
+    "dir=${PATH%%:*}\n"
+    "case \"$1:$2\" in\n"
+    "    --list-components:)\n"
+    "        printf 'gpg:OpenPGP:%s/gpg\\n' \"$dir\"\n"
+    "        ;;\n"
+    "    --reload:gpg-agent) exit 0 ;;\n"
+    "    *) exit 64 ;;\n"
+    "esac\n";
 
 static int redirect_output(const char *path);
 
