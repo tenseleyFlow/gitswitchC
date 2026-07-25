@@ -66,6 +66,15 @@ static int null_runner(const char *const argv[], const run_opts_t *opts,
     return 0;
 }
 
+static size_t g_null_runner_calls;
+
+static int counting_null_runner(const char *const argv[],
+                                const run_opts_t *opts,
+                                run_result_t *result) {
+    g_null_runner_calls++;
+    return null_runner(argv, opts, result);
+}
+
 static const char *extra_env_value(const run_opts_t *opts, const char *prefix) {
     size_t prefix_len = strlen(prefix);
     if (!opts || !opts->extra_env) return NULL;
@@ -299,6 +308,34 @@ static int replace_current_after_reset_capture(int base_fd) {
     return 0;
 }
 
+static const char *g_reset_entry_replacement_name;
+static const char *g_reset_entry_replacement_temp;
+static const char *g_reset_entry_replacement_target;
+static struct stat g_reset_entry_replacement_identity;
+
+static int replace_reset_entry_after_plan_validation(int base_fd) {
+    int saved_errno;
+
+    if (!g_reset_entry_replacement_name ||
+        !g_reset_entry_replacement_temp ||
+        !g_reset_entry_replacement_target ||
+        symlinkat(g_reset_entry_replacement_target, base_fd,
+                  g_reset_entry_replacement_temp) != 0 ||
+        renameat(base_fd, g_reset_entry_replacement_temp, base_fd,
+                 g_reset_entry_replacement_name) != 0 ||
+        fstatat(base_fd, g_reset_entry_replacement_name,
+                &g_reset_entry_replacement_identity,
+                AT_SYMLINK_NOFOLLOW) != 0) {
+        saved_errno = errno;
+        if (g_reset_entry_replacement_temp) {
+            (void)unlinkat(base_fd, g_reset_entry_replacement_temp, 0);
+        }
+        errno = saved_errno;
+        return -1;
+    }
+    return 0;
+}
+
 static const char *g_swap_base;
 static const char *g_swap_moved;
 static const char *g_swap_replacement_home;
@@ -343,6 +380,22 @@ static struct dirent *failing_readdir(DIR *dir) {
     (void)dir;
     errno = EIO;
     return NULL;
+}
+
+static bool g_fail_plan_revalidation_scan;
+
+static struct dirent *fail_armed_plan_revalidation_scan(DIR *dir) {
+    if (g_fail_plan_revalidation_scan) {
+        errno = EIO;
+        return NULL;
+    }
+    return readdir(dir);
+}
+
+static int arm_plan_revalidation_scan_failure(int base_fd) {
+    (void)base_fd;
+    g_fail_plan_revalidation_scan = true;
+    return 0;
 }
 
 TEST(gpg_manager_reset_rejects_empty_selector_without_mutation) {
@@ -826,6 +879,299 @@ TEST(gpg_manager_reset_all_reports_readdir_failure) {
     CHECK(path_exists(marker));
     CHECK_EQ_INT(lstat(current, &st), 0);
     CHECK(S_ISLNK(st.st_mode));
+}
+
+TEST(full_reset_final_scan_failure_preserves_complete_plan) {
+    char xdg[128], base[256], home[320], marker[384], current[320];
+    char rollback[416], publish[416], reset[416], witness[448];
+    struct stat home_before;
+    struct stat marker_before;
+    struct stat current_before;
+    struct stat rollback_before;
+    struct stat publish_before;
+    struct stat reset_before;
+    struct stat witness_before;
+    struct stat observed;
+    command_runner_fn old_runner;
+    gpg_reset_current_hook_fn old_hook;
+    gpg_readdir_fn previous;
+
+    CHECK_EQ_INT(make_xdg(xdg, sizeof(xdg)), 0);
+    snprintf(base, sizeof(base), "%s/gitswitch-gpg", xdg);
+    snprintf(home, sizeof(home), "%s/work", base);
+    snprintf(marker, sizeof(marker), "%s/private.key", home);
+    snprintf(current, sizeof(current), "%s/current", base);
+    snprintf(rollback, sizeof(rollback),
+             "%s/.gitswitch-gpg-rollback.%ld.4000000000000001",
+             base, (long)getpid());
+    snprintf(publish, sizeof(publish),
+             "%s/.gitswitch-gpg-publish.%ld.4000000000000002",
+             base, (long)getpid());
+    snprintf(reset, sizeof(reset),
+             "%s/.gitswitch-gpg-reset.%ld.4000000000000003",
+             base, (long)getpid());
+    snprintf(witness, sizeof(witness), "%s.witness", reset);
+    CHECK_EQ_INT(mkdir(base, 0700), 0);
+    CHECK_EQ_INT(mkdir(home, 0700), 0);
+    CHECK_EQ_INT(touch(marker), 0);
+    CHECK_EQ_INT(symlink(home, current), 0);
+    CHECK_EQ_INT(symlink(home, rollback), 0);
+    CHECK_EQ_INT(symlink(home, publish), 0);
+    CHECK_EQ_INT(symlink(home, reset), 0);
+    CHECK_EQ_INT(link(reset, witness), 0);
+    CHECK_EQ_INT(lstat(home, &home_before), 0);
+    CHECK_EQ_INT(lstat(marker, &marker_before), 0);
+    CHECK_EQ_INT(lstat(current, &current_before), 0);
+    CHECK_EQ_INT(lstat(rollback, &rollback_before), 0);
+    CHECK_EQ_INT(lstat(publish, &publish_before), 0);
+    CHECK_EQ_INT(lstat(reset, &reset_before), 0);
+    CHECK_EQ_INT(lstat(witness, &witness_before), 0);
+
+    g_fail_plan_revalidation_scan = false;
+    g_null_runner_calls = 0U;
+    old_runner = run_set_runner(counting_null_runner);
+    previous = gpg_manager_set_readdir_fn(
+        fail_armed_plan_revalidation_scan);
+    old_hook = gpg_manager_set_reset_current_hook_fn(
+        arm_plan_revalidation_scan_failure);
+    CHECK_EQ_INT(gpg_manager_reset(NULL), -1);
+    gpg_manager_set_reset_current_hook_fn(old_hook);
+    gpg_manager_set_readdir_fn(previous);
+    run_set_runner(old_runner);
+
+    CHECK(g_fail_plan_revalidation_scan);
+    CHECK_EQ_INT(g_null_runner_calls, 0);
+    CHECK_EQ_INT(lstat(home, &observed), 0);
+    CHECK_EQ_INT(observed.st_dev, home_before.st_dev);
+    CHECK_EQ_INT(observed.st_ino, home_before.st_ino);
+    CHECK_EQ_INT(lstat(marker, &observed), 0);
+    CHECK_EQ_INT(observed.st_dev, marker_before.st_dev);
+    CHECK_EQ_INT(observed.st_ino, marker_before.st_ino);
+    CHECK_EQ_INT(lstat(current, &observed), 0);
+    CHECK_EQ_INT(observed.st_dev, current_before.st_dev);
+    CHECK_EQ_INT(observed.st_ino, current_before.st_ino);
+    CHECK_EQ_INT(lstat(rollback, &observed), 0);
+    CHECK_EQ_INT(observed.st_dev, rollback_before.st_dev);
+    CHECK_EQ_INT(observed.st_ino, rollback_before.st_ino);
+    CHECK_EQ_INT(lstat(publish, &observed), 0);
+    CHECK_EQ_INT(observed.st_dev, publish_before.st_dev);
+    CHECK_EQ_INT(observed.st_ino, publish_before.st_ino);
+    CHECK_EQ_INT(lstat(reset, &observed), 0);
+    CHECK_EQ_INT(observed.st_dev, reset_before.st_dev);
+    CHECK_EQ_INT(observed.st_ino, reset_before.st_ino);
+    CHECK_EQ_INT(lstat(witness, &observed), 0);
+    CHECK_EQ_INT(observed.st_dev, witness_before.st_dev);
+    CHECK_EQ_INT(observed.st_ino, witness_before.st_ino);
+    g_fail_plan_revalidation_scan = false;
+}
+
+TEST(full_reset_revalidation_preserves_later_current_and_recovery_plan) {
+    char xdg[128], base[256], current[320], rollback[416];
+    char target[MAX_PATH_LEN];
+    struct stat rollback_before;
+    struct stat observed;
+    ssize_t target_len;
+    command_runner_fn old_runner;
+    gpg_reset_current_hook_fn old_hook;
+
+    CHECK_EQ_INT(make_xdg(xdg, sizeof(xdg)), 0);
+    snprintf(base, sizeof(base), "%s/gitswitch-gpg", xdg);
+    snprintf(current, sizeof(current), "%s/current", base);
+    snprintf(rollback, sizeof(rollback),
+             "%s/.gitswitch-gpg-rollback.%ld.5000000000000001",
+             base, (long)getpid());
+    CHECK_EQ_INT(mkdir(base, 0700), 0);
+    CHECK_EQ_INT(symlink("old-current", current), 0);
+    CHECK_EQ_INT(symlink("retired-rollback", rollback), 0);
+    CHECK_EQ_INT(lstat(rollback, &rollback_before), 0);
+
+    g_reset_replacement_target = "later-current";
+    memset(&g_reset_replacement_identity, 0,
+           sizeof(g_reset_replacement_identity));
+    old_hook = gpg_manager_set_reset_current_hook_fn(
+        replace_current_after_reset_capture);
+    g_null_runner_calls = 0U;
+    old_runner = run_set_runner(counting_null_runner);
+    CHECK_EQ_INT(gpg_manager_reset(NULL), -1);
+    run_set_runner(old_runner);
+    gpg_manager_set_reset_current_hook_fn(old_hook);
+
+    CHECK_EQ_INT(g_null_runner_calls, 0);
+    CHECK_EQ_INT(lstat(current, &observed), 0);
+    CHECK_EQ_INT(observed.st_dev, g_reset_replacement_identity.st_dev);
+    CHECK_EQ_INT(observed.st_ino, g_reset_replacement_identity.st_ino);
+    target_len = readlink(current, target, sizeof(target) - 1U);
+    CHECK(target_len > 0);
+    if (target_len > 0) {
+        target[target_len] = '\0';
+        CHECK_STR_EQ(target, "later-current");
+    }
+    CHECK_EQ_INT(lstat(rollback, &observed), 0);
+    CHECK_EQ_INT(observed.st_dev, rollback_before.st_dev);
+    CHECK_EQ_INT(observed.st_ino, rollback_before.st_ino);
+    g_reset_replacement_target = NULL;
+}
+
+TEST(full_reset_revalidation_preserves_later_recovery_entry) {
+    char xdg[128], base[256], current[320], rollback[416];
+    char target[MAX_PATH_LEN];
+    struct stat current_before;
+    struct stat observed;
+    ssize_t target_len;
+    command_runner_fn old_runner;
+    gpg_reset_current_hook_fn old_hook;
+
+    CHECK_EQ_INT(make_xdg(xdg, sizeof(xdg)), 0);
+    snprintf(base, sizeof(base), "%s/gitswitch-gpg", xdg);
+    snprintf(current, sizeof(current), "%s/current", base);
+    snprintf(rollback, sizeof(rollback),
+             "%s/.gitswitch-gpg-rollback.%ld.5000000000000002",
+             base, (long)getpid());
+    CHECK_EQ_INT(mkdir(base, 0700), 0);
+    CHECK_EQ_INT(symlink("old-current", current), 0);
+    CHECK_EQ_INT(symlink("old-rollback", rollback), 0);
+    CHECK_EQ_INT(lstat(current, &current_before), 0);
+
+    g_reset_entry_replacement_name = strrchr(rollback, '/');
+    CHECK(g_reset_entry_replacement_name != NULL);
+    if (g_reset_entry_replacement_name) {
+        g_reset_entry_replacement_name++;
+    }
+    g_reset_entry_replacement_temp = ".replacement-under-validation";
+    g_reset_entry_replacement_target = "later-rollback";
+    memset(&g_reset_entry_replacement_identity, 0,
+           sizeof(g_reset_entry_replacement_identity));
+    old_hook = gpg_manager_set_reset_current_hook_fn(
+        replace_reset_entry_after_plan_validation);
+    g_null_runner_calls = 0U;
+    old_runner = run_set_runner(counting_null_runner);
+    CHECK_EQ_INT(gpg_manager_reset(NULL), -1);
+    run_set_runner(old_runner);
+    gpg_manager_set_reset_current_hook_fn(old_hook);
+
+    CHECK_EQ_INT(g_null_runner_calls, 0);
+    CHECK_EQ_INT(lstat(current, &observed), 0);
+    CHECK_EQ_INT(observed.st_dev, current_before.st_dev);
+    CHECK_EQ_INT(observed.st_ino, current_before.st_ino);
+    CHECK_EQ_INT(lstat(rollback, &observed), 0);
+    CHECK_EQ_INT(observed.st_dev,
+                 g_reset_entry_replacement_identity.st_dev);
+    CHECK_EQ_INT(observed.st_ino,
+                 g_reset_entry_replacement_identity.st_ino);
+    target_len = readlink(rollback, target, sizeof(target) - 1U);
+    CHECK(target_len > 0);
+    if (target_len > 0) {
+        target[target_len] = '\0';
+        CHECK_STR_EQ(target, "later-rollback");
+    }
+    g_reset_entry_replacement_name = NULL;
+    g_reset_entry_replacement_temp = NULL;
+    g_reset_entry_replacement_target = NULL;
+}
+
+TEST(full_reset_forward_quarantine_sync_failure_is_retryable) {
+    char xdg[128], base[256], current[320];
+    char candidate[416], witness[416], quarantine[416];
+    struct stat st;
+    gpg_sync_base_fn old_sync;
+
+    CHECK_EQ_INT(make_xdg(xdg, sizeof(xdg)), 0);
+    snprintf(base, sizeof(base), "%s/gitswitch-gpg", xdg);
+    snprintf(current, sizeof(current), "%s/current", base);
+    snprintf(candidate, sizeof(candidate),
+             "%s/.gitswitch-gpg-forward.%ld.6000000000000001.p",
+             base, (long)getpid());
+    snprintf(witness, sizeof(witness),
+             "%s/.gitswitch-gpg-forward.%ld.6000000000000001.w",
+             base, (long)getpid());
+    snprintf(quarantine, sizeof(quarantine),
+             "%s/.gitswitch-gpg-forward.%ld.6000000000000001.q",
+             base, (long)getpid());
+    CHECK_EQ_INT(mkdir(base, 0700), 0);
+    CHECK_EQ_INT(symlink("candidate", candidate), 0);
+    CHECK_EQ_INT(symlink("expected", witness), 0);
+    CHECK_EQ_INT(link(witness, quarantine), 0);
+    CHECK(lstat(current, &st) != 0 && errno == ENOENT);
+
+    g_reset_sync_calls = 0;
+    g_fail_reset_sync = true;
+    old_sync = gpg_manager_set_sync_base_fn(record_reset_sync);
+    CHECK_EQ_INT(gpg_manager_reset(NULL), -1);
+    CHECK_EQ_INT(g_reset_sync_calls, 1);
+    CHECK_EQ_INT(lstat(candidate, &st), 0);
+    CHECK_EQ_INT(lstat(witness, &st), 0);
+    CHECK(lstat(quarantine, &st) != 0 && errno == ENOENT);
+    CHECK(lstat(current, &st) != 0 && errno == ENOENT);
+
+    g_fail_reset_sync = false;
+    CHECK_EQ_INT(gpg_manager_reset(NULL), 0);
+    CHECK_EQ_INT(g_reset_sync_calls, 4);
+    gpg_manager_set_sync_base_fn(old_sync);
+    CHECK(lstat(candidate, &st) != 0 && errno == ENOENT);
+    CHECK(lstat(witness, &st) != 0 && errno == ENOENT);
+    CHECK(lstat(quarantine, &st) != 0 && errno == ENOENT);
+    CHECK(lstat(current, &st) != 0 && errno == ENOENT);
+}
+
+TEST(full_reset_accepts_displaced_forward_writer_state) {
+    char xdg[128], base[256], current[320];
+    char candidate_home[320], expected_home[320], displaced_home[320];
+    char candidate_marker[384], expected_marker[384], displaced_marker[384];
+    char candidate[416], witness[416], quarantine[416];
+    struct stat witness_identity;
+    struct stat quarantine_identity;
+    struct stat st;
+    command_runner_fn old_runner;
+
+    CHECK_EQ_INT(make_xdg(xdg, sizeof(xdg)), 0);
+    snprintf(base, sizeof(base), "%s/gitswitch-gpg", xdg);
+    snprintf(current, sizeof(current), "%s/current", base);
+    snprintf(candidate_home, sizeof(candidate_home), "%s/candidate", base);
+    snprintf(expected_home, sizeof(expected_home), "%s/expected", base);
+    snprintf(displaced_home, sizeof(displaced_home), "%s/displaced", base);
+    snprintf(candidate_marker, sizeof(candidate_marker),
+             "%s/private.key", candidate_home);
+    snprintf(expected_marker, sizeof(expected_marker),
+             "%s/private.key", expected_home);
+    snprintf(displaced_marker, sizeof(displaced_marker),
+             "%s/private.key", displaced_home);
+    snprintf(candidate, sizeof(candidate),
+             "%s/.gitswitch-gpg-forward.%ld.6000000000000002.p",
+             base, (long)getpid());
+    snprintf(witness, sizeof(witness),
+             "%s/.gitswitch-gpg-forward.%ld.6000000000000002.w",
+             base, (long)getpid());
+    snprintf(quarantine, sizeof(quarantine),
+             "%s/.gitswitch-gpg-forward.%ld.6000000000000002.q",
+             base, (long)getpid());
+    CHECK_EQ_INT(mkdir(base, 0700), 0);
+    CHECK_EQ_INT(mkdir(candidate_home, 0700), 0);
+    CHECK_EQ_INT(mkdir(expected_home, 0700), 0);
+    CHECK_EQ_INT(mkdir(displaced_home, 0700), 0);
+    CHECK_EQ_INT(touch(candidate_marker), 0);
+    CHECK_EQ_INT(touch(expected_marker), 0);
+    CHECK_EQ_INT(touch(displaced_marker), 0);
+    CHECK_EQ_INT(symlink(candidate_home, candidate), 0);
+    CHECK_EQ_INT(symlink(expected_home, witness), 0);
+    CHECK_EQ_INT(symlink(displaced_home, quarantine), 0);
+    CHECK_EQ_INT(lstat(witness, &witness_identity), 0);
+    CHECK_EQ_INT(lstat(quarantine, &quarantine_identity), 0);
+    CHECK(witness_identity.st_dev != quarantine_identity.st_dev ||
+          witness_identity.st_ino != quarantine_identity.st_ino);
+    CHECK(lstat(current, &st) != 0 && errno == ENOENT);
+
+    g_null_runner_calls = 0U;
+    old_runner = run_set_runner(counting_null_runner);
+    CHECK_EQ_INT(gpg_manager_reset(NULL), 0);
+    run_set_runner(old_runner);
+    CHECK_EQ_INT(g_null_runner_calls, 3);
+    CHECK(lstat(candidate_home, &st) != 0 && errno == ENOENT);
+    CHECK(lstat(expected_home, &st) != 0 && errno == ENOENT);
+    CHECK(lstat(displaced_home, &st) != 0 && errno == ENOENT);
+    CHECK(lstat(candidate, &st) != 0 && errno == ENOENT);
+    CHECK(lstat(witness, &st) != 0 && errno == ENOENT);
+    CHECK(lstat(quarantine, &st) != 0 && errno == ENOENT);
+    CHECK(lstat(current, &st) != 0 && errno == ENOENT);
 }
 
 TEST(gpg_manager_reset_reports_stable_link_cleanup_failure) {
@@ -1323,6 +1669,11 @@ TEST_MAIN_BEGIN()
     RUN_TEST(gpg_manager_reset_all_aggregates_failures_and_continues);
     RUN_TEST(gpg_manager_reset_all_retains_first_structured_cause);
     RUN_TEST(gpg_manager_reset_all_reports_readdir_failure);
+    RUN_TEST(full_reset_final_scan_failure_preserves_complete_plan);
+    RUN_TEST(full_reset_revalidation_preserves_later_current_and_recovery_plan);
+    RUN_TEST(full_reset_revalidation_preserves_later_recovery_entry);
+    RUN_TEST(full_reset_forward_quarantine_sync_failure_is_retryable);
+    RUN_TEST(full_reset_accepts_displaced_forward_writer_state);
     RUN_TEST(gpg_manager_reset_reports_stable_link_cleanup_failure);
     RUN_TEST(gpg_manager_reset_all_drops_external_live_target);
     RUN_TEST(gpg_manager_targeted_reset_drops_external_current_target);

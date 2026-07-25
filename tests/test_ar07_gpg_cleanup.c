@@ -226,6 +226,18 @@ static bool base_contains_only_lock(const char *base) {
     return saw_lock;
 }
 
+static bool path_has_identity(const char *path,
+                              const struct stat *expected) {
+    struct stat observed;
+
+    return path && expected && lstat(path, &observed) == 0 &&
+           observed.st_dev == expected->st_dev &&
+           observed.st_ino == expected->st_ino &&
+           observed.st_mode == expected->st_mode &&
+           observed.st_uid == expected->st_uid &&
+           observed.st_size == expected->st_size;
+}
+
 static bool has_agent_conf_scratch(const char *home) {
     static const char prefix[] = ".gpg-agent.conf.gitswitch.";
     DIR *dir = opendir(home);
@@ -394,7 +406,8 @@ TEST(full_reset_rejects_every_unknown_base_entry_before_deletion) {
     snprintf(hidden_link, sizeof(hidden_link), "%s/.hidden-link", base);
     snprintf(stray, sizeof(stray), "%s/stray", base);
     snprintf(publish, sizeof(publish),
-             "%s/.gitswitch-gpg-publish.interrupted", base);
+             "%s/.gitswitch-gpg-publish.%ld.0123456789abcdef",
+             base, (long)getpid());
     CHECK_EQ_INT(make_file(marker, "secret\n"), 0);
     CHECK_EQ_INT(symlink(home, current), 0);
     CHECK_EQ_INT(make_file(orphan, "unknown\n"), 0);
@@ -499,7 +512,8 @@ TEST(full_reset_fails_closed_on_unwitnessed_reset_quarantine) {
     CHECK_EQ_INT(symlink(home, current), 0);
 
     snprintf(residue, sizeof(residue),
-             "%s/.gitswitch-gpg-reset.1.0123456789abcdef", base);
+             "%s/.gitswitch-gpg-reset.%ld.0123456789abcdef",
+             base, (long)getpid());
     CHECK_EQ_INT(symlink(home, residue), 0);
     previous = run_set_runner(recording_null_runner);
     CHECK_EQ_INT(gpg_manager_reset(NULL), -1);
@@ -509,6 +523,203 @@ TEST(full_reset_fails_closed_on_unwitnessed_reset_quarantine) {
     CHECK(lstat(residue, &(struct stat){0}) == 0); /* residue preserved */
     CHECK(path_exists(marker));                    /* nothing destroyed */
     CHECK_EQ_INT(unlink(residue), 0);
+}
+
+TEST(full_reset_preflight_preserves_every_planned_entry_on_home_blocker) {
+    char xdg[128], base[256], home[320], marker[384], outside[256];
+    char current[320], rollback[416], publish[416], reset[416];
+    char reset_witness[448], forward_p[416], forward_w[416], forward_q[416];
+    const char *paths[8];
+    struct stat identities[8];
+    command_runner_fn previous;
+
+    CHECK_EQ_INT(make_home(xdg, sizeof(xdg), base, sizeof(base),
+                           home, sizeof(home), "work"), 0);
+    snprintf(marker, sizeof(marker), "%s/private.key", home);
+    snprintf(outside, sizeof(outside), "%s/external-hardlink", xdg);
+    snprintf(current, sizeof(current), "%s/current", base);
+    snprintf(rollback, sizeof(rollback),
+             "%s/.gitswitch-gpg-rollback.%ld.1000000000000001",
+             base, (long)getpid());
+    snprintf(publish, sizeof(publish),
+             "%s/.gitswitch-gpg-publish.%ld.1000000000000002",
+             base, (long)getpid());
+    snprintf(reset, sizeof(reset),
+             "%s/.gitswitch-gpg-reset.%ld.1000000000000003",
+             base, (long)getpid());
+    snprintf(reset_witness, sizeof(reset_witness), "%s.witness", reset);
+    snprintf(forward_p, sizeof(forward_p),
+             "%s/.gitswitch-gpg-forward.%ld.1000000000000004.p",
+             base, (long)getpid());
+    snprintf(forward_w, sizeof(forward_w),
+             "%s/.gitswitch-gpg-forward.%ld.1000000000000004.w",
+             base, (long)getpid());
+    snprintf(forward_q, sizeof(forward_q),
+             "%s/.gitswitch-gpg-forward.%ld.1000000000000004.q",
+             base, (long)getpid());
+    CHECK_EQ_INT(make_file(marker, "secret\n"), 0);
+    CHECK_EQ_INT(link(marker, outside), 0);
+    CHECK_EQ_INT(symlink(home, current), 0);
+    CHECK_EQ_INT(symlink(home, rollback), 0);
+    CHECK_EQ_INT(symlink(home, publish), 0);
+    CHECK_EQ_INT(symlink(home, reset), 0);
+    CHECK_EQ_INT(link(reset, reset_witness), 0);
+    CHECK_EQ_INT(symlink(home, forward_p), 0);
+    CHECK_EQ_INT(symlink(home, forward_w), 0);
+    CHECK_EQ_INT(link(forward_w, forward_q), 0);
+
+    paths[0] = current;
+    paths[1] = rollback;
+    paths[2] = publish;
+    paths[3] = reset;
+    paths[4] = reset_witness;
+    paths[5] = forward_p;
+    paths[6] = forward_w;
+    paths[7] = forward_q;
+    for (size_t i = 0; i < 8U; i++) {
+        CHECK_EQ_INT(lstat(paths[i], &identities[i]), 0);
+    }
+
+    g_runner_calls = 0;
+    previous = run_set_runner(recording_null_runner);
+    CHECK_EQ_INT(gpg_manager_reset(NULL), -1);
+    run_set_runner(previous);
+
+    CHECK_EQ_INT(g_runner_calls, 0);
+    CHECK(path_exists(marker));
+    CHECK(path_exists(outside));
+    for (size_t i = 0; i < 8U; i++) {
+        CHECK(path_has_identity(paths[i], &identities[i]));
+    }
+    CHECK_EQ_INT(unlink(outside), 0);
+}
+
+TEST(full_reset_preflight_rejects_mixed_invalid_recovery_without_retirement) {
+    char xdg[128], base[256], home[320], marker[384], current[320];
+    char eligible[416], malformed[416], live[416], reset[416];
+    char reset_witness[448];
+    struct stat eligible_identity;
+    struct stat invalid_identity;
+    struct stat witness_identity;
+    command_runner_fn previous;
+
+    CHECK_EQ_INT(make_home(xdg, sizeof(xdg), base, sizeof(base),
+                           home, sizeof(home), "work"), 0);
+    snprintf(marker, sizeof(marker), "%s/private.key", home);
+    snprintf(current, sizeof(current), "%s/current", base);
+    snprintf(eligible, sizeof(eligible),
+             "%s/.gitswitch-gpg-rollback.%ld.2000000000000001",
+             base, (long)getpid());
+    snprintf(malformed, sizeof(malformed),
+             "%s/.gitswitch-gpg-publish.interrupted", base);
+    CHECK_EQ_INT(make_file(marker, "secret\n"), 0);
+    CHECK_EQ_INT(symlink(home, current), 0);
+    CHECK_EQ_INT(symlink(home, eligible), 0);
+    CHECK_EQ_INT(symlink(home, malformed), 0);
+    CHECK_EQ_INT(lstat(eligible, &eligible_identity), 0);
+    CHECK_EQ_INT(lstat(malformed, &invalid_identity), 0);
+
+    g_runner_calls = 0;
+    previous = run_set_runner(recording_null_runner);
+    CHECK_EQ_INT(gpg_manager_reset(NULL), -1);
+    CHECK_EQ_INT(g_runner_calls, 0);
+    CHECK(path_has_identity(eligible, &eligible_identity));
+    CHECK(path_has_identity(malformed, &invalid_identity));
+    CHECK(path_exists(marker));
+    CHECK_EQ_INT(unlink(malformed), 0);
+
+    snprintf(live, sizeof(live),
+             "%s/.gitswitch-gpg-publish.1.2000000000000002", base);
+    CHECK_EQ_INT(symlink(home, live), 0);
+    CHECK_EQ_INT(lstat(live, &invalid_identity), 0);
+    CHECK_EQ_INT(gpg_manager_reset(NULL), -1);
+    CHECK_EQ_INT(g_runner_calls, 0);
+    CHECK(path_has_identity(eligible, &eligible_identity));
+    CHECK(path_has_identity(live, &invalid_identity));
+    CHECK(path_exists(marker));
+    CHECK_EQ_INT(unlink(live), 0);
+
+    snprintf(reset, sizeof(reset),
+             "%s/.gitswitch-gpg-reset.%ld.2000000000000003",
+             base, (long)getpid());
+    snprintf(reset_witness, sizeof(reset_witness), "%s.witness", reset);
+    CHECK_EQ_INT(symlink(home, reset), 0);
+    CHECK_EQ_INT(symlink(home, reset_witness), 0);
+    CHECK_EQ_INT(lstat(reset, &invalid_identity), 0);
+    CHECK_EQ_INT(lstat(reset_witness, &witness_identity), 0);
+    CHECK_EQ_INT(gpg_manager_reset(NULL), -1);
+    run_set_runner(previous);
+    CHECK_EQ_INT(g_runner_calls, 0);
+    CHECK(path_has_identity(eligible, &eligible_identity));
+    CHECK(path_has_identity(reset, &invalid_identity));
+    CHECK(path_has_identity(reset_witness, &witness_identity));
+    CHECK(path_exists(marker));
+}
+
+TEST(full_reset_applies_valid_full_and_recovery_only_plans) {
+    char xdg[128], base[256], home[320], marker[384], current[320];
+    char rollback[416], publish[416], reset[416], reset_witness[448];
+    char forward_p[416], forward_w[416], forward_q[416];
+    command_runner_fn previous;
+
+    CHECK_EQ_INT(make_home(xdg, sizeof(xdg), base, sizeof(base),
+                           home, sizeof(home), "work"), 0);
+    snprintf(marker, sizeof(marker), "%s/private.key", home);
+    snprintf(current, sizeof(current), "%s/current", base);
+    snprintf(rollback, sizeof(rollback),
+             "%s/.gitswitch-gpg-rollback.%ld.3000000000000001",
+             base, (long)getpid());
+    snprintf(publish, sizeof(publish),
+             "%s/.gitswitch-gpg-publish.%ld.3000000000000002",
+             base, (long)getpid());
+    snprintf(reset, sizeof(reset),
+             "%s/.gitswitch-gpg-reset.%ld.3000000000000003",
+             base, (long)getpid());
+    snprintf(reset_witness, sizeof(reset_witness), "%s.witness", reset);
+    snprintf(forward_p, sizeof(forward_p),
+             "%s/.gitswitch-gpg-forward.%ld.3000000000000004.p",
+             base, (long)getpid());
+    snprintf(forward_w, sizeof(forward_w),
+             "%s/.gitswitch-gpg-forward.%ld.3000000000000004.w",
+             base, (long)getpid());
+    snprintf(forward_q, sizeof(forward_q),
+             "%s/.gitswitch-gpg-forward.%ld.3000000000000004.q",
+             base, (long)getpid());
+    CHECK_EQ_INT(make_file(marker, "secret\n"), 0);
+    CHECK_EQ_INT(symlink(home, current), 0);
+    CHECK_EQ_INT(symlink(home, rollback), 0);
+    CHECK_EQ_INT(symlink(home, publish), 0);
+    CHECK_EQ_INT(symlink(home, reset), 0);
+    CHECK_EQ_INT(link(reset, reset_witness), 0);
+    CHECK_EQ_INT(symlink(home, forward_p), 0);
+    CHECK_EQ_INT(symlink(home, forward_w), 0);
+    CHECK_EQ_INT(link(forward_w, forward_q), 0);
+
+    g_runner_calls = 0;
+    previous = run_set_runner(recording_null_runner);
+    CHECK_EQ_INT(gpg_manager_reset(NULL), 0);
+    CHECK_EQ_INT(g_runner_calls, 1);
+    CHECK(base_contains_only_lock(base));
+
+    /* Recovery-only reductions are also planned and retired without launching
+     * an agent: witness-only reset and candidate-only forward are both durable
+     * cleanup tails, while the rollback symlink is an owned crash orphan. */
+    snprintf(rollback, sizeof(rollback),
+             "%s/.gitswitch-gpg-rollback.%ld.3000000000000005",
+             base, (long)getpid());
+    snprintf(reset_witness, sizeof(reset_witness),
+             "%s/.gitswitch-gpg-reset.%ld.3000000000000006.witness",
+             base, (long)getpid());
+    snprintf(forward_p, sizeof(forward_p),
+             "%s/.gitswitch-gpg-forward.%ld.3000000000000007.p",
+             base, (long)getpid());
+    CHECK_EQ_INT(symlink("retired-rollback", rollback), 0);
+    CHECK_EQ_INT(symlink("retired-reset-witness", reset_witness), 0);
+    CHECK_EQ_INT(symlink("retired-forward-candidate", forward_p), 0);
+    CHECK_EQ_INT(gpg_manager_reset(NULL), 0);
+    run_set_runner(previous);
+    CHECK_EQ_INT(g_runner_calls, 1);
+    CHECK(base_contains_only_lock(base));
 }
 
 /* AR-13 L34 / AR-12 P3: the removal walk is depth-bounded (each frame holds a
@@ -1157,6 +1368,9 @@ TEST_MAIN_BEGIN()
     RUN_TEST(full_reset_rejects_every_unknown_base_entry_before_deletion);
     RUN_TEST(full_reset_refuses_live_owned_quarantine_but_retires_own);
     RUN_TEST(full_reset_fails_closed_on_unwitnessed_reset_quarantine);
+    RUN_TEST(full_reset_preflight_preserves_every_planned_entry_on_home_blocker);
+    RUN_TEST(full_reset_preflight_rejects_mixed_invalid_recovery_without_retirement);
+    RUN_TEST(full_reset_applies_valid_full_and_recovery_only_plans);
     RUN_TEST(reset_walk_refuses_adversarially_deep_home);
     RUN_TEST(final_enumeration_catches_late_unknown_survivor);
 #ifdef __linux__

@@ -1899,134 +1899,6 @@ static int gpg_reject_stale_quarantines_locked(int base_fd,
     return 0;
 }
 
-/* AR-12 L11: a SIGKILL/power loss between quarantine creation and its
- * unlink orphans a .gitswitch-gpg-rollback.* / .gitswitch-gpg-publish.*
- * symlink with no in-memory token, and the stale-quarantine gate then
- * blocks every switch, drop, AND reset forever. Full reset deletes every
- * managed home anyway, so an owned orphaned quarantine SYMLINK preserves
- * nothing — retire it. Anything that is not an owned symlink stays fatal. */
-static int gpg_retire_orphan_quarantines_locked(int base_fd) {
-    int scan_flags = O_RDONLY | O_CLOEXEC;
-    int scan_fd;
-    DIR *dir;
-    struct dirent *entry;
-
-#ifdef O_DIRECTORY
-    scan_flags |= O_DIRECTORY;
-#endif
-#ifdef O_NOFOLLOW
-    scan_flags |= O_NOFOLLOW;
-#endif
-    scan_fd = openat(base_fd, ".", scan_flags);
-    if (scan_fd < 0 || !(dir = fdopendir(scan_fd))) {
-        if (scan_fd >= 0) close(scan_fd);
-        set_system_error(ERR_FILE_IO,
-                         "Cannot inspect GPG quarantine residue");
-        return -1;
-    }
-    for (;;) {
-        struct stat orphan;
-
-        errno = 0;
-        entry = readdir(dir);
-        if (!entry) {
-            if (errno != 0) {
-                int saved_errno = errno;
-                closedir(dir);
-                errno = saved_errno;
-                set_system_error(ERR_FILE_IO,
-                                 "Cannot enumerate GPG quarantine residue");
-                return -1;
-            }
-            break;
-        }
-        /* AR-13 L4: also retire orphaned reset-prefix residue. Full reset runs
-         * gpg_reconcile_reset_retry_locked first (and fails closed if it does
-         * not succeed), which retires every VALID witnessed reset retry, so any
-         * reset-prefix name still present here is a malformed or unwitnessed
-         * orphan — previously it had no auto-clear path and bricked switch,
-         * drop AND reset via the stale-quarantine gate. The S_ISLNK/uid gate
-         * and the live-owner (pid) guard below apply to it exactly as to the
-         * rollback/publish residue. */
-        if (!gpg_name_has_prefix(entry->d_name, GPG_ROLLBACK_PREFIX) &&
-            !gpg_name_has_prefix(entry->d_name, GPG_PUBLISH_PREFIX) &&
-            !gpg_name_has_prefix(entry->d_name, GPG_RESET_PREFIX)) {
-            continue;
-        }
-        if (fstatat(base_fd, entry->d_name, &orphan,
-                    AT_SYMLINK_NOFOLLOW) != 0) {
-            if (errno == ENOENT) continue;
-            set_system_error(ERR_FILE_IO,
-                             "Cannot inspect GPG quarantine residue: %s",
-                             entry->d_name);
-            closedir(dir);
-            return -1;
-        }
-        if (!S_ISLNK(orphan.st_mode) || orphan.st_uid != getuid()) {
-            set_error(ERR_PERMISSION_DENIED,
-                      "Refusing foreign GPG quarantine residue: %s",
-                      entry->d_name);
-            closedir(dir);
-            return -1;
-        }
-        /* AR-13 M8: a quarantine name is {prefix}{pid}.{16-hex}. If that pid is
-         * a DIFFERENT still-live process of ours, this is not a crash orphan
-         * but the live retry handle of a concurrent gitswitch (a rollback token
-         * retained across lock releases after an I/O/hook failure). Retiring it
-         * here — before the destructive pass, and even if the all-or-nothing
-         * preflight later aborts and deletes nothing else — would strand that
-         * owner's recovery. Fail the reset instead of deleting live-owned state;
-         * the user can retry once the other process completes. A genuine crash
-         * orphan has a dead pid (kill -> ESRCH), and this process's own residue
-         * (pid == getpid()) is still cleared, so L11's wedge-clearing holds. */
-        {
-            const char *pid_str = entry->d_name +
-                (gpg_name_has_prefix(entry->d_name, GPG_ROLLBACK_PREFIX)
-                     ? strlen(GPG_ROLLBACK_PREFIX)
-                 : gpg_name_has_prefix(entry->d_name, GPG_PUBLISH_PREFIX)
-                     ? strlen(GPG_PUBLISH_PREFIX)
-                     : strlen(GPG_RESET_PREFIX));
-
-            if (*pid_str >= '1' && *pid_str <= '9') {
-                long pid = 0;
-                bool parsed = true;
-
-                for (; *pid_str && *pid_str != '.'; pid_str++) {
-                    if (!isdigit((unsigned char)*pid_str) ||
-                        pid > (LONG_MAX - 9) / 10) {
-                        parsed = false;
-                        break;
-                    }
-                    pid = pid * 10 + (*pid_str - '0');
-                }
-                if (parsed && pid > 0 && (pid_t)pid != getpid()) {
-                    errno = 0;
-                    if (kill((pid_t)pid, 0) == 0 || errno == EPERM) {
-                        set_error(ERR_FILE_IO,
-                                  "Refusing to retire a GPG quarantine held by "
-                                  "a live gitswitch process (pid %ld): %s; "
-                                  "retry reset after it completes",
-                                  pid, entry->d_name);
-                        closedir(dir);
-                        return -1;
-                    }
-                }
-            }
-        }
-        if (unlinkat(base_fd, entry->d_name, 0) != 0 && errno != ENOENT) {
-            set_system_error(ERR_FILE_IO,
-                             "Cannot retire orphaned GPG quarantine: %s",
-                             entry->d_name);
-            closedir(dir);
-            return -1;
-        }
-        log_warning("Retired orphaned GPG quarantine residue: %s",
-                    entry->d_name);
-    }
-    closedir(dir);
-    return 0;
-}
-
 static int gpg_make_private_name(char *name, size_t size,
                                  const char *prefix) {
     char random[17];
@@ -2070,6 +1942,52 @@ static bool gpg_valid_private_name(const char *name, const char *prefix) {
         if (!strchr("0123456789abcdef", random[i])) return false;
     }
     return true;
+}
+
+/* Private runtime names bind recovery ownership to the process that created
+ * them. A different still-live owner may hold in-memory settlement state even
+ * after releasing the base lock, so full reset must preserve its names. */
+static int gpg_private_name_owner_is_live(const char *name,
+                                          const char *prefix,
+                                          bool *live) {
+    const char *cursor;
+    uintmax_t value = 0U;
+    pid_t pid;
+
+    if (!name || !prefix || !live ||
+        !gpg_valid_private_name(name, prefix)) {
+        set_error(ERR_INVALID_ARGS, "Invalid GPG private runtime name");
+        return -1;
+    }
+    *live = false;
+    cursor = name + strlen(prefix);
+    while (isdigit((unsigned char)*cursor)) {
+        unsigned int digit = (unsigned int)(*cursor - '0');
+        if (value > (UINTMAX_MAX - digit) / 10U) {
+            set_error(ERR_FILE_IO,
+                      "GPG runtime owner pid exceeds its bounded grammar: %s",
+                      name);
+            return -1;
+        }
+        value = value * 10U + digit;
+        cursor++;
+    }
+    pid = (pid_t)value;
+    if (pid <= 0 || (uintmax_t)pid != value) {
+        set_error(ERR_FILE_IO, "Invalid GPG runtime owner pid: %s", name);
+        return -1;
+    }
+    if (pid == getpid()) return 0;
+
+    errno = 0;
+    if (kill(pid, 0) == 0 || errno == EPERM) {
+        *live = true;
+        return 0;
+    }
+    if (errno == ESRCH) return 0;
+    set_system_error(ERR_FILE_IO,
+                     "Cannot determine GPG runtime owner state: %s", name);
+    return -1;
 }
 
 static int gpg_reset_witness_name(const char *quarantine,
@@ -4421,7 +4339,8 @@ static int gpg_walk_tree_contents_fd(
  * pass, so a hazard in a later account cannot be discovered only after an
  * earlier account has already been erased. */
 static int gpg_preflight_home_at(int base_fd, const char *base,
-                                 const char *name) {
+                                 const char *name,
+                                 struct stat *identity) {
     char home[MAX_PATH_LEN];
     struct stat named;
     struct stat opened;
@@ -4436,7 +4355,7 @@ static int gpg_preflight_home_at(int base_fd, const char *base,
 #ifdef O_NOFOLLOW
     flags |= O_NOFOLLOW;
 #endif
-    if (!validate_name(name) ||
+    if (!identity || !validate_name(name) ||
         (size_t)snprintf(home, sizeof(home), "%s/%s", base, name) >=
             sizeof(home)) {
         set_error(ERR_INVALID_PATH, "Invalid GPG home during reset: %s", name);
@@ -4481,14 +4400,391 @@ static int gpg_preflight_home_at(int base_fd, const char *base,
                          "Failed to close GPG home after preflight: %s", home);
         return -1;
     }
+    *identity = named;
     return 0;
 }
 
-static int gpg_preflight_reset_all_locked(int base_fd, const char *base) {
+enum {
+    GPG_RESET_PLAN_MAX_ENTRIES = 4096
+};
+
+typedef enum {
+    GPG_RESET_PLAN_ROLLBACK,
+    GPG_RESET_PLAN_PUBLISH,
+    GPG_RESET_PLAN_RESET_QUARANTINE,
+    GPG_RESET_PLAN_RESET_WITNESS,
+    GPG_RESET_PLAN_FORWARD_CANDIDATE,
+    GPG_RESET_PLAN_FORWARD_WITNESS,
+    GPG_RESET_PLAN_FORWARD_QUARANTINE
+} gpg_reset_plan_residue_kind_t;
+
+typedef struct {
+    char name[MAX_NAME_LEN];
+    struct stat identity;
+} gpg_reset_plan_home_t;
+
+typedef struct {
+    char name[GPG_QUARANTINE_NAME_LEN];
+    gpg_reset_plan_residue_kind_t kind;
+    gpg_link_identity_t identity;
+} gpg_reset_plan_residue_t;
+
+typedef struct {
+    gpg_reset_plan_home_t *homes;
+    size_t home_count;
+    size_t home_capacity;
+    gpg_reset_plan_residue_t *residues;
+    size_t residue_count;
+    size_t residue_capacity;
+    bool lock_present;
+    struct stat lock_identity;
+    bool current_present;
+    gpg_link_identity_t current;
+    char reset_stem[GPG_QUARANTINE_NAME_LEN];
+    size_t reset_quarantine;
+    size_t reset_witness;
+    char forward_stem[GPG_QUARANTINE_NAME_LEN];
+    size_t forward_candidate;
+    size_t forward_witness;
+    size_t forward_quarantine;
+} gpg_reset_all_plan_t;
+
+static void gpg_reset_all_plan_init(gpg_reset_all_plan_t *plan) {
+    if (!plan) return;
+    memset(plan, 0, sizeof(*plan));
+    plan->reset_quarantine = SIZE_MAX;
+    plan->reset_witness = SIZE_MAX;
+    plan->forward_candidate = SIZE_MAX;
+    plan->forward_witness = SIZE_MAX;
+    plan->forward_quarantine = SIZE_MAX;
+}
+
+static void gpg_reset_all_plan_destroy(gpg_reset_all_plan_t *plan) {
+    if (!plan) return;
+    free(plan->homes);
+    free(plan->residues);
+    gpg_reset_all_plan_init(plan);
+}
+
+static int gpg_reset_plan_grow_homes(gpg_reset_all_plan_t *plan) {
+    size_t capacity;
+    gpg_reset_plan_home_t *grown;
+
+    if (plan->home_count < plan->home_capacity) return 0;
+    capacity = plan->home_capacity ? plan->home_capacity * 2U : 8U;
+    if (capacity > GPG_RESET_PLAN_MAX_ENTRIES) {
+        capacity = GPG_RESET_PLAN_MAX_ENTRIES;
+    }
+    if (capacity <= plan->home_capacity) {
+        set_error(ERR_FILE_IO,
+                  "GPG reset namespace exceeds the bounded plan size");
+        return -1;
+    }
+    grown = realloc(plan->homes, capacity * sizeof(*grown));
+    if (!grown) {
+        set_system_error(ERR_FILE_IO, "Cannot allocate GPG reset home plan");
+        return -1;
+    }
+    plan->homes = grown;
+    plan->home_capacity = capacity;
+    return 0;
+}
+
+static int gpg_reset_plan_grow_residues(gpg_reset_all_plan_t *plan) {
+    size_t capacity;
+    gpg_reset_plan_residue_t *grown;
+
+    if (plan->residue_count < plan->residue_capacity) return 0;
+    capacity = plan->residue_capacity ? plan->residue_capacity * 2U : 8U;
+    if (capacity > GPG_RESET_PLAN_MAX_ENTRIES) {
+        capacity = GPG_RESET_PLAN_MAX_ENTRIES;
+    }
+    if (capacity <= plan->residue_capacity) {
+        set_error(ERR_FILE_IO,
+                  "GPG reset namespace exceeds the bounded plan size");
+        return -1;
+    }
+    grown = realloc(plan->residues, capacity * sizeof(*grown));
+    if (!grown) {
+        set_system_error(ERR_FILE_IO,
+                         "Cannot allocate GPG reset recovery plan");
+        return -1;
+    }
+    plan->residues = grown;
+    plan->residue_capacity = capacity;
+    return 0;
+}
+
+static int gpg_reset_plan_add_home(gpg_reset_all_plan_t *plan,
+                                   const char *name,
+                                   const struct stat *identity) {
+    gpg_reset_plan_home_t *home;
+
+    if (!plan || !name || !identity ||
+        plan->home_count + plan->residue_count >=
+            GPG_RESET_PLAN_MAX_ENTRIES ||
+        gpg_reset_plan_grow_homes(plan) != 0) {
+        if (plan && plan->home_count + plan->residue_count >=
+                        GPG_RESET_PLAN_MAX_ENTRIES) {
+            set_error(ERR_FILE_IO,
+                      "GPG reset namespace exceeds the bounded plan size");
+        }
+        return -1;
+    }
+    home = &plan->homes[plan->home_count];
+    memset(home, 0, sizeof(*home));
+    if (safe_strncpy(home->name, name, sizeof(home->name)) != 0) {
+        set_error(ERR_INVALID_PATH, "GPG reset home name is too long");
+        return -1;
+    }
+    home->identity = *identity;
+    plan->home_count++;
+    return 0;
+}
+
+static int gpg_reset_plan_add_residue(
+    int base_fd, gpg_reset_all_plan_t *plan, const char *name,
+    gpg_reset_plan_residue_kind_t kind, size_t *index) {
+    gpg_reset_plan_residue_t *residue;
+
+    if (!plan || !name || !index ||
+        plan->home_count + plan->residue_count >=
+            GPG_RESET_PLAN_MAX_ENTRIES ||
+        gpg_reset_plan_grow_residues(plan) != 0) {
+        if (plan && plan->home_count + plan->residue_count >=
+                        GPG_RESET_PLAN_MAX_ENTRIES) {
+            set_error(ERR_FILE_IO,
+                      "GPG reset namespace exceeds the bounded plan size");
+        }
+        return -1;
+    }
+    residue = &plan->residues[plan->residue_count];
+    memset(residue, 0, sizeof(*residue));
+    if (safe_strncpy(residue->name, name, sizeof(residue->name)) != 0) {
+        set_error(ERR_INVALID_PATH,
+                  "GPG reset recovery name exceeds its bounded grammar");
+        return -1;
+    }
+    if (gpg_capture_link_at(base_fd, name, &residue->identity) != 0) {
+        return -1;
+    }
+    residue->kind = kind;
+    *index = plan->residue_count;
+    plan->residue_count++;
+    return 0;
+}
+
+static int gpg_reset_plan_require_orphan_owner(
+    const char *name, const char *stem, const char *prefix) {
+    bool live = false;
+
+    if (gpg_private_name_owner_is_live(stem, prefix, &live) != 0) return -1;
+    if (live) {
+        set_error(ERR_FILE_IO,
+                  "Refusing to retire GPG recovery state held by a live "
+                  "gitswitch process: %s",
+                  name);
+        return -1;
+    }
+    return 0;
+}
+
+static int gpg_reset_plan_classify_residue(
+    int base_fd, gpg_reset_all_plan_t *plan, const char *name) {
+    const char *prefix;
+    char stem[GPG_QUARANTINE_NAME_LEN];
+    size_t index = SIZE_MAX;
+    size_t length;
+    size_t suffix_length;
+    gpg_reset_plan_residue_kind_t kind;
+
+    if (gpg_name_has_prefix(name, GPG_ROLLBACK_PREFIX) ||
+        gpg_name_has_prefix(name, GPG_PUBLISH_PREFIX)) {
+        bool rollback =
+            gpg_name_has_prefix(name, GPG_ROLLBACK_PREFIX);
+        prefix = rollback ? GPG_ROLLBACK_PREFIX : GPG_PUBLISH_PREFIX;
+        kind = rollback ? GPG_RESET_PLAN_ROLLBACK
+                        : GPG_RESET_PLAN_PUBLISH;
+        if (!gpg_valid_private_name(name, prefix)) {
+            set_error(ERR_FILE_IO,
+                      "Malformed GPG orphan recovery entry blocks reset: %s",
+                      name);
+            return -1;
+        }
+        if (gpg_reset_plan_require_orphan_owner(name, name, prefix) != 0 ||
+            gpg_reset_plan_add_residue(base_fd, plan, name, kind,
+                                       &index) != 0) {
+            return -1;
+        }
+        return 0;
+    }
+
+    if (gpg_name_has_prefix(name, GPG_RESET_PREFIX)) {
+        suffix_length = strlen(GPG_RESET_WITNESS_SUFFIX);
+        length = strlen(name);
+        if (length > suffix_length &&
+            strcmp(name + length - suffix_length,
+                   GPG_RESET_WITNESS_SUFFIX) == 0) {
+            length -= suffix_length;
+            kind = GPG_RESET_PLAN_RESET_WITNESS;
+        } else {
+            kind = GPG_RESET_PLAN_RESET_QUARANTINE;
+        }
+        if (length == 0U || length >= sizeof(stem)) {
+            set_error(ERR_FILE_IO,
+                      "Malformed GPG reset recovery entry blocks reset: %s",
+                      name);
+            return -1;
+        }
+        memcpy(stem, name, length);
+        stem[length] = '\0';
+        if (!gpg_valid_private_name(stem, GPG_RESET_PREFIX) ||
+            (plan->reset_stem[0] &&
+             strcmp(plan->reset_stem, stem) != 0)) {
+            set_error(ERR_FILE_IO,
+                      "Ambiguous GPG reset recovery state blocks reset: %s",
+                      name);
+            return -1;
+        }
+        if (gpg_reset_plan_require_orphan_owner(
+                name, stem, GPG_RESET_PREFIX) != 0 ||
+            safe_strncpy(plan->reset_stem, stem,
+                         sizeof(plan->reset_stem)) != 0) {
+            return -1;
+        }
+        if ((kind == GPG_RESET_PLAN_RESET_QUARANTINE &&
+             plan->reset_quarantine != SIZE_MAX) ||
+            (kind == GPG_RESET_PLAN_RESET_WITNESS &&
+             plan->reset_witness != SIZE_MAX)) {
+            set_error(ERR_FILE_IO,
+                      "Duplicate GPG reset recovery entry blocks reset: %s",
+                      name);
+            return -1;
+        }
+        if (gpg_reset_plan_add_residue(base_fd, plan, name, kind,
+                                       &index) != 0) {
+            return -1;
+        }
+        if (kind == GPG_RESET_PLAN_RESET_QUARANTINE) {
+            plan->reset_quarantine = index;
+        } else {
+            plan->reset_witness = index;
+        }
+        return 0;
+    }
+
+    if (!gpg_name_has_prefix(name, GPG_FORWARD_PREFIX)) {
+        set_error(ERR_PERMISSION_DENIED,
+                  "Refusing unmanaged GPG reset entry: %s", name);
+        return -1;
+    }
+    length = strlen(name);
+    if (length < 3U || length >= GPG_QUARANTINE_NAME_LEN ||
+        name[length - 2U] != '.' ||
+        !strchr("pwq", name[length - 1U]) ||
+        length - 2U >= sizeof(stem)) {
+        set_error(ERR_FILE_IO,
+                  "Malformed GPG forward recovery entry blocks reset: %s",
+                  name);
+        return -1;
+    }
+    memcpy(stem, name, length - 2U);
+    stem[length - 2U] = '\0';
+    if (!gpg_valid_private_name(stem, GPG_FORWARD_PREFIX) ||
+        (plan->forward_stem[0] &&
+         strcmp(plan->forward_stem, stem) != 0)) {
+        set_error(ERR_FILE_IO,
+                  "Ambiguous GPG forward recovery state blocks reset: %s",
+                  name);
+        return -1;
+    }
+    if (gpg_reset_plan_require_orphan_owner(
+            name, stem, GPG_FORWARD_PREFIX) != 0 ||
+        safe_strncpy(plan->forward_stem, stem,
+                     sizeof(plan->forward_stem)) != 0) {
+        return -1;
+    }
+    if (name[length - 1U] == 'p') {
+        kind = GPG_RESET_PLAN_FORWARD_CANDIDATE;
+        if (plan->forward_candidate != SIZE_MAX) index = plan->forward_candidate;
+    } else if (name[length - 1U] == 'w') {
+        kind = GPG_RESET_PLAN_FORWARD_WITNESS;
+        if (plan->forward_witness != SIZE_MAX) index = plan->forward_witness;
+    } else {
+        kind = GPG_RESET_PLAN_FORWARD_QUARANTINE;
+        if (plan->forward_quarantine != SIZE_MAX) {
+            index = plan->forward_quarantine;
+        }
+    }
+    if (index != SIZE_MAX) {
+        set_error(ERR_FILE_IO,
+                  "Duplicate GPG forward recovery entry blocks reset: %s",
+                  name);
+        return -1;
+    }
+    if (gpg_reset_plan_add_residue(base_fd, plan, name, kind, &index) != 0) {
+        return -1;
+    }
+    if (kind == GPG_RESET_PLAN_FORWARD_CANDIDATE) {
+        plan->forward_candidate = index;
+    } else if (kind == GPG_RESET_PLAN_FORWARD_WITNESS) {
+        plan->forward_witness = index;
+    } else {
+        plan->forward_quarantine = index;
+    }
+    return 0;
+}
+
+static int gpg_reset_plan_validate_groups(
+    const gpg_reset_all_plan_t *plan) {
+    if (plan->reset_quarantine != SIZE_MAX &&
+        plan->reset_witness == SIZE_MAX) {
+        set_error(ERR_FILE_IO,
+                  "Unwitnessed GPG reset quarantine preserved: %s",
+                  plan->residues[plan->reset_quarantine].name);
+        return -1;
+    }
+    if (plan->reset_quarantine != SIZE_MAX &&
+        !gpg_same_link(
+            &plan->residues[plan->reset_quarantine].identity,
+            &plan->residues[plan->reset_witness].identity)) {
+        set_error(ERR_FILE_IO,
+                  "GPG reset quarantine differs from its witness; "
+                  "replacement preserved: %s",
+                  plan->residues[plan->reset_quarantine].name);
+        return -1;
+    }
+    if (plan->forward_candidate == SIZE_MAX &&
+        (plan->forward_witness != SIZE_MAX ||
+         plan->forward_quarantine != SIZE_MAX)) {
+        set_error(ERR_FILE_IO,
+                  "Malformed GPG forward recovery group blocks reset");
+        return -1;
+    }
+    if (plan->forward_quarantine != SIZE_MAX &&
+        plan->forward_witness == SIZE_MAX) {
+        set_error(ERR_FILE_IO,
+                  "Unwitnessed GPG forward quarantine blocks reset");
+        return -1;
+    }
+    /* Full reset does not need to infer which forward generation should be
+     * restored. P+W without Q/current is its own retry tail after Q was
+     * unlinked but the directory sync failed, while Q!=W is the valid M17
+     * displaced-writer state. Once the complete namespace plan has passed
+     * both identity scans, every exact private alias and managed home is an
+     * explicit deletion target. Targeted mutation still uses the stricter
+     * forward reconciliation state machine above. */
+    return 0;
+}
+
+static int gpg_discover_reset_all_plan_locked(
+    int base_fd, int lock_fd, const char *base,
+    gpg_reset_all_plan_t *plan) {
     int flags = O_RDONLY | O_CLOEXEC;
     int scan_fd;
     DIR *dir;
     struct dirent *entry;
+    int rc = -1;
 
 #ifdef O_DIRECTORY
     flags |= O_DIRECTORY;
@@ -4513,52 +4809,384 @@ static int gpg_preflight_reset_all_locked(int base_fd, const char *base) {
                 closedir(dir);
                 errno = saved_errno;
                 set_system_error(ERR_FILE_IO,
-                                 "Failed while preflighting GPG base: %s", base);
+                                 "Failed while discovering GPG reset plan: %s",
+                                 base);
                 return -1;
             }
             break;
         }
         if (strcmp(entry->d_name, ".") == 0 ||
-            strcmp(entry->d_name, "..") == 0 ||
-            strcmp(entry->d_name, ".lock") == 0) {
+            strcmp(entry->d_name, "..") == 0) {
+            continue;
+        }
+        if (strcmp(entry->d_name, ".lock") == 0) {
+            if (plan->lock_present ||
+                verify_private_lock_file_at(lock_fd, base_fd, ".lock") != 0 ||
+                fstatat(base_fd, ".lock", &plan->lock_identity,
+                        AT_SYMLINK_NOFOLLOW) != 0) {
+                set_error(ERR_FILE_IO,
+                          "GPG reset plan does not own one exact lock: %s",
+                          base);
+                goto out;
+            }
+            plan->lock_present = true;
             continue;
         }
         if (strcmp(entry->d_name, "current") == 0) {
-            gpg_link_identity_t current;
-            if (gpg_capture_link_at(base_fd, "current", &current) != 0) {
-                closedir(dir);
-                return -1;
+            if (plan->current_present ||
+                gpg_capture_link_at(base_fd, "current", &plan->current) != 0) {
+                set_error(ERR_FILE_IO,
+                          "Cannot capture exact stable GNUPGHOME for reset");
+                goto out;
             }
+            plan->current_present = true;
             continue;
         }
         if (gpg_name_has_prefix(entry->d_name, GPG_ROLLBACK_PREFIX) ||
             gpg_name_has_prefix(entry->d_name, GPG_PUBLISH_PREFIX) ||
-            gpg_name_has_prefix(entry->d_name, GPG_RESET_PREFIX)) {
-            char residue[GPG_QUARANTINE_NAME_LEN];
-            safe_strncpy(residue, entry->d_name, sizeof(residue));
-            closedir(dir);
-            set_error(ERR_FILE_IO,
-                      "Unresolved GPG runtime quarantine blocks reset: %s",
-                      residue);
-            return -1;
+            gpg_name_has_prefix(entry->d_name, GPG_RESET_PREFIX) ||
+            gpg_name_has_prefix(entry->d_name, GPG_FORWARD_PREFIX)) {
+            if (gpg_reset_plan_classify_residue(
+                    base_fd, plan, entry->d_name) != 0) {
+                goto out;
+            }
+            continue;
         }
         if (entry->d_name[0] == '.' || !validate_name(entry->d_name)) {
-            char residue[MAX_PATH_LEN];
-            safe_strncpy(residue, entry->d_name, sizeof(residue));
-            closedir(dir);
             set_error(ERR_PERMISSION_DENIED,
-                      "Refusing unmanaged GPG reset entry: %s", residue);
+                      "Refusing unmanaged GPG reset entry: %s",
+                      entry->d_name);
+            goto out;
+        }
+        {
+            struct stat identity;
+            if (fstatat(base_fd, entry->d_name, &identity,
+                        AT_SYMLINK_NOFOLLOW) != 0) {
+                set_system_error(ERR_FILE_IO,
+                                 "Cannot inspect GPG reset plan entry: %s/%s",
+                                 base, entry->d_name);
+                goto out;
+            }
+            if (gpg_reset_plan_add_home(plan, entry->d_name,
+                                        &identity) != 0) {
+                goto out;
+            }
+        }
+    }
+    rc = 0;
+out:
+    if (closedir(dir) != 0 && rc == 0) {
+        set_system_error(ERR_FILE_IO,
+                         "Failed to close GPG reset discovery: %s", base);
+        rc = -1;
+    }
+    return rc;
+}
+
+/* Discovery above records the complete bounded top-level namespace without
+ * modifying it. Only after that scan closes do we validate the exact lock,
+ * recovery groups, and every complete home tree. This ordering guarantees
+ * that a blocker at the end of the directory cannot be learned after an
+ * earlier recovery entry was already retired. */
+static int gpg_validate_reset_all_plan_locked(
+    int base_fd, int lock_fd, const char *base,
+    const gpg_reset_all_plan_t *plan) {
+    if (!plan->lock_present ||
+        verify_private_lock_file_at(lock_fd, base_fd, ".lock") != 0) {
+        set_error(ERR_FILE_IO, "GPG reset plan lost its exact lock: %s", base);
+        return -1;
+    }
+    if (gpg_reset_plan_validate_groups(plan) != 0) {
+        return -1;
+    }
+    for (size_t i = 0; i < plan->home_count; i++) {
+        struct stat validated;
+
+        if (gpg_preflight_home_at(base_fd, base, plan->homes[i].name,
+                                  &validated) != 0) {
             return -1;
         }
-        if (gpg_preflight_home_at(base_fd, base, entry->d_name) != 0) {
-            closedir(dir);
+        if (!gpg_same_file_version(&validated,
+                                   &plan->homes[i].identity)) {
+            set_error(ERR_FILE_IO,
+                      "GPG reset home changed during plan validation: %s",
+                      plan->homes[i].name);
             return -1;
         }
     }
-    if (closedir(dir) != 0) {
+    return 0;
+}
+
+static size_t gpg_reset_plan_find_home(
+    const gpg_reset_all_plan_t *plan, const char *name) {
+    for (size_t i = 0; i < plan->home_count; i++) {
+        if (strcmp(plan->homes[i].name, name) == 0) return i;
+    }
+    return SIZE_MAX;
+}
+
+static size_t gpg_reset_plan_find_residue(
+    const gpg_reset_all_plan_t *plan, const char *name) {
+    for (size_t i = 0; i < plan->residue_count; i++) {
+        if (strcmp(plan->residues[i].name, name) == 0) return i;
+    }
+    return SIZE_MAX;
+}
+
+static bool gpg_same_planned_link(const gpg_link_identity_t *left,
+                                  const gpg_link_identity_t *right) {
+    return gpg_same_link(left, right) &&
+           gpg_same_file_version(&left->st, &right->st);
+}
+
+static int gpg_revalidate_reset_all_plan_locked(
+    int base_fd, int lock_fd, const char *base,
+    const gpg_reset_all_plan_t *plan) {
+    int flags = O_RDONLY | O_CLOEXEC;
+    int scan_fd;
+    DIR *dir;
+    struct dirent *entry;
+    bool *homes_seen = NULL;
+    bool *residues_seen = NULL;
+    bool lock_seen = false;
+    bool current_seen = false;
+    int rc = -1;
+
+#ifdef O_DIRECTORY
+    flags |= O_DIRECTORY;
+#endif
+#ifdef O_NOFOLLOW
+    flags |= O_NOFOLLOW;
+#endif
+    if (plan->home_count) {
+        homes_seen = calloc(plan->home_count, sizeof(*homes_seen));
+    }
+    if (plan->residue_count) {
+        residues_seen = calloc(plan->residue_count, sizeof(*residues_seen));
+    }
+    if ((plan->home_count && !homes_seen) ||
+        (plan->residue_count && !residues_seen)) {
         set_system_error(ERR_FILE_IO,
-                         "Failed to close GPG reset preflight: %s", base);
+                         "Cannot allocate GPG reset revalidation state");
+        goto out;
+    }
+    if (verify_private_lock_file_at(lock_fd, base_fd, ".lock") != 0) {
+        set_error(ERR_FILE_IO,
+                  "GPG reset lock changed before plan revalidation: %s", base);
+        goto out;
+    }
+    scan_fd = openat(base_fd, ".", flags);
+    dir = scan_fd >= 0 ? fdopendir(scan_fd) : NULL;
+    if (!dir) {
+        if (scan_fd >= 0) close(scan_fd);
+        set_system_error(ERR_FILE_IO,
+                         "Cannot revalidate GPG reset plan: %s", base);
+        goto out;
+    }
+    for (;;) {
+        size_t index;
+
+        errno = 0;
+        entry = g_gpg_readdir(dir);
+        if (!entry) {
+            if (errno != 0) {
+                int saved_errno = errno;
+                closedir(dir);
+                dir = NULL;
+                errno = saved_errno;
+                set_system_error(ERR_FILE_IO,
+                                 "Failed while revalidating GPG reset plan: %s",
+                                 base);
+                goto out;
+            }
+            break;
+        }
+        if (strcmp(entry->d_name, ".") == 0 ||
+            strcmp(entry->d_name, "..") == 0) {
+            continue;
+        }
+        if (strcmp(entry->d_name, ".lock") == 0) {
+            struct stat lock_identity;
+            if (lock_seen ||
+                fstatat(base_fd, ".lock", &lock_identity,
+                        AT_SYMLINK_NOFOLLOW) != 0 ||
+                !gpg_same_file_version(&lock_identity,
+                                       &plan->lock_identity) ||
+                verify_private_lock_file_at(lock_fd, base_fd, ".lock") != 0) {
+                set_error(ERR_FILE_IO,
+                          "GPG reset lock changed during plan revalidation");
+                goto close_out;
+            }
+            lock_seen = true;
+            continue;
+        }
+        if (strcmp(entry->d_name, "current") == 0) {
+            gpg_link_identity_t current;
+            if (current_seen || !plan->current_present ||
+                gpg_capture_link_at(base_fd, "current", &current) != 0 ||
+                !gpg_same_planned_link(&current, &plan->current)) {
+                set_error(ERR_FILE_IO,
+                          "Stable GNUPGHOME changed during reset preflight");
+                goto close_out;
+            }
+            current_seen = true;
+            continue;
+        }
+        index = gpg_reset_plan_find_home(plan, entry->d_name);
+        if (index != SIZE_MAX) {
+            struct stat home;
+            if (homes_seen[index] ||
+                fstatat(base_fd, entry->d_name, &home,
+                        AT_SYMLINK_NOFOLLOW) != 0 ||
+                !gpg_same_file_version(&home,
+                                       &plan->homes[index].identity)) {
+                set_error(ERR_FILE_IO,
+                          "GPG reset home changed during plan revalidation: %s",
+                          entry->d_name);
+                goto close_out;
+            }
+            homes_seen[index] = true;
+            continue;
+        }
+        index = gpg_reset_plan_find_residue(plan, entry->d_name);
+        if (index != SIZE_MAX) {
+            gpg_link_identity_t residue;
+            if (residues_seen[index] ||
+                gpg_capture_link_at(base_fd, entry->d_name,
+                                    &residue) != 0 ||
+                !gpg_same_planned_link(
+                    &residue, &plan->residues[index].identity)) {
+                set_error(ERR_FILE_IO,
+                          "GPG recovery entry changed during reset preflight: %s",
+                          entry->d_name);
+                goto close_out;
+            }
+            residues_seen[index] = true;
+            continue;
+        }
+        set_error(ERR_FILE_IO,
+                  "GPG reset namespace changed after discovery: %s",
+                  entry->d_name);
+        goto close_out;
+    }
+    if (!lock_seen || current_seen != plan->current_present) {
+        set_error(ERR_FILE_IO,
+                  "GPG reset namespace changed after discovery");
+        goto close_out;
+    }
+    for (size_t i = 0; i < plan->home_count; i++) {
+        if (!homes_seen[i]) {
+            set_error(ERR_FILE_IO,
+                      "GPG reset home disappeared after discovery: %s",
+                      plan->homes[i].name);
+            goto close_out;
+        }
+    }
+    for (size_t i = 0; i < plan->residue_count; i++) {
+        if (!residues_seen[i]) {
+            set_error(ERR_FILE_IO,
+                      "GPG recovery entry disappeared after discovery: %s",
+                      plan->residues[i].name);
+            goto close_out;
+        }
+    }
+    if (verify_private_lock_file_at(lock_fd, base_fd, ".lock") != 0) {
+        set_error(ERR_FILE_IO,
+                  "GPG reset lock changed after plan revalidation: %s", base);
+        goto close_out;
+    }
+    rc = 0;
+close_out:
+    if (dir && closedir(dir) != 0 && rc == 0) {
+        set_system_error(ERR_FILE_IO,
+                         "Failed to close GPG reset revalidation: %s", base);
+        rc = -1;
+    }
+    if (rc == 0) {
+        for (size_t i = 0; i < plan->home_count; i++) {
+            struct stat validated;
+
+            if (gpg_preflight_home_at(base_fd, base,
+                                      plan->homes[i].name,
+                                      &validated) != 0) {
+                rc = -1;
+                break;
+            }
+            if (!gpg_same_file_version(
+                    &validated, &plan->homes[i].identity)) {
+                set_error(
+                    ERR_FILE_IO,
+                    "GPG reset home changed during final plan validation: %s",
+                    plan->homes[i].name);
+                rc = -1;
+                break;
+            }
+        }
+    }
+out:
+    free(homes_seen);
+    free(residues_seen);
+    return rc;
+}
+
+static unsigned int gpg_reset_plan_residue_priority(
+    gpg_reset_plan_residue_kind_t kind) {
+    switch (kind) {
+        case GPG_RESET_PLAN_RESET_QUARANTINE:
+        case GPG_RESET_PLAN_FORWARD_QUARANTINE:
+            return 0U;
+        case GPG_RESET_PLAN_RESET_WITNESS:
+        case GPG_RESET_PLAN_FORWARD_WITNESS:
+            return 1U;
+        case GPG_RESET_PLAN_FORWARD_CANDIDATE:
+            return 2U;
+        case GPG_RESET_PLAN_ROLLBACK:
+        case GPG_RESET_PLAN_PUBLISH:
+            return 3U;
+        default:
+            return 4U;
+    }
+}
+
+static int gpg_retire_planned_reset_residue_locked(
+    int base_fd, const gpg_reset_plan_residue_t *residue) {
+    gpg_link_identity_t observed;
+
+    if (gpg_capture_link_at(base_fd, residue->name, &observed) != 0 ||
+        !gpg_same_link(&observed, &residue->identity)) {
+        set_error(ERR_FILE_IO,
+                  "GPG recovery entry changed; preserving replacement: %s",
+                  residue->name);
         return -1;
+    }
+    if (unlinkat(base_fd, residue->name, 0) != 0) {
+        set_system_error(ERR_FILE_IO,
+                         "Cannot retire planned GPG recovery entry: %s",
+                         residue->name);
+        return -1;
+    }
+    if (g_sync_base(base_fd) != 0) {
+        set_system_error(ERR_FILE_IO,
+                         "Cannot synchronize GPG recovery retirement: %s",
+                         residue->name);
+        return -1;
+    }
+    log_warning("Retired orphaned GPG recovery residue: %s",
+                residue->name);
+    return 0;
+}
+
+static int gpg_apply_reset_recovery_plan_locked(
+    int base_fd, const gpg_reset_all_plan_t *plan) {
+    for (unsigned int priority = 0U; priority <= 3U; priority++) {
+        for (size_t i = 0; i < plan->residue_count; i++) {
+            if (gpg_reset_plan_residue_priority(plan->residues[i].kind) ==
+                    priority &&
+                gpg_retire_planned_reset_residue_locked(
+                    base_fd, &plan->residues[i]) != 0) {
+                return -1;
+            }
+        }
     }
     return 0;
 }
@@ -4639,7 +5267,8 @@ static int gpg_verify_reset_all_final_locked(int base_fd, int lock_fd,
  * retry handle for both the agent and its secret-key material, so an
  * unconfirmed stop must retain it rather than erase the only targeting state. */
 static int gpg_kill_and_remove_home(int base_fd, const char *base,
-                                    const char *name) {
+                                    const char *name,
+                                    const struct stat *expected) {
     const char *argv[] = {"gpgconf", "--kill", "all", NULL};
     char home[MAX_PATH_LEN];
     const char *env[2] = {"GNUPGHOME=.", NULL};
@@ -4668,9 +5297,13 @@ static int gpg_kill_and_remove_home(int base_fd, const char *base,
     }
     if (fstatat(base_fd, name, &entry_before, AT_SYMLINK_NOFOLLOW) != 0 ||
         !S_ISDIR(entry_before.st_mode) || entry_before.st_uid != getuid() ||
-        (entry_before.st_mode & 077) != 0) {
+        (entry_before.st_mode & 077) != 0 ||
+        (expected && !gpg_same_file_version(&entry_before, expected))) {
         set_error(ERR_PERMISSION_DENIED,
-                  "Refusing unsafe isolated GPG home: %s", home);
+                  expected
+                      ? "Planned isolated GPG home changed before cleanup: %s"
+                      : "Refusing unsafe isolated GPG home: %s",
+                  home);
         return -1;
     }
     home_fd = openat(base_fd, name, home_flags);
@@ -5025,6 +5658,7 @@ static void gpg_record_reset_failure(error_accumulator_t *failures,
 int gpg_manager_reset(const char *account) {
     char base[MAX_PATH_LEN];
     char current[MAX_PATH_LEN];
+    gpg_reset_all_plan_t plan;
     error_accumulator_t failures;
     bool absent = false;
     int base_fd = -1;
@@ -5032,6 +5666,7 @@ int gpg_manager_reset(const char *account) {
     bool failed = false;
 
     error_accumulator_init(&failures);
+    gpg_reset_all_plan_init(&plan);
 
     if (account && !validate_name(account)) {
         set_error(ERR_INVALID_ARGS, "Invalid account name for reset");
@@ -5050,22 +5685,39 @@ int gpg_manager_reset(const char *account) {
         set_system_error(ERR_FILE_IO, "Failed to lock GPG base directory: %s", base);
         return -1;
     }
-    if (gpg_reconcile_reset_retry_locked(base_fd) != 0) {
-        unlock_gpg_dir(base_fd, lock_fd);
-        return -1;
-    }
-    if (!account && gpg_retire_orphan_quarantines_locked(base_fd) != 0) {
-        unlock_gpg_dir(base_fd, lock_fd);
-        return -1;
-    }
-    if (gpg_reject_stale_quarantines_locked(base_fd, NULL) != 0) {
-        unlock_gpg_dir(base_fd, lock_fd);
-        return -1;
-    }
-    if (!account &&
-        gpg_preflight_reset_all_locked(base_fd, base) != 0) {
-        unlock_gpg_dir(base_fd, lock_fd);
-        return -1;
+    if (account) {
+        if (gpg_reconcile_reset_retry_locked(base_fd) != 0 ||
+            gpg_reject_stale_quarantines_locked(base_fd, NULL) != 0) {
+            unlock_gpg_dir(base_fd, lock_fd);
+            return -1;
+        }
+    } else {
+        if (gpg_discover_reset_all_plan_locked(
+                base_fd, lock_fd, base, &plan) != 0 ||
+            gpg_validate_reset_all_plan_locked(
+                base_fd, lock_fd, base, &plan) != 0) {
+            gpg_reset_all_plan_destroy(&plan);
+            unlock_gpg_dir(base_fd, lock_fd);
+            return -1;
+        }
+        /* Test and race seam: the complete plan has been captured and
+         * validated, but no recovery name, home, or current link has been
+         * changed. The second scan below must reject any replacement. */
+        if (plan.current_present && g_reset_current_hook &&
+            g_reset_current_hook(base_fd) != 0) {
+            set_error(ERR_FILE_IO,
+                      "GPG reset plan revalidation hook failed");
+            gpg_reset_all_plan_destroy(&plan);
+            unlock_gpg_dir(base_fd, lock_fd);
+            return -1;
+        }
+        if (gpg_revalidate_reset_all_plan_locked(
+                base_fd, lock_fd, base, &plan) != 0 ||
+            gpg_apply_reset_recovery_plan_locked(base_fd, &plan) != 0) {
+            gpg_reset_all_plan_destroy(&plan);
+            unlock_gpg_dir(base_fd, lock_fd);
+            return -1;
+        }
     }
 
     if (account) {
@@ -5078,7 +5730,8 @@ int gpg_manager_reset(const char *account) {
                           base, account);
                 unlock_gpg_dir(base_fd, lock_fd);
                 return -1;
-            } else if (gpg_kill_and_remove_home(base_fd, base, account) != 0) {
+            } else if (gpg_kill_and_remove_home(
+                           base_fd, base, account, NULL) != 0) {
                 gpg_record_reset_failure(&failures, &failed,
                                          "target GPG home cleanup");
             }
@@ -5090,82 +5743,12 @@ int gpg_manager_reset(const char *account) {
                                      "target GPG home inspection");
         }
     } else {
-        int scan_flags = O_RDONLY | O_CLOEXEC;
-#ifdef O_DIRECTORY
-        scan_flags |= O_DIRECTORY;
-#endif
-#ifdef O_NOFOLLOW
-        scan_flags |= O_NOFOLLOW;
-#endif
-        int scan_fd = openat(base_fd, ".", scan_flags);
-        DIR *d = scan_fd >= 0 ? fdopendir(scan_fd) : NULL;
-        if (!d) {
-            int saved_errno = errno;
-            if (scan_fd >= 0) close(scan_fd);
-            errno = saved_errno;
-            set_system_error(ERR_FILE_IO, "Cannot enumerate GPG base directory: %s", base);
-            gpg_record_reset_failure(&failures, &failed,
-                                     "GPG base enumeration");
-        } else {
-            struct dirent *ent;
-            for (;;) {
-                errno = 0;
-                ent = g_gpg_readdir(d);
-                if (!ent) {
-                    if (errno != 0) {
-                        set_system_error(ERR_FILE_IO,
-                                         "Failed while enumerating GPG base directory: %s",
-                                         base);
-                        gpg_record_reset_failure(
-                            &failures, &failed, "GPG base enumeration read");
-                    }
-                    break;
-                }
-                /* Only the exact lock and deferred stable link are manager
-                 * metadata. Every other hidden name is an unknown survivor,
-                 * not a broad dotfile exemption. */
-                if (strcmp(ent->d_name, ".") == 0 ||
-                    strcmp(ent->d_name, "..") == 0 ||
-                    strcmp(ent->d_name, ".lock") == 0 ||
-                    strcmp(ent->d_name, "current") == 0) {
-                    continue;
-                }
-                if (!validate_name(ent->d_name)) {
-                    set_error(ERR_PERMISSION_DENIED,
-                              "Refusing unmanaged GPG reset entry: %s",
-                              ent->d_name);
-                    gpg_record_reset_failure(
-                        &failures, &failed, "unmanaged GPG base entry");
-                    continue;
-                }
-                struct stat est;
-                if (fstatat(base_fd, ent->d_name, &est,
-                            AT_SYMLINK_NOFOLLOW) != 0) {
-                    set_system_error(ERR_FILE_IO,
-                                     "Cannot inspect GPG home during reset: %s/%s",
-                                     base, ent->d_name);
-                    gpg_record_reset_failure(
-                        &failures, &failed, "GPG home inspection");
-                    continue;
-                }
-                if (!S_ISDIR(est.st_mode) || est.st_uid != getuid() ||
-                    (est.st_mode & 077) != 0) {
-                    set_error(ERR_PERMISSION_DENIED,
-                              "Refusing unsafe GPG home during reset: %s/%s",
-                              base, ent->d_name);
-                    gpg_record_reset_failure(
-                        &failures, &failed, "unsafe GPG home");
-                    continue;
-                }
-                if (gpg_kill_and_remove_home(base_fd, base, ent->d_name) != 0) {
-                    gpg_record_reset_failure(&failures, &failed,
-                                             "GPG home cleanup");
-                }
-            }
-            if (closedir(d) != 0) {
-                set_system_error(ERR_FILE_IO, "Failed to close GPG base directory: %s", base);
+        for (size_t i = 0; i < plan.home_count; i++) {
+            if (gpg_kill_and_remove_home(
+                    base_fd, base, plan.homes[i].name,
+                    &plan.homes[i].identity) != 0) {
                 gpg_record_reset_failure(&failures, &failed,
-                                         "GPG base enumeration close");
+                                         "GPG home cleanup");
             }
         }
     }
@@ -5181,8 +5764,15 @@ int gpg_manager_reset(const char *account) {
                                  "stable GNUPGHOME path");
     } else {
         gpg_link_identity_t captured_current;
-        int current_rc = gpg_capture_link_at(base_fd, "current",
+        int current_rc;
+
+        if (!account) {
+            captured_current = plan.current;
+            current_rc = plan.current_present ? 0 : 1;
+        } else {
+            current_rc = gpg_capture_link_at(base_fd, "current",
                                              &captured_current);
+        }
         if (current_rc == 0) {
             if (!account && !failed) {
                 bool current_changed = false;
@@ -5253,6 +5843,7 @@ reset_finalize:
         gpg_record_reset_failure(&failures, &failed,
                                  "GPG base directory synchronization");
     }
+    gpg_reset_all_plan_destroy(&plan);
     unlock_gpg_dir(base_fd, lock_fd);
     if (failed) {
         if (!error_accumulator_publish(&failures)) {
