@@ -66,9 +66,7 @@ TEST(all_retained_public_apis_compile_and_link) {
     REQUIRE_PUBLIC_API(accounts_show_status);
     REQUIRE_PUBLIC_API(accounts_switch);
     REQUIRE_PUBLIC_API(accounts_switch_abort);
-    REQUIRE_PUBLIC_API(accounts_switch_commit);
     REQUIRE_PUBLIC_API(accounts_switch_commit_result);
-    REQUIRE_PUBLIC_API(accounts_switch_prepare);
     REQUIRE_PUBLIC_API(accounts_switch_prepare_result);
     REQUIRE_PUBLIC_API(accounts_switch_publication);
     REQUIRE_PUBLIC_API(accounts_transaction_begin);

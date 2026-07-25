@@ -129,13 +129,13 @@ int accounts_switch(gitswitch_ctx_t *ctx, const char *identifier);
  * rollback state and runtime lock. Commit releases that state only after the
  * caller durably saves active-account metadata; abort restores the prior Git,
  * runtime, and in-memory active state. Resume and direct library callers keep
- * using accounts_switch().
+ * using accounts_switch(). The structured result is mandatory: callers must
+ * settle PREPARED versus ABORT_REQUIRED before releasing their context, and
+ * must distinguish a completed commit from a still-abortable failure.
  */
-int accounts_switch_prepare(gitswitch_ctx_t *ctx, const char *identifier);
 int accounts_switch_prepare_result(gitswitch_ctx_t *ctx,
                                    const char *identifier,
                                    accounts_switch_prepare_state_t *state);
-int accounts_switch_commit(gitswitch_ctx_t *ctx);
 int accounts_switch_commit_result(gitswitch_ctx_t *ctx,
                                   accounts_switch_commit_state_t *state);
 /* Borrow the exact sealed Git publication owned by a prepared switch. The

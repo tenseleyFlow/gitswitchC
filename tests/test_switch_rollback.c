@@ -1209,6 +1209,32 @@ static gitswitch_ctx_t make_ctx(void) {
     return ctx;
 }
 
+static int prepare_switch_expect(
+    gitswitch_ctx_t *ctx, const char *identifier,
+    accounts_switch_prepare_state_t expected_state) {
+    accounts_switch_prepare_state_t state =
+        expected_state == ACCOUNTS_SWITCH_PREPARE_CLEAN_FAILURE
+            ? ACCOUNTS_SWITCH_PREPARE_PREPARED
+            : ACCOUNTS_SWITCH_PREPARE_CLEAN_FAILURE;
+    int rc = accounts_switch_prepare_result(ctx, identifier, &state);
+
+    CHECK_EQ_INT(state, expected_state);
+    return rc;
+}
+
+static int commit_switch_expect(
+    gitswitch_ctx_t *ctx,
+    accounts_switch_commit_state_t expected_state) {
+    accounts_switch_commit_state_t state =
+        expected_state == ACCOUNTS_SWITCH_COMMIT_NOT_COMMITTED
+            ? ACCOUNTS_SWITCH_COMMIT_COMPLETE
+            : ACCOUNTS_SWITCH_COMMIT_NOT_COMMITTED;
+    int rc = accounts_switch_commit_result(ctx, &state);
+
+    CHECK_EQ_INT(state, expected_state);
+    return rc;
+}
+
 /* Add the pre-switch account that owns the saved/current metadata. Runtime
  * capabilities are enabled by individual cases only when they are relevant. */
 static account_t *add_previous_account(gitswitch_ctx_t *ctx) {
@@ -1362,7 +1388,8 @@ TEST(signal_guard_failure_aborts_before_switch_mutation) {
     clear_error();
     errno = 0;
     command_runner_fn previous = run_set_runner(fake_runner);
-    int rc = accounts_switch_prepare(&ctx, "testacct");
+    int rc = prepare_switch_expect(
+        &ctx, "testacct", ACCOUNTS_SWITCH_PREPARE_CLEAN_FAILURE);
     returned_errno = errno;
     failure = *get_last_error();
     seal_rc = git_config_seal();
@@ -1493,7 +1520,8 @@ TEST(late_runtime_teardown_failure_rolls_back_git_and_gpg) {
     g_log = NULL;
 
     command_runner_fn previous_runner = run_set_runner(fake_runner);
-    int rc = accounts_switch_prepare(&ctx, "testacct");
+    int rc = prepare_switch_expect(
+        &ctx, "testacct", ACCOUNTS_SWITCH_PREPARE_ABORT_REQUIRED);
     run_set_runner(previous_runner);
     g_fail_list_config = false;
 
@@ -1512,7 +1540,9 @@ TEST(late_runtime_teardown_failure_rolls_back_git_and_gpg) {
     CHECK(strstr(get_last_error()->details,
                  "[SSH runtime deactivation]") != NULL);
     CHECK(runtime_lock_available_to_child());
-    CHECK_EQ_INT(accounts_switch_commit(&ctx), -1);
+    CHECK_EQ_INT(commit_switch_expect(
+                     &ctx, ACCOUNTS_SWITCH_COMMIT_NOT_COMMITTED),
+                 -1);
     CHECK(strstr(get_last_error()->message, "can only be retried") != NULL);
 
     CHECK_EQ_INT(rmdir(lock_path), 0);
@@ -1578,7 +1608,8 @@ TEST(ssh_init_failure_keeps_previous_runtime_isolation) {
     g_raise_on_user_name = false;
     g_log = NULL;
     command_runner_fn prev = run_set_runner(fake_runner);
-    int rc = accounts_switch_prepare(&ctx, "testacct");
+    int rc = prepare_switch_expect(
+        &ctx, "testacct", ACCOUNTS_SWITCH_PREPARE_CLEAN_FAILURE);
     failure = *get_last_error();
     run_set_runner(prev);
     CHECK_EQ_INT(saved_path_present ? setenv("PATH", saved_path, 1)
@@ -1631,7 +1662,8 @@ TEST(prepared_ssh_switch_failure_releases_transaction_ownership) {
     seed_previous_git_identity();
     g_fail_ssh_add = true;
     previous_runner = run_set_runner(ssh_git_runner);
-    rc = accounts_switch_prepare(&ctx, "testacct");
+    rc = prepare_switch_expect(
+        &ctx, "testacct", ACCOUNTS_SWITCH_PREPARE_CLEAN_FAILURE);
     failure = *get_last_error();
     run_set_runner(previous_runner);
     g_fail_ssh_add = false;
@@ -1798,13 +1830,18 @@ TEST(repeated_switch_reap_failure_preserves_live_session) {
     ctx.account_count = 2;
 
     previous_reap = ssh_manager_set_reap_fn(refuse_session_agent_reap);
-    CHECK_EQ_INT(accounts_switch_prepare(&ctx, "second"), -1);
+    CHECK_EQ_INT(prepare_switch_expect(
+                     &ctx, "second",
+                     ACCOUNTS_SWITCH_PREPARE_ABORT_REQUIRED),
+                 -1);
     ssh_manager_set_reap_fn(previous_reap);
 
     CHECK(strstr(get_last_error()->details,
                  "[SSH runtime deactivation]") != NULL);
     CHECK(runtime_lock_available_to_child());
-    CHECK_EQ_INT(accounts_switch_commit(&ctx), -1);
+    CHECK_EQ_INT(commit_switch_expect(
+                     &ctx, ACCOUNTS_SWITCH_COMMIT_NOT_COMMITTED),
+                 -1);
     CHECK(strstr(get_last_error()->message, "can only be retried") != NULL);
     CHECK_EQ_INT(accounts_switch_abort(&ctx, false), 0);
 
@@ -2342,7 +2379,10 @@ TEST(prepared_verbose_fresh_switch_runs_one_default_probe) {
     CHECK_EQ_INT(enable_switch_target_ssh(&ctx, NULL), 0);
     seed_previous_git_identity();
     previous_runner = run_set_runner(ssh_git_runner);
-    CHECK_EQ_INT(accounts_switch_prepare(&ctx, "testacct"), 0);
+    CHECK_EQ_INT(prepare_switch_expect(
+                     &ctx, "testacct",
+                     ACCOUNTS_SWITCH_PREPARE_PREPARED),
+                 0);
     CHECK_EQ_INT(g_ssh_connection_probes, 0);
     g_probe_expected_ctx = &ctx;
     CHECK_EQ_INT(accounts_switch_commit_result(&ctx, &state), 0);
@@ -2615,7 +2655,10 @@ TEST(postrename_alias_fsync_failure_retains_complete_prepared_switch) {
     g_raise_on_user_name = false;
     g_log = NULL;
     previous_runner = run_set_runner(ssh_git_runner);
-    CHECK_EQ_INT(accounts_switch_prepare(&ctx, "testacct"), 0);
+    CHECK_EQ_INT(prepare_switch_expect(
+                     &ctx, "testacct",
+                     ACCOUNTS_SWITCH_PREPARE_PREPARED),
+                 0);
     previous_sync = ssh_manager_set_dirsync_fn(fail_alias_dirsync);
     rc = accounts_switch_commit_result(&ctx, &state);
     safe_strncpy(detail, get_last_error()->message, sizeof(detail));
@@ -2679,7 +2722,10 @@ TEST(first_ssh_home_sync_failure_remains_abortable_preinstall) {
     g_raise_on_user_name = false;
     g_log = NULL;
     previous_runner = run_set_runner(ssh_git_runner);
-    CHECK_EQ_INT(accounts_switch_prepare(&ctx, "testacct"), 0);
+    CHECK_EQ_INT(prepare_switch_expect(
+                     &ctx, "testacct",
+                     ACCOUNTS_SWITCH_PREPARE_PREPARED),
+                 0);
     previous_sync = ssh_manager_set_dirsync_fn(fail_alias_dirsync);
     clear_error();
     rc = accounts_switch_commit_result(&ctx, &state);
@@ -2766,7 +2812,10 @@ TEST(identical_insecure_alias_prerename_failure_remains_abortable) {
     g_log = NULL;
     before_fds = test_open_fd_count();
     previous_runner = run_set_runner(ssh_git_runner);
-    CHECK_EQ_INT(accounts_switch_prepare(&ctx, "testacct"), 0);
+    CHECK_EQ_INT(prepare_switch_expect(
+                     &ctx, "testacct",
+                     ACCOUNTS_SWITCH_PREPARE_PREPARED),
+                 0);
     CHECK_EQ_INT(chmod(config_path, 0666), 0);
     CHECK_EQ_INT(stat(config_path, &before), 0);
     CHECK(S_ISREG(before.st_mode));
@@ -2865,7 +2914,10 @@ TEST(identical_insecure_alias_dirsync_failure_retains_normalized_commit) {
     g_log = NULL;
     before_fds = test_open_fd_count();
     previous_runner = run_set_runner(ssh_git_runner);
-    CHECK_EQ_INT(accounts_switch_prepare(&ctx, "testacct"), 0);
+    CHECK_EQ_INT(prepare_switch_expect(
+                     &ctx, "testacct",
+                     ACCOUNTS_SWITCH_PREPARE_PREPARED),
+                 0);
     CHECK_EQ_INT(chmod(config_path, 0666), 0);
     CHECK_EQ_INT(stat(config_path, &before), 0);
     CHECK(S_ISREG(before.st_mode));
@@ -3574,7 +3626,10 @@ TEST(abort_accumulates_git_then_gpg_failure_and_retries_exactly) {
     seed_previous_git_identity();
     previous_runner = run_set_runner(gpg_git_runner);
 
-    CHECK_EQ_INT(accounts_switch_prepare(&ctx, "testacct"), 0);
+    CHECK_EQ_INT(prepare_switch_expect(
+                     &ctx, "testacct",
+                     ACCOUNTS_SWITCH_PREPARE_PREPARED),
+                 0);
     CHECK_STR_EQ(g_store_name, "testacct");
     CHECK(getenv("GNUPGHOME") != NULL);
     if (getenv("GNUPGHOME")) {
@@ -3727,7 +3782,8 @@ TEST(signing_capability_failure_precedes_runtime_and_git_publication) {
     g_gpg_secret_listing = SEC_CERT_ONLY;
     command_runner_fn previous_runner = run_set_runner(gpg_git_runner);
 
-    int rc = accounts_switch_prepare(&ctx, "testacct");
+    int rc = prepare_switch_expect(
+        &ctx, "testacct", ACCOUNTS_SWITCH_PREPARE_CLEAN_FAILURE);
     failure = *get_last_error();
 
     run_set_runner(previous_runner);
@@ -3778,11 +3834,16 @@ TEST(prepared_commit_accepts_unchanged_gpg_selector_after_normalization) {
     g_gpg_secret_listing = SEC_SIGN;
     previous_runner = run_set_runner(gpg_git_runner);
 
-    CHECK_EQ_INT(accounts_switch_prepare(&ctx, "testacct"), 0);
+    CHECK_EQ_INT(prepare_switch_expect(
+                     &ctx, "testacct",
+                     ACCOUNTS_SWITCH_PREPARE_PREPARED),
+                 0);
     CHECK_STR_EQ(ctx.accounts[0].gpg_key_id, "FEEDFACE01234567");
     CHECK_STR_EQ(g_store_signingkey,
                  "0123456789ABCDEF0123456789ABCDEF01234567");
-    CHECK_EQ_INT(accounts_switch_commit(&ctx), 0);
+    CHECK_EQ_INT(commit_switch_expect(
+                     &ctx, ACCOUNTS_SWITCH_COMMIT_COMPLETE),
+                 0);
     CHECK_STR_EQ(ctx.accounts[0].gpg_key_id, "FEEDFACE01234567");
     CHECK_EQ_INT(accounts_session_cleanup(), 0);
 
@@ -4017,7 +4078,8 @@ TEST(late_seal_failure_restores_exact_gpg_selector_vectors) {
     g_mutate_name_before_seal = true;
     previous_runner = run_set_runner(gpg_git_runner);
 
-    rc = accounts_switch_prepare(&ctx, "testacct");
+    rc = prepare_switch_expect(
+        &ctx, "testacct", ACCOUNTS_SWITCH_PREPARE_ABORT_REQUIRED);
     g_mutate_name_before_seal = false;
 
     CHECK_EQ_INT(rc, -1);
@@ -4309,7 +4371,7 @@ TEST(pending_postcommit_signal_skips_ssh_probe) {
 /* AR-11 M4: the structured prepare result is a caller-lifetime contract.
  * Only an exact successful handoff is PREPARED; a failed call that publishes
  * an abort-only record says so explicitly, while validation or competing-
- * owner failures remain clean. The legacy wrapper keeps its integer result. */
+ * owner failures remain clean. */
 TEST(structured_prepare_result_tracks_exact_context_ownership) {
     gitswitch_ctx_t owner;
     gitswitch_ctx_t contender;
@@ -4324,7 +4386,10 @@ TEST(structured_prepare_result_tracks_exact_context_ownership) {
                  -1);
     CHECK_EQ_INT(state, ACCOUNTS_SWITCH_PREPARE_CLEAN_FAILURE);
     CHECK(accounts_transaction_context_release_safe(&owner));
-    CHECK_EQ_INT(accounts_switch_prepare(&owner, "missing"), -1);
+    CHECK_EQ_INT(prepare_switch_expect(
+                     &owner, "missing",
+                     ACCOUNTS_SWITCH_PREPARE_CLEAN_FAILURE),
+                 -1);
     CHECK(accounts_transaction_context_release_safe(&owner));
 
     CHECK_EQ_INT(setup_empty_runtime_dir(), 0);
@@ -4336,14 +4401,19 @@ TEST(structured_prepare_result_tracks_exact_context_ownership) {
                  0);
     CHECK_EQ_INT(state, ACCOUNTS_SWITCH_PREPARE_PREPARED);
     CHECK(!accounts_transaction_context_release_safe(&owner));
-    CHECK_EQ_INT(accounts_switch_commit(&owner), 0);
+    CHECK_EQ_INT(commit_switch_expect(
+                     &owner, ACCOUNTS_SWITCH_COMMIT_COMPLETE),
+                 0);
     CHECK(accounts_transaction_context_release_safe(&owner));
 
     CHECK_EQ_INT(setup_empty_runtime_dir(), 0);
     owner = make_ctx();
     contender = make_ctx();
     seed_previous_git_identity();
-    CHECK_EQ_INT(accounts_switch_prepare(&owner, "testacct"), 0);
+    CHECK_EQ_INT(prepare_switch_expect(
+                     &owner, "testacct",
+                     ACCOUNTS_SWITCH_PREPARE_PREPARED),
+                 0);
     CHECK(!accounts_transaction_context_release_safe(&owner));
     state = ACCOUNTS_SWITCH_PREPARE_ABORT_REQUIRED;
     CHECK_EQ_INT(accounts_switch_prepare_result(&contender, NULL, &state),
@@ -4363,7 +4433,9 @@ TEST(structured_prepare_result_tracks_exact_context_ownership) {
     g_mutate_name_before_seal = false;
     CHECK_EQ_INT(state, ACCOUNTS_SWITCH_PREPARE_ABORT_REQUIRED);
     CHECK(!accounts_transaction_context_release_safe(&owner));
-    CHECK_EQ_INT(accounts_switch_commit(&owner), -1);
+    CHECK_EQ_INT(commit_switch_expect(
+                     &owner, ACCOUNTS_SWITCH_COMMIT_NOT_COMMITTED),
+                 -1);
     CHECK(strstr(get_last_error()->message, "can only be retried") != NULL);
     safe_strncpy(g_store_name, "testacct", sizeof(g_store_name));
     CHECK_EQ_INT(accounts_switch_abort(&owner, false), 0);
@@ -4465,7 +4537,10 @@ TEST(prepared_commit_rejects_every_frozen_account_field_change) {
         owner = make_ctx();
         contender = make_ctx();
         seed_previous_git_identity();
-        CHECK_EQ_INT(accounts_switch_prepare(&owner, "testacct"), 0);
+        CHECK_EQ_INT(prepare_switch_expect(
+                         &owner, "testacct",
+                         ACCOUNTS_SWITCH_PREPARE_PREPARED),
+                     0);
         runner_calls = g_fake_runner_calls;
         mutate_account_field(&owner.accounts[0],
                              (account_mutation_field_t)field);
@@ -4524,7 +4599,10 @@ TEST(prepared_switch_gates_public_account_model_mutation_matrix) {
                               sizeof(edited.description)), 0);
     seed_previous_git_identity();
     previous_runner = run_set_runner(fake_runner);
-    CHECK_EQ_INT(accounts_switch_prepare(&owner, "testacct"), 0);
+    CHECK_EQ_INT(prepare_switch_expect(
+                     &owner, "testacct",
+                     ACCOUNTS_SWITCH_PREPARE_PREPARED),
+                 0);
     owner_before = owner;
     contender_before = contender;
     runner_calls = g_fake_runner_calls;
@@ -4585,10 +4663,15 @@ TEST(prepared_commit_accepts_unchanged_tilde_ssh_path) {
     seed_previous_git_identity();
     previous_runner = run_set_runner(ssh_git_runner);
 
-    CHECK_EQ_INT(accounts_switch_prepare(&ctx, "testacct"), 0);
+    CHECK_EQ_INT(prepare_switch_expect(
+                     &ctx, "testacct",
+                     ACCOUNTS_SWITCH_PREPARE_PREPARED),
+                 0);
     CHECK_STR_EQ(ctx.accounts[0].ssh_key_path, "~/key_target");
     CHECK(strstr(g_store_sshcmd, key_path) != NULL);
-    CHECK_EQ_INT(accounts_switch_commit(&ctx), 0);
+    CHECK_EQ_INT(commit_switch_expect(
+                     &ctx, ACCOUNTS_SWITCH_COMMIT_COMPLETE),
+                 0);
     CHECK_STR_EQ(ctx.accounts[0].ssh_key_path, "~/key_target");
     CHECK_EQ_INT(accounts_session_cleanup(), 0);
 
@@ -4619,7 +4702,10 @@ TEST(clean_pending_switch_excludes_competing_entry_matrix) {
     seed_previous_git_identity();
     previous_runner = run_set_runner(fake_runner);
 
-    CHECK_EQ_INT(accounts_switch_prepare(&owner, "testacct"), 0);
+    CHECK_EQ_INT(prepare_switch_expect(
+                     &owner, "testacct",
+                     ACCOUNTS_SWITCH_PREPARE_PREPARED),
+                 0);
     CHECK_STR_EQ(g_store_name, "testacct");
     CHECK_STR_EQ(g_store_email, "test@example.com");
     CHECK(!runtime_lock_available_to_child());
@@ -4641,11 +4727,20 @@ TEST(clean_pending_switch_excludes_competing_entry_matrix) {
     CHECK(strstr(get_last_error()->message, "already pending") != NULL);
     CHECK_EQ_INT(accounts_switch(NULL, NULL), -1);
     CHECK(strstr(get_last_error()->message, "already pending") != NULL);
-    CHECK_EQ_INT(accounts_switch_prepare(&owner, "testacct"), -1);
+    CHECK_EQ_INT(prepare_switch_expect(
+                     &owner, "testacct",
+                     ACCOUNTS_SWITCH_PREPARE_CLEAN_FAILURE),
+                 -1);
     CHECK(strstr(get_last_error()->message, "already pending") != NULL);
-    CHECK_EQ_INT(accounts_switch_prepare(&contender, NULL), -1);
+    CHECK_EQ_INT(prepare_switch_expect(
+                     &contender, NULL,
+                     ACCOUNTS_SWITCH_PREPARE_CLEAN_FAILURE),
+                 -1);
     CHECK(strstr(get_last_error()->message, "already pending") != NULL);
-    CHECK_EQ_INT(accounts_switch_prepare(NULL, NULL), -1);
+    CHECK_EQ_INT(prepare_switch_expect(
+                     NULL, NULL,
+                     ACCOUNTS_SWITCH_PREPARE_CLEAN_FAILURE),
+                 -1);
     CHECK(strstr(get_last_error()->message, "already pending") != NULL);
 
     CHECK(memcmp(&owner, &owner_before, sizeof(owner)) == 0);
@@ -4664,7 +4759,10 @@ TEST(clean_pending_switch_excludes_competing_entry_matrix) {
         CHECK(switch_actions_equal(&observed, &guarded[i]));
     }
 
-    CHECK_EQ_INT(accounts_switch_commit(&contender), -1);
+    CHECK_EQ_INT(commit_switch_expect(
+                     &contender,
+                     ACCOUNTS_SWITCH_COMMIT_NOT_COMMITTED),
+                 -1);
     CHECK(strstr(get_last_error()->message,
                  "No prepared account switch") != NULL);
     CHECK_EQ_INT(accounts_switch_abort(&contender, false), -1);
@@ -4676,7 +4774,9 @@ TEST(clean_pending_switch_excludes_competing_entry_matrix) {
     CHECK_STR_EQ(g_store_email, "test@example.com");
     CHECK(!runtime_lock_available_to_child());
 
-    CHECK_EQ_INT(accounts_switch_commit(&owner), 0);
+    CHECK_EQ_INT(commit_switch_expect(
+                     &owner, ACCOUNTS_SWITCH_COMMIT_COMPLETE),
+                 0);
     CHECK(runtime_lock_available_to_child());
     CHECK_EQ_INT(git_config_seal(), -1);
     CHECK(strstr(get_last_error()->message, "No Git snapshot to seal") !=
@@ -4689,7 +4789,10 @@ TEST(clean_pending_switch_excludes_competing_entry_matrix) {
      * finalization paths reopen the public admission gate. */
     owner = make_ctx();
     seed_previous_git_identity();
-    CHECK_EQ_INT(accounts_switch_prepare(&owner, "testacct"), 0);
+    CHECK_EQ_INT(prepare_switch_expect(
+                     &owner, "testacct",
+                     ACCOUNTS_SWITCH_PREPARE_PREPARED),
+                 0);
     CHECK_EQ_INT(accounts_switch_abort(&owner, false), 0);
     CHECK_STR_EQ(g_store_name, "Previous Name");
     CHECK_STR_EQ(g_store_email, "prev@example.com");
@@ -4748,7 +4851,10 @@ TEST(abort_only_pending_switch_excludes_competing_entry_matrix) {
     seed_previous_git_identity();
     g_mutate_name_before_seal = true;
     previous_runner = run_set_runner(fake_runner);
-    CHECK_EQ_INT(accounts_switch_prepare(&owner, "testacct"), -1);
+    CHECK_EQ_INT(prepare_switch_expect(
+                     &owner, "testacct",
+                     ACCOUNTS_SWITCH_PREPARE_ABORT_REQUIRED),
+                 -1);
     g_mutate_name_before_seal = false;
     CHECK(strstr(get_last_error()->details,
                  "[Git configuration restore]") != NULL);
@@ -4769,11 +4875,20 @@ TEST(abort_only_pending_switch_excludes_competing_entry_matrix) {
     CHECK(strstr(get_last_error()->message, "already pending") != NULL);
     CHECK_EQ_INT(accounts_switch(NULL, NULL), -1);
     CHECK(strstr(get_last_error()->message, "already pending") != NULL);
-    CHECK_EQ_INT(accounts_switch_prepare(&owner, "testacct"), -1);
+    CHECK_EQ_INT(prepare_switch_expect(
+                     &owner, "testacct",
+                     ACCOUNTS_SWITCH_PREPARE_CLEAN_FAILURE),
+                 -1);
     CHECK(strstr(get_last_error()->message, "already pending") != NULL);
-    CHECK_EQ_INT(accounts_switch_prepare(&contender, NULL), -1);
+    CHECK_EQ_INT(prepare_switch_expect(
+                     &contender, NULL,
+                     ACCOUNTS_SWITCH_PREPARE_CLEAN_FAILURE),
+                 -1);
     CHECK(strstr(get_last_error()->message, "already pending") != NULL);
-    CHECK_EQ_INT(accounts_switch_prepare(NULL, NULL), -1);
+    CHECK_EQ_INT(prepare_switch_expect(
+                     NULL, NULL,
+                     ACCOUNTS_SWITCH_PREPARE_CLEAN_FAILURE),
+                 -1);
     CHECK(strstr(get_last_error()->message, "already pending") != NULL);
 
     CHECK(memcmp(&owner, &owner_before, sizeof(owner)) == 0);
@@ -4790,13 +4905,18 @@ TEST(abort_only_pending_switch_excludes_competing_entry_matrix) {
         CHECK(switch_actions_equal(&observed, &guarded[i]));
     }
 
-    CHECK_EQ_INT(accounts_switch_commit(&contender), -1);
+    CHECK_EQ_INT(commit_switch_expect(
+                     &contender,
+                     ACCOUNTS_SWITCH_COMMIT_NOT_COMMITTED),
+                 -1);
     CHECK(strstr(get_last_error()->message,
                  "No prepared account switch") != NULL);
     CHECK_EQ_INT(accounts_switch_abort(&contender, false), -1);
     CHECK(strstr(get_last_error()->message,
                  "No prepared account switch") != NULL);
-    CHECK_EQ_INT(accounts_switch_commit(&owner), -1);
+    CHECK_EQ_INT(commit_switch_expect(
+                     &owner, ACCOUNTS_SWITCH_COMMIT_NOT_COMMITTED),
+                 -1);
     CHECK(strstr(get_last_error()->message, "can only be retried") != NULL);
     CHECK(memcmp(&owner, &owner_before, sizeof(owner)) == 0);
     CHECK_EQ_INT(g_fake_runner_calls, runner_calls);
@@ -4827,7 +4947,9 @@ TEST(abort_only_pending_switch_excludes_competing_entry_matrix) {
     CHECK_STR_EQ(g_store_email, "prev@example.com");
     CHECK(signals_guard_active());
     CHECK(signals_rollback_active());
-    CHECK_EQ_INT(accounts_switch_commit(&owner), -1);
+    CHECK_EQ_INT(commit_switch_expect(
+                     &owner, ACCOUNTS_SWITCH_COMMIT_NOT_COMMITTED),
+                 -1);
     CHECK(strstr(get_last_error()->message, "can only be retried") != NULL);
     CHECK_EQ_INT(accounts_init(&contender), -1);
     CHECK(memcmp(&contender, &contender_before, sizeof(contender)) == 0);
@@ -4887,7 +5009,10 @@ TEST(guard_restore_failure_after_commit_reports_committed_state) {
     ctx = make_ctx();
     seed_previous_git_identity();
     previous_runner = run_set_runner(fake_runner);
-    CHECK_EQ_INT(accounts_switch_prepare(&ctx, "testacct"), 0);
+    CHECK_EQ_INT(prepare_switch_expect(
+                     &ctx, "testacct",
+                     ACCOUNTS_SWITCH_PREPARE_PREPARED),
+                 0);
     signals_test_fail_sigaction(SIGTERM, SIGNALS_TEST_SIGACTION_RESTORE,
                                 EIO);
     rc = accounts_switch_commit_result(&ctx, &state);
@@ -4927,7 +5052,8 @@ TEST(guard_begin_partial_restore_is_synchronously_released) {
     ctx = make_ctx();
     seed_previous_git_identity();
     previous_runner = run_set_runner(fake_runner);
-    rc = accounts_switch_prepare(&ctx, "testacct");
+    rc = prepare_switch_expect(
+        &ctx, "testacct", ACCOUNTS_SWITCH_PREPARE_CLEAN_FAILURE);
     run_set_runner(previous_runner);
 
     CHECK_EQ_INT(rc, -1);
@@ -4979,7 +5105,8 @@ TEST(guard_begin_restore_retry_publishes_abort_only_handle) {
     ctx = make_ctx();
     seed_previous_git_identity();
     previous_runner = run_set_runner(fake_runner);
-    rc = accounts_switch_prepare(&ctx, "testacct");
+    rc = prepare_switch_expect(
+        &ctx, "testacct", ACCOUNTS_SWITCH_PREPARE_ABORT_REQUIRED);
     run_set_runner(previous_runner);
 
     CHECK_EQ_INT(rc, -1);
@@ -4989,7 +5116,9 @@ TEST(guard_begin_restore_retry_publishes_abort_only_handle) {
     CHECK_EQ_INT(git_config_seal(), -1);
     CHECK(strstr(get_last_error()->message, "No Git snapshot to seal") !=
           NULL);
-    CHECK_EQ_INT(accounts_switch_commit(&ctx), -1);
+    CHECK_EQ_INT(commit_switch_expect(
+                     &ctx, ACCOUNTS_SWITCH_COMMIT_NOT_COMMITTED),
+                 -1);
     CHECK(strstr(get_last_error()->message, "can only be retried") != NULL);
 
     signals_test_fail_sigaction(0, SIGNALS_TEST_SIGACTION_NONE, 0);
@@ -5045,7 +5174,8 @@ TEST(failed_prepare_releases_callers_signal_dispositions) {
     g_raise_on_user_name = false;
     g_log = NULL;
     previous_runner = run_set_runner(fake_runner);
-    rc = accounts_switch_prepare(&ctx, "testacct");
+    rc = prepare_switch_expect(
+        &ctx, "testacct", ACCOUNTS_SWITCH_PREPARE_CLEAN_FAILURE);
     run_set_runner(previous_runner);
     g_fail_user_name_set = false;
 
@@ -5105,7 +5235,8 @@ TEST(prepared_interruption_preserves_failure_diagnostic) {
     g_log = NULL;
     previous_runner = run_set_runner(fake_runner);
     clear_error();
-    rc = accounts_switch_prepare(&ctx, "testacct");
+    rc = prepare_switch_expect(
+        &ctx, "testacct", ACCOUNTS_SWITCH_PREPARE_CLEAN_FAILURE);
     failure = *get_last_error();
     run_set_runner(previous_runner);
     g_raise_on_user_name = false;
@@ -5140,7 +5271,8 @@ TEST(prepared_seal_failure_retains_abort_retry_handle) {
     seed_previous_git_identity();
     g_mutate_name_before_seal = true;
     previous_runner = run_set_runner(fake_runner);
-    rc = accounts_switch_prepare(&ctx, "testacct");
+    rc = prepare_switch_expect(
+        &ctx, "testacct", ACCOUNTS_SWITCH_PREPARE_ABORT_REQUIRED);
     run_set_runner(previous_runner);
     g_mutate_name_before_seal = false;
 
@@ -5152,7 +5284,9 @@ TEST(prepared_seal_failure_retains_abort_retry_handle) {
     CHECK(strstr(get_last_error()->details,
                  "[Git configuration restore]") != NULL);
     CHECK(runtime_lock_available_to_child());
-    CHECK_EQ_INT(accounts_switch_commit(&ctx), -1);
+    CHECK_EQ_INT(commit_switch_expect(
+                     &ctx, ACCOUNTS_SWITCH_COMMIT_NOT_COMMITTED),
+                 -1);
     CHECK(strstr(get_last_error()->message, "can only be retried") != NULL);
 
     safe_strncpy(g_store_name, "testacct", sizeof(g_store_name));
@@ -5402,6 +5536,8 @@ TEST(repeated_signals_wait_for_prepared_switch_rollback) {
         if (pid == 0) {
             struct sigaction default_action;
             gitswitch_ctx_t ctx = make_ctx();
+            accounts_switch_prepare_state_t state =
+                ACCOUNTS_SWITCH_PREPARE_CLEAN_FAILURE;
 
             memset(&default_action, 0, sizeof(default_action));
             default_action.sa_handler = SIG_DFL;
@@ -5412,7 +5548,11 @@ TEST(repeated_signals_wait_for_prepared_switch_rollback) {
             g_log = fopen(log_path, "w");
             if (!g_log) _exit(21);
             run_set_runner(fake_runner);
-            if (accounts_switch_prepare(&ctx, "testacct") != 0) _exit(22);
+            if (accounts_switch_prepare_result(
+                    &ctx, "testacct", &state) != 0) {
+                _exit(22);
+            }
+            if (state != ACCOUNTS_SWITCH_PREPARE_PREPARED) _exit(26);
             if (fputs("MARK-HANDOFF\n", g_log) == EOF || fflush(g_log) != 0)
                 _exit(23);
             raise(signal_number);
@@ -5476,6 +5616,8 @@ TEST(incomplete_prepared_abort_retains_signal_ownership_until_retry) {
         if (pid == 0) {
             struct sigaction default_action;
             gitswitch_ctx_t ctx = make_ctx();
+            accounts_switch_prepare_state_t state =
+                ACCOUNTS_SWITCH_PREPARE_CLEAN_FAILURE;
 
             memset(&default_action, 0, sizeof(default_action));
             default_action.sa_handler = SIG_DFL;
@@ -5486,7 +5628,11 @@ TEST(incomplete_prepared_abort_retains_signal_ownership_until_retry) {
             g_log = fopen(log_path, "w");
             if (!g_log) _exit(41);
             run_set_runner(fake_runner);
-            if (accounts_switch_prepare(&ctx, "testacct") != 0) _exit(42);
+            if (accounts_switch_prepare_result(
+                    &ctx, "testacct", &state) != 0) {
+                _exit(42);
+            }
+            if (state != ACCOUNTS_SWITCH_PREPARE_PREPARED) _exit(48);
 
             /* External writer after the sealed post-image. */
             safe_strncpy(g_store_name, "later-writer",
@@ -5557,11 +5703,17 @@ TEST(deferred_signal_survives_post_switch_window) {
     CHECK(pid >= 0);
     if (pid == 0) {
         gitswitch_ctx_t ctx = make_ctx();
+        accounts_switch_prepare_state_t state =
+            ACCOUNTS_SWITCH_PREPARE_CLEAN_FAILURE;
         g_fail_user_name_set = false;
         g_raise_on_user_name = false;
         g_log = NULL;
         run_set_runner(fake_runner);
-        if (accounts_switch_prepare(&ctx, "testacct") != 0) _exit(8);
+        if (accounts_switch_prepare_result(
+                &ctx, "testacct", &state) != 0) {
+            _exit(8);
+        }
+        if (state != ACCOUNTS_SWITCH_PREPARE_PREPARED) _exit(9);
         /* Ctrl-C in the prepared persistence gap. */
         raise(SIGINT);
         if (!signals_pending()) _exit(7);

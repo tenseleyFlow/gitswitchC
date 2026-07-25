@@ -80,6 +80,7 @@ static runtime_holder_t g_runtime_holder = { -1, -1 };
 static bool g_hook_should_hold_runtime;
 static int g_hook_called;
 static int g_hook_commit_rc;
+static accounts_switch_commit_state_t g_hook_commit_state;
 static int g_hook_holder_rc;
 static int g_hook_prepare_errno;
 static error_context_t g_hook_prepare_error;
@@ -1201,7 +1202,8 @@ static void inspect_abort_owner(gitswitch_ctx_t *ctx) {
     g_hook_called++;
     g_hook_prepare_errno = errno;
     g_hook_prepare_error = *get_last_error();
-    g_hook_commit_rc = accounts_switch_commit(ctx);
+    g_hook_commit_rc =
+        accounts_switch_commit_result(ctx, &g_hook_commit_state);
     (void)snprintf(g_hook_commit_error, sizeof(g_hook_commit_error), "%s",
                    get_last_error()->message);
     if (g_hook_should_hold_runtime) {
@@ -1310,6 +1312,7 @@ static int run_cli_owner_case(const cli_owner_fixture_t *fixture,
         g_hook_should_hold_runtime = persist_first_abort;
         g_hook_called = 0;
         g_hook_commit_rc = 0;
+        g_hook_commit_state = ACCOUNTS_SWITCH_COMMIT_COMPLETE;
         g_hook_holder_rc = 0;
         g_hook_prepare_errno = 0;
         memset(&g_hook_prepare_error, 0, sizeof(g_hook_prepare_error));
@@ -1344,13 +1347,16 @@ static int run_cli_owner_case(const cli_owner_fixture_t *fixture,
             strcmp(g_publish_error.message,
                    g_hook_prepare_error.message) != 0 ||
             g_hook_commit_rc != -1 ||
+            g_hook_commit_state !=
+                ACCOUNTS_SWITCH_COMMIT_NOT_COMMITTED ||
             strstr(g_hook_commit_error, "can only be retried") == NULL) {
             fprintf(stderr,
                     "AR-11 CLI owner hook mismatch: called=%d "
                     "prepare_errno=%d prepare_code=%d prepare_error=%s "
                     "publish_called=%d publish_errno=%d "
                     "publish_code=%d publish_error=%s "
-                    "publish_details=%s commit_rc=%d commit_error=%s\n",
+                    "publish_details=%s commit_rc=%d commit_state=%d "
+                    "commit_error=%s\n",
                     g_hook_called, g_hook_prepare_errno,
                     (int)g_hook_prepare_error.code,
                     g_hook_prepare_error.message[0]
@@ -1365,6 +1371,7 @@ static int run_cli_owner_case(const cli_owner_fixture_t *fixture,
                         ? g_publish_error.details
                         : "(empty)",
                     g_hook_commit_rc,
+                    (int)g_hook_commit_state,
                     g_hook_commit_error[0] ? g_hook_commit_error : "(empty)");
             _exit(103);
         }

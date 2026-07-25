@@ -1941,10 +1941,11 @@ static int accounts_switch_impl(gitswitch_ctx_t *ctx, const char *identifier,
 
         /* Direct callers install the managed host-alias block here as their
          * final fallible commit. A transactional CLI switch defers it to
-         * accounts_switch_commit(): otherwise a later active/hint save failure
-         * could roll Git/runtime back while leaving the new user-file mapping.
-         * The writer uses a no-follow read plus atomic rename and makes no
-         * durable change when it refuses. Resume skips the persistent file. */
+         * accounts_switch_commit_result(): otherwise a later active/hint save
+         * failure could roll Git/runtime back while leaving the new user-file
+         * mapping. The writer uses a no-follow read plus atomic rename and
+         * makes no durable change when it refuses. Resume skips the persistent
+         * file. */
         if (!defer_commit && !ctx->config.resuming &&
             account->ssh_enabled && strlen(account->ssh_key_path) > 0 &&
             strlen(account->ssh_host_alias) > 0) {
@@ -2220,12 +2221,6 @@ int accounts_switch_prepare_result(gitswitch_ctx_t *ctx,
         return -1;
     }
     return rc;
-}
-
-int accounts_switch_prepare(gitswitch_ctx_t *ctx, const char *identifier) {
-    accounts_switch_prepare_state_t state;
-
-    return accounts_switch_prepare_result(ctx, identifier, &state);
 }
 
 /* Compare semantic account fields one by one. Avoiding a struct memcmp keeps
@@ -2607,10 +2602,6 @@ int accounts_switch_publication(
     }
     *publication = &g_pending_switch.publication;
     return 0;
-}
-
-int accounts_switch_commit(gitswitch_ctx_t *ctx) {
-    return accounts_switch_commit_result(ctx, NULL);
 }
 
 static int publish_abort_result(error_accumulator_t *errors, int result) {
