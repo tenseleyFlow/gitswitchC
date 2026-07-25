@@ -867,6 +867,7 @@ TEST(edit_empty_input_keeps_all_fields) {
     CHECK_EQ_INT(expect_send(&g_p, "Description [work account]:", "\n"), 0);
     CHECK_EQ_INT(expect_send(&g_p, "'none' to disable):", "\n"), 0); /* SSH */
     CHECK_EQ_INT(expect_send(&g_p, "'none' to disable):", "\n"), 0); /* GPG */
+    CHECK_EQ_INT(expect_send(&g_p, "Enable GPG signing for commits?", "\n"), 0);
     CHECK_EQ_INT(expect_send(&g_p, "Preferred Git Scope", "\n"), 0);
     CHECK_EQ_INT(expect_send(&g_p, "this account? (y/N)", "y\n"), 0);
     CHECK_EQ_INT(pty_expect(&g_p, "Account updated"), 0);
@@ -951,6 +952,7 @@ TEST(yes_flag_skips_confirmation) {
     CHECK_EQ_INT(expect_send(&g_p, "Description [work account]:", "\n"), 0);
     CHECK_EQ_INT(expect_send(&g_p, "'none' to disable):", "\n"), 0); /* SSH */
     CHECK_EQ_INT(expect_send(&g_p, "'none' to disable):", "\n"), 0); /* GPG */
+    CHECK_EQ_INT(expect_send(&g_p, "Enable GPG signing for commits?", "\n"), 0);
     CHECK_EQ_INT(expect_send(&g_p, "Preferred Git Scope", "\n"), 0);
     CHECK_EQ_INT(pty_expect(&g_p, "Account updated"), 0);
     CHECK_EQ_INT(pty_wait_exit(&g_p), 0);
@@ -1247,6 +1249,7 @@ TEST(cancelled_ops_leave_config_byte_identical) {
     CHECK_EQ_INT(expect_send(&g_p, "Description [work account]:", "\n"), 0);
     CHECK_EQ_INT(expect_send(&g_p, "'none' to disable):", "\n"), 0); /* SSH */
     CHECK_EQ_INT(expect_send(&g_p, "'none' to disable):", "\n"), 0); /* GPG */
+    CHECK_EQ_INT(expect_send(&g_p, "Enable GPG signing for commits?", "\n"), 0);
     CHECK_EQ_INT(expect_send(&g_p, "Preferred Git Scope", "\n"), 0);
     CHECK_EQ_INT(expect_send(&g_p, "this account? (y/N)", "n\n"), 0);
     CHECK_EQ_INT(pty_expect(&g_p, "Edit cancelled"), 0);
