@@ -1016,8 +1016,19 @@ int toml_validate_gitswitch_schema(toml_document_t *doc) {
                         return -1;
                     }
                     if (strlen(kv->value) > 0 && !validate_key_id(kv->value)) {
-                        set_error(ERR_CONFIG_INVALID, "Invalid GPG key ID: %s", kv->value);
-                        return -1;
+                        /* AR-14 M11: an obsolete or hand-edited string
+                         * selector affects only this account. Keep the
+                         * section enumerable so the loader counts the skip
+                         * and blocks reconstructive saves, but continue
+                         * validating its later fields: a structural type
+                         * error must still reject the complete document. */
+                        log_warning("Account section [%s]: gpg_key is not a "
+                                    "valid hexadecimal key selector; skipping "
+                                    "this account, the rest of the config "
+                                    "still loads",
+                                    section->name);
+                        skip_section = true;
+                        continue;
                     }
                     has_nonempty_gpg_key = strlen(kv->value) > 0;
                 }

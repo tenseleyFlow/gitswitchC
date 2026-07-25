@@ -494,6 +494,17 @@ TEST(schema_rejects_lossy_types_and_dependent_keys) {
                       "[accounts.1]\nname=\"alice\"\nemail=\"a@b.com\"\n"
                       "gpg_signing_enabled=1\n",
                       "gpg_signing_enabled must be a boolean");
+    expect_load_error("[settings]\ndefault_scope=\"local\"\n"
+                      "[accounts.1]\nname=\"alice\"\nemail=\"a@b.com\"\n"
+                      "gpg_key=7\n",
+                      "gpg_key must be a string");
+    /* A malformed string selector is account-local, but it must not hide a
+     * later structural error in the same section. */
+    expect_load_error("[settings]\ndefault_scope=\"local\"\n"
+                      "[accounts.1]\nname=\"alice\"\nemail=\"a@b.com\"\n"
+                      "gpg_key=\"NOT-A-HEX-SELECTOR\"\n"
+                      "gpg_signing_enabled=1\n",
+                      "gpg_signing_enabled must be a boolean");
     /* AR-13 M7: the three cross-field DEPENDENCY gaps now skip the offending
      * section instead of bricking the whole file (unlike the type errors
      * above, which stay hard rejects). A valid sibling account still loads. */
@@ -512,6 +523,57 @@ TEST(schema_rejects_lossy_types_and_dependent_keys) {
         "[accounts.1]\nname=\"alice\"\nemail=\"a@b.com\"\n"
         "gpg_key=\"\"\ngpg_signing_enabled=false\n"
         "[accounts.2]\nname=\"bob\"\nemail=\"b@b.com\"\n");
+}
+
+TEST(malformed_gpg_selector_skips_only_its_account_and_blocks_rewrite) {
+    static const char source[] =
+        "[settings]\n"
+        "default_scope = \"local\"\n"
+        "[accounts.1]\n"
+        "name = \"alice\"\n"
+        "email = \"alice@example.com\"\n"
+        "[accounts.2]\n"
+        "name = \"broken\"\n"
+        "email = \"broken@example.com\"\n"
+        "gpg_key = \"NOT-A-HEX-SELECTOR\"\n"
+        "gpg_signing_enabled = false\n"
+        "[accounts.3]\n"
+        "name = \"carol\"\n"
+        "email = \"carol@example.com\"\n";
+    char dir[128], path[256], observed[sizeof(source) + 32U];
+    gitswitch_ctx_t ctx;
+
+    CHECK_EQ_INT(private_dir(dir, sizeof(dir)), 0);
+    snprintf(path, sizeof(path), "%s/accounts.toml", dir);
+    CHECK_EQ_INT(write_private(path, source), 0);
+
+    memset(&ctx, 0, sizeof(ctx));
+    clear_error();
+    CHECK_EQ_INT(config_load(&ctx, path), 0);
+    CHECK_EQ_INT(get_last_error()->code, ERR_SUCCESS);
+    CHECK_EQ_INT(ctx.account_count, 2);
+    CHECK_EQ_INT(ctx.accounts_skipped_on_load, 1);
+    if (ctx.account_count == 2) {
+        CHECK_EQ_INT(ctx.accounts[0].id, 1);
+        CHECK_STR_EQ(ctx.accounts[0].name, "alice");
+        CHECK_EQ_INT(ctx.accounts[1].id, 3);
+        CHECK_STR_EQ(ctx.accounts[1].name, "carol");
+    }
+    CHECK_EQ_INT((long)read_text(path, observed, sizeof(observed)),
+                 (long)strlen(source));
+    CHECK(memcmp(observed, source, sizeof(source)) == 0);
+
+    clear_error();
+    CHECK_EQ_INT(config_check_rewritable(&ctx), -1);
+    CHECK_EQ_INT(get_last_error()->code, ERR_CONFIG_INVALID);
+
+    clear_error();
+    CHECK_EQ_INT(config_save(&ctx, path), -1);
+    CHECK_EQ_INT(get_last_error()->code, ERR_CONFIG_INVALID);
+    CHECK_EQ_INT((long)read_text(path, observed, sizeof(observed)),
+                 (long)strlen(source));
+    CHECK(memcmp(observed, source, sizeof(source)) == 0);
+    ts_rm_rf(dir);
 }
 
 TEST(default_create_fault_matrix_is_atomic_and_closes_fds) {
@@ -1985,6 +2047,7 @@ TEST(active_state_registration_failure_is_atomic_and_retryable) {
 
 TEST_MAIN_BEGIN()
     RUN_TEST(schema_rejects_lossy_types_and_dependent_keys);
+    RUN_TEST(malformed_gpg_selector_skips_only_its_account_and_blocks_rewrite);
     RUN_TEST(default_create_fault_matrix_is_atomic_and_closes_fds);
     RUN_TEST(default_create_signal_death_is_truthful_at_every_boundary);
     RUN_TEST(backups_are_durable_monotonic_and_bounded);
