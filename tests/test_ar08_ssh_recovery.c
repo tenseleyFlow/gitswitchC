@@ -44,6 +44,17 @@
 
 #define TEST_PID ((pid_t)1073741824)
 #define TEST_FP "SHA256:AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA"
+#define TEST_RECORD_TEXT                                                   \
+    "v1 1073741824 1 01020304050607081112131415161718 "                   \
+    "00000000000000002122232425262728\n"
+
+static const ssh_process_generation_t g_test_generation = {
+    .kind = SSH_PROCESS_GENERATION_LINUX,
+    .boot_hi = UINT64_C(0x0102030405060708),
+    .boot_lo = UINT64_C(0x1112131415161718),
+    .start_hi = 0,
+    .start_lo = UINT64_C(0x2122232425262728)
+};
 
 typedef struct {
     char xdg[64];
@@ -102,25 +113,59 @@ static int make_fixture(ssh_fixture_t *fixture, const char *stem) {
 }
 
 static int publish_sidecar(const ssh_fixture_t *fixture, pid_t pid) {
+    ssh_agent_record_t record = {
+        .pid = pid,
+        .generation = g_test_generation
+    };
     return ssh_manager_test_write_pid_sidecar(
-        fixture->dir_fd, "ssh-agent.work.pid", pid);
+        fixture->dir_fd, "ssh-agent.work.pid", &record);
 }
 
-static ssh_process_outcome_t reap_gone(pid_t pid, const char *socket_arg,
+static int publish_sidecar_for_process(const ssh_fixture_t *fixture,
+                                       pid_t pid) {
+    ssh_agent_record_t record = {.pid = pid};
+    if (ssh_manager_test_capture_process_generation(
+            pid, &record.generation) != 0) {
+        return -1;
+    }
+    return ssh_manager_test_write_pid_sidecar(
+        fixture->dir_fd, "ssh-agent.work.pid", &record);
+}
+
+static ssh_process_outcome_t reap_gone(const ssh_agent_record_t *record,
+                                       const char *socket_arg,
                                        int runtime_dir_fd) {
-    (void)pid;
+    (void)record;
     (void)socket_arg;
     (void)runtime_dir_fd;
     return SSH_PROCESS_GONE;
 }
 
-static ssh_process_outcome_t reap_indeterminate(pid_t pid,
-                                                const char *socket_arg,
-                                                int runtime_dir_fd) {
-    (void)pid;
+static ssh_process_outcome_t reap_indeterminate(
+    const ssh_agent_record_t *record, const char *socket_arg,
+    int runtime_dir_fd) {
+    (void)record;
     (void)socket_arg;
     (void)runtime_dir_fd;
     return SSH_PROCESS_INDETERMINATE;
+}
+
+static ssh_process_outcome_t reap_unrelated(
+    const ssh_agent_record_t *record, const char *socket_arg,
+    int runtime_dir_fd) {
+    (void)record;
+    (void)socket_arg;
+    (void)runtime_dir_fd;
+    return SSH_PROCESS_UNRELATED;
+}
+
+static ssh_process_outcome_t reap_replaced(
+    const ssh_agent_record_t *record, const char *socket_arg,
+    int runtime_dir_fd) {
+    (void)record;
+    (void)socket_arg;
+    (void)runtime_dir_fd;
+    return SSH_PROCESS_REPLACED;
 }
 
 static char g_race_runtime[192];
@@ -377,6 +422,34 @@ static int replace_unrecorded_socket_before_cleanup(int dir_fd,
     return g_race_hook_succeeded ? 0 : -1;
 }
 
+static int fail_retry_pid_sidecar_publication(int dir_fd,
+                                              const char *temp_name) {
+    (void)dir_fd;
+    (void)temp_name;
+    errno = EIO;
+    return -1;
+}
+
+static int fail_exact_pid_postrename_verification(int dir_fd,
+                                                  const char *name) {
+    (void)dir_fd;
+    (void)name;
+    errno = EIO;
+    return -1;
+}
+
+static int g_exact_recovery_reap_calls;
+
+static ssh_process_outcome_t exact_recovery_reap_must_not_run(
+    const ssh_agent_record_t *record, const char *socket_arg,
+    int runtime_dir_fd) {
+    (void)record;
+    (void)socket_arg;
+    (void)runtime_dir_fd;
+    g_exact_recovery_reap_calls++;
+    return SSH_PROCESS_INDETERMINATE;
+}
+
 static int replace_reset_retirement_entry(int dir_fd, const char *name) {
     int fd;
     size_t content_len;
@@ -418,10 +491,11 @@ static int fail_third_reset_dirsync(int dir_fd) {
 }
 
 static ssh_process_outcome_t swap_runtime_namespace_then_gone(
-    pid_t pid, const char *socket_arg, int runtime_dir_fd) {
+    const ssh_agent_record_t *record, const char *socket_arg,
+    int runtime_dir_fd) {
     char replacement_socket[256];
     char replacement_sidecar[256];
-    (void)pid;
+    (void)record;
     (void)socket_arg;
     (void)runtime_dir_fd;
 
@@ -442,8 +516,9 @@ static ssh_process_outcome_t swap_runtime_namespace_then_gone(
 }
 
 static ssh_process_outcome_t replace_sidecar_then_gone(
-    pid_t pid, const char *socket_arg, int runtime_dir_fd) {
-    (void)pid;
+    const ssh_agent_record_t *record, const char *socket_arg,
+    int runtime_dir_fd) {
+    (void)record;
     (void)socket_arg;
     (void)runtime_dir_fd;
     g_race_hook_succeeded =
@@ -454,8 +529,9 @@ static ssh_process_outcome_t replace_sidecar_then_gone(
 }
 
 static ssh_process_outcome_t replace_socket_then_gone(
-    pid_t pid, const char *socket_arg, int runtime_dir_fd) {
-    (void)pid;
+    const ssh_agent_record_t *record, const char *socket_arg,
+    int runtime_dir_fd) {
+    (void)record;
     (void)socket_arg;
     (void)runtime_dir_fd;
     g_race_hook_succeeded =
@@ -465,8 +541,9 @@ static ssh_process_outcome_t replace_socket_then_gone(
 }
 
 static ssh_process_outcome_t remove_socket_then_gone(
-    pid_t pid, const char *socket_arg, int runtime_dir_fd) {
-    (void)pid;
+    const ssh_agent_record_t *record, const char *socket_arg,
+    int runtime_dir_fd) {
+    (void)record;
     (void)socket_arg;
     g_race_hook_succeeded =
         unlinkat(runtime_dir_fd, "ssh-agent.work.sock", 0) == 0;
@@ -505,18 +582,132 @@ static int signal_must_not_run(pid_t pid, int signal_number) {
     return -1;
 }
 
-static ssh_process_outcome_t identity_indeterminate(
-    pid_t pid, const char *socket_arg, int runtime_dir_fd) {
+static int generation_matches_record(
+    pid_t pid, ssh_process_generation_t *generation) {
+    if (pid <= 1 || !generation) {
+        errno = EINVAL;
+        return -1;
+    }
+    *generation = g_test_generation;
+    return 0;
+}
+
+static ssh_process_generation_t g_observed_generation;
+static int g_generation_calls;
+static int g_term_calls;
+static int g_kill_calls;
+static int g_presence_calls;
+static bool g_replace_generation_after_term;
+static bool g_process_gone_after_kill;
+static int g_pidfd_keepalive = -1;
+static bool g_pidfd_open_saw_generation;
+
+static ssh_process_generation_t replacement_generation(void) {
+    ssh_process_generation_t generation = g_test_generation;
+    generation.start_lo++;
+    return generation;
+}
+
+static int generation_from_fixture(
+    pid_t pid, ssh_process_generation_t *generation) {
+    if (pid != TEST_PID || !generation) {
+        errno = EINVAL;
+        return -1;
+    }
+    g_generation_calls++;
+    *generation = g_observed_generation;
+    return 0;
+}
+
+static int generation_inspection_fails(
+    pid_t pid, ssh_process_generation_t *generation) {
     (void)pid;
+    (void)generation;
+    g_generation_calls++;
+    errno = EIO;
+    return -1;
+}
+
+static int record_generation_signal(pid_t pid, int signal_number) {
+    if (pid != TEST_PID) {
+        errno = ESRCH;
+        return -1;
+    }
+    if (signal_number == 0) {
+        g_presence_calls++;
+        if (g_process_gone_after_kill && g_kill_calls > 0) {
+            errno = ESRCH;
+            return -1;
+        }
+        return 0;
+    }
+    if (signal_number == SIGTERM) {
+        g_term_calls++;
+        if (g_replace_generation_after_term) {
+            g_observed_generation = replacement_generation();
+        }
+        return 0;
+    }
+    if (signal_number == SIGKILL) {
+        g_kill_calls++;
+        return 0;
+    }
+    errno = EINVAL;
+    return -1;
+}
+
+static int record_generation_pidfd_signal(int pidfd, int signal_number) {
+    (void)pidfd;
+    return record_generation_signal(TEST_PID, signal_number);
+}
+
+static int pidfd_open_pipe(pid_t pid) {
+    int fds[2];
+    if (pid != TEST_PID || pipe(fds) != 0) return -1;
+    g_pidfd_keepalive = fds[1];
+    return fds[0];
+}
+
+static int pidfd_open_flips_numeric_generation(pid_t pid) {
+    if (pid != TEST_PID) {
+        errno = ESRCH;
+        return -1;
+    }
+    g_pidfd_open_saw_generation = g_generation_calls > 0;
+    g_observed_generation = replacement_generation();
+    return open("/dev/null", O_RDONLY | O_CLOEXEC);
+}
+
+static void reset_generation_harness(void) {
+    g_observed_generation = g_test_generation;
+    g_generation_calls = 0;
+    g_signal_calls = 0;
+    g_last_signal = -1;
+    g_term_calls = 0;
+    g_kill_calls = 0;
+    g_presence_calls = 0;
+    g_replace_generation_after_term = false;
+    g_process_gone_after_kill = false;
+    g_pidfd_open_saw_generation = false;
+    if (g_pidfd_keepalive >= 0) {
+        close(g_pidfd_keepalive);
+        g_pidfd_keepalive = -1;
+    }
+}
+
+static ssh_process_outcome_t identity_indeterminate(
+    const ssh_agent_record_t *record, const char *socket_arg,
+    int runtime_dir_fd) {
+    (void)record;
     (void)socket_arg;
     (void)runtime_dir_fd;
     return SSH_PROCESS_INDETERMINATE;
 }
 
-static ssh_process_outcome_t identity_owned(pid_t pid,
+static ssh_process_outcome_t identity_owned(const ssh_agent_record_t *record,
                                             const char *socket_arg,
                                             int runtime_dir_fd) {
-    (void)pid;
+    (void)record;
     (void)socket_arg;
     (void)runtime_dir_fd;
     return SSH_PROCESS_OWNED;
@@ -542,6 +733,34 @@ static const unsigned char g_malformed_embedded_nul[] =
 static const unsigned char g_malformed_oversized[] =
     "9999999999999999999999999999999999999999999999999999999999999999"
     "9999999999999999999999999999999999999999999999999999999999999999\n";
+static const unsigned char g_malformed_version[] =
+    "v2 1073741824 1 01020304050607081112131415161718 "
+    "00000000000000002122232425262728\n";
+static const unsigned char g_malformed_missing_field[] =
+    "v1 1073741824 1 01020304050607081112131415161718\n";
+static const unsigned char g_malformed_extra_field[] =
+    "v1 1073741824 1 01020304050607081112131415161718 "
+    "00000000000000002122232425262728 extra\n";
+static const unsigned char g_malformed_pid_overflow[] =
+    "v1 9999999999999999999999999999999999999999 1 "
+    "01020304050607081112131415161718 "
+    "00000000000000002122232425262728\n";
+static const unsigned char g_malformed_kind_overflow[] =
+    "v1 1073741824 18446744073709551616 "
+    "01020304050607081112131415161718 "
+    "00000000000000002122232425262728\n";
+static const unsigned char g_malformed_short_generation[] =
+    "v1 1073741824 1 0102030405060708111213141516171 "
+    "00000000000000002122232425262728\n";
+static const unsigned char g_malformed_long_generation[] =
+    "v1 1073741824 1 010203040506070811121314151617180 "
+    "00000000000000002122232425262728\n";
+static const unsigned char g_malformed_nonhex_generation[] =
+    "v1 1073741824 1 0102030405060708111213141516171g "
+    "00000000000000002122232425262728\n";
+static const unsigned char g_malformed_record_embedded_nul[] =
+    "v1 1073741824 1 01020304050607081112131415161718 "
+    "00000000000000002122232425262728\0trailing\n";
 
 static const malformed_sidecar_case_t g_malformed_sidecars[] = {
     {"gsar11pidempty", g_malformed_empty, 0U},
@@ -549,14 +768,33 @@ static const malformed_sidecar_case_t g_malformed_sidecars[] = {
     {"gsar11pidnul", g_malformed_embedded_nul,
      sizeof(g_malformed_embedded_nul) - 1U},
     {"gsar11pidlarge", g_malformed_oversized,
-     sizeof(g_malformed_oversized) - 1U}
+     sizeof(g_malformed_oversized) - 1U},
+    {"gsar14pidversion", g_malformed_version,
+     sizeof(g_malformed_version) - 1U},
+    {"gsar14pidmissing", g_malformed_missing_field,
+     sizeof(g_malformed_missing_field) - 1U},
+    {"gsar14pidextra", g_malformed_extra_field,
+     sizeof(g_malformed_extra_field) - 1U},
+    {"gsar14pidoverflow", g_malformed_pid_overflow,
+     sizeof(g_malformed_pid_overflow) - 1U},
+    {"gsar14kindoverflow", g_malformed_kind_overflow,
+     sizeof(g_malformed_kind_overflow) - 1U},
+    {"gsar14genshort", g_malformed_short_generation,
+     sizeof(g_malformed_short_generation) - 1U},
+    {"gsar14genlong", g_malformed_long_generation,
+     sizeof(g_malformed_long_generation) - 1U},
+    {"gsar14gennonhex", g_malformed_nonhex_generation,
+     sizeof(g_malformed_nonhex_generation) - 1U},
+    {"gsar14recordnul", g_malformed_record_embedded_nul,
+     sizeof(g_malformed_record_embedded_nul) - 1U}
 };
 
 static int g_malformed_reap_calls;
 
 static ssh_process_outcome_t malformed_reap_must_not_run(
-    pid_t pid, const char *socket_arg, int runtime_dir_fd) {
-    (void)pid;
+    const ssh_agent_record_t *record, const char *socket_arg,
+    int runtime_dir_fd) {
+    (void)record;
     (void)socket_arg;
     (void)runtime_dir_fd;
     g_malformed_reap_calls++;
@@ -763,6 +1001,7 @@ TEST(indeterminate_identity_retains_retry_sidecar) {
     ssh_fixture_t fixture;
     ssh_reap_test_ops_t ops = {
         .identity = identity_indeterminate,
+        .generation = generation_matches_record,
         .signal = signal_must_not_run,
         .pidfd_open = pidfd_unavailable,
         .pidfd_signal = pidfd_signal_unused
@@ -797,6 +1036,7 @@ TEST(permission_denied_presence_probe_is_indeterminate) {
     ssh_fixture_t fixture;
     ssh_reap_test_ops_t ops = {
         .identity = NULL, /* production inspection begins with kill(pid, 0) */
+        .generation = generation_matches_record,
         .signal = signal_permission_denied,
         .pidfd_open = pidfd_unavailable,
         .pidfd_signal = pidfd_signal_unused
@@ -836,8 +1076,9 @@ TEST(failed_pidfd_signal_retains_retry_sidecar) {
     ssh_fixture_t fixture;
     ssh_reap_test_ops_t ops = {
         .identity = identity_owned,
+        .generation = generation_matches_record,
         .signal = signal_must_not_run,
-        .pidfd_open = pidfd_open_devnull,
+        .pidfd_open = pidfd_open_pipe,
         .pidfd_signal = pidfd_signal_permission_denied
     };
     ssh_reap_test_ops_t previous;
@@ -850,12 +1091,385 @@ TEST(failed_pidfd_signal_retains_retry_sidecar) {
     previous = ssh_manager_set_reap_test_ops(&ops);
     CHECK_EQ_INT(ssh_manager_reset("work"), -1);
     ssh_manager_set_reap_test_ops(&previous);
+    if (g_pidfd_keepalive >= 0) {
+        CHECK_EQ_INT(close(g_pidfd_keepalive), 0);
+        g_pidfd_keepalive = -1;
+    }
 
     CHECK_EQ_INT(g_signal_calls, 1);
     CHECK_EQ_INT(g_last_signal, SIGTERM);
     CHECK(path_exists(fixture.sidecar));
     cleanup_retained_fixture(&fixture);
     close(fixture.dir_fd);
+}
+
+static void exercise_preterm_generation_mismatch(bool use_pidfd,
+                                                 bool reset_all) {
+    ssh_fixture_t fixture;
+    artifact_snapshot_t sidecar_before = {0};
+    artifact_snapshot_t socket_before = {0};
+    artifact_snapshot_t current_before = {0};
+    ssh_reap_test_ops_t ops = {
+        .identity = identity_owned,
+        .generation = generation_from_fixture,
+        .signal = record_generation_signal,
+        .pidfd_open = use_pidfd ? pidfd_open_devnull : pidfd_unavailable,
+        .pidfd_signal = record_generation_pidfd_signal
+    };
+    ssh_reap_test_ops_t previous;
+
+    CHECK_EQ_INT(make_fixture(
+                     &fixture,
+                     use_pidfd ? (reset_all ? "gsar14genpidfdall"
+                                            : "gsar14genpidfd")
+                               : (reset_all ? "gsar14genfallbackall"
+                                            : "gsar14genfallback")), 0);
+    if (fixture.dir_fd < 0) return;
+    CHECK_EQ_INT(publish_sidecar(&fixture, TEST_PID), 0);
+    CHECK_EQ_INT(bind_stale_socket(fixture.socket), 0);
+    CHECK_EQ_INT(symlink(fixture.socket, fixture.current), 0);
+    CHECK_EQ_INT(capture_artifact_snapshot(fixture.sidecar,
+                                           &sidecar_before), 0);
+    CHECK_EQ_INT(capture_artifact_snapshot(fixture.socket,
+                                           &socket_before), 0);
+    CHECK_EQ_INT(capture_artifact_snapshot(fixture.current,
+                                           &current_before), 0);
+
+    reset_generation_harness();
+    g_observed_generation = replacement_generation();
+    previous = ssh_manager_set_reap_test_ops(&ops);
+    CHECK_EQ_INT(ssh_manager_reset(reset_all ? NULL : "work"), -1);
+    ssh_manager_set_reap_test_ops(&previous);
+
+    CHECK(g_generation_calls > 0);
+    CHECK_EQ_INT(g_term_calls, 0);
+    CHECK_EQ_INT(g_kill_calls, 0);
+    CHECK_EQ_INT(g_presence_calls, 0);
+    CHECK(artifact_matches_snapshot(fixture.sidecar, &sidecar_before));
+    CHECK(artifact_matches_snapshot(fixture.socket, &socket_before));
+    CHECK(artifact_matches_snapshot(fixture.current, &current_before));
+
+    cleanup_retained_fixture(&fixture);
+    close(fixture.dir_fd);
+}
+
+TEST(fallback_generation_mismatch_before_term_preserves_retry_tuple) {
+    exercise_preterm_generation_mismatch(false, false);
+}
+
+TEST(pidfd_generation_mismatch_before_term_preserves_retry_tuple) {
+    exercise_preterm_generation_mismatch(true, false);
+}
+
+TEST(reset_all_generation_mismatch_before_term_preserves_retry_tuple) {
+    exercise_preterm_generation_mismatch(false, true);
+}
+
+TEST(generation_is_verified_before_pidfd_open_and_reverified_afterward) {
+    ssh_fixture_t fixture;
+    artifact_snapshot_t sidecar_before = {0};
+    ssh_reap_test_ops_t ops = {
+        .identity = identity_owned,
+        .generation = generation_from_fixture,
+        .signal = record_generation_signal,
+        .pidfd_open = pidfd_open_flips_numeric_generation,
+        .pidfd_signal = record_generation_pidfd_signal
+    };
+    ssh_reap_test_ops_t previous;
+
+    CHECK_EQ_INT(make_fixture(&fixture, "gsar14genpidfdopen"), 0);
+    if (fixture.dir_fd < 0) return;
+    CHECK_EQ_INT(publish_sidecar(&fixture, TEST_PID), 0);
+    CHECK_EQ_INT(capture_artifact_snapshot(fixture.sidecar,
+                                           &sidecar_before), 0);
+
+    reset_generation_harness();
+    previous = ssh_manager_set_reap_test_ops(&ops);
+    CHECK_EQ_INT(ssh_manager_reset("work"), -1);
+    ssh_manager_set_reap_test_ops(&previous);
+
+    CHECK(g_pidfd_open_saw_generation);
+    CHECK(g_generation_calls >= 2);
+    CHECK_EQ_INT(g_term_calls, 0);
+    CHECK_EQ_INT(g_kill_calls, 0);
+    CHECK(artifact_matches_snapshot(fixture.sidecar, &sidecar_before));
+    cleanup_retained_fixture(&fixture);
+    close(fixture.dir_fd);
+}
+
+static void exercise_generation_change_after_term(bool use_pidfd) {
+    ssh_fixture_t fixture;
+    artifact_snapshot_t sidecar_before = {0};
+    artifact_snapshot_t socket_before = {0};
+    ssh_reap_test_ops_t ops = {
+        .identity = identity_owned,
+        .generation = generation_from_fixture,
+        .signal = record_generation_signal,
+        .pidfd_open = use_pidfd ? pidfd_open_pipe : pidfd_unavailable,
+        .pidfd_signal = record_generation_pidfd_signal
+    };
+    ssh_reap_test_ops_t previous;
+
+    CHECK_EQ_INT(make_fixture(
+                     &fixture,
+                     use_pidfd ? "gsar14genaftertermpidfd"
+                               : "gsar14genaftertermfallback"), 0);
+    if (fixture.dir_fd < 0) return;
+    CHECK_EQ_INT(publish_sidecar(&fixture, TEST_PID), 0);
+    CHECK_EQ_INT(bind_stale_socket(fixture.socket), 0);
+    CHECK_EQ_INT(capture_artifact_snapshot(fixture.sidecar,
+                                           &sidecar_before), 0);
+    CHECK_EQ_INT(capture_artifact_snapshot(fixture.socket,
+                                           &socket_before), 0);
+
+    reset_generation_harness();
+    g_replace_generation_after_term = true;
+    previous = ssh_manager_set_reap_test_ops(&ops);
+    CHECK_EQ_INT(ssh_manager_reset("work"), -1);
+    ssh_manager_set_reap_test_ops(&previous);
+    if (g_pidfd_keepalive >= 0) {
+        CHECK_EQ_INT(close(g_pidfd_keepalive), 0);
+        g_pidfd_keepalive = -1;
+    }
+
+    CHECK(g_generation_calls >= 2);
+    CHECK_EQ_INT(g_term_calls, 1);
+    CHECK_EQ_INT(g_kill_calls, 0);
+    CHECK(artifact_matches_snapshot(fixture.sidecar, &sidecar_before));
+    CHECK(artifact_matches_snapshot(fixture.socket, &socket_before));
+
+    cleanup_retained_fixture(&fixture);
+    close(fixture.dir_fd);
+}
+
+TEST(fallback_generation_change_after_term_prevents_kill) {
+    exercise_generation_change_after_term(false);
+}
+
+TEST(pidfd_generation_change_after_term_prevents_kill) {
+    exercise_generation_change_after_term(true);
+}
+
+TEST(exact_generation_allows_term_kill_and_cleanup) {
+    ssh_fixture_t fixture;
+    ssh_reap_test_ops_t ops = {
+        .identity = identity_owned,
+        .generation = generation_from_fixture,
+        .signal = record_generation_signal,
+        .pidfd_open = pidfd_unavailable,
+        .pidfd_signal = pidfd_signal_unused
+    };
+    ssh_reap_test_ops_t previous;
+
+    CHECK_EQ_INT(make_fixture(&fixture, "gsar14genexact"), 0);
+    if (fixture.dir_fd < 0) return;
+    CHECK_EQ_INT(publish_sidecar(&fixture, TEST_PID), 0);
+    CHECK_EQ_INT(bind_stale_socket(fixture.socket), 0);
+
+    reset_generation_harness();
+    g_process_gone_after_kill = true;
+    previous = ssh_manager_set_reap_test_ops(&ops);
+    CHECK_EQ_INT(ssh_manager_reset("work"), 0);
+    ssh_manager_set_reap_test_ops(&previous);
+
+    CHECK(g_generation_calls >= 2);
+    CHECK_EQ_INT(g_term_calls, 1);
+    CHECK_EQ_INT(g_kill_calls, 1);
+    CHECK(!entry_exists(fixture.sidecar));
+    CHECK(!entry_exists(fixture.socket));
+    close(fixture.dir_fd);
+}
+
+TEST(generation_inspection_error_never_terminates_or_consumes_tuple) {
+    ssh_fixture_t fixture;
+    artifact_snapshot_t sidecar_before = {0};
+    artifact_snapshot_t socket_before = {0};
+    ssh_reap_test_ops_t ops = {
+        .identity = identity_owned,
+        .generation = generation_inspection_fails,
+        .signal = record_generation_signal,
+        .pidfd_open = pidfd_unavailable,
+        .pidfd_signal = pidfd_signal_unused
+    };
+    ssh_reap_test_ops_t previous;
+
+    CHECK_EQ_INT(make_fixture(&fixture, "gsar14generror"), 0);
+    if (fixture.dir_fd < 0) return;
+    CHECK_EQ_INT(publish_sidecar(&fixture, TEST_PID), 0);
+    CHECK_EQ_INT(bind_stale_socket(fixture.socket), 0);
+    CHECK_EQ_INT(capture_artifact_snapshot(fixture.sidecar,
+                                           &sidecar_before), 0);
+    CHECK_EQ_INT(capture_artifact_snapshot(fixture.socket,
+                                           &socket_before), 0);
+
+    reset_generation_harness();
+    previous = ssh_manager_set_reap_test_ops(&ops);
+    CHECK_EQ_INT(ssh_manager_reset("work"), -1);
+    ssh_manager_set_reap_test_ops(&previous);
+
+    CHECK(g_generation_calls > 0);
+    CHECK_EQ_INT(g_term_calls, 0);
+    CHECK_EQ_INT(g_kill_calls, 0);
+    CHECK_EQ_INT(g_presence_calls, 1);
+    CHECK(artifact_matches_snapshot(fixture.sidecar, &sidecar_before));
+    CHECK(artifact_matches_snapshot(fixture.socket, &socket_before));
+    cleanup_retained_fixture(&fixture);
+    close(fixture.dir_fd);
+}
+
+TEST(legacy_live_sidecar_is_retained_without_reap) {
+    static const char legacy[] = "1073741824\n";
+    ssh_fixture_t fixture;
+    ssh_reap_fn previous;
+    int listener;
+
+    CHECK_EQ_INT(make_fixture(&fixture, "gsar14legacylive"), 0);
+    if (fixture.dir_fd < 0) return;
+    CHECK_EQ_INT(write_sidecar_bytes(&fixture, legacy,
+                                     sizeof(legacy) - 1U, 0600), 0);
+    listener = bind_live_socket(fixture.socket);
+    CHECK(listener >= 0);
+    g_malformed_reap_calls = 0;
+    previous = ssh_manager_set_reap_fn(malformed_reap_must_not_run);
+    CHECK_EQ_INT(ssh_manager_reset("work"), -1);
+    ssh_manager_set_reap_fn(previous);
+
+    CHECK_EQ_INT(g_malformed_reap_calls, 0);
+    CHECK(entry_exists(fixture.sidecar));
+    CHECK(entry_exists(fixture.socket));
+    if (listener >= 0) close(listener);
+    cleanup_retained_fixture(&fixture);
+    close(fixture.dir_fd);
+}
+
+TEST(legacy_dead_sidecar_is_cleaned_without_reap) {
+    static const char legacy[] = "1073741824\n";
+    ssh_fixture_t fixture;
+    ssh_reap_fn previous;
+
+    CHECK_EQ_INT(make_fixture(&fixture, "gsar14legacydead"), 0);
+    if (fixture.dir_fd < 0) return;
+    CHECK_EQ_INT(write_sidecar_bytes(&fixture, legacy,
+                                     sizeof(legacy) - 1U, 0600), 0);
+    CHECK_EQ_INT(bind_stale_socket(fixture.socket), 0);
+    g_malformed_reap_calls = 0;
+    previous = ssh_manager_set_reap_fn(malformed_reap_must_not_run);
+    CHECK_EQ_INT(ssh_manager_reset("work"), 0);
+    ssh_manager_set_reap_fn(previous);
+
+    CHECK_EQ_INT(g_malformed_reap_calls, 0);
+    CHECK(!entry_exists(fixture.sidecar));
+    CHECK(!entry_exists(fixture.socket));
+    close(fixture.dir_fd);
+}
+
+TEST(stopped_session_preserves_same_pid_replacement_generation) {
+    ssh_fixture_t fixture;
+    ssh_config_t config;
+    ssh_agent_record_t replacement = {
+        .pid = TEST_PID,
+        .generation = {
+            .kind = SSH_PROCESS_GENERATION_LINUX,
+            .boot_hi = UINT64_C(0x0102030405060708),
+            .boot_lo = UINT64_C(0x1112131415161718),
+            .start_hi = 0,
+            .start_lo = UINT64_C(0x2122232425262729)
+        }
+    };
+    artifact_snapshot_t sidecar_before = {0};
+    artifact_snapshot_t socket_before = {0};
+    artifact_snapshot_t current_before = {0};
+    ssh_reap_fn previous;
+
+    CHECK_EQ_INT(make_fixture(&fixture, "gsar14stopreplacement"), 0);
+    if (fixture.dir_fd < 0) return;
+    CHECK_EQ_INT(ssh_manager_test_write_pid_sidecar(
+                     fixture.dir_fd, "ssh-agent.work.pid",
+                     &replacement), 0);
+    CHECK_EQ_INT(bind_stale_socket(fixture.socket), 0);
+    CHECK_EQ_INT(symlink(fixture.socket, fixture.current), 0);
+    CHECK_EQ_INT(capture_artifact_snapshot(fixture.sidecar,
+                                           &sidecar_before), 0);
+    CHECK_EQ_INT(capture_artifact_snapshot(fixture.socket,
+                                           &socket_before), 0);
+    CHECK_EQ_INT(capture_artifact_snapshot(fixture.current,
+                                           &current_before), 0);
+
+    memset(&config, 0, sizeof(config));
+    config.mode = SSH_AGENT_ISOLATED;
+    config.agent_pid = TEST_PID;
+    config.agent_generation = g_test_generation;
+    config.agent_owned = true;
+    CHECK_EQ_INT(safe_strncpy(config.agent_socket_path, fixture.socket,
+                              sizeof(config.agent_socket_path)), 0);
+    CHECK_EQ_INT(safe_strncpy(config.agent_socket_arg, fixture.socket,
+                              sizeof(config.agent_socket_arg)), 0);
+
+    g_malformed_reap_calls = 0;
+    previous = ssh_manager_set_reap_fn(malformed_reap_must_not_run);
+    CHECK_EQ_INT(ssh_stop_agent(&config), -1);
+    ssh_manager_set_reap_fn(previous);
+
+    CHECK_EQ_INT(g_malformed_reap_calls, 0);
+    CHECK(config.agent_owned);
+    CHECK_EQ_INT(config.agent_pid, TEST_PID);
+    CHECK(artifact_matches_snapshot(fixture.sidecar, &sidecar_before));
+    CHECK(artifact_matches_snapshot(fixture.socket, &socket_before));
+    CHECK(artifact_matches_snapshot(fixture.current, &current_before));
+    cleanup_retained_fixture(&fixture);
+    if (entry_exists(fixture.current)) CHECK_EQ_INT(unlink(fixture.current), 0);
+    close(fixture.dir_fd);
+}
+
+static void exercise_stale_process_outcome_with_live_replacement(
+    ssh_process_outcome_t outcome, bool reset_all) {
+    ssh_fixture_t fixture;
+    artifact_snapshot_t sidecar_before = {0};
+    artifact_snapshot_t socket_before = {0};
+    artifact_snapshot_t current_before = {0};
+    ssh_reap_fn previous;
+    int listener;
+
+    CHECK_EQ_INT(make_fixture(
+                     &fixture,
+                     outcome == SSH_PROCESS_GONE
+                         ? "gsar14gonelivesocket"
+                         : "gsar14unrelatedlivesocket"), 0);
+    if (fixture.dir_fd < 0) return;
+    CHECK_EQ_INT(publish_sidecar(&fixture, TEST_PID), 0);
+    listener = bind_live_socket(fixture.socket);
+    CHECK(listener >= 0);
+    CHECK_EQ_INT(symlink(fixture.socket, fixture.current), 0);
+    CHECK_EQ_INT(capture_artifact_snapshot(fixture.sidecar,
+                                           &sidecar_before), 0);
+    CHECK_EQ_INT(capture_artifact_snapshot(fixture.socket,
+                                           &socket_before), 0);
+    CHECK_EQ_INT(capture_artifact_snapshot(fixture.current,
+                                           &current_before), 0);
+
+    previous = ssh_manager_set_reap_fn(
+        outcome == SSH_PROCESS_GONE ? reap_gone : reap_unrelated);
+    CHECK_EQ_INT(ssh_manager_reset(reset_all ? NULL : "work"), -1);
+    ssh_manager_set_reap_fn(previous);
+
+    CHECK(artifact_matches_snapshot(fixture.sidecar, &sidecar_before));
+    CHECK(artifact_matches_snapshot(fixture.socket, &socket_before));
+    CHECK(artifact_matches_snapshot(fixture.current, &current_before));
+
+    if (listener >= 0) CHECK_EQ_INT(close(listener), 0);
+    cleanup_retained_fixture(&fixture);
+    if (entry_exists(fixture.current)) CHECK_EQ_INT(unlink(fixture.current), 0);
+    close(fixture.dir_fd);
+}
+
+TEST(gone_record_with_live_replacement_preserves_complete_tuple) {
+    exercise_stale_process_outcome_with_live_replacement(
+        SSH_PROCESS_GONE, false);
+}
+
+TEST(unrelated_record_with_live_replacement_preserves_complete_tuple) {
+    exercise_stale_process_outcome_with_live_replacement(
+        SSH_PROCESS_UNRELATED, true);
 }
 
 static int signal_eintr_then_esrch(pid_t pid, int signal_number) {
@@ -874,6 +1488,7 @@ TEST(interrupted_fallback_signal_retries_and_esrch_cleans) {
     ssh_fixture_t fixture;
     ssh_reap_test_ops_t ops = {
         .identity = identity_owned,
+        .generation = generation_matches_record,
         .signal = signal_eintr_then_esrch,
         .pidfd_open = pidfd_unavailable,
         .pidfd_signal = pidfd_signal_unused
@@ -911,7 +1526,7 @@ TEST(runtime_namespace_replacement_fails_without_mutating_either_tree) {
     ssh_reap_fn previous;
     char moved_socket[256];
     char moved_sidecar[256];
-    char content[64];
+    char content[160];
 
     CHECK_EQ_INT(make_fixture(&fixture, "gsar08namespace"), 0);
     if (fixture.dir_fd < 0) return;
@@ -1170,7 +1785,7 @@ TEST(portable_restore_retirement_substitution_is_preserved) {
     ssh_dirsync_fn previous_dirsync;
     bool previous_portable;
     char quarantine_path[320];
-    char content[64];
+    char content[160];
 
     CHECK_EQ_INT(make_fixture(&fixture, "gsar08restore"), 0);
     if (fixture.dir_fd < 0) return;
@@ -1197,7 +1812,7 @@ TEST(portable_restore_retirement_substitution_is_preserved) {
     CHECK_EQ_INT(g_retire_mutations, 1);
     CHECK(path_exists(fixture.sidecar));
     CHECK(read_file_to_string(fixture.sidecar, content, sizeof(content)) > 0);
-    CHECK_STR_EQ(content, "1073741824\n");
+    CHECK_STR_EQ(content, TEST_RECORD_TEXT);
     CHECK_EQ_INT(safe_snprintf(quarantine_path, sizeof(quarantine_path),
                                "%s/%s", fixture.runtime,
                                g_retire_quarantine), 0);
@@ -1225,7 +1840,7 @@ TEST(unrelated_live_pid_is_not_signaled) {
         for (;;) pause();
     }
 
-    CHECK_EQ_INT(publish_sidecar(&fixture, child), 0);
+    CHECK_EQ_INT(publish_sidecar_for_process(&fixture, child), 0);
     CHECK_EQ_INT(ssh_manager_reset("work"), 0);
     CHECK_EQ_INT(kill(child, 0), 0);
     CHECK(!path_exists(fixture.sidecar));
@@ -1237,8 +1852,6 @@ TEST(unrelated_live_pid_is_not_signaled) {
 }
 
 static volatile sig_atomic_t g_alarm_count;
-static int g_term_calls;
-static int g_kill_calls;
 
 static void record_alarm(int signal_number) {
     (void)signal_number;
@@ -1262,6 +1875,7 @@ TEST(signal_storm_preserves_term_and_kill_deadlines) {
     ssh_fixture_t fixture;
     ssh_reap_test_ops_t ops = {
         .identity = identity_owned,
+        .generation = generation_matches_record,
         .signal = signal_target_survives,
         .pidfd_open = pidfd_unavailable,
         .pidfd_signal = pidfd_signal_unused
@@ -1396,13 +2010,13 @@ TEST(runtime_root_provenance_prevents_cross_root_reap) {
     CHECK(path_exists(first.socket));
 
     if (pid > 1) {
-        CHECK_EQ_INT(publish_sidecar(&second, pid), 0);
+        CHECK_EQ_INT(publish_sidecar_for_process(&second, pid), 0);
         CHECK_EQ_INT(setenv("XDG_RUNTIME_DIR", second.xdg, 1), 0);
         CHECK_EQ_INT(ssh_manager_reset("work"), 0);
         CHECK_EQ_INT(kill(pid, 0), 0);
         CHECK(!path_exists(second.sidecar));
 
-        CHECK_EQ_INT(publish_sidecar(&first, pid), 0);
+        CHECK_EQ_INT(publish_sidecar_for_process(&first, pid), 0);
         CHECK_EQ_INT(setenv("XDG_RUNTIME_DIR", first.xdg, 1), 0);
         CHECK_EQ_INT(ssh_manager_reset("work"), 0);
         CHECK_EQ_INT(wait_process_absent(pid), 0);
@@ -1606,14 +2220,101 @@ static int successful_agent_runner(const char *const argv[],
     return 0;
 }
 
+static int g_launch_generation_calls;
+static int g_captured_unrecorded_reap_calls;
+static ssh_agent_record_t g_captured_unrecorded_record;
+
+static int generation_replaced_after_launch_capture(
+    pid_t pid, ssh_process_generation_t *generation) {
+    if (pid != TEST_PID || !generation) {
+        errno = EINVAL;
+        return -1;
+    }
+    g_launch_generation_calls++;
+    *generation = g_launch_generation_calls == 1
+                      ? g_test_generation
+                      : replacement_generation();
+    return 0;
+}
+
+static ssh_process_outcome_t capture_unrecorded_reap_generation(
+    const ssh_agent_record_t *record, const char *socket_arg,
+    int runtime_dir_fd) {
+    (void)socket_arg;
+    (void)runtime_dir_fd;
+    g_captured_unrecorded_reap_calls++;
+    if (record) g_captured_unrecorded_record = *record;
+    return SSH_PROCESS_INDETERMINATE;
+}
+
+TEST(unrecorded_launch_cleanup_keeps_original_captured_generation) {
+    ssh_fixture_t fixture;
+    account_t account;
+    ssh_config_t config;
+    command_runner_fn previous_runner;
+    ssh_reap_fn previous_reap;
+    ssh_reap_test_ops_t ops = {
+        .generation = generation_replaced_after_launch_capture
+    };
+    ssh_reap_test_ops_t previous_ops;
+    char sidecar_text[160];
+
+    CHECK_EQ_INT(make_fixture(&fixture, "gsar14launchgeneration"), 0);
+    if (fixture.dir_fd < 0) return;
+    memset(&account, 0, sizeof(account));
+    account.id = 1;
+    CHECK_EQ_INT(safe_strncpy(account.name, "work",
+                              sizeof(account.name)), 0);
+    CHECK_EQ_INT(safe_strncpy(account.email, "work@example.invalid",
+                              sizeof(account.email)), 0);
+    account.ssh_enabled = true;
+    CHECK((size_t)snprintf(account.ssh_key_path,
+                           sizeof(account.ssh_key_path), "%s/key",
+                           fixture.xdg) < sizeof(account.ssh_key_path));
+    memset(&config, 0, sizeof(config));
+    config.mode = SSH_AGENT_ISOLATED;
+    config.agent_pid = -1;
+
+    g_launch_generation_calls = 0;
+    g_captured_unrecorded_reap_calls = 0;
+    memset(&g_captured_unrecorded_record, 0,
+           sizeof(g_captured_unrecorded_record));
+    previous_runner = run_set_runner(bad_permission_agent_runner);
+    previous_reap = ssh_manager_set_reap_fn(
+        capture_unrecorded_reap_generation);
+    previous_ops = ssh_manager_set_reap_test_ops(&ops);
+    CHECK_EQ_INT(ssh_start_isolated_agent(&config, &account), -1);
+    ssh_manager_set_reap_test_ops(&previous_ops);
+    run_set_runner(previous_runner);
+    ssh_manager_set_reap_fn(previous_reap);
+
+    CHECK_EQ_INT(g_captured_unrecorded_reap_calls, 1);
+    CHECK_EQ_INT(g_captured_unrecorded_record.pid, TEST_PID);
+    CHECK(g_captured_unrecorded_record.generation.start_lo ==
+          g_test_generation.start_lo);
+    CHECK(config.agent_generation.start_lo ==
+          g_test_generation.start_lo);
+    CHECK(path_exists(fixture.sidecar));
+    CHECK(read_file_to_string(fixture.sidecar, sidecar_text,
+                              sizeof(sidecar_text)) > 0);
+    CHECK_STR_EQ(sidecar_text, TEST_RECORD_TEXT);
+
+    ssh_manager_set_reap_fn(reap_gone);
+    CHECK_EQ_INT(ssh_manager_reset("work"), 0);
+    ssh_manager_set_reap_fn(previous_reap);
+    close(fixture.dir_fd);
+}
+
 TEST(runner_failure_indeterminate_reap_publishes_retry_tuple) {
     ssh_fixture_t fixture;
     account_t account;
     ssh_config_t config;
     command_runner_fn previous_runner;
     ssh_reap_fn previous_reap;
+    ssh_reap_test_ops_t ops = {.generation = generation_matches_record};
+    ssh_reap_test_ops_t previous_ops;
     char current[192];
-    char sidecar_text[64];
+    char sidecar_text[160];
 
     CHECK_EQ_INT(make_fixture(&fixture, "gsar11runretry"), 0);
     if (fixture.dir_fd < 0) return;
@@ -1633,6 +2334,7 @@ TEST(runner_failure_indeterminate_reap_publishes_retry_tuple) {
 
     previous_runner = run_set_runner(failed_after_agent_spawn_runner);
     previous_reap = ssh_manager_set_reap_fn(reap_indeterminate);
+    previous_ops = ssh_manager_set_reap_test_ops(&ops);
     CHECK_EQ_INT(ssh_start_isolated_agent(&config, &account), -1);
     run_set_runner(previous_runner);
 
@@ -1642,9 +2344,9 @@ TEST(runner_failure_indeterminate_reap_publishes_retry_tuple) {
     CHECK(path_exists(fixture.sidecar));
     CHECK(read_file_to_string(fixture.sidecar, sidecar_text,
                               sizeof(sidecar_text)) > 0);
-    CHECK_STR_EQ(sidecar_text, "1073741824\n");
+    CHECK_STR_EQ(sidecar_text, TEST_RECORD_TEXT);
     CHECK(strstr(get_last_error()->message,
-                 "runtime retained for retry") != NULL);
+                 "runtime durably retained for retry") != NULL);
     CHECK((size_t)snprintf(current, sizeof(current), "%s/current.sock",
                            fixture.runtime) < sizeof(current));
     CHECK(!path_exists(current));
@@ -1668,6 +2370,7 @@ TEST(runner_failure_indeterminate_reap_publishes_retry_tuple) {
     CHECK(!path_exists(fixture.socket));
     CHECK(!path_exists(fixture.sidecar));
     CHECK(!path_exists(current));
+    ssh_manager_set_reap_test_ops(&previous_ops);
     close(fixture.dir_fd);
 }
 
@@ -1716,7 +2419,9 @@ TEST(pre_sidecar_failed_reap_publishes_retry_tuple) {
     ssh_config_t config;
     command_runner_fn previous_runner;
     ssh_reap_fn previous_reap;
-    char sidecar_text[64];
+    ssh_reap_test_ops_t ops = {.generation = generation_matches_record};
+    ssh_reap_test_ops_t previous_ops;
+    char sidecar_text[160];
 
     CHECK_EQ_INT(make_fixture(&fixture, "gsar08retry"), 0);
     if (fixture.dir_fd < 0) return;
@@ -1734,7 +2439,9 @@ TEST(pre_sidecar_failed_reap_publishes_retry_tuple) {
 
     previous_runner = run_set_runner(bad_permission_agent_runner);
     previous_reap = ssh_manager_set_reap_fn(reap_indeterminate);
+    previous_ops = ssh_manager_set_reap_test_ops(&ops);
     CHECK_EQ_INT(ssh_start_isolated_agent(&config, &account), -1);
+    ssh_manager_set_reap_test_ops(&previous_ops);
     run_set_runner(previous_runner);
     ssh_manager_set_reap_fn(reap_gone);
 
@@ -1744,8 +2451,165 @@ TEST(pre_sidecar_failed_reap_publishes_retry_tuple) {
     CHECK(path_exists(fixture.sidecar));
     CHECK(read_file_to_string(fixture.sidecar, sidecar_text,
                               sizeof(sidecar_text)) > 0);
-    CHECK_STR_EQ(sidecar_text, "1073741824\n");
+    CHECK_STR_EQ(sidecar_text, TEST_RECORD_TEXT);
 
+    CHECK_EQ_INT(ssh_manager_reset("work"), 0);
+    ssh_manager_set_reap_fn(previous_reap);
+    CHECK(!path_exists(fixture.socket));
+    CHECK(!path_exists(fixture.sidecar));
+    close(fixture.dir_fd);
+}
+
+TEST(pre_sidecar_replaced_generation_retains_socket_unowned) {
+    ssh_fixture_t fixture;
+    account_t account;
+    ssh_config_t config;
+    command_runner_fn previous_runner;
+    ssh_reap_fn previous_reap;
+    ssh_reap_test_ops_t ops = {.generation = generation_matches_record};
+    ssh_reap_test_ops_t previous_ops;
+
+    CHECK_EQ_INT(make_fixture(&fixture, "gsar14replacedlaunch"), 0);
+    if (fixture.dir_fd < 0) return;
+    memset(&account, 0, sizeof(account));
+    account.id = 1;
+    CHECK_EQ_INT(safe_strncpy(account.name, "work",
+                              sizeof(account.name)), 0);
+    CHECK_EQ_INT(safe_strncpy(account.email, "work@example.invalid",
+                              sizeof(account.email)), 0);
+    account.ssh_enabled = true;
+    CHECK((size_t)snprintf(account.ssh_key_path,
+                           sizeof(account.ssh_key_path), "%s/key",
+                           fixture.xdg) < sizeof(account.ssh_key_path));
+    memset(&config, 0, sizeof(config));
+    config.mode = SSH_AGENT_ISOLATED;
+    config.agent_pid = -1;
+
+    previous_runner = run_set_runner(bad_permission_agent_runner);
+    previous_reap = ssh_manager_set_reap_fn(reap_replaced);
+    previous_ops = ssh_manager_set_reap_test_ops(&ops);
+    CHECK_EQ_INT(ssh_start_isolated_agent(&config, &account), -1);
+    ssh_manager_set_reap_test_ops(&previous_ops);
+    ssh_manager_set_reap_fn(previous_reap);
+    run_set_runner(previous_runner);
+
+    CHECK_EQ_INT(config.agent_pid, -1);
+    CHECK(!config.agent_owned);
+    CHECK_EQ_INT(config.agent_generation.kind,
+                 SSH_PROCESS_GENERATION_NONE);
+    CHECK(path_exists(fixture.socket));
+    CHECK(!path_exists(fixture.sidecar));
+    CHECK(strstr(get_last_error()->message, "artifact retained") != NULL);
+    CHECK(strstr(get_last_error()->message,
+                 "durably retained") == NULL);
+
+    CHECK_EQ_INT(unlink(fixture.socket), 0);
+    close(fixture.dir_fd);
+}
+
+TEST(failed_retry_sidecar_publication_retains_artifact_without_ownership) {
+    ssh_fixture_t fixture;
+    account_t account;
+    ssh_config_t config;
+    command_runner_fn previous_runner;
+    ssh_reap_fn previous_reap;
+    ssh_reap_test_ops_t ops = {.generation = generation_matches_record};
+    ssh_reap_test_ops_t previous_ops;
+    ssh_pid_commit_hook_fn previous_commit;
+
+    CHECK_EQ_INT(make_fixture(&fixture, "gsar14retrypublication"), 0);
+    if (fixture.dir_fd < 0) return;
+    memset(&account, 0, sizeof(account));
+    account.id = 1;
+    CHECK_EQ_INT(safe_strncpy(account.name, "work",
+                              sizeof(account.name)), 0);
+    CHECK_EQ_INT(safe_strncpy(account.email, "work@example.invalid",
+                              sizeof(account.email)), 0);
+    account.ssh_enabled = true;
+    CHECK((size_t)snprintf(account.ssh_key_path,
+                           sizeof(account.ssh_key_path), "%s/key",
+                           fixture.xdg) < sizeof(account.ssh_key_path));
+    memset(&config, 0, sizeof(config));
+    config.mode = SSH_AGENT_ISOLATED;
+    config.agent_pid = -1;
+
+    previous_runner = run_set_runner(bad_permission_agent_runner);
+    previous_reap = ssh_manager_set_reap_fn(reap_indeterminate);
+    previous_ops = ssh_manager_set_reap_test_ops(&ops);
+    previous_commit = ssh_manager_set_pid_commit_hook_fn(
+        fail_retry_pid_sidecar_publication);
+    CHECK_EQ_INT(ssh_start_isolated_agent(&config, &account), -1);
+    ssh_manager_set_pid_commit_hook_fn(previous_commit);
+    ssh_manager_set_reap_test_ops(&previous_ops);
+    ssh_manager_set_reap_fn(previous_reap);
+    run_set_runner(previous_runner);
+
+    CHECK_EQ_INT(config.agent_pid, -1);
+    CHECK(!config.agent_owned);
+    CHECK(path_exists(fixture.socket));
+    CHECK(!path_exists(fixture.sidecar));
+    CHECK(strstr(get_last_error()->message, "artifact retained") != NULL);
+    CHECK(strstr(get_last_error()->message, "runtime removed") == NULL);
+
+    CHECK_EQ_INT(unlink(fixture.socket), 0);
+    close(fixture.dir_fd);
+}
+
+TEST(exact_durable_sidecar_recovery_retains_agent_ownership) {
+    ssh_fixture_t fixture;
+    account_t account;
+    ssh_config_t config;
+    command_runner_fn previous_runner;
+    ssh_reap_fn previous_reap;
+    ssh_reap_test_ops_t ops = {.generation = generation_matches_record};
+    ssh_reap_test_ops_t previous_ops;
+    ssh_pid_commit_hook_fn previous_postrename;
+    char sidecar_text[160];
+
+    CHECK_EQ_INT(make_fixture(&fixture, "gsar14exactrecovery"), 0);
+    if (fixture.dir_fd < 0) return;
+    memset(&account, 0, sizeof(account));
+    account.id = 1;
+    CHECK_EQ_INT(safe_strncpy(account.name, "work",
+                              sizeof(account.name)), 0);
+    CHECK_EQ_INT(safe_strncpy(account.email, "work@example.invalid",
+                              sizeof(account.email)), 0);
+    account.ssh_enabled = true;
+    CHECK((size_t)snprintf(account.ssh_key_path,
+                           sizeof(account.ssh_key_path), "%s/key",
+                           fixture.xdg) < sizeof(account.ssh_key_path));
+    memset(&config, 0, sizeof(config));
+    config.mode = SSH_AGENT_ISOLATED;
+    config.agent_pid = -1;
+
+    g_exact_recovery_reap_calls = 0;
+    previous_runner = run_set_runner(successful_agent_runner);
+    previous_reap = ssh_manager_set_reap_fn(
+        exact_recovery_reap_must_not_run);
+    previous_ops = ssh_manager_set_reap_test_ops(&ops);
+    previous_postrename = ssh_manager_set_pid_postrename_hook_fn(
+        fail_exact_pid_postrename_verification);
+    CHECK_EQ_INT(ssh_start_isolated_agent(&config, &account), -1);
+    ssh_manager_set_pid_postrename_hook_fn(previous_postrename);
+    ssh_manager_set_reap_test_ops(&previous_ops);
+    ssh_manager_set_reap_fn(previous_reap);
+    run_set_runner(previous_runner);
+
+    CHECK_EQ_INT(g_exact_recovery_reap_calls, 0);
+    CHECK_EQ_INT(config.agent_pid, TEST_PID);
+    CHECK(config.agent_owned);
+    CHECK(config.agent_generation.start_lo ==
+          g_test_generation.start_lo);
+    CHECK(path_exists(fixture.socket));
+    CHECK(path_exists(fixture.sidecar));
+    CHECK(!path_exists(fixture.current));
+    CHECK(read_file_to_string(fixture.sidecar, sidecar_text,
+                              sizeof(sidecar_text)) > 0);
+    CHECK_STR_EQ(sidecar_text, TEST_RECORD_TEXT);
+    CHECK(strstr(get_last_error()->message,
+                 "exact durable record recovered") != NULL);
+
+    previous_reap = ssh_manager_set_reap_fn(reap_gone);
     CHECK_EQ_INT(ssh_manager_reset("work"), 0);
     ssh_manager_set_reap_fn(previous_reap);
     CHECK(!path_exists(fixture.socket));
@@ -1759,6 +2623,8 @@ TEST(pre_sidecar_cleanup_preserves_reaped_socket_replacement) {
     ssh_config_t config;
     command_runner_fn previous_runner;
     ssh_reap_fn previous_reap;
+    ssh_reap_test_ops_t ops = {.generation = generation_matches_record};
+    ssh_reap_test_ops_t previous_ops;
     struct stat replacement;
 
     CHECK_EQ_INT(make_fixture(&fixture, "gsar08prerace"), 0);
@@ -1782,16 +2648,20 @@ TEST(pre_sidecar_cleanup_preserves_reaped_socket_replacement) {
 
     previous_runner = run_set_runner(bad_permission_agent_runner);
     previous_reap = ssh_manager_set_reap_fn(replace_socket_then_gone);
+    previous_ops = ssh_manager_set_reap_test_ops(&ops);
     CHECK_EQ_INT(ssh_start_isolated_agent(&config, &account), -1);
+    ssh_manager_set_reap_test_ops(&previous_ops);
     ssh_manager_set_reap_fn(previous_reap);
     run_set_runner(previous_runner);
 
     CHECK(g_race_hook_succeeded);
     CHECK_EQ_INT(lstat(fixture.socket, &replacement), 0);
     CHECK(S_ISSOCK(replacement.st_mode));
-    CHECK_EQ_INT(config.agent_pid, TEST_PID);
-    CHECK(config.agent_owned);
+    CHECK_EQ_INT(config.agent_pid, -1);
+    CHECK(!config.agent_owned);
     CHECK(!path_exists(fixture.sidecar));
+    CHECK(strstr(get_last_error()->message, "artifact retained") != NULL);
+    CHECK(strstr(get_last_error()->message, "runtime removed") == NULL);
     CHECK_EQ_INT(unlink(fixture.socket), 0);
     close(fixture.dir_fd);
 }
@@ -1923,6 +2793,19 @@ TEST_MAIN_BEGIN()
     RUN_TEST(indeterminate_identity_retains_retry_sidecar);
     RUN_TEST(permission_denied_presence_probe_is_indeterminate);
     RUN_TEST(failed_pidfd_signal_retains_retry_sidecar);
+    RUN_TEST(fallback_generation_mismatch_before_term_preserves_retry_tuple);
+    RUN_TEST(pidfd_generation_mismatch_before_term_preserves_retry_tuple);
+    RUN_TEST(reset_all_generation_mismatch_before_term_preserves_retry_tuple);
+    RUN_TEST(generation_is_verified_before_pidfd_open_and_reverified_afterward);
+    RUN_TEST(fallback_generation_change_after_term_prevents_kill);
+    RUN_TEST(pidfd_generation_change_after_term_prevents_kill);
+    RUN_TEST(exact_generation_allows_term_kill_and_cleanup);
+    RUN_TEST(generation_inspection_error_never_terminates_or_consumes_tuple);
+    RUN_TEST(legacy_live_sidecar_is_retained_without_reap);
+    RUN_TEST(legacy_dead_sidecar_is_cleaned_without_reap);
+    RUN_TEST(stopped_session_preserves_same_pid_replacement_generation);
+    RUN_TEST(gone_record_with_live_replacement_preserves_complete_tuple);
+    RUN_TEST(unrelated_record_with_live_replacement_preserves_complete_tuple);
     RUN_TEST(interrupted_fallback_signal_retries_and_esrch_cleans);
     RUN_TEST(real_kernel_esrch_consumes_stale_sidecar);
     RUN_TEST(runtime_namespace_replacement_fails_without_mutating_either_tree);
@@ -1937,9 +2820,13 @@ TEST_MAIN_BEGIN()
     RUN_TEST(unrelated_live_pid_is_not_signaled);
     RUN_TEST(signal_storm_preserves_term_and_kill_deadlines);
     RUN_TEST(runtime_root_provenance_prevents_cross_root_reap);
+    RUN_TEST(unrecorded_launch_cleanup_keeps_original_captured_generation);
     RUN_TEST(runner_failure_indeterminate_reap_publishes_retry_tuple);
     RUN_TEST(socket_evidence_recovers_without_trusting_truncated_pid);
     RUN_TEST(pre_sidecar_failed_reap_publishes_retry_tuple);
+    RUN_TEST(pre_sidecar_replaced_generation_retains_socket_unowned);
+    RUN_TEST(failed_retry_sidecar_publication_retains_artifact_without_ownership);
+    RUN_TEST(exact_durable_sidecar_recovery_retains_agent_ownership);
     RUN_TEST(pre_sidecar_cleanup_preserves_reaped_socket_replacement);
     RUN_TEST(pre_sidecar_probe_cleanup_preserves_socket_replacement);
     RUN_TEST(runtime_metadata_mismatches_use_stable_estale_diagnostics);

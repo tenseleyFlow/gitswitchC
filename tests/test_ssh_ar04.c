@@ -508,6 +508,49 @@ static int write_bytes_file(const char *path, const void *content,
     return close(fd) == 0 && write_rc == 0 ? 0 : -1;
 }
 
+static int write_agent_record(const char *agent_dir, const char *name,
+                              pid_t pid, bool capture_live_generation) {
+    ssh_agent_record_t record = {
+        .pid = pid,
+        .generation = {
+            .kind = SSH_PROCESS_GENERATION_LINUX,
+            .boot_hi = UINT64_C(0x0102030405060708),
+            .boot_lo = UINT64_C(0x1112131415161718),
+            .start_hi = UINT64_C(0x2122232425262728),
+            .start_lo = UINT64_C(0x3132333435363738),
+        },
+    };
+    int dir_fd;
+    int rc;
+
+    if (capture_live_generation &&
+        ssh_manager_test_capture_process_generation(
+            pid, &record.generation) != 0) {
+        return -1;
+    }
+    dir_fd = open(agent_dir, O_RDONLY | O_DIRECTORY | O_CLOEXEC);
+    if (dir_fd < 0) return -1;
+    rc = ssh_manager_test_write_pid_sidecar(dir_fd, name, &record);
+    if (close(dir_fd) != 0) rc = -1;
+    return rc;
+}
+
+static int capture_fake_agent_generation(
+    pid_t pid, ssh_process_generation_t *generation) {
+    if (pid != (pid_t)1073741824 || !generation) {
+        errno = ESRCH;
+        return -1;
+    }
+    *generation = (ssh_process_generation_t) {
+        .kind = SSH_PROCESS_GENERATION_LINUX,
+        .boot_hi = UINT64_C(0x0102030405060708),
+        .boot_lo = UINT64_C(0x1112131415161718),
+        .start_hi = UINT64_C(0x2122232425262728),
+        .start_lo = UINT64_C(0x3132333435363738),
+    };
+    return 0;
+}
+
 static bool entry_exists(const char *path) {
     struct stat st;
     return lstat(path, &st) == 0;
@@ -899,6 +942,10 @@ TEST(post_spawn_runner_failure_reaps_runtime_and_allows_retry) {
     ssh_config_t cfg;
     account_t account;
     command_runner_fn previous;
+    ssh_reap_test_ops_t previous_reap_ops;
+    const ssh_reap_test_ops_t fake_reap_ops = {
+        .generation = capture_fake_agent_generation,
+    };
     bool pid_gone;
 
     if (!command_exists("ssh-agent")) {
@@ -948,9 +995,11 @@ TEST(post_spawn_runner_failure_reaps_runtime_and_allows_retry) {
     memset(&cfg, 0, sizeof(cfg));
     cfg.mode = SSH_AGENT_ISOLATED;
     cfg.agent_pid = -1;
+    previous_reap_ops = ssh_manager_set_reap_test_ops(&fake_reap_ops);
     previous = run_set_runner(fake_agent_runner);
     CHECK_EQ_INT(ssh_start_isolated_agent(&cfg, &account), 0);
     run_set_runner(previous);
+    ssh_manager_set_reap_test_ops(&previous_reap_ops);
     CHECK(entry_exists(sock));
     CHECK(entry_exists(pidfile));
     CHECK(entry_exists(current));
@@ -1298,7 +1347,9 @@ TEST(reset_fails_closed_when_lock_is_unavailable) {
     snprintf(current, sizeof(current), "%s/current.sock", agent_dir);
     CHECK_EQ_INT(unlink(lock), 0);
     CHECK_EQ_INT(mkdir(lock, 0700), 0); /* open(O_RDWR) must fail */
-    CHECK_EQ_INT(write_text_file(pidfile, "424242\n"), 0);
+    CHECK_EQ_INT(write_agent_record(agent_dir, "ssh-agent.work.pid",
+                                    (pid_t)424242, false),
+                 0);
     CHECK_EQ_INT(write_text_file(sock, "socket marker\n"), 0);
     CHECK_EQ_INT(symlink(sock, current), 0);
 
@@ -1495,7 +1546,7 @@ TEST(targeted_reset_never_reaps_embedded_nul_pid_prefix) {
  * managed socket. Identity-refusing the bystander PID is not proof the socket
  * is dead: preserve the reachable runtime and leave both processes alive. */
 TEST(targeted_reset_preserves_live_socket_when_sidecar_pid_is_bystander) {
-    char agent_dir[128], sock[192], current[192], pidfile[192], pid_text[64];
+    char agent_dir[128], sock[192], current[192], pidfile[192];
     pid_t agent_pid = -1;
     pid_t bystander_pid = -1;
     int start_rc;
@@ -1527,20 +1578,26 @@ TEST(targeted_reset_preserves_live_socket_when_sidecar_pid_is_bystander) {
     }
 
     snprintf(pidfile, sizeof(pidfile), "%s/ssh-agent.work.pid", agent_dir);
-    snprintf(pid_text, sizeof(pid_text), "%ld\n", (long)bystander_pid);
-    CHECK_EQ_INT(write_text_file(pidfile, pid_text), 0);
+    CHECK_EQ_INT(write_agent_record(agent_dir, "ssh-agent.work.pid",
+                                    bystander_pid, true),
+                 0);
 
     CHECK_EQ_INT(ssh_manager_reset("work"), -1); /* pre-fix: 0 */
     CHECK_EQ_INT(kill(agent_pid, 0), 0);          /* socket owner untouched */
     CHECK_EQ_INT(kill(bystander_pid, 0), 0);      /* stale PID never signaled */
     CHECK(entry_exists(sock));
     CHECK(entry_exists(current));
-    CHECK(!entry_exists(pidfile)); /* safely-classified garbage record dropped */
+    /* A reachable managed socket means the tuple is unresolved. Preserve its
+     * exact sidecar as retry evidence instead of creating a live sidecar-less
+     * agent merely because the recorded process is unrelated. */
+    CHECK(entry_exists(pidfile));
     CHECK(strstr(get_last_error()->message, "no safely matched PID") != NULL);
 
     (void)kill(bystander_pid, SIGKILL);
     (void)waitpid(bystander_pid, &status, 0);
     stop_real_agent(agent_pid, sock, current);
+    CHECK_EQ_INT(ssh_manager_reset("work"), 0);
+    CHECK(!entry_exists(pidfile));
 }
 
 /* The all-account path must make the same fail-closed classification instead
@@ -1580,7 +1637,7 @@ TEST(reset_all_preserves_live_agent_when_sidecar_is_missing) {
  * the kernel-reported argc entries; a >4 KiB environment used to truncate the
  * fixed buffer and make a managed agent permanently unreapable. */
 TEST(darwin_reset_reaps_managed_agent_with_large_environment) {
-    char agent_dir[128], sock[192], current[192], pidfile[192], pid_text[64];
+    char agent_dir[128], sock[192], current[192], pidfile[192];
     char *large_environment;
     char *saved_environment = NULL;
     const char *old_environment;
@@ -1628,8 +1685,9 @@ TEST(darwin_reset_reaps_managed_agent_with_large_environment) {
     if (start_rc != TEST_REAL_AGENT_START_OK) return;
 
     snprintf(pidfile, sizeof(pidfile), "%s/ssh-agent.work.pid", agent_dir);
-    snprintf(pid_text, sizeof(pid_text), "%ld\n", (long)pid);
-    CHECK_EQ_INT(write_text_file(pidfile, pid_text), 0);
+    CHECK_EQ_INT(write_agent_record(agent_dir, "ssh-agent.work.pid",
+                                    pid, true),
+                 0);
 
     CHECK_EQ_INT(ssh_manager_reset("work"), 0);
     for (int i = 0; i < 50 && kill(pid, 0) == 0; i++) {
@@ -1651,7 +1709,7 @@ TEST(darwin_reset_reaps_managed_agent_with_large_environment) {
  * Its 16 KiB environment makes the old 4096-byte retrieval fail every time. */
 TEST(darwin_kern_procargs_reaps_unrestricted_large_environment_agent) {
     char agent_dir[128], helper[192], sock[192], current[192];
-    char pidfile[192], pid_text[64];
+    char pidfile[192];
     struct timespec delay = {.tv_sec = 0, .tv_nsec = 10000000L};
     pid_t pid = -1;
 
@@ -1669,8 +1727,9 @@ TEST(darwin_kern_procargs_reaps_unrestricted_large_environment_agent) {
         return;
     }
     CHECK_EQ_INT(symlink(sock, current), 0);
-    snprintf(pid_text, sizeof(pid_text), "%ld\n", (long)pid);
-    CHECK_EQ_INT(write_text_file(pidfile, pid_text), 0);
+    CHECK_EQ_INT(write_agent_record(agent_dir, "ssh-agent.work.pid",
+                                    pid, true),
+                 0);
 
     CHECK_EQ_INT(ssh_manager_reset("work"), 0);
     for (int i = 0; i < 50 && kill(pid, 0) == 0; i++) {

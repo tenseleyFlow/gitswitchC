@@ -8,6 +8,7 @@
 #include "git_ops.h"
 #include "publication.h"
 #include "gitswitch.h"
+#include "ssh_manager.h"
 #include "utils.h"
 
 #include <dirent.h>
@@ -134,6 +135,26 @@ static int write_text(const char *path, const char *text, mode_t mode) {
     if (!f) return -1;
     if (fputs(text, f) == EOF || fclose(f) != 0) return -1;
     return chmod(path, mode);
+}
+
+static int write_live_agent_record(const char *runtime, const char *name,
+                                   pid_t pid) {
+    char dir[PATH_MAX];
+    ssh_agent_record_t record = {.pid = pid};
+    int dir_fd;
+    int rc;
+
+    if ((size_t)snprintf(dir, sizeof(dir), "%s/gitswitch-ssh", runtime) >=
+            sizeof(dir) ||
+        ssh_manager_test_capture_process_generation(
+            pid, &record.generation) != 0) {
+        return -1;
+    }
+    dir_fd = open(dir, O_RDONLY | O_DIRECTORY | O_CLOEXEC);
+    if (dir_fd < 0) return -1;
+    rc = ssh_manager_test_write_pid_sidecar(dir_fd, name, &record);
+    if (close(dir_fd) != 0) rc = -1;
+    return rc;
 }
 
 static int write_all(int fd, const void *data, size_t length) {
@@ -765,7 +786,7 @@ static int run_remove_with_one_shot_save_fault(
 
 static void exercise_remove_runtime_teardown(const char *ssh_agent_path) {
     char home[256], runtime[256], shims[512], path[1024], target[1024];
-    char output[1024], contents[8192], cmd[PATH_MAX + 4096], pid_text[64];
+    char output[1024], contents[8192], cmd[PATH_MAX + 4096];
     pid_t agent_pid = -1;
     bool agent_started = false;
 
@@ -797,10 +818,9 @@ static void exercise_remove_runtime_teardown(const char *ssh_agent_path) {
         }
         CHECK(agent_pid > 1);
         if (agent_pid > 1) {
-            snprintf(path, sizeof(path),
-                     "%s/gitswitch-ssh/ssh-agent.work.pid", runtime);
-            snprintf(pid_text, sizeof(pid_text), "%ld\n", (long)agent_pid);
-            CHECK_EQ_INT(write_text(path, pid_text, 0600), 0);
+            CHECK_EQ_INT(write_live_agent_record(
+                             runtime, "ssh-agent.work.pid", agent_pid),
+                         0);
             agent_started = true;
         }
     } else {
@@ -959,7 +979,20 @@ TEST(remove_save_failure_keeps_retry_handle_after_runtime_teardown) {
                                 "/gitswitch-ssh"), 0);
     CHECK_EQ_INT(directory_has_entry_prefix(path, ".key-fingerprint."), 0);
     slurp(pid_path, contents, sizeof(contents));
-    retry_pid = (pid_t)strtol(contents, NULL, 10);
+    {
+        char *pid_end = NULL;
+        long parsed_pid;
+
+        errno = 0;
+        parsed_pid = strtol(
+            strncmp(contents, "v1 ", 3) == 0 ? contents + 3 : contents,
+            &pid_end, 10);
+        if (errno == 0 && pid_end &&
+            (*pid_end == ' ' || *pid_end == '\n' || *pid_end == '\0') &&
+            parsed_pid > 1 && (long)(pid_t)parsed_pid == parsed_pid) {
+            retry_pid = (pid_t)parsed_pid;
+        }
+    }
     CHECK(retry_pid > 1);
 
     CHECK_EQ_INT(run_remove(home, runtime, shims, "work", output), 0);

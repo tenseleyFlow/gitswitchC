@@ -403,8 +403,9 @@ static const int switch_guarded_signals[] = {
     (sizeof(switch_guarded_signals) / sizeof(switch_guarded_signals[0]))
 
 static ssh_process_outcome_t refuse_session_agent_reap(
-    pid_t pid, const char *socket_arg, int runtime_dir_fd) {
-    (void)pid;
+    const ssh_agent_record_t *record, const char *socket_arg,
+    int runtime_dir_fd) {
+    (void)record;
     (void)socket_arg;
     (void)runtime_dir_fd;
     return SSH_PROCESS_OWNED;
@@ -419,7 +420,8 @@ static ssh_reap_fn g_session_reap_delegate;
  * accounts_session_cleanup(); a later call proves the checked abort reached
  * runtime rollback before the pending signal was re-raised. */
 static ssh_process_outcome_t signal_during_session_agent_reap(
-    pid_t pid, const char *socket_arg, int runtime_dir_fd) {
+    const ssh_agent_record_t *record, const char *socket_arg,
+    int runtime_dir_fd) {
     int call = ++g_session_reap_calls;
     ssh_process_outcome_t outcome;
 
@@ -436,7 +438,7 @@ static ssh_process_outcome_t signal_during_session_agent_reap(
         fflush(g_log);
     }
     outcome = g_session_reap_delegate
-                  ? g_session_reap_delegate(pid, socket_arg, runtime_dir_fd)
+                  ? g_session_reap_delegate(record, socket_arg, runtime_dir_fd)
                   : SSH_PROCESS_INDETERMINATE;
     return outcome;
 }
@@ -882,6 +884,25 @@ static int bind_fake_agent_socket_for_runner(const char *path,
  * it. */
 #define FAKE_AGENT_PID 1073741824
 #define FAKE_AGENT_FP "SHA256:AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA"
+
+static int capture_rollback_process_generation(
+    pid_t pid, ssh_process_generation_t *generation) {
+    if (!generation) {
+        errno = EINVAL;
+        return -1;
+    }
+    if (pid == (pid_t)FAKE_AGENT_PID) {
+        *generation = (ssh_process_generation_t) {
+            .kind = SSH_PROCESS_GENERATION_LINUX,
+            .boot_hi = UINT64_C(0x0102030405060708),
+            .boot_lo = UINT64_C(0x1112131415161718),
+            .start_hi = UINT64_C(0x2122232425262728),
+            .start_lo = UINT64_C(0x3132333435363738),
+        };
+        return 0;
+    }
+    return ssh_manager_test_capture_process_generation(pid, generation);
+}
 
 static bool ssh_probe_observes_committed_switch(void) {
     char config[4096];
@@ -5798,6 +5819,11 @@ TEST(sigint_mid_git_config_rolls_back_then_reraises) {
 }
 
 TEST_MAIN_BEGIN()
+    const ssh_reap_test_ops_t generation_ops = {
+        .generation = capture_rollback_process_generation,
+    };
+    ssh_reap_test_ops_t previous_reap_ops =
+        ssh_manager_set_reap_test_ops(&generation_ops);
     error_init(LOG_LEVEL_WARNING, NULL);
     RUN_TEST(unpersisted_target_fails_before_switch_mutation);
     RUN_TEST(snapshot_failure_aborts_before_any_git_write);
@@ -5877,4 +5903,5 @@ TEST_MAIN_BEGIN()
     RUN_TEST(incomplete_prepared_abort_retains_signal_ownership_until_retry);
     RUN_TEST(deferred_signal_survives_post_switch_window);
     RUN_TEST(sigint_mid_git_config_rolls_back_then_reraises);
+    ssh_manager_set_reap_test_ops(&previous_reap_ops);
 TEST_MAIN_END()

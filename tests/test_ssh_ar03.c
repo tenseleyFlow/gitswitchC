@@ -126,6 +126,23 @@ static int make_xdg_agent_dir(char *dir_out, size_t size) {
     return mkdir(dir_out, 0700);
 }
 
+static int write_live_agent_record(const char *dir, const char *name,
+                                   pid_t pid) {
+    ssh_agent_record_t record = {.pid = pid};
+    int dir_fd;
+    int rc;
+
+    if (ssh_manager_test_capture_process_generation(
+            pid, &record.generation) != 0) {
+        return -1;
+    }
+    dir_fd = open(dir, O_RDONLY | O_DIRECTORY | O_CLOEXEC);
+    if (dir_fd < 0) return -1;
+    rc = ssh_manager_test_write_pid_sidecar(dir_fd, name, &record);
+    if (close(dir_fd) != 0) rc = -1;
+    return rc;
+}
+
 static int make_account(account_t *a, const char *key_basename) {
     static const char private_prefix[] =
         "-----BEGIN OPENSSH PRIVATE KEY-----\n";
@@ -522,7 +539,6 @@ TEST(reset_reaps_real_recorded_agent) {
     run_result_t res;
     struct timespec t0, t1;
     long ms;
-    FILE *pf;
     char *p;
     pid_t pid;
 
@@ -548,12 +564,9 @@ TEST(reset_reaps_real_recorded_agent) {
     CHECK(pid > 1);
     CHECK_EQ_INT(kill(pid, 0), 0); /* the daemonized agent is alive */
 
-    pf = fopen(pidp, "w");
-    CHECK(pf != NULL);
-    if (pf) {
-        fprintf(pf, "%d\n", (int)pid);
-        fclose(pf);
-    }
+    CHECK_EQ_INT(write_live_agent_record(
+                     dir, "ssh-agent.work.pid", pid),
+                 0);
 
     clock_gettime(CLOCK_MONOTONIC, &t0);
     CHECK_EQ_INT(ssh_manager_reset("work"), 0);

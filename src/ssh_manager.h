@@ -26,12 +26,33 @@ typedef enum {
     SSH_AGENT_NONE         /* No SSH agent management */
 } ssh_agent_mode_t;
 
+typedef enum {
+    SSH_PROCESS_GENERATION_NONE = 0,
+    SSH_PROCESS_GENERATION_LINUX = 1,
+    SSH_PROCESS_GENERATION_DARWIN = 2,
+    SSH_PROCESS_GENERATION_FREEBSD = 3
+} ssh_process_generation_kind_t;
+
+typedef struct {
+    uint64_t kind;
+    uint64_t boot_hi;
+    uint64_t boot_lo;
+    uint64_t start_hi;
+    uint64_t start_lo;
+} ssh_process_generation_t;
+
+typedef struct {
+    pid_t pid;
+    ssh_process_generation_t generation;
+} ssh_agent_record_t;
+
 /* SSH configuration structure */
 typedef struct {
     ssh_agent_mode_t mode;
     char agent_socket_path[MAX_PATH_LEN];
     char agent_socket_arg[MAX_PATH_LEN]; /* exact -a argument used to start it */
     pid_t agent_pid;
+    ssh_process_generation_t agent_generation;
     bool agent_owned;      /* Whether we started this agent */
     bool key_already_loaded; /* The isolated agent already holds the account key;
                               * reuse avoids a passphrase re-prompt. */
@@ -44,25 +65,33 @@ typedef struct {
  * still alive. UNRELATED means a live PID was conclusively proved to be a
  * different process. GONE means no process remains at that PID. Every failed,
  * inaccessible, truncated, or permission-denied inspection is INDETERMINATE.
- * Only UNRELATED and GONE authorize consuming a recovery sidecar. */
+ * REPLACED means the numeric PID now denotes a different process generation;
+ * it never authorizes signaling, adoption, or recovery-name cleanup. Only
+ * UNRELATED and GONE can authorize process-record cleanup, and callers must
+ * separately prove the paired socket generation dead before consuming it. */
 typedef enum {
     SSH_PROCESS_OWNED,
     SSH_PROCESS_UNRELATED,
     SSH_PROCESS_GONE,
+    SSH_PROCESS_REPLACED,
     SSH_PROCESS_INDETERMINATE
 } ssh_process_outcome_t;
 
 typedef int (*ssh_setenv_fn)(const char *name, const char *value, int overwrite);
-typedef ssh_process_outcome_t (*ssh_reap_fn)(pid_t pid,
+typedef ssh_process_outcome_t (*ssh_reap_fn)(const ssh_agent_record_t *record,
                                              const char *socket_arg,
                                              int runtime_dir_fd);
 typedef ssh_process_outcome_t (*ssh_process_identity_fn)(
-    pid_t pid, const char *socket_arg, int runtime_dir_fd);
+    const ssh_agent_record_t *record, const char *socket_arg,
+    int runtime_dir_fd);
+typedef int (*ssh_process_generation_fn)(
+    pid_t pid, ssh_process_generation_t *generation);
 typedef int (*ssh_process_signal_fn)(pid_t pid, int signal_number);
 typedef int (*ssh_pidfd_open_fn)(pid_t pid);
 typedef int (*ssh_pidfd_signal_fn)(int pidfd, int signal_number);
 typedef struct {
     ssh_process_identity_fn identity;
+    ssh_process_generation_fn generation;
     ssh_process_signal_fn signal;
     ssh_pidfd_open_fn pidfd_open;
     ssh_pidfd_signal_fn pidfd_signal;
@@ -255,7 +284,9 @@ int ssh_inspect_key_file(const char *key_path,
 bool ssh_manager_test_socket_has_key(int dir_fd, const char *socket_arg,
                                      const char *key_path);
 int ssh_manager_test_write_pid_sidecar(int dir_fd, const char *name,
-                                       pid_t pid);
+                                       const ssh_agent_record_t *record);
+int ssh_manager_test_capture_process_generation(
+    pid_t pid, ssh_process_generation_t *generation);
 int ssh_manager_test_publish_current_link(int dir_fd, const char *target);
 int ssh_manager_test_cleanup_current_link(int dir_fd);
 int ssh_manager_test_probe_socket(const char *path, bool *reachable);

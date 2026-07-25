@@ -209,11 +209,26 @@ static int counting_key_open(const char *path, int flags) {
 }
 
 static ssh_process_outcome_t classify_recorded_agent_gone(
-    pid_t pid, const char *socket_arg, int runtime_dir_fd) {
-    (void)pid;
+    const ssh_agent_record_t *record, const char *socket_arg,
+    int runtime_dir_fd) {
+    (void)record;
     (void)socket_arg;
     (void)runtime_dir_fd;
     return SSH_PROCESS_GONE;
+}
+
+static ssh_agent_record_t synthetic_agent_record(pid_t pid) {
+    ssh_agent_record_t record = {
+        .pid = pid,
+        .generation = {
+            .kind = SSH_PROCESS_GENERATION_LINUX,
+            .boot_hi = UINT64_C(0x0102030405060708),
+            .boot_lo = UINT64_C(0x1112131415161718),
+            .start_hi = UINT64_C(0x2122232425262728),
+            .start_lo = UINT64_C(0x3132333435363738),
+        },
+    };
+    return record;
 }
 
 static int replace_current_during_cleanup(int dir_fd) {
@@ -635,7 +650,8 @@ TEST(pid_sidecar_sync_failure_retains_complete_recovery_record) {
     char xdg[64];
     char dir[96];
     char sidecar[160];
-    char content[32];
+    char content[128];
+    ssh_agent_record_t record = synthetic_agent_record((pid_t)12345);
     int parent_fd = make_private_dir(xdg, sizeof(xdg));
     int dir_fd;
     ssh_dirsync_fn previous;
@@ -656,14 +672,16 @@ TEST(pid_sidecar_sync_failure_retains_complete_recovery_record) {
     g_dirsync_fail_call = 1;
     previous = ssh_manager_set_dirsync_fn(counting_dirsync);
     CHECK_EQ_INT(ssh_manager_test_write_pid_sidecar(
-                     dir_fd, "ssh-agent.work.pid", (pid_t)12345),
+                     dir_fd, "ssh-agent.work.pid", &record),
                  -1);
     ssh_manager_set_dirsync_fn(previous);
 
     CHECK_EQ_INT(g_dirsync_calls, 1);
     snprintf(sidecar, sizeof(sidecar), "%s/ssh-agent.work.pid", dir);
-    CHECK_EQ_INT(read_file_to_string(sidecar, content, sizeof(content)), 6);
-    CHECK_STR_EQ(content, "12345\n");
+    CHECK_EQ_INT(read_file_to_string(sidecar, content, sizeof(content)), 77);
+    CHECK_STR_EQ(content,
+                 "v1 12345 1 01020304050607081112131415161718 "
+                 "21222324252627283132333435363738\n");
     close(dir_fd);
     close(parent_fd);
 
@@ -682,6 +700,7 @@ TEST(pid_postrename_identity_failure_is_synced_and_explicitly_uncertain) {
     char dir[64];
     char sidecar[128];
     char content[32];
+    ssh_agent_record_t record = synthetic_agent_record((pid_t)12345);
     int dir_fd = make_private_dir(dir, sizeof(dir));
     ssh_pid_commit_hook_fn previous_hook;
     ssh_dirsync_fn previous_sync;
@@ -694,7 +713,7 @@ TEST(pid_postrename_identity_failure_is_synced_and_explicitly_uncertain) {
         replace_pid_after_rename);
     previous_sync = ssh_manager_set_dirsync_fn(counting_dirsync);
     CHECK_EQ_INT(ssh_manager_test_write_pid_sidecar(
-                     dir_fd, "ssh-agent.work.pid", (pid_t)12345),
+                     dir_fd, "ssh-agent.work.pid", &record),
                  -1);
     ssh_manager_set_dirsync_fn(previous_sync);
     ssh_manager_set_pid_postrename_hook_fn(previous_hook);
