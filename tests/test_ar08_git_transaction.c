@@ -66,6 +66,9 @@ typedef struct {
     saved_env_t global_env;
     saved_env_t nosystem_env;
     saved_env_t config_count_env;
+    saved_env_t config_key0_env;
+    saved_env_t config_value0_env;
+    saved_env_t config_parameters_env;
     saved_env_t ssh_command_env;
     saved_env_t ssh_env;
     saved_env_t trace_env;
@@ -79,6 +82,24 @@ static const char *const g_gpg_model_keys[] = {
     "gpg.x509.program",
     "gpg.ssh.program"
 };
+
+static const char *const g_managed_override_keys[] = {
+    GIT_CONFIG_USER_NAME,
+    GIT_CONFIG_USER_EMAIL,
+    GIT_CONFIG_CORE_SSHCOMMAND,
+    GIT_CONFIG_USER_SIGNINGKEY,
+    GIT_CONFIG_COMMIT_GPGSIGN,
+    GIT_CONFIG_GPG_FORMAT,
+    GIT_CONFIG_GPG_PROGRAM,
+    GIT_CONFIG_GPG_OPENPGP_PROGRAM,
+    GIT_CONFIG_GPG_X509_PROGRAM,
+    GIT_CONFIG_GPG_SSH_PROGRAM
+};
+
+typedef enum {
+    COMMAND_OVERRIDE_COUNT = 0,
+    COMMAND_OVERRIDE_PARAMETERS
+} command_override_encoding_t;
 
 static saved_env_t save_env(const char *name) {
     saved_env_t saved;
@@ -137,6 +158,9 @@ static bool fixture_init(git_fixture_t *fixture) {
     fixture->global_env = save_env("GIT_CONFIG_GLOBAL");
     fixture->nosystem_env = save_env("GIT_CONFIG_NOSYSTEM");
     fixture->config_count_env = save_env("GIT_CONFIG_COUNT");
+    fixture->config_key0_env = save_env("GIT_CONFIG_KEY_0");
+    fixture->config_value0_env = save_env("GIT_CONFIG_VALUE_0");
+    fixture->config_parameters_env = save_env("GIT_CONFIG_PARAMETERS");
     fixture->ssh_command_env = save_env("GIT_SSH_COMMAND");
     fixture->ssh_env = save_env("GIT_SSH");
     fixture->trace_env = save_env("GIT_TRACE");
@@ -163,6 +187,9 @@ static bool fixture_init(git_fixture_t *fixture) {
         setenv("GIT_CONFIG_GLOBAL", fixture->global_config, 1) != 0 ||
         setenv("GIT_CONFIG_NOSYSTEM", "1", 1) != 0 ||
         unsetenv("GIT_CONFIG_COUNT") != 0 ||
+        unsetenv("GIT_CONFIG_KEY_0") != 0 ||
+        unsetenv("GIT_CONFIG_VALUE_0") != 0 ||
+        unsetenv("GIT_CONFIG_PARAMETERS") != 0 ||
         unsetenv("GIT_SSH_COMMAND") != 0 || unsetenv("GIT_SSH") != 0 ||
         unsetenv("GIT_TRACE") != 0 || chdir(fixture->repo) != 0) {
         return false;
@@ -184,6 +211,9 @@ static void fixture_cleanup(git_fixture_t *fixture) {
     restore_env("GIT_TRACE", &fixture->trace_env);
     restore_env("GIT_SSH", &fixture->ssh_env);
     restore_env("GIT_SSH_COMMAND", &fixture->ssh_command_env);
+    restore_env("GIT_CONFIG_PARAMETERS", &fixture->config_parameters_env);
+    restore_env("GIT_CONFIG_VALUE_0", &fixture->config_value0_env);
+    restore_env("GIT_CONFIG_KEY_0", &fixture->config_key0_env);
     restore_env("GIT_CONFIG_COUNT", &fixture->config_count_env);
     restore_env("GIT_CONFIG_NOSYSTEM", &fixture->nosystem_env);
     restore_env("GIT_CONFIG_GLOBAL", &fixture->global_env);
@@ -241,6 +271,37 @@ static int git_set_file(const char *path, const char *key,
     return run_git(argv);
 }
 
+static int clear_command_override(void) {
+    int result = 0;
+
+    if (unsetenv("GIT_CONFIG_COUNT") != 0) result = -1;
+    if (unsetenv("GIT_CONFIG_KEY_0") != 0) result = -1;
+    if (unsetenv("GIT_CONFIG_VALUE_0") != 0) result = -1;
+    if (unsetenv("GIT_CONFIG_PARAMETERS") != 0) result = -1;
+    return result;
+}
+
+static int set_command_override(command_override_encoding_t encoding,
+                                const char *key, const char *value) {
+    char parameters[GIT_CONFIG_VALUE_MAX + 128U];
+
+    if (!key || !value || clear_command_override() != 0) return -1;
+    if (encoding == COMMAND_OVERRIDE_COUNT) {
+        return setenv("GIT_CONFIG_KEY_0", key, 1) == 0 &&
+                       setenv("GIT_CONFIG_VALUE_0", value, 1) == 0 &&
+                       setenv("GIT_CONFIG_COUNT", "1", 1) == 0
+                   ? 0
+                   : -1;
+    }
+    if (encoding != COMMAND_OVERRIDE_PARAMETERS ||
+        strchr(key, '\'') != NULL || strchr(value, '\'') != NULL ||
+        (size_t)snprintf(parameters, sizeof(parameters), "'%s'='%s'",
+                         key, value) >= sizeof(parameters)) {
+        return -1;
+    }
+    return setenv("GIT_CONFIG_PARAMETERS", parameters, 1);
+}
+
 static int retain_file_generation(const char *path, char *retained,
                                   size_t retained_size) {
     if ((size_t)snprintf(retained, retained_size, "%s.retained", path) >=
@@ -273,6 +334,31 @@ static char g_locked_hardlink[MAX_PATH_LEN];
 static int g_postpublish_writer_calls;
 static char g_postpublish_config[MAX_PATH_LEN];
 static char g_postpublish_installed[MAX_PATH_LEN];
+static command_runner_fn g_late_override_delegate;
+static const char *g_late_override_value;
+static int g_late_override_injected;
+
+static int inject_command_override_after_name_write(
+    const char *const argv[], const run_opts_t *opts, run_result_t *result) {
+    int command_result;
+
+    if (!g_late_override_delegate) return -1;
+    command_result = g_late_override_delegate(argv, opts, result);
+    if (command_result == 0 && g_late_override_injected == 0 &&
+        argv && argv[0] && argv[1] && argv[2] && argv[3] && argv[4] &&
+        argv[5] == NULL &&
+        strcmp(argv[0], "git") == 0 && strcmp(argv[1], "config") == 0 &&
+        strcmp(argv[2], "--global") == 0 &&
+        strcmp(argv[3], GIT_CONFIG_USER_NAME) == 0) {
+        g_late_override_injected =
+            set_command_override(COMMAND_OVERRIDE_COUNT,
+                                 GIT_CONFIG_USER_NAME,
+                                 g_late_override_value) == 0
+                ? 1
+                : -1;
+    }
+    return command_result;
+}
 
 static void drift_config_ctime_while_restore_lock_is_held(
     git_scope_t scope) {
@@ -712,6 +798,177 @@ TEST(real_git_proves_narrow_ssh_environment_precedence_and_api_rejects_it) {
     restored_core[strcspn(restored_core, "\n")] = '\0';
     CHECK_STR_EQ(restored_core, core_helper);
 
+    fixture_cleanup(&fixture);
+}
+
+TEST(managed_command_scope_overrides_are_rejected_before_snapshot) {
+    static const char same_value[] = "same-command-value";
+    static const char *const scope_flags[] = {"--global", "--local"};
+    static const git_scope_t scopes[] = {
+        GIT_SCOPE_GLOBAL, GIT_SCOPE_LOCAL
+    };
+    git_fixture_t fixture;
+    char actual[256];
+    git_current_config_t current;
+
+    if (!fixture_init(&fixture)) {
+        CHECK(false);
+        fixture_cleanup(&fixture);
+        return;
+    }
+    for (int encoding = COMMAND_OVERRIDE_COUNT;
+         encoding <= COMMAND_OVERRIDE_PARAMETERS; encoding++) {
+        for (size_t scope = 0;
+             scope < sizeof(scopes) / sizeof(scopes[0]); scope++) {
+            for (size_t key = 0;
+                 key < sizeof(g_managed_override_keys) /
+                           sizeof(g_managed_override_keys[0]);
+                 key++) {
+                CHECK_EQ_INT(git_set(scope_flags[scope],
+                                     g_managed_override_keys[key],
+                                     same_value), 0);
+                CHECK_EQ_INT(set_command_override(
+                                 (command_override_encoding_t)encoding,
+                                 g_managed_override_keys[key], same_value),
+                             0);
+                git_ops_test_reset_caches();
+                clear_error();
+                errno = 0;
+                CHECK_EQ_INT(git_config_snapshot(scopes[scope]), -1);
+                CHECK_EQ_INT(get_last_error()->code,
+                             ERR_GIT_CONFIG_FAILED);
+                CHECK_EQ_INT(errno, ESTALE);
+                CHECK(strstr(get_last_error()->message,
+                             g_managed_override_keys[key]) != NULL);
+
+                CHECK_EQ_INT(clear_command_override(), 0);
+                CHECK_EQ_INT(git_get_all(scope_flags[scope],
+                                         g_managed_override_keys[key],
+                                         actual, sizeof(actual)), 0);
+                CHECK_STR_EQ(actual, "same-command-value\n");
+                CHECK_EQ_INT(git_unset_all(
+                                 scope_flags[scope],
+                                 g_managed_override_keys[key]), 0);
+            }
+        }
+
+        /* Command scope itself is not prohibited. Only the managed identity
+         * and signing selectors are incompatible with durable publication. */
+        CHECK_EQ_INT(set_command_override(
+                         (command_override_encoding_t)encoding,
+                         "audit.unrelated", "allowed"),
+                     0);
+        git_ops_test_reset_caches();
+        CHECK_EQ_INT(git_config_snapshot(GIT_SCOPE_GLOBAL), 0);
+        git_config_commit();
+        CHECK_EQ_INT(clear_command_override(), 0);
+    }
+
+    /* Status remains observational: it reports the winning command scope
+     * instead of treating an override as a persisted publication. */
+    CHECK_EQ_INT(git_set("--global", GIT_CONFIG_USER_NAME,
+                         "persisted-name"), 0);
+    CHECK_EQ_INT(git_set("--global", GIT_CONFIG_USER_EMAIL,
+                         "persisted@example.test"), 0);
+    CHECK_EQ_INT(set_command_override(COMMAND_OVERRIDE_COUNT,
+                                      GIT_CONFIG_USER_NAME,
+                                      "command-name"), 0);
+    git_ops_test_reset_caches();
+    memset(&current, 0, sizeof(current));
+    CHECK_EQ_INT(git_get_current_config(&current), 0);
+    CHECK_STR_EQ(current.name, "command-name");
+    CHECK_EQ_INT(current.effective_name_scope,
+                 GIT_CONFIG_ORIGIN_COMMAND);
+    CHECK_EQ_INT(clear_command_override(), 0);
+
+    fixture_cleanup(&fixture);
+}
+
+TEST(late_command_override_is_rejected_at_account_writer_boundary) {
+    git_fixture_t fixture;
+    account_t account;
+    char before[4096];
+    char after[4096];
+
+    if (!fixture_init(&fixture)) {
+        CHECK(false);
+        fixture_cleanup(&fixture);
+        return;
+    }
+    CHECK_EQ_INT(git_set("--global", GIT_CONFIG_USER_NAME,
+                         "writer-boundary-before"), 0);
+    CHECK_EQ_INT(git_set("--global", GIT_CONFIG_USER_EMAIL,
+                         "writer-boundary@example.test"), 0);
+    CHECK_EQ_INT(read_file(fixture.global_config, before, sizeof(before)), 0);
+    CHECK_EQ_INT(git_config_snapshot(GIT_SCOPE_GLOBAL), 0);
+    account = basic_account(&fixture, false);
+
+    /* The environment can change after snapshot. The public account writer
+     * must repeat the preflight before its first Git mutation. */
+    CHECK_EQ_INT(set_command_override(COMMAND_OVERRIDE_PARAMETERS,
+                                      GIT_CONFIG_USER_NAME,
+                                      account.name), 0);
+    clear_error();
+    errno = 0;
+    CHECK_EQ_INT(git_set_config(&account, GIT_SCOPE_GLOBAL), -1);
+    CHECK_EQ_INT(get_last_error()->code, ERR_GIT_CONFIG_FAILED);
+    CHECK_EQ_INT(errno, ESTALE);
+    CHECK(strstr(get_last_error()->message,
+                 GIT_CONFIG_USER_NAME) != NULL);
+    CHECK_EQ_INT(read_file(fixture.global_config, after, sizeof(after)), 0);
+    CHECK_STR_EQ(after, before);
+
+    CHECK_EQ_INT(clear_command_override(), 0);
+    CHECK_EQ_INT(git_config_restore(), 0);
+    CHECK_EQ_INT(read_file(fixture.global_config, after, sizeof(after)), 0);
+    CHECK_STR_EQ(after, before);
+    fixture_cleanup(&fixture);
+}
+
+TEST(post_write_command_override_fails_merged_proof_and_restores_exactly) {
+    git_fixture_t fixture;
+    account_t account;
+    command_runner_fn previous;
+    char before[4096];
+    char after[4096];
+
+    if (!fixture_init(&fixture)) {
+        CHECK(false);
+        fixture_cleanup(&fixture);
+        return;
+    }
+    CHECK_EQ_INT(git_set("--global", GIT_CONFIG_USER_NAME,
+                         "verification-before"), 0);
+    CHECK_EQ_INT(git_set("--global", GIT_CONFIG_USER_EMAIL,
+                         "verification@example.test"), 0);
+    CHECK_EQ_INT(git_set("--global", "audit.preserved",
+                         "byte-for-byte"), 0);
+    CHECK_EQ_INT(read_file(fixture.global_config, before, sizeof(before)), 0);
+    CHECK_EQ_INT(git_config_snapshot(GIT_SCOPE_GLOBAL), 0);
+    account = basic_account(&fixture, false);
+
+    /* Inject a same-valued command override only after the persisted name
+     * write succeeds. Scoped read-back still matches, so the final atomic
+     * merged listing is the boundary that must detect the lost provenance. */
+    g_late_override_value = account.name;
+    g_late_override_injected = 0;
+    previous = run_set_runner(inject_command_override_after_name_write);
+    g_late_override_delegate = previous;
+    clear_error();
+    errno = 0;
+    CHECK_EQ_INT(git_set_config(&account, GIT_SCOPE_GLOBAL), -1);
+    run_set_runner(previous);
+    g_late_override_delegate = NULL;
+    CHECK_EQ_INT(g_late_override_injected, 1);
+    CHECK_EQ_INT(get_last_error()->code, ERR_GIT_CONFIG_FAILED);
+    CHECK_EQ_INT(errno, ESTALE);
+    CHECK(strstr(get_last_error()->message,
+                 GIT_CONFIG_USER_NAME) != NULL);
+
+    CHECK_EQ_INT(clear_command_override(), 0);
+    CHECK_EQ_INT(git_config_restore(), 0);
+    CHECK_EQ_INT(read_file(fixture.global_config, after, sizeof(after)), 0);
+    CHECK_STR_EQ(after, before);
     fixture_cleanup(&fixture);
 }
 
@@ -2447,6 +2704,9 @@ TEST(metadata_mismatches_use_stable_eagain_diagnostics) {
 TEST_MAIN_BEGIN()
     error_init(LOG_LEVEL_WARNING, NULL);
     RUN_TEST(real_git_proves_narrow_ssh_environment_precedence_and_api_rejects_it);
+    RUN_TEST(managed_command_scope_overrides_are_rejected_before_snapshot);
+    RUN_TEST(late_command_override_is_rejected_at_account_writer_boundary);
+    RUN_TEST(post_write_command_override_fails_merged_proof_and_restores_exactly);
     RUN_TEST(all_gpg_format_and_program_keys_normalize_and_restore_exactly);
     RUN_TEST(large_unrelated_config_allows_snapshot_switch_status_and_rollback);
     RUN_TEST(rollback_preserves_concurrent_ordered_vectors_in_every_managed_scope);

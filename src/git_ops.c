@@ -434,6 +434,7 @@ typedef struct {
 /* Single-threaded CLI scratch. Keeping the large status representation in
  * .bss avoids adding it to the already substantial status stack frame. */
 static git_effective_listing_t g_effective_listing;
+static int git_reject_managed_command_overrides(void);
 
 static git_config_origin_scope_t parse_origin_scope(const char *scope,
                                                     size_t scope_len) {
@@ -5784,6 +5785,7 @@ int git_config_snapshot(git_scope_t scope) {
         return -1;
     }
     if (git_reject_ssh_command_override() != 0) return -1;
+    if (git_reject_managed_command_overrides() != 0) return -1;
     git_snapshot_clear(&g_git_snapshot);
 
     /* Worktree attribution must be known before any forward mutation. A
@@ -6524,6 +6526,7 @@ static int git_set_config_impl(const account_t *account, git_scope_t scope) {
         return -1;
     }
     if (git_reject_ssh_command_override() != 0) return -1;
+    if (git_reject_managed_command_overrides() != 0) return -1;
     
     /* If local scope, ensure we're in a git repository */
     if (scope == GIT_SCOPE_LOCAL && !git_is_repository()) {
@@ -6827,6 +6830,47 @@ static int git_read_effective_keys(git_effective_listing_t **out) {
     }
 }
 
+/* Command-scope configuration is process-local and outranks every persisted
+ * scope. Matching bytes therefore do not prove that the selected account was
+ * durably published: a later Git process without the override can observe a
+ * different identity. Inspect only the winning managed entries from Git's own
+ * parser, so both supported command-override environment encodings and their
+ * quoting rules share one authority. */
+static int git_effective_reject_managed_command_scope(
+    const git_effective_listing_t *listing) {
+    if (!listing) {
+        set_error(ERR_INVALID_ARGS,
+                  "Missing effective Git configuration for command-scope validation");
+        return -1;
+    }
+    for (int i = 0; i < GIT_MANAGED_KEY_COUNT; i++) {
+        if (listing->keys[i].present &&
+            listing->scopes[i] == GIT_CONFIG_ORIGIN_COMMAND) {
+            errno = ESTALE;
+            set_error(ERR_GIT_CONFIG_FAILED,
+                      "Git command-scope override for managed key %s prevents durable account switching",
+                      g_managed_keys[i]);
+            return -1;
+        }
+    }
+    return 0;
+}
+
+/* Preserve the ordinary no-override path: most switch callers and command
+ * runner fixtures must not pay for an additional effective-config read.
+ * Presence, including an empty value or GIT_CONFIG_COUNT=0, asks Git to parse
+ * the environment. Unrelated command-scope keys remain permitted. */
+static int git_reject_managed_command_overrides(void) {
+    git_effective_listing_t *effective;
+
+    if (getenv("GIT_CONFIG_COUNT") == NULL &&
+        getenv("GIT_CONFIG_PARAMETERS") == NULL) {
+        return 0;
+    }
+    if (git_read_effective_keys(&effective) != 0) return -1;
+    return git_effective_reject_managed_command_scope(effective);
+}
+
 /* Canonicalize a captured non-text Boolean without rereading the user's
  * configuration. Git's accepted numeric range changed when its historical
  * INT_MIN off-by-one was fixed, and vendor Git builds can lag that change.
@@ -6934,6 +6978,9 @@ static int git_verify_merged_account(const account_t *account,
 
     if (git_reject_ssh_command_override() != 0) return -1;
     if (git_read_effective_keys(&effective) != 0) return -1;
+    if (git_effective_reject_managed_command_scope(effective) != 0) {
+        return -1;
+    }
     if (ssh_present &&
         git_expected_ssh_command(account, expected_ssh,
                                  sizeof(expected_ssh)) != 0)
