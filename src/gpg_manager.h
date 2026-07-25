@@ -81,6 +81,14 @@ typedef int (*gpg_agent_conf_precommit_fn)(int home_fd,
 typedef int (*gpg_retarget_commit_hook_fn)(int base_fd);
 typedef int (*gpg_retarget_restore_hook_fn)(int base_fd);
 typedef enum {
+    GPG_RETARGET_FORWARD_AFTER_SNAPSHOT,
+    GPG_RETARGET_FORWARD_AFTER_WITNESS_SYNC,
+    GPG_RETARGET_FORWARD_AFTER_QUARANTINE_SYNC,
+    GPG_RETARGET_FORWARD_AFTER_PUBLICATION_SYNC
+} gpg_retarget_forward_hook_stage_t;
+typedef int (*gpg_retarget_forward_hook_fn)(
+    int base_fd, gpg_retarget_forward_hook_stage_t stage);
+typedef enum {
     GPG_ROLLBACK_HOOK_BEFORE_QUARANTINE,
     GPG_ROLLBACK_HOOK_AFTER_QUARANTINE,
     GPG_ROLLBACK_HOOK_BEFORE_QUARANTINE_UNLINK
@@ -141,6 +149,8 @@ gpg_retarget_commit_hook_fn
 gpg_manager_set_retarget_commit_hook_fn(gpg_retarget_commit_hook_fn fn);
 gpg_retarget_restore_hook_fn
 gpg_manager_set_retarget_restore_hook_fn(gpg_retarget_restore_hook_fn fn);
+gpg_retarget_forward_hook_fn
+gpg_manager_set_retarget_forward_hook_fn(gpg_retarget_forward_hook_fn fn);
 gpg_rollback_hook_fn
 gpg_manager_set_rollback_hook_fn(gpg_rollback_hook_fn fn);
 gpg_sync_base_fn gpg_manager_set_sync_base_fn(gpg_sync_base_fn fn);

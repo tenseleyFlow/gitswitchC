@@ -158,6 +158,7 @@ static gpg_agent_conf_preopen_fn g_agent_conf_preopen;
 static gpg_agent_conf_precommit_fn g_agent_conf_precommit;
 static gpg_retarget_commit_hook_fn g_retarget_commit_hook;
 static gpg_retarget_restore_hook_fn g_retarget_restore_hook;
+static gpg_retarget_forward_hook_fn g_retarget_forward_hook;
 static gpg_rollback_hook_fn g_rollback_hook;
 static gpg_sync_base_fn g_sync_base = gpg_default_sync_base;
 static gpg_rename_noreplace_fn g_rename_noreplace =
@@ -182,6 +183,9 @@ static gpg_base_warning_probe_fn g_base_warning_probe =
 static bool g_base_warning_probe_checked;
 static bool g_base_warning_memory_backed;
 static bool g_base_warning_emitted;
+/* Narrow in-process exception while the rollback state machine settles the
+ * publication belonging to this exact forward transaction. */
+static const char *g_allowed_forward_stem;
 static gpg_key_cache_post_scan_hook_fn g_key_cache_post_scan_hook;
 
 static void gpg_agent_config_update_init(gpg_agent_config_update_t *update) {
@@ -246,6 +250,13 @@ gpg_retarget_restore_hook_fn
 gpg_manager_set_retarget_restore_hook_fn(gpg_retarget_restore_hook_fn fn) {
     gpg_retarget_restore_hook_fn previous = g_retarget_restore_hook;
     g_retarget_restore_hook = fn;
+    return previous;
+}
+
+gpg_retarget_forward_hook_fn
+gpg_manager_set_retarget_forward_hook_fn(gpg_retarget_forward_hook_fn fn) {
+    gpg_retarget_forward_hook_fn previous = g_retarget_forward_hook;
+    g_retarget_forward_hook = fn;
     return previous;
 }
 
@@ -1732,6 +1743,7 @@ enum {
 
 #define GPG_ROLLBACK_PREFIX ".gitswitch-gpg-rollback."
 #define GPG_PUBLISH_PREFIX ".gitswitch-gpg-publish."
+#define GPG_FORWARD_PREFIX ".gitswitch-gpg-forward."
 #define GPG_RESET_PREFIX ".gitswitch-gpg-reset."
 #define GPG_RESET_WITNESS_SUFFIX ".witness"
 
@@ -1810,6 +1822,20 @@ static bool gpg_name_has_prefix(const char *name, const char *prefix) {
     return name && prefix && strncmp(name, prefix, strlen(prefix)) == 0;
 }
 
+static bool gpg_forward_name_belongs_to_stem(const char *name,
+                                             const char *stem) {
+    size_t stem_length;
+
+    if (!name || !stem) return false;
+    stem_length = strlen(stem);
+    return strncmp(name, stem, stem_length) == 0 &&
+           name[stem_length] == '.' &&
+           (name[stem_length + 1U] == 'p' ||
+            name[stem_length + 1U] == 'w' ||
+            name[stem_length + 1U] == 'q') &&
+           name[stem_length + 2U] == '\0';
+}
+
 /* A quarantine without an in-memory transaction token may contain a symlink
  * displaced by an interrupted process. Never guess at its ownership. */
 static int gpg_reject_stale_quarantines_locked(int base_fd,
@@ -1848,7 +1874,11 @@ static int gpg_reject_stale_quarantines_locked(int base_fd,
         }
         if ((gpg_name_has_prefix(entry->d_name, GPG_ROLLBACK_PREFIX) ||
              gpg_name_has_prefix(entry->d_name, GPG_PUBLISH_PREFIX) ||
+             gpg_name_has_prefix(entry->d_name, GPG_FORWARD_PREFIX) ||
              gpg_name_has_prefix(entry->d_name, GPG_RESET_PREFIX)) &&
+            !(g_allowed_forward_stem &&
+              gpg_forward_name_belongs_to_stem(entry->d_name,
+                                               g_allowed_forward_stem)) &&
             (!allowed_name || strcmp(entry->d_name, allowed_name) != 0)) {
             char stale[GPG_QUARANTINE_NAME_LEN];
             safe_strncpy(stale, entry->d_name, sizeof(stale));
@@ -3030,15 +3060,366 @@ static int gpg_finish_failed_retarget(int base_fd, const char *base,
     return -1;
 }
 
+typedef struct {
+    char stem[GPG_QUARANTINE_NAME_LEN];
+    char candidate[GPG_QUARANTINE_NAME_LEN];
+    char witness[GPG_QUARANTINE_NAME_LEN];
+    char quarantine[GPG_QUARANTINE_NAME_LEN];
+    bool candidate_present;
+    bool witness_present;
+    bool quarantine_present;
+} gpg_forward_state_t;
+
+static int gpg_forward_names(gpg_forward_state_t *state) {
+    if (!state ||
+        gpg_make_private_name(state->stem, sizeof(state->stem),
+                              GPG_FORWARD_PREFIX) != 0 ||
+        safe_snprintf(state->candidate, sizeof(state->candidate), "%s.p",
+                      state->stem) != 0 ||
+        safe_snprintf(state->witness, sizeof(state->witness), "%s.w",
+                      state->stem) != 0 ||
+        safe_snprintf(state->quarantine, sizeof(state->quarantine), "%s.q",
+                      state->stem) != 0) {
+        set_error(ERR_INVALID_PATH,
+                  "Cannot allocate GPG forward-transaction names");
+        return -1;
+    }
+    return 0;
+}
+
+static int gpg_forward_retire_if_present(
+    int base_fd, const char *name, const gpg_link_identity_t *expected,
+    const char *description) {
+    gpg_link_identity_t observed;
+    int rc = gpg_capture_link_at(base_fd, name, &observed);
+
+    if (rc < 0) return -1;
+    if (rc > 0) return 0;
+    if (!gpg_same_link(&observed, expected)) {
+        set_error(ERR_FILE_IO, "%s changed; preserving replacement: %s",
+                  description, name);
+        return -1;
+    }
+    return gpg_discard_prepared_link_locked(base_fd, name, expected);
+}
+
+static int gpg_forward_cleanup_locked(
+    int base_fd, const gpg_forward_state_t *state,
+    const gpg_link_identity_t *candidate,
+    const gpg_link_identity_t *witness,
+    const gpg_link_identity_t *quarantine) {
+    if (quarantine && quarantine->valid &&
+        gpg_forward_retire_if_present(base_fd, state->quarantine, quarantine,
+                                      "GPG forward quarantine") != 0) {
+        return -1;
+    }
+    if (witness && witness->valid &&
+        gpg_forward_retire_if_present(base_fd, state->witness, witness,
+                                      "GPG forward expected witness") != 0) {
+        return -1;
+    }
+    if (candidate && candidate->valid &&
+        gpg_forward_retire_if_present(base_fd, state->candidate, candidate,
+                                      "GPG forward candidate witness") != 0) {
+        return -1;
+    }
+    return 0;
+}
+
+/* Restore a displaced writer only into an absent public name. A concurrent
+ * occupant always wins. FreeBSD's retained source alias is retired only after
+ * the public name is proven to be the exact displaced inode. */
+static int gpg_forward_restore_quarantine_locked(
+    int base_fd, const char *name, const gpg_link_identity_t *quarantine,
+    bool *blocked) {
+    gpg_link_identity_t current;
+    int current_rc;
+
+    *blocked = false;
+    current_rc = gpg_capture_link_at(base_fd, "current", &current);
+    if (current_rc < 0) return -1;
+    if (current_rc == 0) {
+        *blocked = true;
+        return 0;
+    }
+    if (g_rename_noreplace(base_fd, name, base_fd, "current") != 0) {
+        set_system_error(ERR_FILE_IO,
+                         "Cannot restore displaced GNUPGHOME writer");
+        return -1;
+    }
+    if (gpg_capture_link_at(base_fd, "current", &current) != 0 ||
+        !gpg_same_link(&current, quarantine)) {
+        set_error(ERR_FILE_IO,
+                  "Restored GNUPGHOME writer changed during recovery");
+        return -1;
+    }
+    if (gpg_forward_retire_if_present(base_fd, name, quarantine,
+                                      "restored GPG forward quarantine") != 0) {
+        return -1;
+    }
+    if (g_sync_base(base_fd) != 0) {
+        set_system_error(ERR_FILE_IO,
+                         "Cannot synchronize restored GNUPGHOME writer");
+        return -1;
+    }
+    return 0;
+}
+
+static int gpg_scan_forward_state_locked(int base_fd,
+                                         gpg_forward_state_t *state) {
+    int flags = O_RDONLY | O_CLOEXEC;
+    int scan_fd;
+    DIR *dir;
+    struct dirent *entry;
+
+    memset(state, 0, sizeof(*state));
+#ifdef O_DIRECTORY
+    flags |= O_DIRECTORY;
+#endif
+#ifdef O_NOFOLLOW
+    flags |= O_NOFOLLOW;
+#endif
+    scan_fd = openat(base_fd, ".", flags);
+    dir = scan_fd >= 0 ? fdopendir(scan_fd) : NULL;
+    if (!dir) {
+        if (scan_fd >= 0) close(scan_fd);
+        set_system_error(ERR_FILE_IO,
+                         "Cannot inspect GPG forward retry state");
+        return -1;
+    }
+    for (;;) {
+        char stem[GPG_QUARANTINE_NAME_LEN];
+        size_t length;
+        char kind;
+        bool *present;
+        char *destination;
+
+        errno = 0;
+        entry = g_gpg_readdir(dir);
+        if (!entry) {
+            if (errno != 0) {
+                int saved_errno = errno;
+                closedir(dir);
+                errno = saved_errno;
+                set_system_error(ERR_FILE_IO,
+                                 "Cannot enumerate GPG forward retry state");
+                return -1;
+            }
+            break;
+        }
+        if (!gpg_name_has_prefix(entry->d_name, GPG_FORWARD_PREFIX)) continue;
+        length = strlen(entry->d_name);
+        if (length < 3U || entry->d_name[length - 2U] != '.' ||
+            !strchr("pwq", entry->d_name[length - 1U]) ||
+            length - 2U >= sizeof(stem) ||
+            length >= GPG_QUARANTINE_NAME_LEN) {
+            set_error(ERR_FILE_IO,
+                      "Malformed GPG forward retry entry blocks mutation: %s",
+                      entry->d_name);
+            closedir(dir);
+            return -1;
+        }
+        memcpy(stem, entry->d_name, length - 2U);
+        stem[length - 2U] = '\0';
+        if (!gpg_valid_private_name(stem, GPG_FORWARD_PREFIX) ||
+            (state->stem[0] && strcmp(state->stem, stem) != 0)) {
+            closedir(dir);
+            set_error(ERR_FILE_IO,
+                      "Ambiguous GPG forward retry state blocks mutation");
+            return -1;
+        }
+        if (safe_strncpy(state->stem, stem, sizeof(state->stem)) != 0) {
+            closedir(dir);
+            set_error(ERR_INVALID_PATH,
+                      "GPG forward retry stem exceeds its bounded grammar");
+            return -1;
+        }
+        kind = entry->d_name[length - 1U];
+        if (kind == 'p') {
+            present = &state->candidate_present;
+            destination = state->candidate;
+        } else if (kind == 'w') {
+            present = &state->witness_present;
+            destination = state->witness;
+        } else {
+            present = &state->quarantine_present;
+            destination = state->quarantine;
+        }
+        if (*present) {
+            closedir(dir);
+            set_error(ERR_FILE_IO,
+                      "Duplicate GPG forward retry entry blocks mutation");
+            return -1;
+        }
+        *present = true;
+        if (safe_strncpy(destination, entry->d_name,
+                         GPG_QUARANTINE_NAME_LEN) != 0) {
+            closedir(dir);
+            set_error(ERR_INVALID_PATH,
+                      "GPG forward retry name exceeds its bounded grammar");
+            return -1;
+        }
+    }
+    if (closedir(dir) != 0) {
+        set_system_error(ERR_FILE_IO,
+                         "Cannot close GPG forward retry scan");
+        return -1;
+    }
+    return 0;
+}
+
+static int gpg_reconcile_forward_state_locked(int base_fd) {
+    gpg_forward_state_t state;
+    gpg_link_identity_t candidate;
+    gpg_link_identity_t witness;
+    gpg_link_identity_t quarantine;
+    gpg_link_identity_t current;
+    bool blocked;
+    int current_rc;
+
+    if (gpg_scan_forward_state_locked(base_fd, &state) != 0) return -1;
+    if (!state.candidate_present && !state.witness_present &&
+        !state.quarantine_present) {
+        return 0;
+    }
+    if (!state.candidate_present ||
+        (state.quarantine_present && !state.witness_present) ||
+        gpg_capture_link_at(base_fd, state.candidate, &candidate) != 0) {
+        set_error(ERR_FILE_IO,
+                  "Malformed GPG forward retry group blocks mutation");
+        return -1;
+    }
+    if (!state.witness_present) {
+        return gpg_forward_cleanup_locked(base_fd, &state, &candidate,
+                                          NULL, NULL);
+    }
+    if (gpg_capture_link_at(base_fd, state.witness, &witness) != 0) {
+        set_error(ERR_FILE_IO,
+                  "Cannot identify GPG forward expected witness");
+        return -1;
+    }
+    current_rc = gpg_capture_link_at(base_fd, "current", &current);
+    if (current_rc < 0) return -1;
+    if (!state.quarantine_present) {
+        /* Before quarantine, W and P are private hard-link witnesses and no
+         * public generation has been displaced. After successful publication,
+         * this is also the durable cleanup state reached once Q has retired.
+         * Any still-present current therefore remains authoritative: remove
+         * only the exact private aliases, whether it names W, P, or a later
+         * writer. Absence is ambiguous because the missing Q may have held a
+         * displaced generation. */
+        if (current_rc == 0) {
+            return gpg_forward_cleanup_locked(base_fd, &state, &candidate,
+                                              &witness, NULL);
+        }
+        set_error(ERR_FILE_IO,
+                  "Ambiguous GPG forward retry group preserved");
+        return -1;
+    }
+    if (gpg_capture_link_at(base_fd, state.quarantine, &quarantine) != 0) {
+        set_error(ERR_FILE_IO, "Cannot identify GPG forward quarantine");
+        return -1;
+    }
+    if (!gpg_same_link(&quarantine, &witness)) {
+        if (current_rc == 0 &&
+            gpg_same_link(&current, &quarantine)) {
+            /* FreeBSD may have linked Q without retiring its source alias.
+             * Q is the newer generation in this mismatch state, but current
+             * already preserves that exact inode. The private group is now
+             * disposable; fail this attempt so the caller takes a clean new
+             * snapshot on retry. */
+            if (gpg_forward_cleanup_locked(base_fd, &state, &candidate,
+                                           &witness, &quarantine) != 0) {
+                return -1;
+            }
+            set_error(ERR_FILE_IO,
+                      "A displaced newer GNUPGHOME writer was preserved; retry required");
+            return -1;
+        }
+        if (gpg_forward_restore_quarantine_locked(
+                base_fd, state.quarantine, &quarantine, &blocked) != 0) {
+            return -1;
+        }
+        if (!blocked &&
+            gpg_forward_cleanup_locked(base_fd, &state, &candidate,
+                                       &witness, &quarantine) != 0) {
+            return -1;
+        }
+        set_error(ERR_FILE_IO,
+                  blocked
+                      ? "A later GNUPGHOME writer blocks forward recovery"
+                      : "A displaced newer GNUPGHOME writer was restored; retry required");
+        return -1;
+    }
+    if (current_rc > 0) {
+        if (gpg_forward_restore_quarantine_locked(
+                base_fd, state.quarantine, &quarantine, &blocked) != 0 ||
+            blocked) {
+            set_error(ERR_FILE_IO,
+                      "Cannot restore interrupted GPG forward transaction");
+            return -1;
+        }
+        return gpg_forward_cleanup_locked(base_fd, &state, &candidate,
+                                          &witness, &quarantine);
+    }
+    /* Q==W proves the private quarantine contains only the expected old
+     * generation. A present current is therefore authoritative: it can be the
+     * published P, FreeBSD's retained W/Q source alias, or a distinct later
+     * writer. In every case retire only the exact private group and preserve
+     * current, allowing the caller's new transaction to snapshot it cleanly. */
+    return gpg_forward_cleanup_locked(base_fd, &state, &candidate,
+                                      &witness, &quarantine);
+}
+
+/* A retained rollback token may legitimately coexist with the durable forward
+ * witnesses from the publication it is undoing. Bind that group to the exact
+ * published inode before temporarily exempting its three names from the stale
+ * quarantine gate. */
+static int gpg_forward_state_for_publication_locked(
+    int base_fd, const gpg_link_identity_t *published,
+    gpg_forward_state_t *state, gpg_link_identity_t *candidate,
+    gpg_link_identity_t *witness, gpg_link_identity_t *quarantine) {
+    if (gpg_scan_forward_state_locked(base_fd, state) != 0) return -1;
+    memset(candidate, 0, sizeof(*candidate));
+    memset(witness, 0, sizeof(*witness));
+    memset(quarantine, 0, sizeof(*quarantine));
+    if (!state->candidate_present && !state->witness_present &&
+        !state->quarantine_present) {
+        return 1;
+    }
+    if (!published || !published->valid || !state->candidate_present ||
+        state->witness_present != state->quarantine_present ||
+        gpg_capture_link_at(base_fd, state->candidate, candidate) != 0 ||
+        !gpg_same_link(candidate, published)) {
+        set_error(ERR_FILE_IO,
+                  "Forward retry state does not match retained GPG publication");
+        return -1;
+    }
+    if (!state->witness_present) return 0;
+    if (gpg_capture_link_at(base_fd, state->witness, witness) != 0 ||
+        gpg_capture_link_at(base_fd, state->quarantine, quarantine) != 0 ||
+        !gpg_same_link(witness, quarantine)) {
+        set_error(ERR_FILE_IO,
+                  "Forward retry witnesses do not match retained GPG publication");
+        return -1;
+    }
+    return 0;
+}
+
 static int gpg_retarget_current_locked(int base_fd, const char *base,
                                        const char *real_home,
                                        gpg_retarget_result_t *result) {
     char link_path[MAX_PATH_LEN];
     char prev_target[MAX_PATH_LEN];
-    char publish_name[GPG_QUARANTINE_NAME_LEN] = "";
-    gpg_link_identity_t prepared;
-    gpg_link_identity_t committed;
+    gpg_forward_state_t forward;
+    gpg_link_identity_t expected;
+    gpg_link_identity_t candidate;
+    gpg_link_identity_t witness;
+    gpg_link_identity_t quarantine;
+    gpg_link_identity_t current;
     gpg_retarget_result_t local_result;
+    bool blocked = false;
+    bool restore_present;
     bool prev_existed;
     int prev_rc;
     int live_rc;
@@ -3067,22 +3448,21 @@ static int gpg_retarget_current_locked(int base_fd, const char *base,
     if (gpg_current_path_from_base(base, link_path, sizeof(link_path)) != 0) {
         return -1;
     }
-    if (gpg_reject_stale_quarantines_locked(base_fd, NULL) != 0) {
+    if (gpg_reconcile_forward_state_locked(base_fd) != 0 ||
+        gpg_reject_stale_quarantines_locked(base_fd, NULL) != 0) {
         return -1;
     }
 
-    /* Capture the target `current` names right now, before the atomic rename
-     * overwrites it, so a failed retarget can restore it (AR-06 F41). A
-     * malformed/absent link means there is nothing to restore. */
-    prev_rc = gpg_read_current_locked(base_fd, base, prev_target,
-                                      sizeof(prev_target));
+    prev_rc = gpg_capture_link_at(base_fd, "current", &expected);
     if (prev_rc < 0) {
         return -1;
     }
     prev_existed = prev_rc == 0;
+    restore_present = prev_existed;
     if (prev_existed) {
         int prev_live = -1;
 
+        safe_strncpy(prev_target, expected.target, sizeof(prev_target));
         if (gpg_target_is_managed_child(base, prev_target)) {
             prev_live = gpg_live_private_home(base_fd, base, prev_target);
         }
@@ -3096,7 +3476,7 @@ static int gpg_retarget_current_locked(int base_fd, const char *base,
                 "Previous GNUPGHOME target no longer exists; replacing the dangling current link: %s",
                 prev_target);
             clear_error();
-            prev_existed = false;
+            restore_present = false;
         } else if (prev_live != 0) {
             set_error(
                 ERR_INVALID_PATH,
@@ -3105,79 +3485,231 @@ static int gpg_retarget_current_locked(int base_fd, const char *base,
             return -1;
         }
     }
-    result->previous_present = prev_existed;
-    if (prev_existed) {
+    result->previous_present = restore_present;
+    if (restore_present) {
         safe_strncpy(result->previous_target, prev_target,
                      sizeof(result->previous_target));
     }
     safe_strncpy(result->published_target, real_home,
                  sizeof(result->published_target));
 
-    /* Capture the private symlink inode BEFORE rename makes it public. A stat
-     * performed only after rename cannot distinguish our link from a same-
-     * target replacement installed by another same-uid process (ABA). */
-    if (gpg_make_private_name(publish_name, sizeof(publish_name),
-                              GPG_PUBLISH_PREFIX) != 0 ||
-        symlinkat(real_home, base_fd, publish_name) != 0) {
-        if (publish_name[0] != '\0') {
-            set_system_error(ERR_FILE_IO,
-                             "Failed to prepare stable GNUPGHOME symlink");
-        }
+    if (g_retarget_forward_hook &&
+        g_retarget_forward_hook(
+            base_fd, GPG_RETARGET_FORWARD_AFTER_SNAPSHOT) != 0) {
+        set_error(ERR_FILE_IO, "GPG forward snapshot hook failed");
         return -1;
     }
-    if (gpg_capture_link_at(base_fd, publish_name, &prepared) != 0) {
-        /* Without the first stable capture there is no ownership proof for
-         * unlinking this path. Leave the unpredictable private name visible
-         * for diagnosis rather than risk deleting a raced replacement. */
-        return -1;
-    }
-    if (renameat(base_fd, publish_name, base_fd, "current") != 0) {
-        int saved_errno = errno;
-        gpg_link_identity_t retry;
-        if (gpg_capture_link_at(base_fd, publish_name, &retry) == 0 &&
-            gpg_same_link(&retry, &prepared)) {
-            (void)unlinkat(base_fd, publish_name, 0);
-            (void)g_sync_base(base_fd);
-        }
-        errno = saved_errno;
+
+    memset(&forward, 0, sizeof(forward));
+    memset(&witness, 0, sizeof(witness));
+    memset(&quarantine, 0, sizeof(quarantine));
+    if (gpg_forward_names(&forward) != 0 ||
+        symlinkat(real_home, base_fd, forward.candidate) != 0) {
         set_system_error(ERR_FILE_IO,
-                         "Failed to install stable GNUPGHOME symlink: %s",
-                         link_path);
-        log_warning("Failed to create GNUPGHOME symlink %s -> %s",
-                    link_path, real_home);
+                         "Failed to prepare stable GNUPGHOME candidate");
+        return -1;
+    }
+    forward.candidate_present = true;
+    if (gpg_capture_link_at(base_fd, forward.candidate, &candidate) != 0) {
+        return -1;
+    }
+    if (prev_existed) {
+        if (linkat(base_fd, "current", base_fd, forward.witness, 0) != 0) {
+            set_system_error(ERR_FILE_IO,
+                             "Cannot publish expected GNUPGHOME witness");
+            return -1;
+        }
+        forward.witness_present = true;
+        if (gpg_capture_link_at(base_fd, forward.witness, &witness) != 0) {
+            return -1;
+        }
+        if (!gpg_same_link(&witness, &expected)) {
+            if (gpg_forward_cleanup_locked(base_fd, &forward, &candidate,
+                                           &witness, NULL) != 0) {
+                return -1;
+            }
+            set_error(ERR_FILE_IO,
+                      "Stable GNUPGHOME changed after forward snapshot; later writer preserved");
+            return -1;
+        }
+    }
+    if (g_sync_base(base_fd) != 0) {
+        set_system_error(
+            ERR_FILE_IO,
+            "Cannot synchronize GPG forward witnesses; retry state retained");
+        return -1;
+    }
+    if (g_retarget_forward_hook &&
+        g_retarget_forward_hook(
+            base_fd, GPG_RETARGET_FORWARD_AFTER_WITNESS_SYNC) != 0) {
+        set_error(ERR_FILE_IO,
+                  "GPG forward witness hook failed; retry state retained");
+        return -1;
+    }
+
+    if (prev_existed) {
+        if (g_rename_noreplace(base_fd, "current", base_fd,
+                               forward.quarantine) != 0) {
+            int saved_errno = errno;
+            errno = saved_errno;
+            if (saved_errno == ENOTSUP ||
+#if EOPNOTSUPP != ENOTSUP
+                saved_errno == EOPNOTSUPP ||
+#endif
+                saved_errno == ENOSYS || saved_errno == EINVAL) {
+                set_error(
+                    ERR_FILE_IO,
+                    "Platform lacks atomic no-replace GPG forward quarantine");
+            } else {
+                set_system_error(
+                    ERR_FILE_IO,
+                    "Cannot quarantine expected GNUPGHOME generation");
+            }
+            return -1;
+        }
+        forward.quarantine_present = true;
+        if (gpg_capture_link_at(base_fd, forward.quarantine,
+                                &quarantine) != 0) {
+            set_error(ERR_FILE_IO,
+                      "Cannot capture GPG forward quarantine; retry state retained");
+            return -1;
+        }
+        prev_rc = gpg_capture_link_at(base_fd, "current", &current);
+        if (prev_rc < 0) return -1;
+        if (prev_rc == 0 && gpg_same_link(&current, &quarantine) &&
+            gpg_discard_prepared_link_locked(
+                base_fd, "current", &quarantine) != 0) {
+            return -1;
+        }
+        if (g_sync_base(base_fd) != 0) {
+            set_system_error(
+                ERR_FILE_IO,
+                "Cannot synchronize GPG forward quarantine; retry state retained");
+            return -1;
+        }
+        if (g_retarget_forward_hook &&
+            g_retarget_forward_hook(
+                base_fd, GPG_RETARGET_FORWARD_AFTER_QUARANTINE_SYNC) != 0) {
+            set_error(ERR_FILE_IO,
+                      "GPG forward quarantine hook failed; retry state retained");
+            return -1;
+        }
+        if (gpg_capture_link_at(base_fd, forward.quarantine,
+                                &quarantine) != 0 ||
+            gpg_capture_link_at(base_fd, forward.witness, &witness) != 0) {
+            return -1;
+        }
+        if (!gpg_same_link(&quarantine, &witness)) {
+            if (gpg_forward_restore_quarantine_locked(
+                    base_fd, forward.quarantine, &quarantine,
+                    &blocked) != 0) {
+                return -1;
+            }
+            if (!blocked &&
+                gpg_forward_cleanup_locked(
+                    base_fd, &forward, &candidate, &witness,
+                    &quarantine) != 0) {
+                return -1;
+            }
+            set_error(
+                ERR_FILE_IO,
+                blocked
+                    ? "A later GNUPGHOME writer blocks displaced-writer restoration"
+                    : "GNUPGHOME changed during forward quarantine; newer writer restored");
+            return -1;
+        }
+    }
+
+    if (linkat(base_fd, forward.candidate, base_fd, "current", 0) != 0) {
+        int saved_errno = errno;
+        errno = saved_errno;
+        if (saved_errno == EEXIST) {
+            set_error(ERR_FILE_IO,
+                      "A newer GNUPGHOME writer won forward publication; writer preserved");
+        } else {
+            set_system_error(ERR_FILE_IO,
+                             "Cannot publish stable GNUPGHOME candidate");
+        }
         return -1;
     }
     result->publication_occurred = true;
-    result->published_link = prepared;
+    result->published_link = candidate;
     result->rollback.phase = GPG_ROLLBACK_EXPECTED_CURRENT;
-    result->rollback.published = prepared;
-    result->rollback.restore_present = prev_existed;
-    if (prev_existed) {
+    result->rollback.published = candidate;
+    result->rollback.restore_present = restore_present;
+    if (restore_present) {
         safe_strncpy(result->rollback.restore_target, prev_target,
                      sizeof(result->rollback.restore_target));
     }
-
-    if (gpg_capture_link_at(base_fd, "current", &committed) != 0 ||
-        !gpg_same_link(&committed, &prepared)) {
+    if (gpg_capture_link_at(base_fd, "current", &current) != 0 ||
+        !gpg_same_link(&current, &candidate)) {
         set_error(ERR_FILE_IO,
-                  "Cannot verify committed GNUPGHOME link: %s", link_path);
-        return gpg_finish_failed_retarget(base_fd, base, result);
+                  "Cannot verify committed GNUPGHOME generation: %s",
+                  link_path);
+        goto published_failure;
     }
     if (g_sync_base(base_fd) != 0) {
-        set_system_error(ERR_FILE_IO,
-                         "Cannot synchronize stable GNUPGHOME publication");
-        return gpg_finish_failed_retarget(base_fd, base, result);
+        set_system_error(
+            ERR_FILE_IO,
+            "Cannot synchronize stable GNUPGHOME publication; retry state retained");
+        goto published_failure;
+    }
+    if (g_retarget_forward_hook &&
+        g_retarget_forward_hook(
+            base_fd, GPG_RETARGET_FORWARD_AFTER_PUBLICATION_SYNC) != 0) {
+        set_error(ERR_FILE_IO,
+                  "GPG forward publication hook failed; retry state retained");
+        goto published_failure;
+    }
+    if (gpg_capture_link_at(base_fd, "current", &current) != 0 ||
+        !gpg_same_link(&current, &candidate)) {
+        set_error(ERR_FILE_IO,
+                  "Stable GNUPGHOME changed before final commit validation");
+        goto published_failure;
     }
     if (g_retarget_commit_hook && g_retarget_commit_hook(base_fd) != 0) {
         set_error(ERR_FILE_IO, "GPG retarget commit hook failed");
-        return gpg_finish_failed_retarget(base_fd, base, result);
+        goto published_failure;
     }
     if (gpg_live_private_home(base_fd, base, real_home) != 0) {
-        return gpg_finish_failed_retarget(base_fd, base, result);
+        goto published_failure;
+    }
+    if (gpg_capture_link_at(base_fd, "current", &current) != 0 ||
+        !gpg_same_link(&current, &candidate)) {
+        set_error(ERR_FILE_IO,
+                  "Stable GNUPGHOME changed after final commit validation");
+        goto published_failure;
+    }
+    if (gpg_forward_cleanup_locked(base_fd, &forward, &candidate,
+                                   prev_existed ? &witness : NULL,
+                                   prev_existed ? &quarantine : NULL) != 0) {
+        goto published_failure;
     }
 
     log_debug("Created GNUPGHOME symlink: %s -> %s", link_path, real_home);
     return 0;
+
+published_failure:
+    g_allowed_forward_stem = forward.stem;
+    (void)gpg_finish_failed_retarget(base_fd, base, result);
+    g_allowed_forward_stem = NULL;
+    if (result->restoration_succeeded) {
+        char primary[sizeof(g_last_error.message)];
+
+        safe_strncpy(primary, get_last_error()->message, sizeof(primary));
+        if (gpg_forward_cleanup_locked(
+                base_fd, &forward, &candidate,
+                prev_existed ? &witness : NULL,
+                prev_existed ? &quarantine : NULL) != 0) {
+            char cleanup[sizeof(g_last_error.message)];
+            safe_strncpy(cleanup, get_last_error()->message, sizeof(cleanup));
+            set_error(ERR_FILE_IO, "%s; forward-state cleanup failed: %s",
+                      primary, cleanup);
+        } else {
+            set_error(ERR_FILE_IO, "%s", primary);
+        }
+    }
+    return -1;
 }
 
 /* Point the stable <base>/current symlink at the active account's real
@@ -3240,7 +3772,8 @@ int gpg_manager_drop_current(void) {
     if (base_rc != 0) {
         return base_rc > 0 ? 0 : -1;
     }
-    if (gpg_reject_stale_quarantines_locked(base_fd, NULL) != 0) {
+    if (gpg_reconcile_forward_state_locked(base_fd) != 0 ||
+        gpg_reject_stale_quarantines_locked(base_fd, NULL) != 0) {
         unlock_gpg_dir(base_fd, lock_fd);
         return -1;
     }
@@ -3397,13 +3930,19 @@ int gpg_manager_restore_current_if(gpg_config_t *gpg_config,
                                    bool *changed) {
     char base[MAX_PATH_LEN];
     gpg_link_identity_t actual;
+    gpg_forward_state_t forward;
+    gpg_link_identity_t forward_candidate;
+    gpg_link_identity_t forward_witness;
+    gpg_link_identity_t forward_quarantine;
     int base_fd = -1;
     int lock_fd = -1;
     int base_rc;
     int actual_rc;
+    int forward_rc = 1;
     int rc = -1;
     bool expect_present = expected_target && *expected_target;
     bool restore_present = restore_target && *restore_target;
+    bool rollback_completed = false;
 
     if (!gpg_config || !changed) {
         set_error(ERR_INVALID_ARGS, "Invalid GPG restore arguments");
@@ -3460,9 +3999,27 @@ int gpg_manager_restore_current_if(gpg_config_t *gpg_config,
                       "GPG restore arguments do not match retained rollback state");
             goto out;
         }
+        forward_rc = gpg_forward_state_for_publication_locked(
+            base_fd, &gpg_config->rollback.published, &forward,
+            &forward_candidate, &forward_witness, &forward_quarantine);
+        if (forward_rc < 0) goto out;
+        if (forward_rc == 0) g_allowed_forward_stem = forward.stem;
         rc = gpg_finish_rollback_locked(base_fd, base,
                                         &gpg_config->rollback, changed);
+        g_allowed_forward_stem = NULL;
         if (rc == 0) {
+            rollback_completed = true;
+            if (forward_rc == 0 &&
+                gpg_forward_cleanup_locked(
+                    base_fd, &forward, &forward_candidate,
+                    forward.witness_present ? &forward_witness : NULL,
+                    forward.quarantine_present
+                        ? &forward_quarantine
+                        : NULL) != 0) {
+                rc = -1;
+            }
+        }
+        if (rollback_completed) {
             gpg_config->runtime_restore_pending = false;
             gpg_config->published_link_valid = false;
             memset(&gpg_config->published_link, 0,
@@ -3475,7 +4032,8 @@ int gpg_manager_restore_current_if(gpg_config_t *gpg_config,
                   "GPG rollback token exists without pending ownership");
         goto out;
     }
-    if (gpg_reject_stale_quarantines_locked(base_fd, NULL) != 0) {
+    if (gpg_reconcile_forward_state_locked(base_fd) != 0 ||
+        gpg_reject_stale_quarantines_locked(base_fd, NULL) != 0) {
         goto out;
     }
 

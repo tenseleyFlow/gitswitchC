@@ -267,6 +267,7 @@ TEST(all_retained_public_apis_compile_and_link) {
     REQUIRE_PUBLIC_API(gpg_manager_set_reset_quarantine_hook_fn);
     REQUIRE_PUBLIC_API(gpg_manager_set_reset_final_hook_fn);
     REQUIRE_PUBLIC_API(gpg_manager_set_retarget_commit_hook_fn);
+    REQUIRE_PUBLIC_API(gpg_manager_set_retarget_forward_hook_fn);
     REQUIRE_PUBLIC_API(gpg_manager_set_retarget_restore_hook_fn);
     REQUIRE_PUBLIC_API(gpg_manager_set_rollback_hook_fn);
     REQUIRE_PUBLIC_API(gpg_manager_set_setenv_fn);

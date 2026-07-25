@@ -2039,6 +2039,29 @@ static int rollback_writer_hook(int base_fd,
     return 0;
 }
 
+static gpg_retarget_forward_hook_stage_t g_forward_writer_stage;
+static const char *g_forward_writer_target;
+static int forward_writer_hook(int base_fd,
+                               gpg_retarget_forward_hook_stage_t stage) {
+    if (stage != g_forward_writer_stage) return 0;
+    (void)unlinkat(base_fd, ".gpg-forward-race-writer", 0);
+    if (!g_forward_writer_target ||
+        symlinkat(g_forward_writer_target, base_fd,
+                  ".gpg-forward-race-writer") != 0 ||
+        renameat(base_fd, ".gpg-forward-race-writer",
+                 base_fd, "current") != 0) {
+        return -1;
+    }
+    return 0;
+}
+
+static int forward_exit_after_publication_hook(
+    int base_fd, gpg_retarget_forward_hook_stage_t stage) {
+    (void)base_fd;
+    if (stage == GPG_RETARGET_FORWARD_AFTER_PUBLICATION_SYNC) _exit(77);
+    return 0;
+}
+
 static int unsupported_noreplace(int old_dir_fd, const char *old_name,
                                  int new_dir_fd, const char *new_name) {
     (void)old_dir_fd;
@@ -2057,6 +2080,14 @@ static int link_only_noreplace(int old_dir_fd, const char *old_name,
     return linkat(old_dir_fd, old_name, new_dir_fd, new_name, 0);
 }
 
+static int link_then_exit_noreplace(int old_dir_fd, const char *old_name,
+                                    int new_dir_fd, const char *new_name) {
+    if (linkat(old_dir_fd, old_name, new_dir_fd, new_name, 0) != 0) {
+        return -1;
+    }
+    _exit(79);
+}
+
 static const char *g_wrong_noreplace_target;
 static int publish_replaced_source_noreplace(int old_dir_fd,
                                              const char *old_name,
@@ -2072,6 +2103,19 @@ static int publish_replaced_source_noreplace(int old_dir_fd,
     return 0;
 }
 
+static int publish_replaced_source_then_exit_noreplace(
+    int old_dir_fd, const char *old_name,
+    int new_dir_fd, const char *new_name) {
+    if (!g_wrong_noreplace_target ||
+        unlinkat(old_dir_fd, old_name, 0) != 0 ||
+        symlinkat(g_wrong_noreplace_target, old_dir_fd, old_name) != 0 ||
+        linkat(old_dir_fd, old_name, new_dir_fd, new_name, 0) != 0 ||
+        unlinkat(old_dir_fd, old_name, 0) != 0) {
+        return -1;
+    }
+    _exit(76);
+}
+
 static int g_sync_calls;
 static int g_sync_fail_call;
 static int fail_selected_base_sync(int base_fd) {
@@ -2079,6 +2123,15 @@ static int fail_selected_base_sync(int base_fd) {
     if (g_sync_calls == g_sync_fail_call) {
         errno = EIO;
         return -1;
+    }
+    return fsync(base_fd);
+}
+
+static int g_sync_exit_call;
+static int exit_selected_base_sync(int base_fd) {
+    g_sync_calls++;
+    if (g_sync_calls == g_sync_exit_call) {
+        _exit(80 + g_sync_exit_call);
     }
     return fsync(base_fd);
 }
@@ -2097,6 +2150,330 @@ static int replace_current_writer(const char *base, const char *current,
         return -1;
     }
     return 0;
+}
+
+TEST(forward_cas_rejects_same_target_aba_and_distinct_snapshot_writers) {
+    char base[512], one[512], two[512], three[512], current[512], target[512];
+    struct stat original;
+    struct stat replacement;
+
+    CHECK_EQ_INT(make_cas_runtime(base, sizeof(base), one, sizeof(one),
+                                  two, sizeof(two), three, sizeof(three),
+                                  current, sizeof(current)), 0);
+    CHECK_EQ_INT(gpg_manager_retarget_current(one), 0);
+    CHECK_EQ_INT(lstat(current, &original), 0);
+
+    g_forward_writer_stage = GPG_RETARGET_FORWARD_AFTER_SNAPSHOT;
+    g_forward_writer_target = one;
+    gpg_manager_set_retarget_forward_hook_fn(forward_writer_hook);
+    CHECK_EQ_INT(gpg_manager_retarget_current(two), -1);
+    CHECK_EQ_INT(read_current(target, sizeof(target)), 0);
+    CHECK_STR_EQ(target, one);
+    CHECK_EQ_INT(lstat(current, &replacement), 0);
+    CHECK(original.st_dev != replacement.st_dev ||
+          original.st_ino != replacement.st_ino);
+
+    g_forward_writer_target = three;
+    CHECK_EQ_INT(gpg_manager_retarget_current(two), -1);
+    CHECK_EQ_INT(read_current(target, sizeof(target)), 0);
+    CHECK_STR_EQ(target, three);
+
+    gpg_manager_set_retarget_forward_hook_fn(NULL);
+    g_forward_writer_target = NULL;
+}
+
+TEST(forward_cas_preserves_writers_at_each_publication_window) {
+    char base[512], one[512], two[512], three[512], current[512], target[512];
+
+    /* Absent-at-snapshot publication is no-replace: a writer appearing after
+     * the durable candidate wins. The P-only retry state is then reconciled
+     * before a later, explicit retarget can begin. */
+    CHECK_EQ_INT(make_cas_runtime(base, sizeof(base), one, sizeof(one),
+                                  two, sizeof(two), three, sizeof(three),
+                                  current, sizeof(current)), 0);
+    g_forward_writer_stage = GPG_RETARGET_FORWARD_AFTER_WITNESS_SYNC;
+    g_forward_writer_target = one;
+    gpg_manager_set_retarget_forward_hook_fn(forward_writer_hook);
+    CHECK_EQ_INT(gpg_manager_retarget_current(two), -1);
+    CHECK_EQ_INT(read_current(target, sizeof(target)), 0);
+    CHECK_STR_EQ(target, one);
+    gpg_manager_set_retarget_forward_hook_fn(NULL);
+    CHECK_EQ_INT(gpg_manager_retarget_current(two), 0);
+    CHECK_EQ_INT(read_current(target, sizeof(target)), 0);
+    CHECK_STR_EQ(target, two);
+
+    /* Once the expected generation has been quarantined, a new occupant of
+     * current is never replaced by the prepared candidate. */
+    CHECK_EQ_INT(make_cas_runtime(base, sizeof(base), one, sizeof(one),
+                                  two, sizeof(two), three, sizeof(three),
+                                  current, sizeof(current)), 0);
+    CHECK_EQ_INT(gpg_manager_retarget_current(one), 0);
+    g_forward_writer_stage = GPG_RETARGET_FORWARD_AFTER_QUARANTINE_SYNC;
+    g_forward_writer_target = three;
+    gpg_manager_set_retarget_forward_hook_fn(forward_writer_hook);
+    CHECK_EQ_INT(gpg_manager_retarget_current(two), -1);
+    CHECK_EQ_INT(read_current(target, sizeof(target)), 0);
+    CHECK_STR_EQ(target, three);
+    gpg_manager_set_retarget_forward_hook_fn(NULL);
+    CHECK_EQ_INT(gpg_manager_retarget_current(two), 0);
+    CHECK_EQ_INT(read_current(target, sizeof(target)), 0);
+    CHECK_STR_EQ(target, two);
+
+    /* A replacement after publication also wins. Rollback recognizes that it
+     * no longer owns current and removes only its exact private witnesses. */
+    CHECK_EQ_INT(make_cas_runtime(base, sizeof(base), one, sizeof(one),
+                                  two, sizeof(two), three, sizeof(three),
+                                  current, sizeof(current)), 0);
+    CHECK_EQ_INT(gpg_manager_retarget_current(one), 0);
+    g_forward_writer_stage = GPG_RETARGET_FORWARD_AFTER_PUBLICATION_SYNC;
+    g_forward_writer_target = three;
+    gpg_manager_set_retarget_forward_hook_fn(forward_writer_hook);
+    CHECK_EQ_INT(gpg_manager_retarget_current(two), -1);
+    CHECK_EQ_INT(read_current(target, sizeof(target)), 0);
+    CHECK_STR_EQ(target, three);
+    gpg_manager_set_retarget_forward_hook_fn(NULL);
+    CHECK_EQ_INT(gpg_manager_retarget_current(two), 0);
+    CHECK_EQ_INT(read_current(target, sizeof(target)), 0);
+    CHECK_STR_EQ(target, two);
+    g_forward_writer_target = NULL;
+}
+
+TEST(forward_cas_handles_noreplace_edges_and_quarantine_mismatch) {
+    char base[512], one[512], two[512], three[512], current[512], target[512];
+
+    CHECK_EQ_INT(make_cas_runtime(base, sizeof(base), one, sizeof(one),
+                                  two, sizeof(two), three, sizeof(three),
+                                  current, sizeof(current)), 0);
+    CHECK_EQ_INT(gpg_manager_retarget_current(one), 0);
+    gpg_manager_set_rename_noreplace_fn(unsupported_noreplace);
+    CHECK_EQ_INT(gpg_manager_retarget_current(two), -1);
+    CHECK_EQ_INT(read_current(target, sizeof(target)), 0);
+    CHECK_STR_EQ(target, one);
+    gpg_manager_set_rename_noreplace_fn(NULL);
+    CHECK_EQ_INT(gpg_manager_retarget_current(two), 0);
+    CHECK_EQ_INT(read_current(target, sizeof(target)), 0);
+    CHECK_STR_EQ(target, two);
+
+    /* FreeBSD's successful link-only fallback may retain the source alias.
+     * Retire it only after proving it is the same quarantined inode. */
+    CHECK_EQ_INT(make_cas_runtime(base, sizeof(base), one, sizeof(one),
+                                  two, sizeof(two), three, sizeof(three),
+                                  current, sizeof(current)), 0);
+    CHECK_EQ_INT(gpg_manager_retarget_current(one), 0);
+    gpg_manager_set_rename_noreplace_fn(link_only_noreplace);
+    CHECK_EQ_INT(gpg_manager_retarget_current(two), 0);
+    CHECK_EQ_INT(read_current(target, sizeof(target)), 0);
+    CHECK_STR_EQ(target, two);
+    gpg_manager_set_rename_noreplace_fn(NULL);
+
+    /* If no-replace captured a newer generation, Q != W. Restore that exact
+     * displaced writer into absence and fail instead of publishing over it. */
+    CHECK_EQ_INT(make_cas_runtime(base, sizeof(base), one, sizeof(one),
+                                  two, sizeof(two), three, sizeof(three),
+                                  current, sizeof(current)), 0);
+    CHECK_EQ_INT(gpg_manager_retarget_current(one), 0);
+    g_wrong_noreplace_target = three;
+    gpg_manager_set_rename_noreplace_fn(publish_replaced_source_noreplace);
+    CHECK_EQ_INT(gpg_manager_retarget_current(two), -1);
+    CHECK_EQ_INT(read_current(target, sizeof(target)), 0);
+    CHECK_STR_EQ(target, three);
+    gpg_manager_set_rename_noreplace_fn(NULL);
+    g_wrong_noreplace_target = NULL;
+    CHECK_EQ_INT(gpg_manager_retarget_current(two), 0);
+    CHECK_EQ_INT(read_current(target, sizeof(target)), 0);
+    CHECK_STR_EQ(target, two);
+}
+
+TEST(forward_cas_sync_failures_leave_reconcilable_retry_states) {
+    char base[512], one[512], two[512], three[512], current[512], target[512];
+
+    for (int fail_call = 1; fail_call <= 3; fail_call++) {
+        CHECK_EQ_INT(make_cas_runtime(base, sizeof(base), one, sizeof(one),
+                                      two, sizeof(two), three, sizeof(three),
+                                      current, sizeof(current)), 0);
+        CHECK_EQ_INT(gpg_manager_retarget_current(one), 0);
+        g_sync_calls = 0;
+        g_sync_fail_call = fail_call;
+        gpg_manager_set_sync_base_fn(fail_selected_base_sync);
+        CHECK_EQ_INT(gpg_manager_retarget_current(two), -1);
+        gpg_manager_set_sync_base_fn(NULL);
+        if (fail_call == 2) {
+            struct stat st;
+            CHECK(lstat(current, &st) != 0 && errno == ENOENT);
+        } else {
+            CHECK_EQ_INT(read_current(target, sizeof(target)), 0);
+            CHECK_STR_EQ(target, one);
+        }
+        CHECK_EQ_INT(gpg_manager_retarget_current(two), 0);
+        CHECK_EQ_INT(read_current(target, sizeof(target)), 0);
+        CHECK_STR_EQ(target, two);
+    }
+}
+
+TEST(forward_cas_reconciles_durable_published_state_after_process_exit) {
+    char base[512], one[512], two[512], three[512], current[512], target[512];
+    pid_t child;
+    int status;
+
+    CHECK_EQ_INT(make_cas_runtime(base, sizeof(base), one, sizeof(one),
+                                  two, sizeof(two), three, sizeof(three),
+                                  current, sizeof(current)), 0);
+    CHECK_EQ_INT(gpg_manager_retarget_current(one), 0);
+    child = fork();
+    CHECK(child >= 0);
+    if (child == 0) {
+        gpg_manager_set_retarget_forward_hook_fn(
+            forward_exit_after_publication_hook);
+        (void)gpg_manager_retarget_current(two);
+        _exit(78);
+    }
+    CHECK(waitpid(child, &status, 0) == child);
+    CHECK(WIFEXITED(status) && WEXITSTATUS(status) == 77);
+    CHECK_EQ_INT(read_current(target, sizeof(target)), 0);
+    CHECK_STR_EQ(target, two);
+    CHECK_EQ_INT(gpg_manager_retarget_current(three), 0);
+    CHECK_EQ_INT(read_current(target, sizeof(target)), 0);
+    CHECK_STR_EQ(target, three);
+
+    child = fork();
+    CHECK(child >= 0);
+    if (child == 0) {
+        gpg_manager_set_retarget_forward_hook_fn(
+            forward_exit_after_publication_hook);
+        (void)gpg_manager_retarget_current(two);
+        _exit(78);
+    }
+    CHECK(waitpid(child, &status, 0) == child);
+    CHECK(WIFEXITED(status) && WEXITSTATUS(status) == 77);
+    CHECK_EQ_INT(gpg_manager_drop_current(), 0);
+    {
+        struct stat st;
+        CHECK(lstat(current, &st) != 0 && errno == ENOENT);
+    }
+}
+
+TEST(forward_cas_reconciles_freebsd_retained_source_after_exit) {
+    char base[512], one[512], two[512], three[512], current[512], target[512];
+    pid_t child;
+    int status;
+
+    CHECK_EQ_INT(make_cas_runtime(base, sizeof(base), one, sizeof(one),
+                                  two, sizeof(two), three, sizeof(three),
+                                  current, sizeof(current)), 0);
+    CHECK_EQ_INT(gpg_manager_retarget_current(one), 0);
+    child = fork();
+    CHECK(child >= 0);
+    if (child == 0) {
+        gpg_manager_set_rename_noreplace_fn(link_then_exit_noreplace);
+        (void)gpg_manager_retarget_current(two);
+        _exit(78);
+    }
+    CHECK(waitpid(child, &status, 0) == child);
+    CHECK(WIFEXITED(status) && WEXITSTATUS(status) == 79);
+    CHECK_EQ_INT(read_current(target, sizeof(target)), 0);
+    CHECK_STR_EQ(target, one);
+    CHECK_EQ_INT(gpg_manager_retarget_current(two), 0);
+    CHECK_EQ_INT(read_current(target, sizeof(target)), 0);
+    CHECK_STR_EQ(target, two);
+}
+
+TEST(forward_cas_reconciles_mismatched_quarantine_after_exit) {
+    char base[512], one[512], two[512], three[512], current[512], target[512];
+    struct stat st;
+    pid_t child;
+    int status;
+
+    CHECK_EQ_INT(make_cas_runtime(base, sizeof(base), one, sizeof(one),
+                                  two, sizeof(two), three, sizeof(three),
+                                  current, sizeof(current)), 0);
+    CHECK_EQ_INT(gpg_manager_retarget_current(one), 0);
+    child = fork();
+    CHECK(child >= 0);
+    if (child == 0) {
+        g_wrong_noreplace_target = three;
+        gpg_manager_set_rename_noreplace_fn(
+            publish_replaced_source_then_exit_noreplace);
+        (void)gpg_manager_retarget_current(two);
+        _exit(78);
+    }
+    CHECK(waitpid(child, &status, 0) == child);
+    CHECK(WIFEXITED(status) && WEXITSTATUS(status) == 76);
+    CHECK(lstat(current, &st) != 0 && errno == ENOENT);
+
+    /* The first retry restores exact Q and retires disposable P/W. It still
+     * fails deliberately so the next attempt snapshots the restored writer. */
+    CHECK_EQ_INT(gpg_manager_retarget_current(two), -1);
+    CHECK_EQ_INT(read_current(target, sizeof(target)), 0);
+    CHECK_STR_EQ(target, three);
+    CHECK_EQ_INT(gpg_manager_retarget_current(two), 0);
+    CHECK_EQ_INT(read_current(target, sizeof(target)), 0);
+    CHECK_STR_EQ(target, two);
+}
+
+TEST(forward_cas_reconciles_partial_cleanup_after_exit) {
+    char base[512], one[512], two[512], three[512], current[512], target[512];
+
+    for (int exit_call = 4; exit_call <= 6; exit_call++) {
+        pid_t child;
+        int status;
+
+        CHECK_EQ_INT(make_cas_runtime(base, sizeof(base), one, sizeof(one),
+                                      two, sizeof(two), three, sizeof(three),
+                                      current, sizeof(current)), 0);
+        CHECK_EQ_INT(gpg_manager_retarget_current(one), 0);
+        child = fork();
+        CHECK(child >= 0);
+        if (child == 0) {
+            g_sync_calls = 0;
+            g_sync_exit_call = exit_call;
+            gpg_manager_set_sync_base_fn(exit_selected_base_sync);
+            (void)gpg_manager_retarget_current(two);
+            _exit(78);
+        }
+        CHECK(waitpid(child, &status, 0) == child);
+        CHECK(WIFEXITED(status) &&
+              WEXITSTATUS(status) == 80 + exit_call);
+        CHECK_EQ_INT(read_current(target, sizeof(target)), 0);
+        CHECK_STR_EQ(target, two);
+        CHECK_EQ_INT(gpg_manager_retarget_current(three), 0);
+        CHECK_EQ_INT(read_current(target, sizeof(target)), 0);
+        CHECK_STR_EQ(target, three);
+    }
+}
+
+TEST(forward_cas_rejects_malformed_restart_grammar_before_mutation) {
+    char base[512], one[512], two[512], three[512], current[512], target[512];
+    char malformed[640];
+    char group_one[640];
+    char group_two[640];
+
+    CHECK_EQ_INT(make_cas_runtime(base, sizeof(base), one, sizeof(one),
+                                  two, sizeof(two), three, sizeof(three),
+                                  current, sizeof(current)), 0);
+    CHECK_EQ_INT(gpg_manager_retarget_current(one), 0);
+    CHECK(snprintf(malformed, sizeof(malformed),
+                   "%s/.gitswitch-gpg-forward.invalid", base) <
+          (int)sizeof(malformed));
+    CHECK_EQ_INT(symlink(two, malformed), 0);
+    CHECK_EQ_INT(gpg_manager_retarget_current(two), -1);
+    CHECK_EQ_INT(read_current(target, sizeof(target)), 0);
+    CHECK_STR_EQ(target, one);
+    CHECK_EQ_INT(unlink(malformed), 0);
+
+    CHECK(snprintf(group_one, sizeof(group_one),
+                   "%s/.gitswitch-gpg-forward.123.0123456789abcdef.p",
+                   base) < (int)sizeof(group_one));
+    CHECK(snprintf(group_two, sizeof(group_two),
+                   "%s/.gitswitch-gpg-forward.124.fedcba9876543210.p",
+                   base) < (int)sizeof(group_two));
+    CHECK_EQ_INT(symlink(two, group_one), 0);
+    CHECK_EQ_INT(symlink(three, group_two), 0);
+    CHECK_EQ_INT(gpg_manager_retarget_current(two), -1);
+    CHECK_EQ_INT(read_current(target, sizeof(target)), 0);
+    CHECK_STR_EQ(target, one);
+    CHECK_EQ_INT(unlink(group_one), 0);
+    CHECK_EQ_INT(unlink(group_two), 0);
+    CHECK_EQ_INT(gpg_manager_retarget_current(two), 0);
 }
 
 TEST(rollback_cas_preserves_same_target_and_distinct_later_writers) {
@@ -2782,6 +3159,15 @@ TEST_MAIN_BEGIN()
     RUN_TEST(system_resolver_classifies_managed_aliases_before_helper_launch);
     RUN_TEST(busy_runtime_never_claims_requested_account_live);
     RUN_TEST(failed_retarget_retains_dirty_state_until_controlled_retry);
+    RUN_TEST(forward_cas_rejects_same_target_aba_and_distinct_snapshot_writers);
+    RUN_TEST(forward_cas_preserves_writers_at_each_publication_window);
+    RUN_TEST(forward_cas_handles_noreplace_edges_and_quarantine_mismatch);
+    RUN_TEST(forward_cas_sync_failures_leave_reconcilable_retry_states);
+    RUN_TEST(forward_cas_reconciles_durable_published_state_after_process_exit);
+    RUN_TEST(forward_cas_reconciles_freebsd_retained_source_after_exit);
+    RUN_TEST(forward_cas_reconciles_mismatched_quarantine_after_exit);
+    RUN_TEST(forward_cas_reconciles_partial_cleanup_after_exit);
+    RUN_TEST(forward_cas_rejects_malformed_restart_grammar_before_mutation);
     RUN_TEST(rollback_cas_preserves_same_target_and_distinct_later_writers);
     RUN_TEST(rollback_cas_retries_stale_collision_unsupported_and_sync_states);
     RUN_TEST(public_done_retry_reproves_owned_present_identity);
