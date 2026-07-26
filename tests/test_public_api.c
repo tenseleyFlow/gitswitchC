@@ -389,10 +389,13 @@ TEST(all_retained_public_apis_compile_and_link) {
     REQUIRE_PUBLIC_API(signals_rollback_end_owned);
     REQUIRE_PUBLIC_API(signals_rollback_active);
     REQUIRE_PUBLIC_API(signals_scratch_cleanup);
+    REQUIRE_PUBLIC_API(signals_scratch_cleanup_identities_at);
     REQUIRE_PUBLIC_API(signals_scratch_register);
+    REQUIRE_PUBLIC_API(signals_scratch_register_identity);
     REQUIRE_PUBLIC_API(signals_scratch_unregister);
 #ifdef GITSWITCH_TESTING
     REQUIRE_PUBLIC_API(signals_test_fail_dispatch);
+    REQUIRE_PUBLIC_API(signals_test_fail_scratch_unlink);
     REQUIRE_PUBLIC_API(signals_test_fail_sigaction);
     REQUIRE_PUBLIC_API(signals_test_set_guard_end_hook);
     REQUIRE_PUBLIC_API(signals_test_set_post_wait_hook);

@@ -7694,17 +7694,32 @@ static int ssh_write_config_atomic_at(
     char suffix[17];
     char temp_name[64];
     char temp_path[MAX_PATH_LEN];
+    struct stat created_temp;
     struct stat temp_identity;
     struct stat current_temp;
+    struct stat held_temp;
     struct stat installed;
+    error_accumulator_t failures;
     size_t written = 0;
     int dir_fd = directory->dir_fd;
     const char *dir_path = directory->path;
     int fd = -1;
     int saved_errno;
+    bool cleanup_resolved = false;
+    bool forced_failure;
     bool have_temp_identity = false;
     bool temp_registered = false;
     bool renamed = false;
+
+    /* Every caller holds the pinned directory's private config-transaction
+     * lock. Settle any exact identity-bound obligation from an earlier
+     * failed unlink before admitting another writer generation. */
+    if (signals_scratch_cleanup_identities_at(dir_fd, dir_path) != 0) {
+        set_system_error(
+            ERR_FILE_IO,
+            "Failed to settle a retained temporary SSH config cleanup");
+        return -1;
+    }
 
     for (int attempt = 0; attempt < 16; attempt++) {
         if (generate_random_string(suffix, sizeof(suffix), random_chars) != 0) {
@@ -7733,27 +7748,38 @@ static int ssh_write_config_atomic_at(
                   "Failed to allocate a unique temporary SSH config");
         return -1;
     }
-    /* AR-12 L20: capture the temp's identity FIRST — a failure in the
-     * securing checks below must still reach the guarded unlink in the fail
-     * path, or the just-created O_EXCL file is orphaned permanently in the
-     * user's real ~/.ssh. */
-    if (fstat(fd, &temp_identity) == 0) {
-        have_temp_identity = true;
-    }
-    if (!have_temp_identity || fchmod(fd, 0600) != 0 ||
-        !S_ISREG(temp_identity.st_mode) || temp_identity.st_uid != getuid() ||
-        temp_identity.st_nlink != 1 ||
-        fstat(fd, &temp_identity) != 0 ||
-        (temp_identity.st_mode & 0777) != 0600) {
-        set_system_error(ERR_FILE_IO, "Failed to secure temporary SSH config");
+    /* Capture the O_EXCL generation before any other fallible operation.
+     * Without that identity, deleting by pathname would be unsafe: another
+     * same-UID actor may already have replaced the entry. */
+    errno = 0;
+    forced_failure =
+        g_metadata_test_hook &&
+        g_metadata_test_hook(SSH_METADATA_TEST_CONFIG_TEMP_INITIAL_FSTAT);
+    if (forced_failure || fstat(fd, &created_temp) != 0) {
+        if (forced_failure && errno == 0) errno = EIO;
+        set_system_error(ERR_FILE_IO,
+                         "Failed to capture temporary SSH config identity");
         goto fail;
     }
-    if (signals_scratch_register(temp_path) != 0) {
+    have_temp_identity = true;
+    if (signals_scratch_register_identity(temp_path, &created_temp) != 0) {
         set_error(ERR_FILE_IO,
-                  "Failed to register temporary SSH config for cleanup");
+                  "Failed to register temporary SSH config identity for cleanup");
         goto fail;
     }
     temp_registered = true;
+
+    if (fchmod(fd, 0600) != 0 || fstat(fd, &temp_identity) != 0) {
+        set_system_error(ERR_FILE_IO, "Failed to secure temporary SSH config");
+        goto fail;
+    }
+    if (!S_ISREG(temp_identity.st_mode) ||
+        temp_identity.st_uid != getuid() || temp_identity.st_nlink != 1 ||
+        (temp_identity.st_mode & 0777) != 0600) {
+        set_error(ERR_FILE_IO,
+                  "Temporary SSH config failed security validation");
+        goto fail;
+    }
     while (written < content_len) {
         ssize_t n = write(fd, content + written, content_len - written);
         if (n > 0) {
@@ -7780,14 +7806,6 @@ static int ssh_write_config_atomic_at(
                   "Temporary SSH config failed final identity validation");
         goto fail;
     }
-    if (close(fd) != 0) {
-        fd = -1;
-        set_system_error(ERR_FILE_IO,
-                         "Failed to close temporary SSH config");
-        goto fail;
-    }
-    fd = -1;
-
     if (g_ssh_config_commit_hook &&
         g_ssh_config_commit_hook(dir_fd, temp_name) != 0) {
         set_error(ERR_FILE_IO, "Injected SSH config commit interruption");
@@ -7818,6 +7836,15 @@ static int ssh_write_config_atomic_at(
     }
     if (temp_registered) signals_scratch_unregister(temp_path);
     temp_registered = false;
+    if (close(fd) != 0) {
+        fd = -1;
+        set_system_error(
+            ERR_FILE_IO,
+            "SSH config was installed but its temporary descriptor could not "
+            "be closed; the replacement's public state is uncertain");
+        return -1;
+    }
+    fd = -1;
 
     if (g_ssh_config_postrename_hook &&
         g_ssh_config_postrename_hook(dir_fd) != 0) {
@@ -7869,25 +7896,110 @@ static int ssh_write_config_atomic_at(
 
 fail:
     saved_errno = errno;
-    if (fd >= 0) close(fd);
-    /* AR-13 L12: the initial fstat of the temp may have failed (have_temp_identity
-     * false), but the O_EXCL entry we created microseconds ago inside the
-     * already-verified user-owned 0700 ~/.ssh is still ours to retire. Always
-     * apply the ownership safety checks (regular, our uid, single hard link)
-     * and require the captured identity to match ONLY when we have one — so an
-     * fstat failure no longer orphans the temp permanently (the exact outcome
-     * L20's capture-first was meant to prevent). */
-    if (!renamed &&
-        fstatat(dir_fd, temp_name, &current_temp, AT_SYMLINK_NOFOLLOW) == 0 &&
-        S_ISREG(current_temp.st_mode) && current_temp.st_uid == getuid() &&
-        current_temp.st_nlink == 1 &&
-        (!have_temp_identity ||
-         (current_temp.st_dev == temp_identity.st_dev &&
-          current_temp.st_ino == temp_identity.st_ino))) {
-        (void)unlinkat(dir_fd, temp_name, 0);
-    }
-    if (temp_registered) signals_scratch_unregister(temp_path);
+    error_accumulator_init(&failures);
     errno = saved_errno;
+    (void)error_accumulator_add_last(&failures, "SSH config publication");
+
+    if (!renamed && !have_temp_identity) {
+        set_error(
+            ERR_FILE_IO,
+            "Temporary SSH config identity is unknown; retained untracked "
+            "path '%s' rather than risk deleting a replacement generation",
+            temp_path);
+        (void)error_accumulator_add_last(
+            &failures, "temporary SSH config cleanup");
+    } else if (!renamed) {
+        errno = 0;
+        if (fd < 0 || fstat(fd, &held_temp) != 0 ||
+            held_temp.st_dev != created_temp.st_dev ||
+            held_temp.st_ino != created_temp.st_ino) {
+            if (errno == 0) errno = ESTALE;
+            set_system_error(
+                ERR_FILE_IO,
+                "Temporary SSH config descriptor changed; retained '%s' %s",
+                temp_path,
+                temp_registered
+                    ? "for checked cleanup retry"
+                    : "without cleanup tracking for manual recovery");
+            (void)error_accumulator_add_last(
+                &failures, "temporary SSH config cleanup");
+        } else {
+            /* The metadata hook represents the last in-process writer
+             * boundary and therefore runs before the final name proof. All
+             * cooperating writers hold .gitswitch-config.lock; after this
+             * hook there is no callback or fallible step between fstatat()
+             * and unlinkat(). An uncooperative process with the same uid can
+             * rewrite any entry in this user-owned directory and is outside
+             * that POSIX serialization boundary. */
+            errno = 0;
+            forced_failure =
+                g_metadata_test_hook &&
+                g_metadata_test_hook(
+                    SSH_METADATA_TEST_CONFIG_TEMP_CLEANUP_PREPROOF);
+            if (forced_failure) {
+                if (errno == 0) errno = EIO;
+                set_system_error(
+                    ERR_FILE_IO,
+                    "Failed to remove temporary SSH config '%s'; %s",
+                    temp_path,
+                    temp_registered
+                        ? "identity-bound cleanup remains registered for retry"
+                        : "the untracked file was retained for manual cleanup");
+                (void)error_accumulator_add_last(
+                    &failures, "temporary SSH config cleanup");
+            } else if (fstatat(dir_fd, temp_name, &current_temp,
+                               AT_SYMLINK_NOFOLLOW) != 0) {
+                if (errno == ENOENT) {
+                    cleanup_resolved = true;
+                } else {
+                    set_system_error(
+                        ERR_FILE_IO,
+                        "Failed to inspect temporary SSH config '%s'; %s",
+                        temp_path,
+                        temp_registered
+                            ? "retained its identity-bound cleanup "
+                              "registration for retry"
+                            : "retained the untracked file for manual "
+                              "recovery");
+                    (void)error_accumulator_add_last(
+                        &failures, "temporary SSH config cleanup");
+                }
+            } else if (current_temp.st_dev != created_temp.st_dev ||
+                       current_temp.st_ino != created_temp.st_ino ||
+                       !S_ISREG(current_temp.st_mode) ||
+                       current_temp.st_uid != getuid() ||
+                       current_temp.st_nlink != 1) {
+                /* The public name no longer denotes our O_EXCL generation.
+                 * Preserve the replacement and retire only our stale
+                 * obligation. */
+                cleanup_resolved = true;
+            } else if (unlinkat(dir_fd, temp_name, 0) == 0 ||
+                       errno == ENOENT) {
+                cleanup_resolved = true;
+            } else {
+                set_system_error(
+                    ERR_FILE_IO,
+                    "Failed to remove temporary SSH config '%s'; %s",
+                    temp_path,
+                    temp_registered
+                        ? "identity-bound cleanup remains registered for retry"
+                        : "the untracked file was retained for manual cleanup");
+                (void)error_accumulator_add_last(
+                    &failures, "temporary SSH config cleanup");
+            }
+        }
+    }
+    if (cleanup_resolved && temp_registered) {
+        signals_scratch_unregister(temp_path);
+        temp_registered = false;
+    }
+    if (fd >= 0 && close(fd) != 0) {
+        set_system_error(ERR_FILE_IO,
+                         "Failed to close temporary SSH config descriptor");
+        (void)error_accumulator_add_last(
+            &failures, "temporary SSH config descriptor cleanup");
+    }
+    (void)error_accumulator_publish(&failures);
     return -1;
 }
 

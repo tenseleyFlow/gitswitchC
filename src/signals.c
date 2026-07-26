@@ -1,7 +1,7 @@
 /* Signal guarding for the account-switch critical section (SIG-01, SIG-02).
  * See signals.h for the design rationale. Everything reachable from the
  * handler is restricted to the POSIX async-signal-safe set: sig_atomic_t
- * stores, unlink(), signal(), raise(), kill().
+ * accesses, unlink(), signal(), raise(), kill().
  */
 
 /* glibc wants a POSIX feature macro for sigaction; FreeBSD gates SA_RESTART
@@ -13,8 +13,9 @@
 #endif
 
 #include <errno.h>
+#include <fcntl.h>
+#include <limits.h>
 #include <signal.h>
-#include <stdatomic.h>
 #include <string.h>
 #include <sys/wait.h>
 #include <unistd.h>
@@ -296,27 +297,138 @@ static bool restore_partial_guard(int *restore_signal, int *restore_errno) {
     return restored_all;
 }
 
-/* SIG-02 scratch registry: fixed-size, allocation-free so the handler can
- * walk it safely. `used` is the publish flag — set only after `path` is fully
- * written (normal context), cleared before a slot is considered free — so the
- * handler never sees a torn entry. */
+/* SIG-02 scratch registry. Only state and signal_path are ever shared with
+ * guard_handler, and every handler-visible object is volatile sig_atomic_t.
+ * Identity paths and metadata are normal-context-only. */
 #define SCRATCH_TABLE_SIZE 8
+_Static_assert(SIG_ATOMIC_MAX >= UCHAR_MAX,
+               "sig_atomic_t must represent every encoded path byte");
+
+typedef enum {
+    SCRATCH_SLOT_FREE = 0,
+    SCRATCH_SLOT_PATH,
+    SCRATCH_SLOT_IDENTITY
+} scratch_slot_state_t;
+
 typedef struct {
-    char path[MAX_PATH_LEN];
-    volatile sig_atomic_t used;
+    volatile sig_atomic_t state;
+    volatile sig_atomic_t signal_path[MAX_PATH_LEN];
+    char identity_path[MAX_PATH_LEN];
+    dev_t dev;
+    ino_t ino;
 } scratch_slot_t;
 static scratch_slot_t g_scratch[SCRATCH_TABLE_SIZE];
 
-/* Unlink every registered scratch path. Called from the handler (emergency
- * exit) and from signals_scratch_cleanup(); uses only unlink(), which is
- * async-signal-safe. */
-static void scratch_unlink_all(void) {
+#ifdef GITSWITCH_TESTING
+static volatile sig_atomic_t g_test_scratch_unlink_errno;
+
+void signals_test_fail_scratch_unlink(int system_errno) {
+    g_test_scratch_unlink_errno =
+        system_errno > 0 ? (sig_atomic_t)system_errno : 0;
+}
+#endif
+
+static int scratch_unlinkat(int dir_fd, const char *name) {
+#ifdef GITSWITCH_TESTING
+    if (g_test_scratch_unlink_errno != 0) {
+        int injected_errno = (int)g_test_scratch_unlink_errno;
+
+        g_test_scratch_unlink_errno = 0;
+        errno = injected_errno;
+        return -1;
+    }
+#endif
+    return unlinkat(dir_fd, name, 0);
+}
+
+static scratch_slot_state_t scratch_slot_state(const scratch_slot_t *slot) {
+    return (scratch_slot_state_t)slot->state;
+}
+
+static void scratch_encode_signal_path(scratch_slot_t *slot,
+                                       const char *path) {
+    size_t i = 0;
+
+    do {
+        slot->signal_path[i] =
+            (sig_atomic_t)(unsigned char)path[i];
+    } while (path[i++] != '\0');
+}
+
+static void scratch_decode_signal_path(const scratch_slot_t *slot,
+                                       char path[MAX_PATH_LEN]) {
+    for (size_t i = 0; i < MAX_PATH_LEN; i++) {
+        unsigned char byte = (unsigned char)slot->signal_path[i];
+
+        path[i] = (char)byte;
+        if (byte == '\0') return;
+    }
+    path[MAX_PATH_LEN - 1] = '\0';
+}
+
+static bool scratch_signal_path_equals(const scratch_slot_t *slot,
+                                       const char *path) {
+    size_t i = 0;
+
+    do {
+        unsigned char registered =
+            (unsigned char)slot->signal_path[i];
+        unsigned char requested = (unsigned char)path[i];
+
+        if (registered != requested) return false;
+        if (registered == '\0') return true;
+        i++;
+    } while (i < MAX_PATH_LEN);
+    return false;
+}
+
+/* Handler-only emergency cleanup. Identity slots are deliberately skipped:
+ * their path/dev/inode obligations are owned solely by normal context. */
+static void scratch_unlink_paths_from_handler(void) {
+    char path[MAX_PATH_LEN];
+
     for (size_t i = 0; i < SCRATCH_TABLE_SIZE; i++) {
-        if (g_scratch[i].used) {
-            (void)unlink(g_scratch[i].path);
-            g_scratch[i].used = 0;
+        if (scratch_slot_state(&g_scratch[i]) != SCRATCH_SLOT_PATH) {
+            continue;
+        }
+        scratch_decode_signal_path(&g_scratch[i], path);
+        (void)unlink(path);
+        g_scratch[i].state = SCRATCH_SLOT_FREE;
+    }
+}
+
+/* Generic normal-context cleanup preserves the legacy path-only behavior.
+ * Identity slots are only classified here: vanished or substituted names
+ * retire, while an exact identity remains registered for serialized cleanup. */
+static void scratch_cleanup_generic(void) {
+    int saved_errno = errno;
+    char path[MAX_PATH_LEN];
+
+    for (size_t i = 0; i < SCRATCH_TABLE_SIZE; i++) {
+        scratch_slot_state_t state = scratch_slot_state(&g_scratch[i]);
+
+        if (state == SCRATCH_SLOT_PATH) {
+            scratch_decode_signal_path(&g_scratch[i], path);
+            (void)unlink(path);
+            g_scratch[i].state = SCRATCH_SLOT_FREE;
+            continue;
+        }
+        if (state == SCRATCH_SLOT_IDENTITY) {
+            struct stat observed;
+
+            if (lstat(g_scratch[i].identity_path, &observed) != 0) {
+                if (errno == ENOENT) {
+                    g_scratch[i].state = SCRATCH_SLOT_FREE;
+                }
+                continue;
+            }
+            if (observed.st_dev != g_scratch[i].dev ||
+                observed.st_ino != g_scratch[i].ino) {
+                g_scratch[i].state = SCRATCH_SLOT_FREE;
+            }
         }
     }
+    errno = saved_errno;
 }
 
 static void guard_handler(int sig) {
@@ -386,7 +498,7 @@ static void guard_handler(int sig) {
         g_child_pid > 0) {
         (void)kill(-(pid_t)g_child_pgid, SIGKILL);
     }
-    scratch_unlink_all();
+    scratch_unlink_paths_from_handler();
     (void)signal(sig, SIG_DFL);
     (void)raise(sig);
 }
@@ -992,21 +1104,23 @@ int signals_scratch_register(const char *path) {
     }
     /* Already registered? (idempotent for retry loops) */
     for (size_t i = 0; i < SCRATCH_TABLE_SIZE; i++) {
-        if (g_scratch[i].used && strcmp(g_scratch[i].path, path) == 0) {
+        scratch_slot_state_t state = scratch_slot_state(&g_scratch[i]);
+
+        if ((state == SCRATCH_SLOT_PATH &&
+             scratch_signal_path_equals(&g_scratch[i], path)) ||
+            (state == SCRATCH_SLOT_IDENTITY &&
+             strcmp(g_scratch[i].identity_path, path) == 0)) {
+            /* A legacy retry must not downgrade an identity-bound slot. */
             return 0;
         }
     }
     for (size_t i = 0; i < SCRATCH_TABLE_SIZE; i++) {
-        if (!g_scratch[i].used) {
-            /* Copy the path fully BEFORE publishing the slot via `used` so a
-             * handler interrupting mid-copy sees an unused slot, never a
-             * truncated path it might unlink. AR-10 L18: the fence makes the
-             * copy/publish order a language guarantee instead of an artifact
-             * of current codegen — nothing else stops the compiler from
-             * sinking the copy past the volatile store. */
-            safe_strncpy(g_scratch[i].path, path, sizeof(g_scratch[i].path));
-            atomic_signal_fence(memory_order_release);
-            g_scratch[i].used = 1;
+        if (scratch_slot_state(&g_scratch[i]) == SCRATCH_SLOT_FREE) {
+            /* Copy the path fully BEFORE publishing the slot state so a
+             * handler interrupting mid-copy sees a free slot, never a
+             * truncated path it might unlink. */
+            scratch_encode_signal_path(&g_scratch[i], path);
+            g_scratch[i].state = SCRATCH_SLOT_PATH;
             return 0;
         }
     }
@@ -1015,17 +1129,149 @@ int signals_scratch_register(const char *path) {
     return -1;
 }
 
+int signals_scratch_register_identity(const char *path,
+                                      const struct stat *identity) {
+    if (!path || path[0] == '\0' || strlen(path) >= MAX_PATH_LEN ||
+        !identity || !S_ISREG(identity->st_mode) ||
+        identity->st_uid != getuid() || identity->st_nlink != 1) {
+        return -1;
+    }
+    for (size_t i = 0; i < SCRATCH_TABLE_SIZE; i++) {
+        scratch_slot_state_t state = scratch_slot_state(&g_scratch[i]);
+
+        if (state == SCRATCH_SLOT_FREE) {
+            continue;
+        }
+        if (state == SCRATCH_SLOT_PATH) {
+            if (scratch_signal_path_equals(&g_scratch[i], path)) return -1;
+            continue;
+        }
+        if (strcmp(g_scratch[i].identity_path, path) != 0) continue;
+        if (g_scratch[i].dev == identity->st_dev &&
+            g_scratch[i].ino == identity->st_ino) {
+            return 0;
+        }
+        return -1;
+    }
+    for (size_t i = 0; i < SCRATCH_TABLE_SIZE; i++) {
+        if (scratch_slot_state(&g_scratch[i]) == SCRATCH_SLOT_FREE) {
+            safe_strncpy(g_scratch[i].identity_path, path,
+                         sizeof(g_scratch[i].identity_path));
+            g_scratch[i].dev = identity->st_dev;
+            g_scratch[i].ino = identity->st_ino;
+            g_scratch[i].state = SCRATCH_SLOT_IDENTITY;
+            return 0;
+        }
+    }
+    log_warning("Scratch registry full; %s not covered by signal cleanup",
+                path);
+    return -1;
+}
+
 void signals_scratch_unregister(const char *path) {
     if (!path) {
         return;
     }
     for (size_t i = 0; i < SCRATCH_TABLE_SIZE; i++) {
-        if (g_scratch[i].used && strcmp(g_scratch[i].path, path) == 0) {
-            g_scratch[i].used = 0;
+        scratch_slot_state_t state = scratch_slot_state(&g_scratch[i]);
+
+        if ((state == SCRATCH_SLOT_PATH &&
+             scratch_signal_path_equals(&g_scratch[i], path)) ||
+            (state == SCRATCH_SLOT_IDENTITY &&
+             strcmp(g_scratch[i].identity_path, path) == 0)) {
+            g_scratch[i].state = SCRATCH_SLOT_FREE;
         }
     }
 }
 
 void signals_scratch_cleanup(void) {
-    scratch_unlink_all();
+    scratch_cleanup_generic();
+}
+
+static const char *scratch_direct_child_name(const char *path,
+                                             const char *dir_path) {
+    size_t dir_len = strlen(dir_path);
+    const char *name;
+
+    if (dir_len == 0) return NULL;
+    if (dir_len == 1 && dir_path[0] == '/') {
+        if (path[0] != '/') return NULL;
+        name = path + 1;
+    } else {
+        if (strncmp(path, dir_path, dir_len) != 0 ||
+            path[dir_len] != '/') {
+            return NULL;
+        }
+        name = path + dir_len + 1;
+    }
+    if (name[0] == '\0' || strchr(name, '/') != NULL) return NULL;
+    return name;
+}
+
+int signals_scratch_cleanup_identities_at(int dir_fd,
+                                          const char *dir_path) {
+    struct stat held_dir;
+    struct stat named_dir;
+    int saved_errno = errno;
+    int first_errno = 0;
+
+    if (dir_fd < 0 || !dir_path || dir_path[0] == '\0') {
+        errno = EINVAL;
+        return -1;
+    }
+    if (fstat(dir_fd, &held_dir) != 0 || stat(dir_path, &named_dir) != 0) {
+        return -1;
+    }
+    if (!S_ISDIR(held_dir.st_mode) || !S_ISDIR(named_dir.st_mode) ||
+        held_dir.st_dev != named_dir.st_dev ||
+        held_dir.st_ino != named_dir.st_ino) {
+        errno = ESTALE;
+        return -1;
+    }
+
+    for (size_t i = 0; i < SCRATCH_TABLE_SIZE; i++) {
+        const char *name;
+        struct stat observed;
+
+        if (scratch_slot_state(&g_scratch[i]) != SCRATCH_SLOT_IDENTITY) {
+            continue;
+        }
+        name = scratch_direct_child_name(g_scratch[i].identity_path,
+                                         dir_path);
+        if (!name) continue;
+
+        if (fstatat(dir_fd, name, &observed, AT_SYMLINK_NOFOLLOW) != 0) {
+            if (errno == ENOENT) {
+                g_scratch[i].state = SCRATCH_SLOT_FREE;
+            } else if (first_errno == 0) {
+                first_errno = errno;
+            }
+            continue;
+        }
+        if (observed.st_dev != g_scratch[i].dev ||
+            observed.st_ino != g_scratch[i].ino) {
+            g_scratch[i].state = SCRATCH_SLOT_FREE;
+            continue;
+        }
+        if (!S_ISREG(observed.st_mode) || observed.st_uid != getuid() ||
+            observed.st_nlink != 1) {
+            if (first_errno == 0) first_errno = ESTALE;
+            continue;
+        }
+
+        /* The caller's exclusive directory-writer boundary makes this
+         * proof-to-unlink sequence indivisible with respect to renames. */
+        if (scratch_unlinkat(dir_fd, name) == 0 || errno == ENOENT) {
+            g_scratch[i].state = SCRATCH_SLOT_FREE;
+        } else if (first_errno == 0) {
+            first_errno = errno;
+        }
+    }
+
+    if (first_errno != 0) {
+        errno = first_errno;
+        return -1;
+    }
+    errno = saved_errno;
+    return 0;
 }

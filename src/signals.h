@@ -43,6 +43,7 @@
 #include <stdbool.h>
 #include <stdint.h>
 #include <signal.h>
+#include <sys/stat.h>
 #include <sys/types.h>
 
 /**
@@ -246,12 +247,10 @@ int signals_dispatch_pending(void);
 /* --- SIG-02: scratch-file registry -----------------------------------------
  *
  * Temp files written via a create-then-rename pattern leak when the process
- * dies to a signal mid-write. Creators register the temp path right after
- * creating the file and unregister it after the rename/unlink; the emergency
- * (second-signal) handler and signals_scratch_cleanup() unlink whatever is
- * still registered. Fixed-size table, no allocation: registration in normal
- * context publishes a slot only after the path is fully copied, so the
- * handler can never observe a half-written entry.
+ * dies to a signal mid-write. Legacy path registrations are removed by the
+ * emergency (second-signal) handler and signals_scratch_cleanup(). Identity
+ * registrations are normal-context-only and require the directory-serialized
+ * cleanup API below for deletion.
  *
  * Adopters register around the temp file's lifetime; the table and handler
  * here do the rest. Registration is only effective while a guard is active:
@@ -271,14 +270,45 @@ int signals_dispatch_pending(void);
  */
 int signals_scratch_register(const char *path);
 
+/**
+ * Register a scratch path together with the identity observed immediately
+ * after creation. Generic cleanup only retires a missing or substituted name;
+ * it deliberately leaves the exact identity tracked for serialized cleanup.
+ * Registration is idempotent only for the same path/device/inode tuple and
+ * rejects a collision with a legacy path-only registration or a different
+ * identity. The captured object must be a single-link regular file owned by
+ * the effective user.
+ */
+int signals_scratch_register_identity(const char *path,
+                                      const struct stat *identity);
+
 /** Remove a path from the registry (after the temp was renamed/unlinked). */
 void signals_scratch_unregister(const char *path);
 
 /**
- * Unlink and drop every registered scratch path (normal context). Used on the
- * switch failure path so an interrupted switch leaves no *.tmp.* orphans;
- * unlinking an already-renamed/nonexistent path is harmless.
+ * Unlink and drop every legacy path-only registration (normal context).
+ * Identity registrations whose names are missing or no longer match are
+ * retired; exact identities and inspection failures remain tracked.
  */
 void signals_scratch_cleanup(void);
+
+/**
+ * Delete tracked identity-bound scratch files that are direct children of
+ * exactly dir_path, using dir_fd for fstatat(AT_SYMLINK_NOFOLLOW) followed
+ * immediately by unlinkat. The caller must hold the exclusive writer boundary
+ * for this directory for the entire call; dir_fd must still identify exactly
+ * dir_path. This API is normal-context-only.
+ *
+ * Missing or mismatched names retire their slots. Successful exact deletions
+ * retire their slots. Other inspection/deletion failures retain their slots
+ * and return -1 with the first errno; success preserves the caller's errno.
+ */
+int signals_scratch_cleanup_identities_at(int dir_fd,
+                                          const char *dir_path);
+
+#ifdef GITSWITCH_TESTING
+/** Arm a one-shot serialized identity unlink failure. */
+void signals_test_fail_scratch_unlink(int system_errno);
+#endif
 
 #endif /* SIGNALS_H */

@@ -127,7 +127,9 @@ typedef enum {
     SSH_METADATA_TEST_RESET_QUARANTINE,
     SSH_METADATA_TEST_CONFIG_HOME_CREATE,
     SSH_METADATA_TEST_CONFIG_UNCHANGED_RECHECK,
-    SSH_METADATA_TEST_CONFIG_UNCHANGED_FINAL_RECHECK
+    SSH_METADATA_TEST_CONFIG_UNCHANGED_FINAL_RECHECK,
+    SSH_METADATA_TEST_CONFIG_TEMP_INITIAL_FSTAT,
+    SSH_METADATA_TEST_CONFIG_TEMP_CLEANUP_PREPROOF
 } ssh_metadata_test_stage_t;
 typedef bool (*ssh_metadata_test_hook_fn)(ssh_metadata_test_stage_t stage);
 typedef int (*ssh_key_open_fn)(const char *path, int flags);

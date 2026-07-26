@@ -58,6 +58,11 @@ static int g_unchanged_final_recheck_hook_calls;
 static bool g_unchanged_final_recheck_swap_succeeded;
 static int g_remove_final_sync_swap_calls;
 static bool g_remove_final_sync_swap_succeeded;
+static int g_temp_initial_fstat_fault_calls;
+static int g_temp_cleanup_unlink_fault_calls;
+static int g_observed_temp_dir_fd = -1;
+static char g_observed_temp_name[64];
+static bool g_temp_replacement_written;
 
 static int setup_home_without_ssh(char home[96],
                                   char config[MAX_PATH_LEN]) {
@@ -128,6 +133,19 @@ static int write_bytes(const char *path, const void *bytes, size_t length) {
         }
     }
     return close(fd);
+}
+
+static int write_fd_bytes(int fd, const void *bytes, size_t length) {
+    size_t written = 0;
+
+    while (written < length) {
+        ssize_t n = write(fd, (const char *)bytes + written,
+                          length - written);
+        if (n > 0) written += (size_t)n;
+        else if (n < 0 && errno == EINTR) continue;
+        else return -1;
+    }
+    return 0;
 }
 
 static char *read_bytes(const char *path, size_t *length) {
@@ -245,6 +263,26 @@ static size_t count_temps_in(const char *dir_path) {
     }
     closedir(dir);
     return count;
+}
+
+static int find_single_temp_path(const char *dir_path,
+                                 char path[MAX_PATH_LEN]) {
+    DIR *dir = opendir(dir_path);
+    struct dirent *entry;
+    size_t matches = 0;
+
+    if (!dir) return -1;
+    while ((entry = readdir(dir)) != NULL) {
+        if (strncmp(entry->d_name, "config.gitswitch.", 17) != 0) continue;
+        matches++;
+        if ((size_t)snprintf(path, MAX_PATH_LEN, "%s/%s", dir_path,
+                             entry->d_name) >= MAX_PATH_LEN) {
+            closedir(dir);
+            return -1;
+        }
+    }
+    if (closedir(dir) != 0) return -1;
+    return matches == 1U ? 0 : -1;
 }
 
 typedef struct {
@@ -394,6 +432,67 @@ static bool make_config_writable_before_unchanged_recheck(
     g_unchanged_recheck_hook_calls++;
     g_unchanged_recheck_chmod_succeeded =
         chmod(g_unchanged_recheck_config, 0666) == 0;
+    return false;
+}
+
+static bool fail_initial_temp_fstat(ssh_metadata_test_stage_t stage) {
+    if (stage != SSH_METADATA_TEST_CONFIG_TEMP_INITIAL_FSTAT) return false;
+    g_temp_initial_fstat_fault_calls++;
+    errno = EIO;
+    return true;
+}
+
+static bool fail_temp_cleanup_unlink(ssh_metadata_test_stage_t stage) {
+    if (stage != SSH_METADATA_TEST_CONFIG_TEMP_CLEANUP_PREPROOF) return false;
+    g_temp_cleanup_unlink_fault_calls++;
+    errno = EIO;
+    return true;
+}
+
+static int remember_temp_name(const char *temp_name) {
+    int length = snprintf(g_observed_temp_name,
+                          sizeof(g_observed_temp_name), "%s", temp_name);
+
+    if (length < 0 || (size_t)length >= sizeof(g_observed_temp_name)) {
+        errno = ENAMETOOLONG;
+        return -1;
+    }
+    return 0;
+}
+
+static int record_config_temp_and_fail(int dir_fd, const char *temp_name) {
+    if (remember_temp_name(temp_name) != 0) return -1;
+    g_observed_temp_dir_fd = dir_fd;
+    errno = EIO;
+    return -1;
+}
+
+static bool replace_config_temp_before_cleanup_proof(
+    ssh_metadata_test_stage_t stage) {
+    static const char replacement[] =
+        "Host replacement-temp\n  User untouched\n";
+    int fd;
+
+    if (stage != SSH_METADATA_TEST_CONFIG_TEMP_CLEANUP_PREPROOF) return false;
+    g_temp_replacement_written = false;
+    if (g_observed_temp_dir_fd < 0 || g_observed_temp_name[0] == '\0' ||
+        unlinkat(g_observed_temp_dir_fd, g_observed_temp_name, 0) != 0) {
+        return false;
+    }
+    fd = openat(g_observed_temp_dir_fd, g_observed_temp_name,
+                O_WRONLY | O_CREAT | O_EXCL | O_CLOEXEC | O_NOFOLLOW,
+                0600);
+    if (fd < 0) return false;
+    if (write_fd_bytes(fd, replacement, sizeof(replacement) - 1U) != 0) {
+        int saved_errno = errno;
+        (void)close(fd);
+        errno = saved_errno;
+        return false;
+    }
+    if (close(fd) != 0) {
+        return false;
+    }
+    g_temp_replacement_written = true;
     return false;
 }
 
@@ -3172,6 +3271,216 @@ TEST(config_registration_failure_is_atomic_and_retryable) {
     CHECK_EQ_INT(count_temps_in(ssh_dir), 0);
 }
 
+TEST(initial_temp_fstat_failure_retains_untracked_generation) {
+    char home[96], config[MAX_PATH_LEN], key[MAX_PATH_LEN];
+    char ssh_dir[MAX_PATH_LEN], temp_path[MAX_PATH_LEN];
+    account_t account;
+    error_context_t failure;
+    ssh_metadata_test_hook_fn previous;
+    ssh_config_publication_state_t publication =
+        SSH_CONFIG_PUBLICATION_COMMITTED;
+    int before;
+    int failure_errno;
+
+    CHECK_EQ_INT(setup_home(home, config), 0);
+    CHECK((size_t)snprintf(ssh_dir, sizeof(ssh_dir), "%s/.ssh", home) <
+          sizeof(ssh_dir));
+    CHECK((size_t)snprintf(key, sizeof(key), "%s/id", home) < sizeof(key));
+    make_account(&account, key);
+    before = test_open_fd_count();
+    g_temp_initial_fstat_fault_calls = 0;
+    previous = ssh_manager_set_metadata_test_hook_fn(
+        fail_initial_temp_fstat);
+    clear_error();
+    errno = 0;
+    CHECK_EQ_INT(ssh_configure_host_alias_result(&account, &publication), -1);
+    failure_errno = errno;
+    failure = *get_last_error();
+    ssh_manager_set_metadata_test_hook_fn(previous);
+
+    CHECK_EQ_INT(publication, SSH_CONFIG_PUBLICATION_PREINSTALL_FAILED);
+    CHECK_EQ_INT(g_temp_initial_fstat_fault_calls, 1);
+    CHECK_EQ_INT(failure_errno, EIO);
+    CHECK(strstr(failure.message, "capture") != NULL);
+    CHECK(strstr(failure.details, "identity is unknown") != NULL);
+    CHECK(strstr(failure.details, "untracked") != NULL);
+    CHECK_EQ_INT(count_temps_in(ssh_dir), 1);
+    CHECK_EQ_INT(find_single_temp_path(ssh_dir, temp_path), 0);
+    signals_scratch_cleanup();
+    CHECK_EQ_INT(access(temp_path, F_OK), 0);
+    CHECK_EQ_INT(unlink(temp_path), 0);
+    CHECK_EQ_INT(count_temps_in(ssh_dir), 0);
+    errno = 0;
+    CHECK(access(config, F_OK) != 0 && errno == ENOENT);
+    CHECK_EQ_INT(test_open_fd_count(), before);
+}
+
+TEST(replacement_temp_generation_survives_failed_commit) {
+    static const char replacement[] =
+        "Host replacement-temp\n  User untouched\n";
+    char home[96], config[MAX_PATH_LEN], key[MAX_PATH_LEN];
+    char ssh_dir[MAX_PATH_LEN], temp_path[MAX_PATH_LEN];
+    account_t account;
+    ssh_config_commit_hook_fn previous_commit;
+    ssh_metadata_test_hook_fn previous_metadata;
+    ssh_config_publication_state_t publication =
+        SSH_CONFIG_PUBLICATION_COMMITTED;
+    struct stat replacement_identity;
+    size_t length = 0;
+    char *content;
+    int before;
+
+    CHECK_EQ_INT(setup_home(home, config), 0);
+    CHECK((size_t)snprintf(ssh_dir, sizeof(ssh_dir), "%s/.ssh", home) <
+          sizeof(ssh_dir));
+    CHECK((size_t)snprintf(key, sizeof(key), "%s/id", home) < sizeof(key));
+    make_account(&account, key);
+    before = test_open_fd_count();
+    g_observed_temp_dir_fd = -1;
+    g_observed_temp_name[0] = '\0';
+    g_temp_replacement_written = false;
+    previous_commit = ssh_manager_set_config_commit_hook_fn(
+        record_config_temp_and_fail);
+    previous_metadata = ssh_manager_set_metadata_test_hook_fn(
+        replace_config_temp_before_cleanup_proof);
+    clear_error();
+    CHECK_EQ_INT(ssh_configure_host_alias_result(&account, &publication), -1);
+    ssh_manager_set_metadata_test_hook_fn(previous_metadata);
+    ssh_manager_set_config_commit_hook_fn(previous_commit);
+    g_observed_temp_dir_fd = -1;
+
+    CHECK_EQ_INT(publication, SSH_CONFIG_PUBLICATION_PREINSTALL_FAILED);
+    CHECK(g_temp_replacement_written);
+    CHECK(g_observed_temp_name[0] != '\0');
+    CHECK(strstr(get_last_error()->message, "interruption") != NULL);
+    CHECK((size_t)snprintf(temp_path, sizeof(temp_path), "%s/%s", ssh_dir,
+                           g_observed_temp_name) < sizeof(temp_path));
+    CHECK_EQ_INT(count_temps_in(ssh_dir), 1);
+    content = read_bytes(temp_path, &length);
+    CHECK(content != NULL);
+    if (content) {
+        CHECK_EQ_INT(length, sizeof(replacement) - 1U);
+        CHECK(length != sizeof(replacement) - 1U ||
+              memcmp(content, replacement, sizeof(replacement) - 1U) == 0);
+        free(content);
+    }
+    CHECK_EQ_INT(stat(temp_path, &replacement_identity), 0);
+    CHECK_EQ_INT(
+        signals_scratch_register_identity(temp_path, &replacement_identity),
+        0);
+    signals_scratch_unregister(temp_path);
+    signals_scratch_cleanup();
+    CHECK_EQ_INT(access(temp_path, F_OK), 0);
+    CHECK_EQ_INT(unlink(temp_path), 0);
+    CHECK_EQ_INT(count_temps_in(ssh_dir), 0);
+    errno = 0;
+    CHECK(access(config, F_OK) != 0 && errno == ENOENT);
+    CHECK_EQ_INT(test_open_fd_count(), before);
+}
+
+TEST(temp_cleanup_unlink_failure_is_reported_and_retried) {
+    char home[96], config[MAX_PATH_LEN], key[MAX_PATH_LEN];
+    char ssh_dir[MAX_PATH_LEN], temp_path[MAX_PATH_LEN];
+    account_t account;
+    error_context_t failure;
+    ssh_config_commit_hook_fn previous_commit;
+    ssh_metadata_test_hook_fn previous_metadata;
+    ssh_config_publication_state_t publication =
+        SSH_CONFIG_PUBLICATION_COMMITTED;
+    int before;
+    int failure_errno;
+
+    CHECK_EQ_INT(setup_home(home, config), 0);
+    CHECK((size_t)snprintf(ssh_dir, sizeof(ssh_dir), "%s/.ssh", home) <
+          sizeof(ssh_dir));
+    CHECK((size_t)snprintf(key, sizeof(key), "%s/id", home) < sizeof(key));
+    make_account(&account, key);
+    before = test_open_fd_count();
+    g_observed_temp_dir_fd = -1;
+    g_observed_temp_name[0] = '\0';
+    g_temp_cleanup_unlink_fault_calls = 0;
+    previous_commit = ssh_manager_set_config_commit_hook_fn(
+        record_config_temp_and_fail);
+    previous_metadata = ssh_manager_set_metadata_test_hook_fn(
+        fail_temp_cleanup_unlink);
+    clear_error();
+    errno = 0;
+    CHECK_EQ_INT(ssh_configure_host_alias_result(&account, &publication), -1);
+    failure_errno = errno;
+    failure = *get_last_error();
+    ssh_manager_set_metadata_test_hook_fn(previous_metadata);
+    ssh_manager_set_config_commit_hook_fn(previous_commit);
+    g_observed_temp_dir_fd = -1;
+
+    CHECK_EQ_INT(publication, SSH_CONFIG_PUBLICATION_PREINSTALL_FAILED);
+    CHECK_EQ_INT(g_temp_cleanup_unlink_fault_calls, 1);
+    CHECK_EQ_INT(failure_errno, EIO);
+    CHECK(strstr(failure.message, "interruption") != NULL);
+    CHECK(strstr(failure.details, "cleanup remains registered for retry") !=
+          NULL);
+    CHECK((size_t)snprintf(temp_path, sizeof(temp_path), "%s/%s", ssh_dir,
+                           g_observed_temp_name) < sizeof(temp_path));
+    CHECK_EQ_INT(access(temp_path, F_OK), 0);
+    CHECK_EQ_INT(count_temps_in(ssh_dir), 1);
+    /* Generic failure cleanup cannot unlink an identity-bound name outside
+     * the config writer boundary. */
+    signals_scratch_cleanup();
+    CHECK_EQ_INT(access(temp_path, F_OK), 0);
+    CHECK_EQ_INT(count_temps_in(ssh_dir), 1);
+
+    /* The next serialized writer settles the retained exact generation
+     * before admitting its own temp. */
+    publication = SSH_CONFIG_PUBLICATION_PREINSTALL_FAILED;
+    CHECK_EQ_INT(ssh_configure_host_alias_result(&account, &publication), 0);
+    CHECK_EQ_INT(publication, SSH_CONFIG_PUBLICATION_COMMITTED);
+    errno = 0;
+    CHECK(access(temp_path, F_OK) != 0 && errno == ENOENT);
+    CHECK_EQ_INT(count_temps_in(ssh_dir), 0);
+    CHECK_EQ_INT(test_open_fd_count(), before);
+}
+
+TEST(successful_temp_cleanup_unregisters_completed_obligation) {
+    static const char sentinel[] = "replacement sentinel\n";
+    char home[96], config[MAX_PATH_LEN], key[MAX_PATH_LEN];
+    char ssh_dir[MAX_PATH_LEN], temp_path[MAX_PATH_LEN];
+    account_t account;
+    ssh_config_commit_hook_fn previous;
+    ssh_config_publication_state_t publication =
+        SSH_CONFIG_PUBLICATION_COMMITTED;
+    struct stat sentinel_identity;
+    int before;
+
+    CHECK_EQ_INT(setup_home(home, config), 0);
+    CHECK((size_t)snprintf(ssh_dir, sizeof(ssh_dir), "%s/.ssh", home) <
+          sizeof(ssh_dir));
+    CHECK((size_t)snprintf(key, sizeof(key), "%s/id", home) < sizeof(key));
+    make_account(&account, key);
+    before = test_open_fd_count();
+    g_observed_temp_name[0] = '\0';
+    previous = ssh_manager_set_config_commit_hook_fn(
+        record_config_temp_and_fail);
+    clear_error();
+    CHECK_EQ_INT(ssh_configure_host_alias_result(&account, &publication), -1);
+    ssh_manager_set_config_commit_hook_fn(previous);
+
+    CHECK_EQ_INT(publication, SSH_CONFIG_PUBLICATION_PREINSTALL_FAILED);
+    CHECK(strstr(get_last_error()->message, "interruption") != NULL);
+    CHECK((size_t)snprintf(temp_path, sizeof(temp_path), "%s/%s", ssh_dir,
+                           g_observed_temp_name) < sizeof(temp_path));
+    errno = 0;
+    CHECK(access(temp_path, F_OK) != 0 && errno == ENOENT);
+    CHECK_EQ_INT(count_temps_in(ssh_dir), 0);
+    CHECK_EQ_INT(write_bytes(temp_path, sentinel, sizeof(sentinel) - 1U), 0);
+    CHECK_EQ_INT(stat(temp_path, &sentinel_identity), 0);
+    CHECK_EQ_INT(
+        signals_scratch_register_identity(temp_path, &sentinel_identity), 0);
+    signals_scratch_unregister(temp_path);
+    signals_scratch_cleanup();
+    CHECK_EQ_INT(access(temp_path, F_OK), 0);
+    CHECK_EQ_INT(unlink(temp_path), 0);
+    CHECK_EQ_INT(test_open_fd_count(), before);
+}
+
 TEST(postrename_dirsync_failure_is_durability_uncertain_without_temp) {
     static const char original[] = "Host existing\n  User preserved\n";
     char home[96], config[MAX_PATH_LEN], key[MAX_PATH_LEN], ssh_dir[MAX_PATH_LEN];
@@ -3695,6 +4004,10 @@ TEST_MAIN_BEGIN()
     RUN_TEST(descriptor_relative_first_creation_ignores_home_retarget);
     RUN_TEST(symlinked_home_retarget_during_parent_sync_fails_preinstall);
     RUN_TEST(config_registration_failure_is_atomic_and_retryable);
+    RUN_TEST(initial_temp_fstat_failure_retains_untracked_generation);
+    RUN_TEST(replacement_temp_generation_survives_failed_commit);
+    RUN_TEST(temp_cleanup_unlink_failure_is_reported_and_retried);
+    RUN_TEST(successful_temp_cleanup_unregisters_completed_obligation);
     RUN_TEST(postrename_dirsync_failure_is_durability_uncertain_without_temp);
     RUN_TEST(postrename_verification_failure_reports_installed_unverified);
     RUN_TEST(ctime_only_drift_revalidates_exact_pinned_bytes);
