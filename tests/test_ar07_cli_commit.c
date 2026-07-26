@@ -1007,7 +1007,7 @@ TEST(informational_output_bytes_are_stable) {
         "  config               Show configuration file information\n"
         "  init <shell>         Emit shell integration (bash|zsh|fish|sh|dash|ksh)\n"
         "  resume               Restore saved SSH/GPG state, or reconcile an incomplete switch\n"
-        "  reset [account]      Kill agents and delete isolated GPG/SSH state (all, or one)\n"
+        "  reset [account]      Retire isolated GPG/SSH state (all, or one)\n"
         "  switch <account>     Switch to specified account\n"
         "  <account>            Switch to specified account\n"
         "\nOptions:\n"
