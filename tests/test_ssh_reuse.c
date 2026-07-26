@@ -1475,6 +1475,62 @@ TEST(host_alias_write_rejects_newline_key_path) {
     }
 }
 
+TEST(host_alias_identity_file_supports_apostrophes) {
+    static const char *invalid_suffixes[] = {
+        "key\"quoted",
+        "key\\backslash",
+        "key$HOME",
+        "key\nHost injected"
+    };
+    char home[128];
+    char cfg_path[256];
+    char expected[512];
+    char before[4096];
+    char after[4096];
+    account_t acct;
+
+    snprintf(home, sizeof(home), "/tmp/gswsshaliasquote_XXXXXX");
+    CHECK(ts_mkdtemp(home) != NULL);
+    CHECK_EQ_INT(setenv("HOME", home, 1), 0);
+
+    memset(&acct, 0, sizeof(acct));
+    acct.ssh_enabled = true;
+    CHECK((size_t)snprintf(acct.ssh_host_alias,
+                           sizeof(acct.ssh_host_alias),
+                           "github.com-work") <
+          sizeof(acct.ssh_host_alias));
+    CHECK((size_t)snprintf(acct.ssh_hostname,
+                           sizeof(acct.ssh_hostname),
+                           "github.com") <
+          sizeof(acct.ssh_hostname));
+    CHECK((size_t)snprintf(acct.ssh_key_path,
+                           sizeof(acct.ssh_key_path),
+                           "%s/key's 100%%", home) <
+          sizeof(acct.ssh_key_path));
+
+    CHECK_EQ_INT(ssh_configure_host_alias(&acct), 0);
+    CHECK((size_t)snprintf(cfg_path, sizeof(cfg_path),
+                           "%s/.ssh/config", home) < sizeof(cfg_path));
+    CHECK(read_file_to_string(cfg_path, before, sizeof(before)) > 0);
+    CHECK((size_t)snprintf(expected, sizeof(expected),
+                           "  IdentityFile \"%s/key's 100%%%%\"\n",
+                           home) < sizeof(expected));
+    CHECK(strstr(before, expected) != NULL);
+
+    for (size_t i = 0;
+         i < sizeof(invalid_suffixes) / sizeof(invalid_suffixes[0]); i++) {
+        CHECK((size_t)snprintf(acct.ssh_key_path,
+                               sizeof(acct.ssh_key_path),
+                               "%s/%s", home, invalid_suffixes[i]) <
+              sizeof(acct.ssh_key_path));
+        clear_error();
+        CHECK_EQ_INT(ssh_configure_host_alias(&acct), -1);
+        CHECK_EQ_INT(get_last_error()->code, ERR_INVALID_PATH);
+        CHECK(read_file_to_string(cfg_path, after, sizeof(after)) > 0);
+        CHECK(strcmp(after, before) == 0);
+    }
+}
+
 /* AR-06 F15: a configured host-alias block used to leak forever — account
  * removal never cleaned ~/.ssh/config. ssh_remove_host_alias must excise
  * exactly the named managed block, leave unrelated managed blocks and
@@ -1685,6 +1741,7 @@ TEST_MAIN_BEGIN()
     RUN_TEST(stop_agent_preserves_a_replacement_pid_sidecar);
     RUN_TEST(clear_agent_keys_tracks_the_destructive_child_result);
     RUN_TEST(host_alias_write_rejects_newline_key_path);
+    RUN_TEST(host_alias_identity_file_supports_apostrophes);
     RUN_TEST(host_alias_removal_excises_only_named_block);
     RUN_TEST(host_alias_handles_config_larger_than_64k);
 #if defined(__linux__)

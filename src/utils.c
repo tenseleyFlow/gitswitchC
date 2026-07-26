@@ -6812,25 +6812,12 @@ bool validate_name(const char *name) {
     return false;
 }
 
-/* ssh-1 (shared; moved from git_ops.c for AR-02 #10): the account SSH key
- * path ends up in two security-sensitive sinks, and EACH sink must apply this
- * check itself rather than assume the other (or the TOML-load sanitizer)
- * already did:
- *
- *  1. core.sshCommand — the ONE git config value git hands to /bin/sh. The
- *     path is wrapped in single quotes; inside '...' the shell treats every
- *     byte literally EXCEPT a single quote, which ends the quote and lets a
- *     crafted path smuggle extra ssh options (-oProxyCommand=..., i.e.
- *     arbitrary code on the next fetch). Guarded in git_configure_ssh.
- *  2. ~/.ssh/config — the same path is emitted as an "IdentityFile <path>"
- *     line by the host-alias support. There, a \n or \r starts a new line,
- *     i.e. injects an arbitrary ssh_config keyword (ProxyCommand again), and
- *     a quote breaks the directive's tokenization. Guarded in
- *     ssh_configure_host_alias.
- *
- * So reject both quote characters and every control byte (\n and \r included)
- * up front, before the path is probed or written anywhere. A real SSH key
- * path never needs any of these. */
+/* Conservative path admission for the shell-interpreted core.sshCommand
+ * value. Its word serializer also applies POSIX shell quoting, but retaining
+ * this quote/control gate is an independent defense and stable contract for
+ * that sink. ~/.ssh/config IdentityFile values use a separate
+ * OpenSSH-grammar-aware serializer: apostrophes are literal there, while
+ * controls, double quotes, and expansion tokens need different handling. */
 bool is_safe_ssh_key_path(const char *path) {
     for (const char *p = path; *p; p++) {
         unsigned char c = (unsigned char)*p;

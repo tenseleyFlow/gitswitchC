@@ -6904,10 +6904,10 @@ static bool ssh_config_identity_option_valid(const char *value,
     return true;
 }
 
-/* Serialize IdentityFile as one double-quoted OpenSSH argument. OpenSSH's
- * strdelim_internal removes quote delimiters but does NOT treat backslash as an
- * escape inside them, so a literal backslash must be emitted exactly once.
- * '%' is doubled so %h/%r/etc. token expansion cannot reinterpret a literal
+/* Serialize IdentityFile as one double-quoted OpenSSH argument. Backslash
+ * handling differs across supported OpenSSH parser generations, so reject it
+ * rather than emit a path that can be invalid or silently retargeted. '%'
+ * is doubled so %h/%r/etc. token expansion cannot reinterpret a literal
  * filename. ${ENV} expansion has no portable literal-dollar escape at this
  * layer, so reject '$' rather than silently target a different key. */
 static int ssh_quote_identity_file(const char *path, char **quoted_out) {
@@ -6919,10 +6919,11 @@ static int ssh_quote_identity_file(const char *path, char **quoted_out) {
     *quoted_out = NULL;
     for (size_t i = 0; i < path_len; i++) {
         unsigned char c = (unsigned char)path[i];
-        if (c < 0x20 || c == 0x7f || c == '\'' || c == '"' || c == '$') {
+        if (c < 0x20 || c == 0x7f || c == '"' || c == '\\' || c == '$') {
             set_error(ERR_INVALID_PATH,
-                      "SSH key path contains a quote, control byte, or unsafe "
-                      "OpenSSH expansion token: %s", path);
+                      "SSH key path contains a double quote, backslash, "
+                      "control byte, or unsafe OpenSSH expansion token: %s",
+                      path);
             return -1;
         }
         if (quoted_len > SIZE_MAX - (c == '%' ? 2U : 1U)) {
@@ -8201,18 +8202,10 @@ int ssh_configure_host_alias_result(
     if (expand_path(account->ssh_key_path, expanded_key_path, sizeof(expanded_key_path)) != 0) {
         return -1;
     }
-    /* The expanded path is written below as an "IdentityFile <path>" line; a
-     * newline/CR in it would inject an arbitrary ssh_config directive
-     * (ProxyCommand => code execution on the next connect). This sink used to
-     * rely entirely on the TOML-load sanitizer having stripped such bytes — an
-     * incidental, load-time-only defense — so guard the write site itself
-     * (AR-02 #10). */
-    if (!is_safe_ssh_key_path(expanded_key_path)) {
-        set_error(ERR_INVALID_PATH,
-                  "SSH key path contains an illegal character (quote/control): %s",
-                  expanded_key_path);
-        return -1;
-    }
+    /* IdentityFile has its own OpenSSH-grammar serializer. Keep validation at
+     * this sink: it rejects controls, double quotes, non-portable backslashes,
+     * and dollar expansion; doubles percent tokens; and permits apostrophes
+     * because they are literal inside OpenSSH's double-quoted argument form. */
     if (ssh_quote_identity_file(expanded_key_path, &quoted_key_path) != 0) {
         return -1;
     }

@@ -10277,13 +10277,10 @@ int git_list_config(git_scope_t scope, char *output, size_t output_size) {
     return 0;
 }
 
-/* ssh-1: is_safe_ssh_key_path now lives in utils.c so BOTH of the key path's
- * injection-sensitive sinks apply it themselves: this file's core.sshCommand
- * (below) and ssh_manager.c's ~/.ssh/config IdentityFile write. It used to be
- * static here and guard only core.sshCommand, while comments claimed coverage
- * of the IdentityFile sink too — that sink was in fact protected only by the
- * TOML-load sanitizer stripping newlines/quotes, an incidental, load-time-only
- * defense (AR-02 #10). */
+/* is_safe_ssh_key_path is the conservative admission gate for this
+ * shell-interpreted core.sshCommand sink. The ~/.ssh/config IdentityFile sink
+ * has a separate OpenSSH-grammar-aware serializer because its safely
+ * representable character set differs. */
 
 static int ssh_command_append(char *command, size_t command_size,
                               size_t *used, const char *text) {
@@ -10385,10 +10382,8 @@ static int build_expected_ssh_command_with_program(
         return -1;
     }
 
-    /* Reject injection-capable characters BEFORE touching the filesystem:
-     * whether such a path exists is irrelevant — it must never reach
-     * core.sshCommand or an ~/.ssh/config IdentityFile line (see
-     * is_safe_ssh_key_path above for the exact break-out routes). */
+    /* Apply this sink's conservative quote/control gate before touching the
+     * filesystem. IdentityFile uses a separate grammar-specific serializer. */
     if (!is_safe_ssh_key_path(expanded_path)) {
         set_error(ERR_INVALID_PATH,
                   "SSH key path contains an illegal character (quote/control): %s",
