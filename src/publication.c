@@ -12,6 +12,7 @@
 #include "publication.h"
 
 #include "error.h"
+#include "toml_parser.h"
 #include "utils.h"
 
 #include <ctype.h>
@@ -46,9 +47,22 @@ typedef struct {
     size_t capacity;
 } publication_writer_t;
 
+#define PUBLICATION_SSH_OPTIONS                                              \
+    " -F none -o IdentitiesOnly=yes -o StrictHostKeyChecking=accept-new"    \
+    " -o LogLevel=ERROR"
+#define PUBLICATION_SSH_HOSTNAME_OPTION " -o HostName="
+
 static int publication_writer_printf(publication_writer_t *writer,
                                      const char *format, ...)
     GS_PRINTF_FMT(2, 3);
+
+static size_t g_publication_test_last_serializer_peak_capacity;
+
+size_t publication_test_last_serializer_peak_capacity(void);
+
+size_t publication_test_last_serializer_peak_capacity(void) {
+    return g_publication_test_last_serializer_peak_capacity;
+}
 
 static bool publication_identity_is_zero(
     const publication_identity_t *identity) {
@@ -414,17 +428,57 @@ static bool publication_selector_valid(const char *selector) {
            strcmp(selector, normalized) == 0;
 }
 
+static int publication_parse_ssh_quoted_word(
+    const char *command, size_t command_length, size_t *cursor,
+    char *word, size_t word_size) {
+    size_t used = 0U;
+
+    if (!command || !cursor || !word || word_size == 0U ||
+        *cursor >= command_length || command[*cursor] != '\'') {
+        return -1;
+    }
+    word[0] = '\0';
+    (*cursor)++;
+    while (*cursor < command_length) {
+        unsigned char byte = (unsigned char)command[*cursor];
+
+        if (byte == (unsigned char)'\'') {
+            if (*cursor + 3U < command_length &&
+                command[*cursor + 1U] == '\\' &&
+                command[*cursor + 2U] == '\'' &&
+                command[*cursor + 3U] == '\'') {
+                if (used + 1U >= word_size) return -1;
+                word[used++] = '\'';
+                *cursor += 4U;
+                continue;
+            }
+            (*cursor)++;
+            word[used] = '\0';
+            return 0;
+        }
+        if (byte < 0x20U || byte == 0x7fU ||
+            used + 1U >= word_size) {
+            return -1;
+        }
+        word[used++] = command[(*cursor)++];
+    }
+    return -1;
+}
+
 int publication_extract_ssh_program(const char *command, char *out,
                                     size_t out_size) {
+    char program[MAX_PATH_LEN];
+    char identity[MAX_PATH_LEN];
+    char hostname[MAX_NAME_LEN];
     size_t command_length;
-    size_t cursor;
-    size_t used = 0;
+    size_t cursor = 0U;
+    size_t program_length;
 
     if (!out || out_size == 0U) {
         return publication_invalid("Invalid publication SSH program output");
     }
     out[0] = '\0';
-    if (!command || command[0] != '\'') {
+    if (!command) {
         return publication_invalid(
             "Publication SSH command has no canonical executable word");
     }
@@ -433,46 +487,51 @@ int publication_extract_ssh_program(const char *command, char *out,
         return publication_invalid(
             "Publication SSH command exceeds durable storage");
     }
-
-    cursor = 1U;
-    while (cursor < command_length) {
-        unsigned char byte = (unsigned char)command[cursor];
-
-        if (byte == (unsigned char)'\'') {
-            if (cursor + 3U < command_length &&
-                command[cursor + 1U] == '\\' &&
-                command[cursor + 2U] == '\'' &&
-                command[cursor + 3U] == '\'') {
-                if (used + 1U >= out_size) goto too_long;
-                out[used++] = '\'';
-                cursor += 4U;
-                continue;
-            }
-            cursor++;
-            if (command_length - cursor < sizeof(" -i '") - 1U ||
-                memcmp(command + cursor, " -i '",
-                       sizeof(" -i '") - 1U) != 0 ||
-                used == 0U || out[0] != '/') {
-                return publication_invalid(
-                    "Publication SSH command does not match the managed command grammar");
-            }
-            out[used] = '\0';
-            return 0;
-        }
-        if (byte < 0x20U || byte == 0x7fU) {
-            return publication_invalid(
-                "Publication SSH executable contains a control character");
-        }
-        if (used + 1U >= out_size) goto too_long;
-        out[used++] = command[cursor++];
+    if (publication_parse_ssh_quoted_word(
+            command, command_length, &cursor, program, sizeof(program)) != 0 ||
+        program[0] != '/' ||
+        command_length - cursor < sizeof(" -i ") - 1U ||
+        memcmp(command + cursor, " -i ", sizeof(" -i ") - 1U) != 0) {
+        goto invalid_grammar;
     }
-    return publication_invalid(
-        "Publication SSH command has an unterminated executable word");
+    cursor += sizeof(" -i ") - 1U;
+    if (publication_parse_ssh_quoted_word(
+            command, command_length, &cursor, identity,
+            sizeof(identity)) != 0 ||
+        identity[0] != '/' || !is_safe_ssh_key_path(identity) ||
+        command_length - cursor < sizeof(PUBLICATION_SSH_OPTIONS) - 1U ||
+        memcmp(command + cursor, PUBLICATION_SSH_OPTIONS,
+               sizeof(PUBLICATION_SSH_OPTIONS) - 1U) != 0) {
+        goto invalid_grammar;
+    }
+    cursor += sizeof(PUBLICATION_SSH_OPTIONS) - 1U;
+    if (cursor != command_length) {
+        if (command_length - cursor <
+                sizeof(PUBLICATION_SSH_HOSTNAME_OPTION) - 1U ||
+            memcmp(command + cursor, PUBLICATION_SSH_HOSTNAME_OPTION,
+                   sizeof(PUBLICATION_SSH_HOSTNAME_OPTION) - 1U) != 0) {
+            goto invalid_grammar;
+        }
+        cursor += sizeof(PUBLICATION_SSH_HOSTNAME_OPTION) - 1U;
+        if (publication_parse_ssh_quoted_word(
+                command, command_length, &cursor, hostname,
+                sizeof(hostname)) != 0 ||
+            !toml_validate_ssh_hostname(hostname) ||
+            cursor != command_length) {
+            goto invalid_grammar;
+        }
+    }
+    program_length = strlen(program);
+    if (program_length >= out_size) {
+        return publication_invalid(
+            "Publication SSH executable exceeds durable storage");
+    }
+    memcpy(out, program, program_length + 1U);
+    return 0;
 
-too_long:
-    out[0] = '\0';
+invalid_grammar:
     return publication_invalid(
-        "Publication SSH executable exceeds durable storage");
+        "Publication SSH command does not match the complete managed command grammar");
 }
 
 int publication_record_validate(const publication_record_t *record) {
@@ -1506,10 +1565,46 @@ int publication_ledger_parse(const unsigned char *data, size_t length,
     return 0;
 }
 
+static int publication_writer_reserve(publication_writer_t *writer,
+                                      size_t additional) {
+    size_t required;
+    size_t capacity;
+    unsigned char *grown;
+
+    if (!writer || writer->length > PUBLICATION_LEDGER_MAX_BYTES ||
+        additional > PUBLICATION_LEDGER_MAX_BYTES - writer->length) {
+        return publication_invalid("Publication ledger exceeds byte limit");
+    }
+    required = writer->length + additional;
+    if (required > writer->capacity) {
+        capacity = writer->capacity ? writer->capacity : 64U;
+        while (capacity < required) {
+            if (capacity > PUBLICATION_LEDGER_MAX_BYTES / 2U) {
+                capacity = PUBLICATION_LEDGER_MAX_BYTES;
+            } else {
+                capacity *= 2U;
+            }
+        }
+        grown = realloc(writer->data, capacity);
+        if (!grown) {
+            set_error(ERR_MEMORY_ALLOCATION,
+                      "Cannot grow serialized publication ledger");
+            return -1;
+        }
+        writer->data = grown;
+        writer->capacity = capacity;
+        if (capacity >
+            g_publication_test_last_serializer_peak_capacity) {
+            g_publication_test_last_serializer_peak_capacity = capacity;
+        }
+    }
+    return 0;
+}
+
 static int publication_writer_append(publication_writer_t *writer,
                                      const void *data, size_t length) {
-    if (!writer || !data || length > writer->capacity - writer->length) {
-        return publication_invalid("Publication ledger exceeds byte limit");
+    if (!data || publication_writer_reserve(writer, length) != 0) {
+        return -1;
     }
     memcpy(writer->data + writer->length, data, length);
     writer->length += length;
@@ -1519,21 +1614,68 @@ static int publication_writer_append(publication_writer_t *writer,
 static int publication_writer_printf(publication_writer_t *writer,
                                      const char *format, ...) {
     va_list args;
+    va_list sizing;
     int written;
+    int rendered;
+    size_t required;
     size_t remaining;
-    if (!writer || !format || writer->length > writer->capacity) return -1;
-    remaining = writer->capacity - writer->length;
+    unsigned char *temporary = NULL;
+
+    if (!writer || !format ||
+        writer->length > PUBLICATION_LEDGER_MAX_BYTES) {
+        return -1;
+    }
     va_start(args, format);
-    /* This static, compiler-format-checked helper has literal-only callers;
-     * the bounded write rejects every truncation. */
+    va_copy(sizing, args);
     // flawfinder: ignore
-    written = vsnprintf((char *)writer->data + writer->length, remaining,
-                        format, args);
-    va_end(args);
-    if (written < 0 || (size_t)written >= remaining) {
+    written = vsnprintf(NULL, 0U, format, sizing);
+    va_end(sizing);
+    if (written < 0 ||
+        (size_t)written >
+            PUBLICATION_LEDGER_MAX_BYTES - writer->length) {
+        va_end(args);
         return publication_invalid("Publication ledger exceeds byte limit");
     }
-    writer->length += (size_t)written;
+    required = (size_t)written;
+    if (required == PUBLICATION_LEDGER_MAX_BYTES - writer->length) {
+        if (required == SIZE_MAX) {
+            va_end(args);
+            return publication_invalid("Publication ledger exceeds byte limit");
+        }
+        temporary = malloc(required + 1U);
+        if (!temporary) {
+            va_end(args);
+            set_error(ERR_MEMORY_ALLOCATION,
+                      "Cannot format serialized publication ledger");
+            return -1;
+        }
+        // flawfinder: ignore
+        rendered = vsnprintf((char *)temporary, required + 1U,
+                             format, args);
+        va_end(args);
+        if (rendered != written ||
+            publication_writer_append(writer, temporary, required) != 0) {
+            secure_zero_memory(temporary, required + 1U);
+            free(temporary);
+            return -1;
+        }
+        secure_zero_memory(temporary, required + 1U);
+        free(temporary);
+        return 0;
+    }
+    if (publication_writer_reserve(writer, required + 1U) != 0) {
+        va_end(args);
+        return -1;
+    }
+    remaining = writer->capacity - writer->length;
+    // flawfinder: ignore
+    rendered = vsnprintf((char *)writer->data + writer->length, remaining,
+                         format, args);
+    va_end(args);
+    if (rendered != written || (size_t)rendered >= remaining) {
+        return publication_invalid("Publication ledger formatting failed");
+    }
+    writer->length += required;
     return 0;
 }
 
@@ -1617,6 +1759,7 @@ int publication_ledger_serialize(const publication_ledger_t *ledger,
     }
     *data = NULL;
     *length = 0U;
+    g_publication_test_last_serializer_peak_capacity = 0U;
     if (!ledger->present) {
         if (ledger->version != 0U || ledger->records || ledger->count != 0U) {
             return publication_invalid("Inconsistent absent publication ledger");
@@ -1641,13 +1784,6 @@ int publication_ledger_serialize(const publication_ledger_t *ledger,
         }
     }
     memset(&writer, 0, sizeof(writer));
-    writer.capacity = PUBLICATION_LEDGER_MAX_BYTES;
-    writer.data = malloc(writer.capacity);
-    if (!writer.data) {
-        set_error(ERR_MEMORY_ALLOCATION,
-                  "Cannot allocate serialized publication ledger");
-        return -1;
-    }
     if (publication_writer_printf(&writer, "publications=v1\ncount=%zu\n",
                                   ledger->count) != 0) goto fail;
     for (size_t i = 0; i < ledger->count; i++) {

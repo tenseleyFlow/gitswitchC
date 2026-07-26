@@ -155,4 +155,10 @@ int publication_ledger_parse(const unsigned char *data, size_t length,
 int publication_ledger_serialize(const publication_ledger_t *ledger,
                                  unsigned char **data, size_t *length);
 
+#if defined(GITSWITCH_TESTING) && \
+    defined(GITSWITCH_PUBLICATION_SERIALIZER_TEST_API)
+/* Peak backing allocation used by the most recent serializer call. */
+size_t publication_test_last_serializer_peak_capacity(void);
+#endif
+
 #endif /* PUBLICATION_H */

@@ -1,11 +1,14 @@
 /* AR-11 M8-M10: durable Git-publication provenance is an exact, versioned
  * ownership record. These tests stay on the public record/ledger/config APIs
  * so persistence layout can evolve without weakening the causal contract. */
+#define GITSWITCH_PUBLICATION_SERIALIZER_TEST_API
+#include "publication.h"
+#undef GITSWITCH_PUBLICATION_SERIALIZER_TEST_API
+
 #include "test.h"
 #include "accounts.h"
 #include "config.h"
 #include "error.h"
-#include "publication.h"
 #include "toml_parser.h"
 #include "utils.h"
 
@@ -20,9 +23,11 @@
     "0123456789ABCDEF0123456789ABCDEF0123456789ABCDEF0123456789ABCDEF"
 #define SSH_PROGRAM_A "/usr/bin/ssh"
 #define SSH_PROGRAM_B "/usr/bin/scp"
+#define SSH_COMMAND_OPTIONS \
+    "-F none -o IdentitiesOnly=yes -o StrictHostKeyChecking=accept-new " \
+    "-o LogLevel=ERROR"
 #define SSH_COMMAND_A \
-    "'/usr/bin/ssh' -i '/tmp/ar11 publication key' -F '/dev/null' " \
-    "-o IdentitiesOnly=yes"
+    "'/usr/bin/ssh' -i '/tmp/ar11 publication key' " SSH_COMMAND_OPTIONS
 #define INCARNATION_A \
     "1111111111111111111111111111111111111111111111111111111111111111"
 #define INCARNATION_B \
@@ -844,9 +849,41 @@ TEST(gpg_selector_record_validation_requires_complete_canonical_tuple) {
 
 TEST(ssh_program_extraction_accepts_only_the_managed_first_word) {
     static const char escaped_command[] =
-        "'/opt/ssh'\\''helper' -i '/tmp/key' -F '/dev/null'";
+        "'/opt/ssh'\\''helper' -i '/tmp/key' " SSH_COMMAND_OPTIONS;
+    static const char alias_command[] =
+        "'/usr/bin/ssh' -i '/tmp/key' " SSH_COMMAND_OPTIONS
+        " -o HostName='2001:db8::1'";
+    static const char *const malformed[] = {
+        "/usr/bin/ssh -i '/tmp/key' " SSH_COMMAND_OPTIONS,
+        "'ssh' -i '/tmp/key' " SSH_COMMAND_OPTIONS,
+        "'/usr/bin/ssh' -i 'relative-key' " SSH_COMMAND_OPTIONS,
+        "'/usr/bin/ssh' -i '' " SSH_COMMAND_OPTIONS,
+        "'/usr/bin/ssh' -i '/tmp/key " SSH_COMMAND_OPTIONS,
+        "'/usr/bin/ssh' -i '/tmp/key'\\x " SSH_COMMAND_OPTIONS,
+        "'/usr/bin/ssh' -i '/tmp/key' "
+            "-o IdentitiesOnly=yes -o StrictHostKeyChecking=accept-new "
+            "-o LogLevel=ERROR",
+        "'/usr/bin/ssh' -i '/tmp/key' "
+            "-F none -o StrictHostKeyChecking=accept-new -o LogLevel=ERROR",
+        "'/usr/bin/ssh' -i '/tmp/key' "
+            "-F none -o IdentitiesOnly=yes -o LogLevel=ERROR",
+        "'/usr/bin/ssh' -i '/tmp/key' "
+            "-F none -o IdentitiesOnly=yes "
+            "-o StrictHostKeyChecking=accept-new",
+        "'/usr/bin/ssh' -i '/tmp/key' " SSH_COMMAND_OPTIONS
+            " -o BatchMode=yes",
+        "'/usr/bin/ssh' -i '/tmp/key' " SSH_COMMAND_OPTIONS " trailing",
+        "'/usr/bin/ssh' -i '/tmp/key' " SSH_COMMAND_OPTIONS "\n",
+        "'/usr/bin/ssh' -i '/tmp/key' " SSH_COMMAND_OPTIONS
+            " -o HostName=github.com",
+        "'/usr/bin/ssh' -i '/tmp/key' " SSH_COMMAND_OPTIONS
+            " -o HostName='github.com' trailing",
+        "'/usr/bin/ssh -i '/tmp/key' " SSH_COMMAND_OPTIONS,
+        "'/usr/bin/ssh\n' -i '/tmp/key' " SSH_COMMAND_OPTIONS,
+    };
     char program[MAX_PATH_LEN];
     char tiny[4];
+    size_t i;
 
     CHECK_EQ_INT(publication_extract_ssh_program(
                      SSH_COMMAND_A, program, sizeof(program)), 0);
@@ -854,22 +891,14 @@ TEST(ssh_program_extraction_accepts_only_the_managed_first_word) {
     CHECK_EQ_INT(publication_extract_ssh_program(
                      escaped_command, program, sizeof(program)), 0);
     CHECK_STR_EQ(program, "/opt/ssh'helper");
-
     CHECK_EQ_INT(publication_extract_ssh_program(
-                     "/usr/bin/ssh -i '/tmp/key'", program,
-                     sizeof(program)), -1);
-    CHECK_EQ_INT(publication_extract_ssh_program(
-                     "'ssh' -i '/tmp/key'", program,
-                     sizeof(program)), -1);
-    CHECK_EQ_INT(publication_extract_ssh_program(
-                     "'/usr/bin/ssh' -F '/dev/null'", program,
-                     sizeof(program)), -1);
-    CHECK_EQ_INT(publication_extract_ssh_program(
-                     "'/usr/bin/ssh -i '/tmp/key'", program,
-                     sizeof(program)), -1);
-    CHECK_EQ_INT(publication_extract_ssh_program(
-                     "'/usr/bin/ssh\n' -i '/tmp/key'", program,
-                     sizeof(program)), -1);
+                     alias_command, program, sizeof(program)), 0);
+    CHECK_STR_EQ(program, SSH_PROGRAM_A);
+    for (i = 0U; i < sizeof(malformed) / sizeof(malformed[0]); i++) {
+        CHECK_EQ_INT(publication_extract_ssh_program(
+                         malformed[i], program, sizeof(program)), -1);
+        CHECK_EQ_INT(program[0], '\0');
+    }
     CHECK_EQ_INT(publication_extract_ssh_program(
                      SSH_COMMAND_A, tiny, sizeof(tiny)), -1);
     CHECK_EQ_INT(publication_extract_ssh_program(
@@ -885,6 +914,13 @@ TEST(ssh_record_validation_requires_complete_matching_provenance) {
     };
     publication_record_t record;
     publication_record_t candidate;
+    static const char *const malformed_commands[] = {
+        "'/usr/bin/ssh' -i '/tmp/key'",
+        "'/usr/bin/ssh' -i '/tmp/key' " SSH_COMMAND_OPTIONS " trailing",
+        "'/usr/bin/ssh' -i '/tmp/key' "
+            "-F none -o IdentitiesOnly=yes -o LogLevel=ERROR",
+        "'/usr/bin/ssh' -i '/tmp/key " SSH_COMMAND_OPTIONS,
+    };
 
     fill_ssh_record(&record);
     CHECK_EQ_INT(publication_record_validate(&record), 0);
@@ -924,6 +960,15 @@ TEST(ssh_record_validation_requires_complete_matching_provenance) {
                               "/usr/bin/ssh -i '/tmp/key'",
                               sizeof(candidate.ssh_command)), 0);
     CHECK_EQ_INT(publication_record_validate(&candidate), -1);
+    for (size_t i = 0U;
+         i < sizeof(malformed_commands) / sizeof(malformed_commands[0]);
+         i++) {
+        candidate = record;
+        CHECK_EQ_INT(safe_strncpy(
+                         candidate.ssh_command, malformed_commands[i],
+                         sizeof(candidate.ssh_command)), 0);
+        CHECK_EQ_INT(publication_record_validate(&candidate), -1);
+    }
 
     candidate = record;
     candidate.capabilities &= ~(PUBLICATION_CAP_SSH_COMMAND |
@@ -3300,6 +3345,90 @@ TEST(removed_account_publication_reserves_recycled_id_without_git_mutation) {
     ts_rm_rf(home);
 }
 
+TEST(present_empty_ledger_serializes_canonically_with_tiny_allocation) {
+    static const unsigned char expected[] =
+        "publications=v1\n"
+        "count=0\n"
+        "end=v1\n";
+    publication_ledger_t ledger;
+    publication_ledger_t parsed;
+    unsigned char *serialized = NULL;
+    size_t serialized_length = 0U;
+
+    publication_ledger_init(&ledger);
+    publication_ledger_init(&parsed);
+    ledger.present = true;
+    ledger.version = PUBLICATION_LEDGER_VERSION;
+    CHECK_EQ_INT(publication_ledger_serialize(
+                     &ledger, &serialized, &serialized_length), 0);
+    CHECK_EQ_INT((long)serialized_length, (long)(sizeof(expected) - 1U));
+    CHECK(serialized &&
+          memcmp(serialized, expected, sizeof(expected) - 1U) == 0);
+    CHECK(publication_test_last_serializer_peak_capacity() <= 64U);
+    CHECK(publication_test_last_serializer_peak_capacity() <
+          PUBLICATION_LEDGER_MAX_BYTES);
+    CHECK_EQ_INT(publication_ledger_parse(
+                     serialized, serialized_length, &parsed), 0);
+    CHECK(parsed.present);
+    CHECK_EQ_INT(parsed.version, PUBLICATION_LEDGER_VERSION);
+    CHECK_EQ_INT((long)parsed.count, 0);
+
+    free(serialized);
+    publication_ledger_clear(&parsed);
+    publication_ledger_clear(&ledger);
+}
+
+TEST(reclaim_keeps_the_single_final_v1_record_canonical) {
+    publication_ledger_t ledger;
+    publication_ledger_t parsed;
+    publication_record_t record;
+    publication_record_t before_record;
+    const publication_record_t *found = NULL;
+    unsigned char *before = NULL;
+    unsigned char *after = NULL;
+    size_t before_length = 0U;
+    size_t after_length = 0U;
+
+    fill_ssh_record(&record);
+    publication_ledger_init(&ledger);
+    publication_ledger_init(&parsed);
+    CHECK_EQ_INT(publication_ledger_upsert(&ledger, &record), 0);
+    before_record = ledger.records[0];
+    CHECK_EQ_INT(publication_ledger_serialize(
+                     &ledger, &before, &before_length), 0);
+
+    CHECK_EQ_INT((long)publication_ledger_reclaim_absent(&ledger), 0);
+    CHECK(ledger.present);
+    CHECK_EQ_INT(ledger.version, PUBLICATION_LEDGER_VERSION);
+    CHECK_EQ_INT((long)ledger.count, 1);
+    CHECK(memcmp(&ledger.records[0], &before_record,
+                 sizeof(before_record)) == 0);
+    CHECK_LOOKUP_STATUS(
+        publication_ledger_find(
+            &ledger, record.account_id, record.account_incarnation,
+            record.scope, record.config_path, record.repository_path, &found),
+        PUBLICATION_LOOKUP_FOUND);
+    CHECK(found == &ledger.records[0]);
+    CHECK_EQ_INT(publication_ledger_serialize(
+                     &ledger, &after, &after_length), 0);
+    CHECK_EQ_INT((long)after_length, (long)before_length);
+    CHECK(before && after && memcmp(before, after, before_length) == 0);
+    CHECK_EQ_INT(publication_ledger_parse(after, after_length, &parsed), 0);
+    found = NULL;
+    CHECK_LOOKUP_STATUS(
+        publication_ledger_find(
+            &parsed, record.account_id, record.account_incarnation,
+            record.scope, record.config_path, record.repository_path, &found),
+        PUBLICATION_LOOKUP_FOUND);
+    CHECK(found != NULL);
+    if (found) CHECK_EQ_INT(publication_record_validate(found), 0);
+
+    free(after);
+    free(before);
+    publication_ledger_clear(&parsed);
+    publication_ledger_clear(&ledger);
+}
+
 /* AR-14 M13: a v1 filesystem probe cannot distinguish permanent deletion
  * from rename-away/restore. Exercise each anchor independently under one
  * same-filesystem root and prove both PUBLISHED authority and a RETIRING
@@ -3808,6 +3937,8 @@ TEST_MAIN_BEGIN()
     RUN_TEST(malformed_publication_never_falls_back_to_legacy_ssh_retirement);
     RUN_TEST(same_numeric_id_different_incarnation_is_never_live_publication_owner);
     RUN_TEST(removed_account_publication_reserves_recycled_id_without_git_mutation);
+    RUN_TEST(present_empty_ledger_serializes_canonically_with_tiny_allocation);
+    RUN_TEST(reclaim_keeps_the_single_final_v1_record_canonical);
     RUN_TEST(reclamation_keeps_renamed_published_and_retiring_destinations);
     RUN_TEST(ledger_parse_rejects_l16_l17_grammar_tightenings);
     RUN_TEST(ledger_parse_distinguishes_bad_end_marker_from_trailing_bytes);
