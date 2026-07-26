@@ -190,6 +190,26 @@ static int at_append_file(const char *path, const char *contents) {
     return close(fd);
 }
 
+static int at_build_ssh_command(at_fixture_t *fixture) {
+    const char *path = getenv("PATH");
+    char *saved_path = path ? strdup(path) : NULL;
+    int result = -1;
+    int restore_result;
+
+    if (!fixture || (path && !saved_path) ||
+        setenv("PATH", fixture->root, 1) != 0) {
+        free(saved_path);
+        return -1;
+    }
+    result = git_expected_ssh_command(
+        &fixture->account, fixture->ssh_command,
+        sizeof(fixture->ssh_command));
+    restore_result = path ? setenv("PATH", saved_path, 1)
+                          : unsetenv("PATH");
+    free(saved_path);
+    return restore_result == 0 ? result : -1;
+}
+
 static size_t at_count_prefixed_artifacts(const char *directory,
                                           const char *prefix) {
     struct dirent *entry;
@@ -525,16 +545,14 @@ static int at_refresh_publication(at_fixture_t *fixture) {
 static int at_fixture_init(at_fixture_t *fixture,
                            publication_scope_t scope,
                            bool mixed_values, mode_t mode) {
-    char template_path[] = "/tmp/gsw-ar11-atomic-XXXXXX";
     char local_config[MAX_PATH_LEN];
     static const char initial_config[] =
         "[fixture]\n\tmarker = keep\n";
 
     memset(fixture, 0, sizeof(*fixture));
     fixture->scope = scope;
-    if (!ts_mkdtemp(template_path) ||
-        safe_strncpy(fixture->root, template_path,
-                     sizeof(fixture->root)) != 0 ||
+    if (!ts_mkdtemp_trusted(fixture->root, sizeof(fixture->root),
+                            "gsw-ar11-atomic") ||
         ts_canonicalize_dir_path(fixture->root,
                                  sizeof(fixture->root)) != 0 ||
         safe_snprintf(fixture->repository, sizeof(fixture->repository),
@@ -544,7 +562,7 @@ static int at_fixture_init(at_fixture_t *fixture,
         safe_snprintf(fixture->gpg_program, sizeof(fixture->gpg_program),
                       "%s/gpg-program", fixture->root) != 0 ||
         safe_snprintf(fixture->ssh_program, sizeof(fixture->ssh_program),
-                      "%s/ssh-program", fixture->root) != 0 ||
+                      "%s/ssh", fixture->root) != 0 ||
         safe_snprintf(fixture->ssh_key, sizeof(fixture->ssh_key),
                       "%s/id_key", fixture->root) != 0 ||
         safe_snprintf(fixture->alias_path, sizeof(fixture->alias_path),
@@ -557,10 +575,13 @@ static int at_fixture_init(at_fixture_t *fixture,
                       0700) != 0 ||
         at_write_file(fixture->ssh_program, "#!/bin/sh\nexit 0\n",
                       0700) != 0 ||
-        at_write_file(fixture->ssh_key, "fixture-key\n", 0600) != 0 ||
-        safe_snprintf(fixture->ssh_command, sizeof(fixture->ssh_command),
-                      "'%s' -i '%s' -o IdentitiesOnly=yes",
-                      fixture->ssh_program, fixture->ssh_key) != 0) {
+        at_write_file(fixture->ssh_key, "fixture-key\n", 0600) != 0) {
+        return -1;
+    }
+    fixture->account.ssh_enabled = true;
+    if (safe_strncpy(fixture->account.ssh_key_path, fixture->ssh_key,
+                     sizeof(fixture->account.ssh_key_path)) != 0 ||
+        at_build_ssh_command(fixture) != 0) {
         return -1;
     }
 
@@ -621,15 +642,12 @@ static int at_fixture_init(at_fixture_t *fixture,
     fixture->account.incarnation_persisted = true;
     fixture->account.gpg_enabled = true;
     fixture->account.gpg_signing_enabled = true;
-    fixture->account.ssh_enabled = true;
     if (safe_strncpy(fixture->account.incarnation, AT_INCARNATION,
                      sizeof(fixture->account.incarnation)) != 0 ||
         safe_strncpy(fixture->account.name, "atomic-retirement",
                      sizeof(fixture->account.name)) != 0 ||
         safe_strncpy(fixture->account.gpg_key_id, AT_SELECTOR,
-                     sizeof(fixture->account.gpg_key_id)) != 0 ||
-        safe_strncpy(fixture->account.ssh_key_path, fixture->ssh_key,
-                     sizeof(fixture->account.ssh_key_path)) != 0) {
+                     sizeof(fixture->account.gpg_key_id)) != 0) {
         return -1;
     }
     return at_refresh_publication(fixture);
