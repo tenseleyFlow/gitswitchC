@@ -3512,6 +3512,82 @@ TEST(ledger_parse_rejects_l16_l17_grammar_tightenings) {
     publication_ledger_clear(&source);
 }
 
+TEST(ledger_parse_distinguishes_bad_end_marker_from_trailing_bytes) {
+    static const unsigned char end_marker[] = "end=v1\n";
+    static const char malformed_end_message[] =
+        "Malformed or missing publication ledger end marker";
+    publication_ledger_t source;
+    publication_ledger_t parsed;
+    publication_record_t record;
+    unsigned char *serialized = NULL;
+    unsigned char *bad = NULL;
+    size_t serialized_length = 0U;
+    size_t marker_length = sizeof(end_marker) - 1U;
+
+    fill_gpg_record(&record, "/tmp/ar14-l9-repo", FINGERPRINT_A);
+    publication_ledger_init(&source);
+    CHECK_EQ_INT(publication_ledger_upsert(&source, &record), 0);
+    CHECK_EQ_INT(publication_ledger_serialize(
+                     &source, &serialized, &serialized_length), 0);
+    CHECK(serialized != NULL);
+    CHECK(serialized_length >= marker_length);
+    if (!serialized || serialized_length < marker_length) goto cleanup;
+    CHECK(memcmp(serialized + serialized_length - marker_length,
+                 end_marker, marker_length) == 0);
+
+    bad = malloc(serialized_length);
+    CHECK(bad != NULL);
+    if (bad) {
+        memcpy(bad, serialized, serialized_length);
+        bad[serialized_length - marker_length] = 'X';
+        publication_ledger_init(&parsed);
+        clear_error();
+        CHECK_EQ_INT(publication_ledger_parse(
+                         bad, serialized_length, &parsed), -1);
+        CHECK(strstr(get_last_error()->message,
+                     malformed_end_message) != NULL);
+        CHECK(!parsed.present);
+        CHECK_EQ_INT((long)parsed.count, 0);
+        CHECK(parsed.records == NULL);
+        publication_ledger_clear(&parsed);
+        free(bad);
+        bad = NULL;
+    }
+
+    publication_ledger_init(&parsed);
+    clear_error();
+    CHECK_EQ_INT(publication_ledger_parse(
+                     serialized, serialized_length - marker_length,
+                     &parsed), -1);
+    CHECK(strstr(get_last_error()->message, malformed_end_message) != NULL);
+    CHECK(!parsed.present);
+    CHECK_EQ_INT((long)parsed.count, 0);
+    CHECK(parsed.records == NULL);
+    publication_ledger_clear(&parsed);
+
+    bad = malloc(serialized_length + 1U);
+    CHECK(bad != NULL);
+    if (bad) {
+        memcpy(bad, serialized, serialized_length);
+        bad[serialized_length] = 'X';
+        publication_ledger_init(&parsed);
+        clear_error();
+        CHECK_EQ_INT(publication_ledger_parse(
+                         bad, serialized_length + 1U, &parsed), -1);
+        CHECK(strstr(get_last_error()->message,
+                     "Trailing publication ledger bytes") != NULL);
+        CHECK(!parsed.present);
+        CHECK_EQ_INT((long)parsed.count, 0);
+        CHECK(parsed.records == NULL);
+        publication_ledger_clear(&parsed);
+    }
+
+cleanup:
+    free(bad);
+    free(serialized);
+    publication_ledger_clear(&source);
+}
+
 /* A full ledger still admits an exact destination replacement, but a
  * genuinely new destination fails before active-state mutation even while a
  * recorded repository is renamed away and later restored. */
@@ -3734,5 +3810,6 @@ TEST_MAIN_BEGIN()
     RUN_TEST(removed_account_publication_reserves_recycled_id_without_git_mutation);
     RUN_TEST(reclamation_keeps_renamed_published_and_retiring_destinations);
     RUN_TEST(ledger_parse_rejects_l16_l17_grammar_tightenings);
+    RUN_TEST(ledger_parse_distinguishes_bad_end_marker_from_trailing_bytes);
     RUN_TEST(at_capacity_ledger_admits_replacement_and_rejects_renamed_reuse);
 TEST_MAIN_END()

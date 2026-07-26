@@ -1489,8 +1489,15 @@ int publication_ledger_parse(const unsigned char *data, size_t length,
             }
         }
     }
-    if (publication_expect_literal(&reader, "end=v1") != 0 ||
-        reader.cursor != reader.end) {
+    /* AR-14 L9: an absent, truncated, or noncanonical terminator is malformed
+     * structure, not trailing data. Reserve the trailing-bytes diagnostic for
+     * bytes observed only after a complete canonical `end=v1\n` marker. */
+    if (publication_expect_literal(&reader, "end=v1") != 0) {
+        publication_ledger_clear(&parsed);
+        return publication_invalid(
+            "Malformed or missing publication ledger end marker");
+    }
+    if (reader.cursor != reader.end) {
         publication_ledger_clear(&parsed);
         return publication_invalid("Trailing publication ledger bytes");
     }
