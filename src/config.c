@@ -82,7 +82,8 @@ typedef enum {
     RETIREMENT_GUARD_CLEAR_BEFORE_DIR_SYNC,
     RETIREMENT_GUARD_CLEAR_AFTER_DIR_SYNC,
     RETIREMENT_GUARD_PAIR_AFTER_MARKER_READ,
-    RETIREMENT_GUARD_INSTALL_BEFORE_DIR_SYNC
+    RETIREMENT_GUARD_INSTALL_BEFORE_DIR_SYNC,
+    RETIREMENT_GUARD_READ_AFTER_CLOSE
 } retirement_guard_clear_test_stage_t;
 typedef int (*retirement_guard_clear_test_hook_fn)(
     retirement_guard_clear_test_stage_t stage, int directory_fd,
@@ -126,7 +127,8 @@ enum {
     RETIREMENT_GUARD_CLEAR_BEFORE_DIR_SYNC,
     RETIREMENT_GUARD_CLEAR_AFTER_DIR_SYNC,
     RETIREMENT_GUARD_PAIR_AFTER_MARKER_READ,
-    RETIREMENT_GUARD_INSTALL_BEFORE_DIR_SYNC
+    RETIREMENT_GUARD_INSTALL_BEFORE_DIR_SYNC,
+    RETIREMENT_GUARD_READ_AFTER_CLOSE
 };
 #define RETIREMENT_GUARD_CLEAR_TEST_CHECKPOINT(stage, fd, name)             \
     ((void)(stage), (void)(fd), (void)(name), 0)
@@ -3083,6 +3085,7 @@ static int config_retirement_guard_read_named_at(
     struct stat opened;
     struct stat descriptor_after;
     struct stat named_after;
+    struct stat named_closed;
     unsigned char *buffer = NULL;
     unsigned char extra;
     ssize_t extra_count;
@@ -3166,8 +3169,39 @@ static int config_retirement_guard_read_named_at(
         goto read_fail_preserve_error;
     }
 
-    close(fd);
-    *identity = named_after;
+    if (close(fd) != 0) {
+        fd = -1;
+        failure_errno = errno ? errno : EIO;
+        goto read_fail;
+    }
+    fd = -1;
+
+    if (RETIREMENT_GUARD_CLEAR_TEST_CHECKPOINT(
+            RETIREMENT_GUARD_READ_AFTER_CLOSE,
+            directory_fd, name) != 0) {
+        failure_errno = errno ? errno : EIO;
+        goto read_fail;
+    }
+
+    /* FreeBSD UFS may materialize a reader-induced ctime update only after
+     * close. The complete marker bytes and canonical model were just proved
+     * through this descriptor, so refresh the pathname generation while
+     * admitting only that narrow metadata transition. */
+    errno = 0;
+    if (fstatat(directory_fd, name, &named_closed,
+                AT_SYMLINK_NOFOLLOW) != 0) {
+        failure_errno = config_is_namespace_change_errno(errno)
+                            ? ESTALE
+                            : (errno ? errno : EIO);
+        goto read_fail;
+    }
+    if (!config_metadata_file_is_safe(&named_closed, true) ||
+        !config_metadata_matches_after_exact_content_proof(
+            &descriptor_after, &named_closed)) {
+        failure_errno = ESTALE;
+        goto read_fail;
+    }
+    *identity = named_closed;
     *data = buffer;
     return 0;
 
@@ -3361,6 +3395,7 @@ static int config_retirement_guard_pair_read_at(
         errno = ESTALE;
         goto pair_fail;
     }
+    errno = 0;
     return 0;
 
 pair_fail:
@@ -3406,10 +3441,10 @@ static bool config_retirement_guard_record_same(
     if (left_absent != right_absent) return false;
     if (left_absent) return true;
     return left_identity && right_identity && left_data && right_data &&
-           config_metadata_snapshot_same(
-               left_identity, right_identity) &&
            left_length == right_length &&
-           memcmp(left_data, right_data, left_length) == 0;
+           memcmp(left_data, right_data, left_length) == 0 &&
+           config_metadata_matches_after_exact_content_proof(
+               left_identity, right_identity);
 }
 
 static bool config_retirement_guard_pair_records_same(

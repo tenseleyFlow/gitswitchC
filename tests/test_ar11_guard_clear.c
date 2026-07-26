@@ -8,6 +8,7 @@
 #include "error.h"
 
 #include <stdint.h>
+#include <time.h>
 
 #define GUARD_MAX_BYTES 8192U
 #define GUARD_NAME ".retirement-incomplete"
@@ -24,7 +25,8 @@ typedef enum {
     RETIREMENT_GUARD_CLEAR_BEFORE_DIR_SYNC,
     RETIREMENT_GUARD_CLEAR_AFTER_DIR_SYNC,
     RETIREMENT_GUARD_PAIR_AFTER_MARKER_READ,
-    RETIREMENT_GUARD_INSTALL_BEFORE_DIR_SYNC
+    RETIREMENT_GUARD_INSTALL_BEFORE_DIR_SYNC,
+    RETIREMENT_GUARD_READ_AFTER_CLOSE
 } retirement_guard_clear_test_stage_t;
 typedef int (*retirement_guard_clear_test_hook_fn)(
     retirement_guard_clear_test_stage_t stage, int descriptor,
@@ -127,6 +129,108 @@ static int guard_atomic_replace_at(
         return -1;
     }
     return 0;
+}
+
+static size_t guard_read_file_at(
+    int directory_fd, const char *name, unsigned char *data,
+    size_t capacity) {
+    struct stat st;
+    size_t total = 0U;
+    int fd;
+
+    if (directory_fd < 0 || !name || !data ||
+        fstatat(directory_fd, name, &st, AT_SYMLINK_NOFOLLOW) != 0 ||
+        st.st_size <= 0 || (uintmax_t)st.st_size > capacity) {
+        return 0U;
+    }
+    fd = openat(directory_fd, name, O_RDONLY | O_CLOEXEC | O_NOFOLLOW);
+    if (fd < 0) return 0U;
+    while (total < (size_t)st.st_size) {
+        ssize_t count = read(fd, data + total, (size_t)st.st_size - total);
+
+        if (count > 0) {
+            total += (size_t)count;
+        } else if (count < 0 && errno == EINTR) {
+            continue;
+        } else {
+            total = 0U;
+            break;
+        }
+    }
+    if (close(fd) != 0) return 0U;
+    return total;
+}
+
+static bool guard_same_ctime(const struct stat *left,
+                             const struct stat *right) {
+#if defined(__APPLE__)
+    return left->st_ctimespec.tv_sec == right->st_ctimespec.tv_sec &&
+           left->st_ctimespec.tv_nsec == right->st_ctimespec.tv_nsec;
+#else
+    return left->st_ctim.tv_sec == right->st_ctim.tv_sec &&
+           left->st_ctim.tv_nsec == right->st_ctim.tv_nsec;
+#endif
+}
+
+static bool guard_same_except_ctime(const struct stat *left,
+                                    const struct stat *right) {
+    if (!left || !right ||
+        left->st_dev != right->st_dev ||
+        left->st_ino != right->st_ino ||
+        left->st_mode != right->st_mode ||
+        left->st_uid != right->st_uid ||
+        left->st_gid != right->st_gid ||
+        left->st_nlink != right->st_nlink ||
+        left->st_rdev != right->st_rdev ||
+        left->st_size != right->st_size ||
+        left->st_blksize != right->st_blksize ||
+        left->st_blocks != right->st_blocks) {
+        return false;
+    }
+#if defined(__APPLE__)
+    return left->st_atimespec.tv_sec == right->st_atimespec.tv_sec &&
+           left->st_atimespec.tv_nsec == right->st_atimespec.tv_nsec &&
+           left->st_mtimespec.tv_sec == right->st_mtimespec.tv_sec &&
+           left->st_mtimespec.tv_nsec == right->st_mtimespec.tv_nsec;
+#else
+    return left->st_atim.tv_sec == right->st_atim.tv_sec &&
+           left->st_atim.tv_nsec == right->st_atim.tv_nsec &&
+           left->st_mtim.tv_sec == right->st_mtim.tv_sec &&
+           left->st_mtim.tv_nsec == right->st_mtim.tv_nsec;
+#endif
+}
+
+static int guard_force_ctime_only_drift_at(
+    int directory_fd, const char *name, struct stat *before_out,
+    struct stat *after_out) {
+    const struct timespec retry = {.tv_sec = 0, .tv_nsec = 1000000L};
+    struct stat before;
+    struct stat after;
+
+    if (directory_fd < 0 || !name || !before_out || !after_out ||
+        fstatat(directory_fd, name, &before, AT_SYMLINK_NOFOLLOW) != 0 ||
+        (before.st_mode & 0777U) != 0600U) {
+        errno = errno ? errno : EINVAL;
+        return -1;
+    }
+    for (size_t attempt = 0U; attempt < 256U; attempt++) {
+        if (fchmodat(directory_fd, name, 0400, 0) != 0 ||
+            fchmodat(directory_fd, name, 0600, 0) != 0 ||
+            fstatat(directory_fd, name, &after,
+                    AT_SYMLINK_NOFOLLOW) != 0 ||
+            !guard_same_except_ctime(&before, &after)) {
+            errno = errno ? errno : ESTALE;
+            return -1;
+        }
+        if (!guard_same_ctime(&before, &after)) {
+            *before_out = before;
+            *after_out = after;
+            return 0;
+        }
+        (void)nanosleep(&retry, NULL);
+    }
+    errno = ETIMEDOUT;
+    return -1;
 }
 
 static bool guard_mutate_token(
@@ -311,21 +415,41 @@ static void guard_fixture_cleanup(guard_fixture_t *fixture) {
 typedef enum {
     HOOK_FAIL = 0,
     HOOK_SYNC_THEN_FAIL,
-    HOOK_REPLACE_CANONICAL
+    HOOK_REPLACE_CANONICAL,
+    HOOK_CTIME_AT_INSTALL_SYNC,
+    HOOK_CTIME_AFTER_FRESH_READ,
+    HOOK_REPLACE_AFTER_FRESH_READ
 } hook_action_t;
 
 static retirement_guard_clear_test_stage_t hook_stage;
 static hook_action_t hook_action;
 static bool hook_armed;
+static bool hook_fresh_publish_seen;
+static bool hook_action_observed;
+static int hook_action_error;
+static struct stat hook_identity_before;
+static struct stat hook_identity_after;
 static unsigned char hook_replacement[GUARD_MAX_BYTES];
 static size_t hook_replacement_length;
 
 static int guard_fault_hook(
     retirement_guard_clear_test_stage_t stage, int descriptor,
     const char *marker_name) {
-    (void)marker_name;
-    if (!hook_armed || stage != hook_stage) return 0;
+    if (!hook_armed) return 0;
+    if ((hook_action == HOOK_CTIME_AFTER_FRESH_READ ||
+         hook_action == HOOK_REPLACE_AFTER_FRESH_READ) &&
+        stage == RETIREMENT_GUARD_INSTALL_BEFORE_DIR_SYNC) {
+        hook_fresh_publish_seen = true;
+        return 0;
+    }
+    if (stage != hook_stage ||
+        ((hook_action == HOOK_CTIME_AFTER_FRESH_READ ||
+          hook_action == HOOK_REPLACE_AFTER_FRESH_READ) &&
+         !hook_fresh_publish_seen)) {
+        return 0;
+    }
     hook_armed = false;
+    hook_action_observed = true;
     if (hook_action == HOOK_SYNC_THEN_FAIL &&
         fsync(descriptor) != 0) {
         return -1;
@@ -334,6 +458,35 @@ static int guard_fault_hook(
         return guard_atomic_replace_at(
             descriptor, GUARD_NAME, hook_replacement,
             hook_replacement_length);
+    }
+    if (hook_action == HOOK_CTIME_AT_INSTALL_SYNC ||
+        hook_action == HOOK_CTIME_AFTER_FRESH_READ) {
+        if (guard_force_ctime_only_drift_at(
+                descriptor, marker_name, &hook_identity_before,
+                &hook_identity_after) != 0) {
+            hook_action_error = errno ? errno : EIO;
+            errno = hook_action_error;
+            return -1;
+        }
+        return 0;
+    }
+    if (hook_action == HOOK_REPLACE_AFTER_FRESH_READ) {
+        hook_replacement_length = guard_read_file_at(
+            descriptor, marker_name, hook_replacement,
+            sizeof(hook_replacement));
+        if (hook_replacement_length == 0U ||
+            fstatat(descriptor, marker_name, &hook_identity_before,
+                    AT_SYMLINK_NOFOLLOW) != 0 ||
+            guard_atomic_replace_at(
+                descriptor, marker_name, hook_replacement,
+                hook_replacement_length) != 0 ||
+            fstatat(descriptor, marker_name, &hook_identity_after,
+                    AT_SYMLINK_NOFOLLOW) != 0) {
+            hook_action_error = errno ? errno : EIO;
+            errno = hook_action_error;
+            return -1;
+        }
+        return 0;
     }
     errno = EIO;
     return -1;
@@ -344,6 +497,11 @@ static void guard_arm_hook(
     hook_stage = stage;
     hook_action = action;
     hook_armed = true;
+    hook_fresh_publish_seen = false;
+    hook_action_observed = false;
+    hook_action_error = 0;
+    memset(&hook_identity_before, 0, sizeof(hook_identity_before));
+    memset(&hook_identity_after, 0, sizeof(hook_identity_after));
     (void)gitswitch_test_set_retirement_guard_clear_hook(
         guard_fault_hook);
 }
@@ -680,6 +838,106 @@ TEST(unproven_install_is_not_adopted_until_directory_sync_succeeds) {
     blocked = true;
     CHECK(guard_probe(&fixture, &blocked));
     CHECK(!blocked);
+    guard_fixture_cleanup(&fixture);
+}
+
+TEST(fresh_install_accepts_ctime_only_drift_after_reader_close) {
+    guard_fixture_t fixture;
+    config_retirement_guard_t *installed = NULL;
+
+    CHECK_EQ_INT(guard_fixture_init(&fixture), 0);
+    CHECK_EQ_INT(config_retirement_guard_clear(&fixture.guard), 0);
+    CHECK(fixture.guard == NULL);
+
+    guard_arm_hook(
+        RETIREMENT_GUARD_READ_AFTER_CLOSE,
+        HOOK_CTIME_AFTER_FRESH_READ);
+    CHECK_EQ_INT(config_retirement_guard_install_or_adopt(
+                     fixture.config_path, CONFIG_RETIREMENT_RESET,
+                     &fixture.owner, 1U, &installed), 0);
+    (void)gitswitch_test_set_retirement_guard_clear_hook(NULL);
+    CHECK(installed != NULL);
+    CHECK(config_retirement_guard_was_created(installed));
+    CHECK(!hook_armed);
+    CHECK(hook_fresh_publish_seen);
+    CHECK(hook_action_observed);
+    CHECK_EQ_INT(hook_action_error, 0);
+    CHECK(guard_same_except_ctime(
+        &hook_identity_before, &hook_identity_after));
+    CHECK(!guard_same_ctime(
+        &hook_identity_before, &hook_identity_after));
+
+    fixture.guard = installed;
+    guard_fixture_cleanup(&fixture);
+}
+
+TEST(fresh_install_rejects_identical_inode_swap_after_reader_close) {
+    guard_fixture_t fixture;
+    config_retirement_guard_t *installed = NULL;
+    unsigned char observed[GUARD_MAX_BYTES];
+    struct stat after;
+    size_t observed_length;
+    int install_errno;
+
+    CHECK_EQ_INT(guard_fixture_init(&fixture), 0);
+    CHECK_EQ_INT(config_retirement_guard_clear(&fixture.guard), 0);
+    CHECK(fixture.guard == NULL);
+
+    guard_arm_hook(
+        RETIREMENT_GUARD_READ_AFTER_CLOSE,
+        HOOK_REPLACE_AFTER_FRESH_READ);
+    errno = 0;
+    CHECK_EQ_INT(config_retirement_guard_install_or_adopt(
+                     fixture.config_path, CONFIG_RETIREMENT_RESET,
+                     &fixture.owner, 1U, &installed), -1);
+    install_errno = errno;
+    (void)gitswitch_test_set_retirement_guard_clear_hook(NULL);
+    CHECK(installed == NULL);
+    CHECK_EQ_INT(install_errno, ESTALE);
+    CHECK(!hook_armed);
+    CHECK(hook_fresh_publish_seen);
+    CHECK(hook_action_observed);
+    CHECK_EQ_INT(hook_action_error, 0);
+    CHECK(!ts_same_identity(
+        &hook_identity_before, &hook_identity_after));
+
+    observed_length = guard_read_file(
+        fixture.marker_path, observed, sizeof(observed));
+    CHECK_EQ_INT((long)observed_length,
+                 (long)hook_replacement_length);
+    CHECK(memcmp(observed, hook_replacement,
+                 hook_replacement_length) == 0);
+    CHECK_EQ_INT(stat(fixture.marker_path, &after), 0);
+    CHECK(ts_same_identity(&hook_identity_after, &after));
+    guard_fixture_cleanup(&fixture);
+}
+
+TEST(exact_adoption_accepts_retained_marker_ctime_only_drift) {
+    guard_fixture_t fixture;
+    config_retirement_guard_t *adopted = NULL;
+
+    CHECK_EQ_INT(guard_fixture_init(&fixture), 0);
+    config_retirement_guard_abandon(&fixture.guard);
+    CHECK(fixture.guard == NULL);
+
+    guard_arm_hook(
+        RETIREMENT_GUARD_INSTALL_BEFORE_DIR_SYNC,
+        HOOK_CTIME_AT_INSTALL_SYNC);
+    CHECK_EQ_INT(config_retirement_guard_adopt(
+                     fixture.config_path, CONFIG_RETIREMENT_RESET,
+                     &fixture.owner, 1U, &adopted), 0);
+    (void)gitswitch_test_set_retirement_guard_clear_hook(NULL);
+    CHECK(adopted != NULL);
+    CHECK(!config_retirement_guard_was_created(adopted));
+    CHECK(!hook_armed);
+    CHECK(hook_action_observed);
+    CHECK_EQ_INT(hook_action_error, 0);
+    CHECK(guard_same_except_ctime(
+        &hook_identity_before, &hook_identity_after));
+    CHECK(!guard_same_ctime(
+        &hook_identity_before, &hook_identity_after));
+
+    fixture.guard = adopted;
     guard_fixture_cleanup(&fixture);
 }
 
@@ -1351,6 +1609,9 @@ TEST_MAIN_BEGIN()
     RUN_TEST(lone_and_mismatched_certificates_block);
     RUN_TEST(lifecycle_lock_serializes_guard_owners);
     RUN_TEST(unproven_install_is_not_adopted_until_directory_sync_succeeds);
+    RUN_TEST(fresh_install_accepts_ctime_only_drift_after_reader_close);
+    RUN_TEST(fresh_install_rejects_identical_inode_swap_after_reader_close);
+    RUN_TEST(exact_adoption_accepts_retained_marker_ctime_only_drift);
     RUN_TEST(abandon_after_failed_clear_never_reopens);
     RUN_TEST(recovery_projection_adopts_only_the_exact_active_owner_set);
     RUN_TEST(v2_remove_alias_obligation_roundtrips_and_adopts_exactly);
