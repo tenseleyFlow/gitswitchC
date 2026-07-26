@@ -1768,13 +1768,31 @@ static int gpg_native_rename_noreplace(int old_dir_fd, const char *old_name,
 #endif
 }
 
+/* AR-14 L22: fsync(2) does not request a drive-cache flush on Darwin, so the
+ * base-directory and agent-config barriers use F_FULLFSYNC there.  A volume
+ * or descriptor may not support that command; only the documented
+ * unsupported-command errors fall back to fsync.  Other errors must remain
+ * visible to callers rather than being masked as durable success. */
+static int gpg_full_fsync(int fd) {
+#if defined(__APPLE__)
+    int rc;
+
+    do {
+        rc = fcntl(fd, F_FULLFSYNC);
+    } while (rc != 0 && errno == EINTR);
+    if (rc == 0) return 0;
+    if (errno != ENOTSUP && errno != ENOTTY && errno != EINVAL) return -1;
+#endif
+    return fsync(fd);
+}
+
 static int gpg_default_sync_base(int base_fd) {
-    return fsync(base_fd);
+    return gpg_full_fsync(base_fd);
 }
 
 static int gpg_default_agent_conf_sync(int fd, bool directory) {
     (void)directory;
-    return fsync(fd);
+    return gpg_full_fsync(fd);
 }
 
 static int gpg_current_path_from_base(const char *base, char *buf, size_t size) {
