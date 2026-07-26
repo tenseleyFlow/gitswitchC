@@ -553,6 +553,52 @@ static int start_test_agent_server(const char *path, test_agent_mode_t mode,
     return 0;
 }
 
+static int query_test_agent_identity_count(const char *path,
+                                           uint32_t *identity_count) {
+    static const unsigned char request[] = {
+        0, 0, 0, 1, TEST_AGENT_REQUEST_IDENTITIES
+    };
+    struct sockaddr_un address;
+    unsigned char response[256];
+    unsigned char header[4];
+    uint32_t payload_size;
+    int fd;
+    int rc = -1;
+
+    if (!path || !identity_count ||
+        strlen(path) >= sizeof(address.sun_path)) {
+        return -1;
+    }
+    fd = socket(AF_UNIX, SOCK_STREAM, 0);
+    if (fd < 0) return -1;
+    memset(&address, 0, sizeof(address));
+    address.sun_family = AF_UNIX;
+    memcpy(address.sun_path, path, strlen(path) + 1U);
+    if (connect(fd, (struct sockaddr *)(void *)&address,
+                sizeof(address)) != 0 ||
+        test_agent_write_exact(fd, request, sizeof(request)) != 0 ||
+        test_agent_read_exact(fd, header, sizeof(header)) != 0) {
+        goto out;
+    }
+    payload_size = ((uint32_t)header[0] << 24) |
+                   ((uint32_t)header[1] << 16) |
+                   ((uint32_t)header[2] << 8) |
+                   (uint32_t)header[3];
+    if (payload_size < 5U || payload_size > sizeof(response) ||
+        test_agent_read_exact(fd, response, payload_size) != 0 ||
+        response[0] != TEST_AGENT_IDENTITIES_ANSWER) {
+        goto out;
+    }
+    *identity_count = ((uint32_t)response[1] << 24) |
+                      ((uint32_t)response[2] << 16) |
+                      ((uint32_t)response[3] << 8) |
+                      (uint32_t)response[4];
+    rc = 0;
+out:
+    if (close(fd) != 0) rc = -1;
+    return rc;
+}
+
 static size_t collect_test_agent_trace(test_agent_server_t *server,
                                        unsigned char *trace,
                                        size_t trace_size) {
@@ -1949,13 +1995,16 @@ TEST(reset_all_retains_exact_tuple_when_pidfd_is_unsupported) {
     exercise_unsupported_pidfd_retains_exact_tuple(true);
 }
 
-static void exercise_sidecarless_protocol_detach(bool reset_all) {
+static void exercise_sidecarless_live_agent_retention(bool reset_all) {
     ssh_fixture_t fixture;
     test_agent_server_t server = {.pid = -1, .trace_fd = -1};
+    artifact_snapshot_t socket_before = {0};
+    artifact_snapshot_t current_before = {0};
     artifact_snapshot_t sibling_before = {0};
     unsigned char trace[8];
     char sibling[256];
     size_t trace_size;
+    uint32_t identity_count = 0;
 
     CHECK_EQ_INT(make_fixture(
                      &fixture,
@@ -1969,6 +2018,10 @@ static void exercise_sidecarless_protocol_detach(bool reset_all) {
         return;
     }
     CHECK_EQ_INT(symlink(fixture.socket, fixture.current), 0);
+    CHECK_EQ_INT(capture_artifact_snapshot(
+                     fixture.socket, &socket_before), 0);
+    CHECK_EQ_INT(capture_artifact_snapshot(
+                     fixture.current, &current_before), 0);
     if (!reset_all) {
         CHECK(snprintf(sibling, sizeof(sibling),
                        "%s/unrelated-artifact", fixture.runtime) > 0);
@@ -1977,19 +2030,20 @@ static void exercise_sidecarless_protocol_detach(bool reset_all) {
                          sibling, &sibling_before), 0);
     }
 
-    CHECK_EQ_INT(ssh_manager_reset(reset_all ? NULL : "work"), 0);
+    CHECK_EQ_INT(ssh_manager_reset(reset_all ? NULL : "work"), -1);
     trace_size = collect_test_agent_trace(
         &server, trace, sizeof(trace));
 
-    CHECK_EQ_INT((int)trace_size, 1);
-    CHECK(trace_size < 1U || trace[0] == TEST_AGENT_REQUEST_IDENTITIES);
-    CHECK(trace_size < 1U ||
-          (trace[0] != TEST_AGENT_REMOVE_ALL_IDENTITIES &&
-           trace[0] != TEST_AGENT_REMOVE_ALL_RSA_IDENTITIES));
+    CHECK_EQ_INT((int)trace_size, 0);
     CHECK_EQ_INT(kill(server.pid, 0), 0);
-    CHECK(!entry_exists(fixture.socket));
+    CHECK(artifact_matches_snapshot(fixture.socket, &socket_before));
     CHECK(!entry_exists(fixture.sidecar));
-    CHECK(!entry_exists(fixture.current));
+    CHECK(artifact_matches_snapshot(fixture.current, &current_before));
+    CHECK(strstr(get_last_error()->message,
+                 "no safely matched PID") != NULL);
+    CHECK_EQ_INT(query_test_agent_identity_count(
+                     fixture.socket, &identity_count), 0);
+    CHECK_EQ_INT((int)identity_count, 1);
     if (!reset_all) {
         CHECK(artifact_matches_snapshot(sibling, &sibling_before));
     }
@@ -1999,12 +2053,12 @@ static void exercise_sidecarless_protocol_detach(bool reset_all) {
     ts_rm_rf(fixture.xdg);
 }
 
-TEST(sidecarless_targeted_requests_identities_only_and_detaches_namespace) {
-    exercise_sidecarless_protocol_detach(false);
+TEST(sidecarless_targeted_retains_loaded_live_agent_and_exact_evidence) {
+    exercise_sidecarless_live_agent_retention(false);
 }
 
-TEST(sidecarless_reset_all_requests_identities_only_and_detaches_namespace) {
-    exercise_sidecarless_protocol_detach(true);
+TEST(sidecarless_reset_all_retains_loaded_live_agent_and_exact_evidence) {
+    exercise_sidecarless_live_agent_retention(true);
 }
 
 static void exercise_sidecarless_protocol_failure(
@@ -2033,8 +2087,7 @@ static void exercise_sidecarless_protocol_failure(
     trace_size = collect_test_agent_trace(
         &server, trace, sizeof(trace));
 
-    CHECK_EQ_INT((int)trace_size, 1);
-    CHECK(trace_size < 1U || trace[0] == TEST_AGENT_REQUEST_IDENTITIES);
+    CHECK_EQ_INT((int)trace_size, 0);
     CHECK_EQ_INT(kill(server.pid, 0), 0);
     CHECK(artifact_matches_snapshot(fixture.socket, &socket_before));
     CHECK(artifact_matches_snapshot(fixture.current, &current_before));
@@ -4040,8 +4093,8 @@ TEST_MAIN_BEGIN()
     RUN_TEST(pidfd_escalation_never_returns_to_numeric_process_inspection);
     RUN_TEST(targeted_reset_retains_exact_tuple_when_pidfd_is_unsupported);
     RUN_TEST(reset_all_retains_exact_tuple_when_pidfd_is_unsupported);
-    RUN_TEST(sidecarless_targeted_requests_identities_only_and_detaches_namespace);
-    RUN_TEST(sidecarless_reset_all_requests_identities_only_and_detaches_namespace);
+    RUN_TEST(sidecarless_targeted_retains_loaded_live_agent_and_exact_evidence);
+    RUN_TEST(sidecarless_reset_all_retains_loaded_live_agent_and_exact_evidence);
     RUN_TEST(sidecarless_wrong_protocol_type_retains_exact_artifacts);
     RUN_TEST(sidecarless_malformed_identity_answer_retains_exact_artifacts);
     RUN_TEST(sidecarless_truncated_protocol_frame_retains_exact_artifacts);

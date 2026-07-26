@@ -394,14 +394,15 @@ int ssh_manager_current_is_live_for_account(const account_t *account,
  * Tear down isolated SSH agent state. Recorded processes are terminated only
  * when their exact identity and a descriptor-backed signaling path are safely
  * proved. An exact native BSD v2 endpoint may instead have all identities
- * cleared and its managed names detached without proving process death; a
- * sidecar-less endpoint may only be detached after a read-only SSH-agent
- * protocol proof. In either detached case the process and preexisting
- * connections may remain. Resets a single account when `account` is a
- * nonempty name accepted by validate_name(); callers must pass the canonical
- * stored account name. Resets all accounts only when `account` is NULL.
- * Invalid non-NULL input fails with ERR_INVALID_ARGS before runtime I/O.
- * Returns 0 on success.
+ * cleared and its managed names detached without proving process death; that
+ * recorded process and its preexisting connections may remain. A reachable
+ * sidecar-less endpoint has no trusted process identity that can authorize
+ * bounded termination or namespace removal: reset fails and retains its
+ * socket and matching current.sock as retry evidence. Resets a single account
+ * when `account` is a nonempty name accepted by validate_name(); callers must
+ * pass the canonical stored account name. Resets all accounts only when
+ * `account` is NULL. Invalid non-NULL input fails with ERR_INVALID_ARGS before
+ * runtime I/O. Returns 0 on success.
  */
 int ssh_manager_reset(const char *account);
 

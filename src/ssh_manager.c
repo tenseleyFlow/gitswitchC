@@ -10169,81 +10169,6 @@ static int prove_malformed_pid_socket_dead_at(
     return 0;
 }
 
-static int prove_sidecarless_agent_endpoint(
-    int dir_fd, const char *socket_dir, const char *socket_name,
-    const char *socket_path, const char *pid_name,
-    const ssh_runtime_pin_t *socket_pin, bool socket_present) {
-    ssh_agent_connection_t connection;
-    struct stat held_dir;
-    struct stat held_after;
-    struct stat appeared;
-    uint32_t identity_count;
-    int64_t deadline;
-    int rc = -1;
-
-    connection.fd = -1;
-    if (!socket_present || !socket_pin ||
-        !S_ISSOCK(socket_pin->identity.st_mode) ||
-        socket_pin->identity.st_uid != getuid() ||
-        (socket_pin->identity.st_mode & 0777) != 0600 ||
-        socket_pin->identity.st_nlink !=
-            (socket_pin->anchor[0] != '\0' ? 2 : 1) ||
-        fstat(dir_fd, &held_dir) != 0 ||
-        !S_ISDIR(held_dir.st_mode) || held_dir.st_uid != getuid() ||
-        (held_dir.st_mode & 0777) != 0700 ||
-        verify_socket_dir_namespace(dir_fd, socket_dir) != 0 ||
-        verify_ssh_runtime_pin_at(
-            dir_fd, socket_name, socket_path, socket_pin) != 0) {
-        set_error(ERR_SSH_AGENT_FAILED,
-                  "Sidecar-less SSH endpoint ownership is uncertain; "
-                  "retained for retry: %s", socket_path);
-        return -1;
-    }
-    if (fstatat(dir_fd, pid_name, &appeared, AT_SYMLINK_NOFOLLOW) == 0 ||
-        errno != ENOENT) {
-        set_error(ERR_SSH_AGENT_FAILED,
-                  "SSH PID sidecar appeared during endpoint inspection; "
-                  "retained for retry: %s", socket_path);
-        return -1;
-    }
-    if (open_socket_peer(socket_path, dir_fd, &connection) != 0 ||
-        connection.peer_uid != getuid() ||
-        ssh_agent_deadline(&deadline) != 0 ||
-        ssh_agent_request_identities(
-            connection.fd, deadline, &identity_count) != 0) {
-        set_error(ERR_SSH_AGENT_FAILED,
-                  "Sidecar-less socket did not prove a same-user SSH agent "
-                  "endpoint; retained for retry: %s", socket_path);
-        goto out;
-    }
-    (void)identity_count;
-    if (fstat(dir_fd, &held_after) != 0 ||
-        !same_runtime_revision(&held_dir, &held_after) ||
-        verify_socket_dir_namespace(dir_fd, socket_dir) != 0 ||
-        verify_ssh_runtime_pin_at(
-            dir_fd, socket_name, socket_path, socket_pin) != 0 ||
-        fstatat(dir_fd, pid_name, &appeared, AT_SYMLINK_NOFOLLOW) == 0 ||
-        errno != ENOENT) {
-        set_error(ERR_SSH_AGENT_FAILED,
-                  "Sidecar-less SSH endpoint changed during inspection; "
-                  "retained for retry: %s", socket_path);
-        goto out;
-    }
-    rc = 0;
-out:
-    if (connection.fd >= 0) {
-        int operation_errno = errno;
-
-        if (close(connection.fd) != 0 && rc == 0) {
-            log_warning(
-                "Failed to close the SSH agent connection after confirmed "
-                "key retirement; retirement proof remains valid");
-        }
-        if (rc != 0) errno = operation_errno;
-    }
-    return rc;
-}
-
 static int retire_recorded_agent_endpoint(
     int dir_fd, const char *socket_dir, const char *socket_name,
     const char *socket_path, const char *pid_name,
@@ -11867,10 +11792,11 @@ static int ssh_reset_incomplete(void) {
 
 /* Tear down isolated SSH agents: one account, or all when account is NULL.
  * Terminate a recorded process only through a safe descriptor-backed signal;
- * otherwise an exact eligible endpoint may be cleared and detached without a
- * process-death claim. A sidecar-less endpoint authorizes namespace detachment
- * only after a read-only protocol proof. Every lock, identity/reap, protocol,
- * and relevant unlink failure is fatal; missing owned state is idempotent. */
+ * otherwise an exact eligible recorded endpoint may be cleared and detached
+ * without a process-death claim. A reachable sidecar-less endpoint has no
+ * process identity that can authorize teardown, so retain its recovery
+ * evidence and fail for retry. Every lock, identity/reap, protocol, and
+ * relevant unlink failure is fatal; missing owned state is idempotent. */
 int ssh_manager_reset(const char *account) {
     char socket_dir[MAX_PATH_LEN];
     bool absent = false;
@@ -11923,10 +11849,8 @@ int ssh_manager_reset(const char *account) {
     ssh_current_link_identity_t current_identity;
     bool failed = false;
     bool can_remove_runtime = true;
-    bool sidecarless_endpoint_proved = false;
     bool recorded_endpoint_retired = false;
     bool recorded_endpoint_detached = false;
-    bool socket_detached = false;
     bool socket_present = false;
     ssh_runtime_pin_t pid_pin;
     ssh_runtime_pin_t socket_pin;
@@ -12046,14 +11970,11 @@ int ssh_manager_reset(const char *account) {
             failed = true;
             can_remove_runtime = false;
         } else if (reachable) {
-            if (prove_sidecarless_agent_endpoint(
-                    dir_fd, socket_dir, sock_name, sock_path, pid_name,
-                    &socket_pin, socket_present) != 0) {
-                failed = true;
-                can_remove_runtime = false;
-            } else {
-                sidecarless_endpoint_proved = true;
-            }
+            set_error(ERR_SSH_AGENT_FAILED,
+                      "Reachable SSH agent socket has no safely matched PID; "
+                      "retained for retry: %s", sock_path);
+            failed = true;
+            can_remove_runtime = false;
         }
     }
 
@@ -12139,7 +12060,6 @@ int ssh_manager_reset(const char *account) {
             failed = true;
         } else {
             socket_removed = true;
-            socket_detached = socket_present;
             recorded_endpoint_detached =
                 recorded_endpoint_retired && socket_present;
         }
@@ -12161,13 +12081,6 @@ int ssh_manager_reset(const char *account) {
         warn_recorded_endpoint_retirement(
             sock_path, recorded_endpoint_detached);
     }
-    if (sidecarless_endpoint_proved && socket_detached) {
-        log_warning(
-            "Detached a sidecar-less SSH agent endpoint after a read-only "
-            "protocol proof; preexisting connections and the agent process "
-            "may remain active");
-    }
-
     if (release_ssh_runtime_pin(dir_fd, &pid_pin) != 0) failed = true;
     if (release_ssh_runtime_pin(dir_fd, &socket_pin) != 0) failed = true;
     unlock_agent_dir(lock_fd);
@@ -12178,8 +12091,9 @@ int ssh_manager_reset(const char *account) {
 /* Retire orphaned gitswitch ssh-agent state from previous runs. Recorded
  * processes are signaled only through a descriptor-backed proof; eligible
  * native endpoints may instead have identities cleared and managed names
- * detached. Sidecar-less agents permit namespace detachment only after a
- * read-only protocol proof. Only operates inside our own 0700 directory.
+ * detached. Reachable sidecar-less agents are retained because their endpoint
+ * alone cannot prove bounded process termination. Only operates inside our
+ * own 0700 directory.
  * If keep_account is non-NULL, that account's live agent + sidecar are left
  * intact while every other account is considered for retirement. */
 static int kill_orphaned_gitswitch_agents(int dir_fd, const char *socket_dir,
@@ -12455,8 +12369,6 @@ static int kill_orphaned_gitswitch_agents(int dir_fd, const char *socket_dir,
         size_t nlen = strlen(name);
         char full[MAX_PATH_LEN];
         ssh_runtime_pin_t artifact_pin;
-        bool sidecarless_endpoint_proved = false;
-
         ssh_runtime_pin_init(&artifact_pin);
 
         if (strncmp(name, "ssh-agent.", 10) != 0 ||
@@ -12518,9 +12430,9 @@ static int kill_orphaned_gitswitch_agents(int dir_fd, const char *socket_dir,
                 continue;
             }
 
-            /* A sidecar-less same-user SSH agent can authorize namespace
-             * detachment through a read-only identities request on the exact
-             * pinned endpoint. Other listeners remain non-destructive. */
+            /* Without a trusted process record, a reachable endpoint cannot
+             * authorize signaling or namespace removal. Preserve the exact
+             * pinned socket (and current.sock below) as retry evidence. */
             bool reachable = false;
             if (verify_socket_dir_namespace(dir_fd, socket_dir) != 0 ||
                 verify_ssh_runtime_pin_at(
@@ -12536,10 +12448,10 @@ static int kill_orphaned_gitswitch_agents(int dir_fd, const char *socket_dir,
                 }
                 continue;
             }
-            if (reachable &&
-                prove_sidecarless_agent_endpoint(
-                    dir_fd, socket_dir, name, full, pid_name,
-                    &artifact_pin, true) != 0) {
+            if (reachable) {
+                set_error(ERR_SSH_AGENT_FAILED,
+                          "Reachable SSH agent socket has no safely matched "
+                          "PID; retained for retry: %s", full);
                 failed = true;
                 if (release_ssh_runtime_pin(
                         dir_fd, &artifact_pin) != 0) {
@@ -12547,21 +12459,12 @@ static int kill_orphaned_gitswitch_agents(int dir_fd, const char *socket_dir,
                 }
                 continue;
             }
-            if (reachable) {
-                sidecarless_endpoint_proved = true;
-            }
         }
         if (unlink_ssh_reset_path_at(dir_fd, name, full,
                                      "SSH agent artifact",
                                      &artifact_pin,
                                      true) != 0) {
             failed = true;
-        } else if (sidecarless_endpoint_proved) {
-            log_warning(
-                "Detached sidecar-less SSH agent endpoint %s after read-only "
-                "protocol proof; preexisting connections and the agent "
-                "process may remain active",
-                full);
         }
         if (release_ssh_runtime_pin(dir_fd, &artifact_pin) != 0) failed = true;
     }

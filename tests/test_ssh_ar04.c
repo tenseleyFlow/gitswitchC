@@ -1605,10 +1605,10 @@ TEST(reset_all_aggregates_failures_and_continues) {
     CHECK_EQ_INT(ssh_manager_reset(NULL), 0);
 }
 
-/* A sidecar-less endpoint can be detached only after the exact pinned,
- * same-user listener answers a read-only SSH-agent identities request. The
- * process is deliberately not signaled and can outlive the namespace. */
-TEST(targeted_reset_detaches_live_agent_when_sidecar_is_missing) {
+/* A live sidecar-less endpoint has no trusted process identity that can
+ * authorize bounded termination. Reset must fail and retain both entry points
+ * so the still-live agent remains visible and retryable. */
+TEST(targeted_reset_retains_live_agent_when_sidecar_is_missing) {
     char agent_dir[128], sock[192], current[192], pidfile[192];
     pid_t pid = -1;
     int start_rc;
@@ -1628,10 +1628,12 @@ TEST(targeted_reset_detaches_live_agent_when_sidecar_is_missing) {
     snprintf(pidfile, sizeof(pidfile), "%s/ssh-agent.work.pid", agent_dir);
     CHECK(!entry_exists(pidfile));
 
-    CHECK_EQ_INT(ssh_manager_reset("work"), 0);
+    CHECK_EQ_INT(ssh_manager_reset("work"), -1);
     CHECK_EQ_INT(kill(pid, 0), 0);
-    CHECK(!entry_exists(sock));
-    CHECK(!entry_exists(current));
+    CHECK(entry_exists(sock));
+    CHECK(entry_exists(current));
+    CHECK(strstr(get_last_error()->message,
+                 "no safely matched PID") != NULL);
 
     stop_real_agent(pid, sock, current);
 }
@@ -1653,7 +1655,7 @@ TEST(targeted_reset_retains_sidecarless_non_agent_listener) {
     CHECK(entry_exists(sock));
     CHECK(entry_exists(current));
     CHECK(strstr(get_last_error()->message,
-                 "same-user SSH agent endpoint") != NULL);
+                 "no safely matched PID") != NULL);
 
     CHECK_EQ_INT(close(listener), 0);
     CHECK_EQ_INT(ssh_manager_reset("work"), 0);
@@ -1773,9 +1775,10 @@ TEST(targeted_reset_preserves_live_socket_when_sidecar_pid_is_bystander) {
     CHECK(!entry_exists(pidfile));
 }
 
-/* Reset-all applies the same read-only protocol proof and namespace-only
- * detachment without claiming that the process was killed. */
-TEST(reset_all_detaches_live_agent_when_sidecar_is_missing) {
+/* Reset-all has the same fail-closed contract: a reachable sidecar-less agent
+ * remains live, but that necessarily means reset fails with its socket and
+ * stable recovery entry still intact. */
+TEST(reset_all_retains_live_agent_when_sidecar_is_missing) {
     char agent_dir[128], sock[192], current[192], pidfile[192];
     pid_t pid = -1;
     int start_rc;
@@ -1795,10 +1798,12 @@ TEST(reset_all_detaches_live_agent_when_sidecar_is_missing) {
     snprintf(pidfile, sizeof(pidfile), "%s/ssh-agent.personal.pid", agent_dir);
     CHECK(!entry_exists(pidfile));
 
-    CHECK_EQ_INT(ssh_manager_reset(NULL), 0);
+    CHECK_EQ_INT(ssh_manager_reset(NULL), -1);
     CHECK_EQ_INT(kill(pid, 0), 0);
-    CHECK(!entry_exists(sock));
-    CHECK(!entry_exists(current));
+    CHECK(entry_exists(sock));
+    CHECK(entry_exists(current));
+    CHECK(strstr(get_last_error()->message,
+                 "no safely matched PID") != NULL);
 
     stop_real_agent(pid, sock, current);
 }
@@ -1938,11 +1943,11 @@ int main(int argc, char **argv) {
     RUN_TEST(reset_reports_socket_unlink_failure_and_retains_current);
     RUN_TEST(reset_reports_stable_link_cleanup_failure);
     RUN_TEST(reset_all_aggregates_failures_and_continues);
-    RUN_TEST(targeted_reset_detaches_live_agent_when_sidecar_is_missing);
+    RUN_TEST(targeted_reset_retains_live_agent_when_sidecar_is_missing);
     RUN_TEST(targeted_reset_retains_sidecarless_non_agent_listener);
     RUN_TEST(targeted_reset_never_reaps_embedded_nul_pid_prefix);
     RUN_TEST(targeted_reset_preserves_live_socket_when_sidecar_pid_is_bystander);
-    RUN_TEST(reset_all_detaches_live_agent_when_sidecar_is_missing);
+    RUN_TEST(reset_all_retains_live_agent_when_sidecar_is_missing);
 #ifdef __APPLE__
     RUN_TEST(darwin_reset_retires_managed_agent_endpoint_without_process_claim);
     RUN_TEST(darwin_reset_retains_non_agent_listener_with_valid_process_record);
