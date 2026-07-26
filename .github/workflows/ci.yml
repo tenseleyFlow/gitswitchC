@@ -44,6 +44,8 @@ jobs:
       # no-op command text.
       - name: Verify GNU Make package provenance
         run: /usr/bin/dpkg --verify make
+      - name: Behavioral coverage policy
+        run: COVERAGE_POLICY_MAKE=/usr/bin/make /bin/sh tests/test_coverage.sh --static Makefile
       - name: Shell assets (ShellCheck + native parsers)
         run: /usr/bin/make shell-static-test
       # Fast textual tripwire only — headers included, but whitespace variants,

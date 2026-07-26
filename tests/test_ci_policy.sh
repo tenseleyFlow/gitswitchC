@@ -388,6 +388,9 @@ check_policy()
                 (command ~ /\/usr\/(local\/)?bin\/g?make/ &&
                  command !~ /^\/usr\/bin\/make([[:space:]]|$)/)
         }
+        function is_linux_coverage_policy_gate(command) {
+            return command == "COVERAGE_POLICY_MAKE=/usr/bin/make /bin/sh tests/test_coverage.sh --static Makefile"
+        }
         function record_block_command(raw_line, source, line, i, c, escaped,
                                       quote_at_start, continued_at_start,
                                       depth_at_start, eligible) {
@@ -436,7 +439,9 @@ check_policy()
                  shell_code ~ /^shopt[[:space:]].*expand_aliases/))
                 step_unsafe_script = 1
             if (source == "direct" && required_release_job(current_job) &&
-                mutates_executable_resolution(shell_code))
+                mutates_executable_resolution(shell_code) &&
+                !(current_job == "linux" &&
+                  is_linux_coverage_policy_gate(shell_code)))
                 release_job_resolver_mutation[current_job] = 1
             if (required_release_job(current_job) &&
                 shell_code ~ /GITHUB_(ENV|PATH)/)
@@ -489,7 +494,9 @@ check_policy()
                 scalar_value ~ /GITHUB_(ENV|PATH)/)
                 release_job_dynamic_env[current_job] = 1
             if (source == "direct" && required_release_job(current_job) &&
-                mutates_executable_resolution(scalar_value))
+                mutates_executable_resolution(scalar_value) &&
+                !(current_job == "linux" &&
+                  is_linux_coverage_policy_gate(scalar_value)))
                 release_job_resolver_mutation[current_job] = 1
             add_step_command(scalar_value, source, 1)
         }
@@ -535,6 +542,8 @@ check_policy()
                         linux_first_make_serial = step_command_serial[i]
                     if (command == "/usr/bin/dpkg --verify make")
                         gate = "linux-make-provenance"
+                    else if (is_linux_coverage_policy_gate(command))
+                        gate = "linux-coverage-policy"
                     else if (command == "/bin/sh tests/test_ci_policy.sh .")
                         gate = "linux-policy"
                     else if (command == "/usr/bin/make coverage") {
@@ -1416,6 +1425,7 @@ check_policy()
             close_permissions()
             close_job()
             require_release_gate("linux-make-provenance")
+            require_release_gate("linux-coverage-policy")
             require_release_gate("linux-policy")
             require_release_gate("linux-asan-test")
             require_release_gate("linux-memcheck")
@@ -1470,6 +1480,8 @@ check_policy()
                 reject("Linux CI policy validation must precede every make invocation")
             if (checkout_step_serial["linux"] + 1 != release_gate_step_serial["linux-policy"])
                 reject("Linux CI policy self-check must immediately follow checkout")
+            if (release_gate_step_serial["linux-make-provenance"] + 1 != release_gate_step_serial["linux-coverage-policy"])
+                reject("Linux behavioral coverage policy must immediately follow Make provenance")
             if (linux_unqualified_make)
                 reject("Linux build commands must use verified /usr/bin/make")
             if (macos_unqualified_make)
@@ -1487,7 +1499,8 @@ check_policy()
                 release_gate_step_serial["linux-clang-test"] + 1 != release_gate_step_serial["linux-clang-artifact"])
                 reject("Linux clang release provenance gates must remain adjacent")
             require_release_order("linux-policy", "linux-make-provenance")
-            require_release_order("linux-make-provenance", "linux-coverage")
+            require_release_order("linux-make-provenance", "linux-coverage-policy")
+            require_release_order("linux-coverage-policy", "linux-coverage")
             require_release_order("linux-coverage", "linux-coverage-provenance")
             require_release_order("linux-coverage-provenance", "linux-gcc-clean")
             require_release_order("linux-gcc-clean", "linux-gcc-test")
@@ -1735,6 +1748,15 @@ fi
 root=$1
 workflow=$root/.github/workflows/ci.yml
 today=${GITSWITCH_CI_POLICY_DATE-$(date -u +%F)}
+coverage_contract=$root/tests/test_coverage.sh
+
+# This gate runs directly in CI before Make. Keep the coverage Makefile
+# contract independently enforceable even when a Make error-control directive
+# would otherwise suppress its own recipe status.
+[ -f "$coverage_contract" ] ||
+    fail "coverage contract not found: $coverage_contract"
+/bin/sh "$coverage_contract" --source-static "$root/Makefile" ||
+    fail "coverage Makefile static contract failed"
 
 tmp=$(mktemp -d "${TMPDIR:-/tmp}/gitswitch-ci-policy.XXXXXX") ||
     fail "cannot create policy fixture directory"
@@ -1753,6 +1775,79 @@ check_policy "$workflow" "$today"
 # Mutation-sensitive controls make this a policy gate, not a grep that merely
 # happens to accept the current workflow.
 script=$(CDPATH='' cd "$(dirname "$0")" && pwd)/$(basename "$0")
+
+# The behavioral Make probe is trusted only after package provenance. Removing
+# it or moving it ahead of verification must make the policy checker fail.
+awk '
+    $0 == "      - name: Behavioral coverage policy" && !changed {
+        changed = 1
+        next
+    }
+    changed == 1 &&
+        $0 == "        run: COVERAGE_POLICY_MAKE=/usr/bin/make /bin/sh tests/test_coverage.sh --static Makefile" {
+        changed = 2
+        next
+    }
+    { print }
+    END { if (changed != 2) exit 1 }
+' "$workflow" >"$tmp/missing-coverage-policy.yml"
+expect_rejected "removed behavioral coverage policy" \
+    "$tmp/missing-coverage-policy.yml" "$today"
+
+awk '
+    $0 == "      - name: Verify GNU Make package provenance" && !moved {
+        saw_provenance_name = 1
+        next
+    }
+    saw_provenance_name &&
+        $0 == "        run: /usr/bin/dpkg --verify make" && !moved {
+        print "      - name: Behavioral coverage policy"
+        print "        run: COVERAGE_POLICY_MAKE=/usr/bin/make /bin/sh tests/test_coverage.sh --static Makefile"
+        print "      - name: Verify GNU Make package provenance"
+        print "        run: /usr/bin/dpkg --verify make"
+        moved = 1
+        next
+    }
+    moved == 1 && $0 == "      - name: Behavioral coverage policy" {
+        skipped_name = 1
+        next
+    }
+    skipped_name &&
+        $0 == "        run: COVERAGE_POLICY_MAKE=/usr/bin/make /bin/sh tests/test_coverage.sh --static Makefile" {
+        skipped_run = 1
+        next
+    }
+    { print }
+    END {
+        if (!saw_provenance_name || !moved ||
+            !skipped_name || !skipped_run) exit 1
+    }
+' "$workflow" >"$tmp/reordered-coverage-policy.yml"
+expect_rejected "behavioral coverage policy before Make provenance" \
+    "$tmp/reordered-coverage-policy.yml" "$today"
+
+add_release_step_field linux \
+    "COVERAGE_POLICY_MAKE=/usr/bin/make /bin/sh tests/test_coverage.sh --static Makefile" \
+    "continue-on-error: true" "$tmp/ignored-coverage-policy.yml"
+expect_structural_rejected_for "ignored behavioral coverage policy failure" \
+    "$tmp/ignored-coverage-policy.yml" "$today" \
+    "required release gate step cannot continue on error"
+
+awk '
+    $0 == "        run: COVERAGE_POLICY_MAKE=/usr/bin/make /bin/sh tests/test_coverage.sh --static Makefile" &&
+        !changed {
+        print "        run: |"
+        print "          COVERAGE_POLICY_MAKE=/usr/bin/make /bin/sh tests/test_coverage.sh --static Makefile"
+        print "          true"
+        changed = 1
+        next
+    }
+    { print }
+    END { if (!changed) exit 1 }
+' "$workflow" >"$tmp/extra-command-coverage-policy.yml"
+expect_structural_rejected_for "extra behavioral coverage policy command" \
+    "$tmp/extra-command-coverage-policy.yml" "$today" \
+    "required release gate must be the sole command in its step"
 
 # A full, immutable SHA is necessary but not sufficient for the foundational
 # checkout action. All required jobs must use the single reviewed release,
@@ -2337,6 +2432,7 @@ while IFS='|' read -r matrix_job matrix_gate matrix_command; do
         "missing or duplicate exact release gate: $matrix_gate"
 done <<'EOF'
 linux|linux-make-provenance|/usr/bin/dpkg --verify make
+linux|linux-coverage-policy|COVERAGE_POLICY_MAKE=/usr/bin/make /bin/sh tests/test_coverage.sh --static Makefile
 linux|linux-policy|/bin/sh tests/test_ci_policy.sh .
 linux|linux-coverage|/usr/bin/make coverage
 linux|linux-gcc-test|/usr/bin/make BUILD_TYPE=release READLINE=1 WERROR=1 test

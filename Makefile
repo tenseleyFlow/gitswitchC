@@ -1745,13 +1745,37 @@ ci-policy-test:
 public-api-coverage-test:
 	@PUBLIC_API_CC="$(CC)" sh $(TESTDIR)/test_public_api_coverage.sh "$(CURDIR)"
 
-# The small contract fixture proves both threshold metrics are wired to gcovr's
-# documented nonzero exit bits; a no-op or report-only replacement cannot make
-# the real coverage lane falsely green.
+# Bind the checked-in coverage floors and the real threshold recipe to gcovr's
+# documented exit bits. Causal mutation witnesses reject either missing metric
+# flag or a weakened floor, including lookalike flags outside this target.
 .PHONY: coverage-contract-test
+# A global/targeted .IGNORE can discard the contract process's nonzero status.
+# Keep this awk scan as a fast literal defense-in-depth tripwire over the
+# complete top-level file (including later directives) plus loaded depfiles.
+# The post-provenance behavioral CI gate is authoritative for computed and
+# effective GNU Make semantics that a textual scan cannot prove.
+ifneq ($(strip $(filter coverage coverage-contract-test,$(MAKECMDGOALS))),)
+    override COVERAGE_UNSAFE_MAKE_SEMANTICS := $(shell awk \
+	'{ line = $$0; sub(/[[:space:]]*\043.*/, "", line); \
+	  if (index(line, "." "IGNORE") != 0 || \
+	      index(line, "." "ONESHELL") != 0 || \
+	      index(line, sprintf("%c%c", 36, 40) "eval") != 0 || \
+	      line ~ /(^|[[:space:]:])(MAKEFLAGS|MFLAGS|SHELL|[.]SHELLFLAGS)[[:space:]]*(\?|:|\+)?=/) { \
+	      print "unsafe"; exit \
+	  } \
+	}' $(MAKEFILE_LIST))
+    ifneq ($(strip $(COVERAGE_UNSAFE_MAKE_SEMANTICS)),)
+        $(error coverage targets forbid Make error-control directives or assignments)
+    endif
+endif
+# Export effective floors as environment data instead of interpolating them
+# into shell syntax. Recursive target-specific values observe even a later
+# assignment, while the script validates their numeric range before use.
+coverage-contract-test: export COVERAGE_CONTRACT_LINES = $(COVERAGE_MIN_LINES)
+coverage-contract-test: export COVERAGE_CONTRACT_BRANCHES = $(COVERAGE_MIN_BRANCHES)
 coverage-contract-test:
 	@COVERAGE_CC="$(COVERAGE_CC)" COVERAGE_GCOV="$(COVERAGE_GCOV)" \
-		GCOVR="$(GCOVR)" sh tests/test_coverage.sh
+		GCOVR="$(GCOVR)" sh tests/test_coverage.sh Makefile
 
 .PHONY: coverage
 coverage: coverage-contract-test
