@@ -4288,8 +4288,40 @@ int ssh_list_keys(ssh_config_t *ssh_config, char *output, size_t output_size) {
                   "SSH key listing contained invalid binary data");
         return -1;
     }
-    if (rc != 0) {
+    if (rc != 0 && result.spawned && !result.timed_out &&
+        result.term_signal == 0 && result.exit_code == 1) {
         safe_strncpy(output, "No keys loaded in SSH agent", output_size);
+        return -1;
+    }
+    if (rc != 0) {
+        const char *outcome;
+        char outcome_detail[64];
+
+        output[0] = '\0';
+        if (result.timed_out) {
+            outcome = result.spawned
+                ? "timed out"
+                : "timed out before it could be started";
+        } else if (!result.spawned) {
+            outcome = "could not be started";
+        } else if (result.term_signal != 0) {
+            (void)snprintf(outcome_detail, sizeof(outcome_detail),
+                           "was terminated by signal %d",
+                           result.term_signal);
+            outcome = outcome_detail;
+        } else if (result.exit_code >= 0) {
+            (void)snprintf(outcome_detail, sizeof(outcome_detail),
+                           "exited with status %d", result.exit_code);
+            outcome = outcome_detail;
+        } else {
+            outcome = "did not complete normally";
+        }
+        set_error(ERR_SSH_AGENT_FAILED,
+                  "SSH key listing failed: ssh-add %s "
+                  "(spawned=%s, timed_out=%s, signal=%d, exit_status=%d)",
+                  outcome, result.spawned ? "true" : "false",
+                  result.timed_out ? "true" : "false",
+                  result.term_signal, result.exit_code);
         return -1;
     }
 
