@@ -259,6 +259,7 @@ TEST(all_retained_public_apis_compile_and_link) {
     REQUIRE_PUBLIC_API(gpg_manager_set_agent_conf_precommit_fn);
     REQUIRE_PUBLIC_API(gpg_manager_set_agent_conf_preopen_fn);
     REQUIRE_PUBLIC_API(gpg_manager_set_agent_conf_sync_fn);
+    REQUIRE_PUBLIC_API(gpg_manager_set_agent_conf_postclose_fn);
     REQUIRE_PUBLIC_API(gpg_manager_set_base_warning_probe_fn);
     REQUIRE_PUBLIC_API(gpg_manager_set_cleanup_predelete_fn);
     REQUIRE_PUBLIC_API(gpg_manager_set_identity_unlink_fn);

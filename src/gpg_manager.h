@@ -143,6 +143,9 @@ typedef int (*gpg_identity_unlink_fn)(int dir_fd, const char *name,
  * restores the native statx/fsid and fsync implementations. */
 typedef int (*gpg_mount_identity_probe_fn)(int fd, uint64_t *identity);
 typedef int (*gpg_agent_conf_sync_fn)(int fd, bool directory);
+/* Deterministic close-to-path-stat race seam for the exact config proof.
+ * Production leaves it NULL. */
+typedef int (*gpg_agent_conf_postclose_fn)(int home_fd);
 /* Exact-descriptor probe for the isolated base's storage policy. Return zero
  * and set `memory_backed`, or return -1 with errno on an unknown/error state.
  * NULL restores the native fstatfs implementation. */
@@ -194,6 +197,9 @@ gpg_mount_identity_probe_fn
 gpg_manager_set_mount_identity_probe_fn(gpg_mount_identity_probe_fn fn);
 gpg_agent_conf_sync_fn
 gpg_manager_set_agent_conf_sync_fn(gpg_agent_conf_sync_fn fn);
+gpg_agent_conf_postclose_fn
+gpg_manager_set_agent_conf_postclose_fn(
+    gpg_agent_conf_postclose_fn fn);
 gpg_memory_backed_probe_fn
 gpg_manager_set_memory_backed_probe_fn(gpg_memory_backed_probe_fn fn);
 gpg_base_warning_probe_fn
