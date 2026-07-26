@@ -222,6 +222,21 @@ static int m17_make_dir(const char *path) {
     return mkdir(path, 0700) == 0 ? 0 : -1;
 }
 
+static int m17_fixture_setup_failure(const char *stage, int detail) {
+    const error_context_t *error = get_last_error();
+    int saved_errno = errno;
+
+    fprintf(stderr,
+            "m17 fixture setup failure: stage=%s detail=%d errno=%d "
+            "error=%d system_errno=%d message=%s\n",
+            stage ? stage : "unknown", detail, saved_errno,
+            error ? (int)error->code : -1,
+            error ? error->system_errno : 0,
+            error && error->message[0] ? error->message : "(none)");
+    errno = saved_errno;
+    return -1;
+}
+
 static int m17_git_config(const char *path, const char *operation,
                           const char *key, const char *value) {
     const char *argv[10];
@@ -371,7 +386,10 @@ static int m17_fixture_setup(m17_fixture_t *fixture,
     char config_body[2U * MAX_PATH_LEN];
     int written;
 
-    if (!fixture || (with_ledger && !credentialled)) return -1;
+    if (!fixture || (with_ledger && !credentialled)) {
+        errno = EINVAL;
+        return m17_fixture_setup_failure("arguments", -1);
+    }
     memset(fixture, 0, sizeof(*fixture));
     if (!ts_mkdtemp_trusted(fixture->root, sizeof(fixture->root),
                             "gsw-ar11-m17") ||
@@ -406,7 +424,7 @@ static int m17_fixture_setup(m17_fixture_t *fixture,
                       "%s/id_key", fixture->home) != 0 ||
         m17_make_dir(fixture->home) != 0 ||
         m17_make_dir(fixture->runtime) != 0) {
-        return -1;
+        return m17_fixture_setup_failure("root-paths-and-directories", -1);
     }
     {
         char config_parent[MAX_PATH_LEN];
@@ -415,32 +433,44 @@ static int m17_fixture_setup(m17_fixture_t *fixture,
                           "%s/.config", fixture->home) != 0 ||
             m17_make_dir(config_parent) != 0 ||
             m17_make_dir(fixture->config_dir) != 0) {
-            return -1;
+            return m17_fixture_setup_failure("config-directories", -1);
         }
     }
     if (m17_write_file(fixture->ssh_program, ssh_program_body,
-                       sizeof(ssh_program_body) - 1U, 0700) != 0 ||
-        (credentialled && m17_generate_ssh_key(fixture->ssh_key) != 0) ||
-        (credentialled && m17_build_ssh_command(fixture) != 0)) {
-        return -1;
+                       sizeof(ssh_program_body) - 1U, 0700) != 0) {
+        return m17_fixture_setup_failure("ssh-program-write", -1);
+    }
+    if (credentialled) {
+        int key_result = m17_generate_ssh_key(fixture->ssh_key);
+
+        if (key_result != 0) {
+            return m17_fixture_setup_failure("ssh-keygen", key_result);
+        }
+        if (m17_build_ssh_command(fixture) != 0) {
+            return m17_fixture_setup_failure("ssh-command-build", -1);
+        }
     }
     for (size_t i = 0U; i < 2U; i++) {
         int git_result;
 
         if (m17_write_file(fixture->git_paths[i], git_marker,
                            sizeof(git_marker) - 1U, 0600) != 0) {
-            return -1;
+            return m17_fixture_setup_failure("git-config-write", (int)i);
         }
         git_result = credentialled
                          ? m17_git_config(fixture->git_paths[i], "--add",
                                           GIT_CONFIG_CORE_SSHCOMMAND,
                                           fixture->ssh_command)
                          : 0;
-        if (git_result != 0) return -1;
+        if (git_result != 0) {
+            return m17_fixture_setup_failure(
+                i == 0U ? "git-config-add-0" : "git-config-add-1",
+                git_result);
+        }
     }
     if (m17_write_file(fixture->replacement_path, replacement,
                        sizeof(replacement) - 1U, 0600) != 0) {
-        return -1;
+        return m17_fixture_setup_failure("replacement-write", -1);
     }
     written = snprintf(
         config_body, sizeof(config_body),
@@ -459,14 +489,22 @@ static int m17_fixture_setup(m17_fixture_t *fixture,
         credentialled ? "\"\n" : "");
     if (written < 0 || (size_t)written >= sizeof(config_body) ||
         m17_write_text(fixture->accounts_path, config_body, 0600) != 0) {
-        return -1;
+        return m17_fixture_setup_failure("accounts-write", written);
     }
     if (with_ledger) {
         for (size_t i = 0U; i < 2U; i++) {
-            if (m17_make_record(fixture, i) != 0) return -1;
+            if (m17_make_record(fixture, i) != 0) {
+                return m17_fixture_setup_failure(
+                    i == 0U ? "publication-record-0"
+                            : "publication-record-1",
+                    -1);
+            }
         }
     }
-    return m17_write_state(fixture, with_ledger, credentialled);
+    if (m17_write_state(fixture, with_ledger, credentialled) != 0) {
+        return m17_fixture_setup_failure("state-write", -1);
+    }
+    return 0;
 }
 
 static int m17_multi_account_fixture_setup(m17_fixture_t *fixture) {
@@ -551,6 +589,10 @@ static bool m17_retirement_hook(git_retirement_test_stage_t stage,
     if (!path || strcmp(path, m17_fault_path) != 0) return false;
     if (m17_fault == M17_FAULT_LOCKED_READ &&
         stage == GIT_RETIREMENT_TEST_LOCKED_READ) {
+        if (m17_cleanup_fault == M17_CLEANUP_GUARD_RESTORE) {
+            signals_test_fail_sigaction(
+                SIGTERM, SIGNALS_TEST_SIGACTION_RESTORE, EIO);
+        }
         m17_fault_observed = true;
         return true;
     }
@@ -600,6 +642,8 @@ static int m17_run_cli_with_cleanup_fault(
     pid_t child;
     int observed_pipe[2];
     int status;
+    char observed_marker = '0';
+    ssize_t got;
 
     if (!fixture || fault_path_index >= 2U) return -1;
     if (fault_observed) *fault_observed = false;
@@ -665,10 +709,7 @@ static int m17_run_cli_with_cleanup_fault(
             (void)git_ops_test_set_retirement_hook(
                 m17_retirement_hook);
         }
-        if (cleanup_fault == M17_CLEANUP_GUARD_RESTORE) {
-            signals_test_fail_sigaction(
-                SIGTERM, SIGNALS_TEST_SIGACTION_RESTORE, EIO);
-        } else if (cleanup_fault == M17_CLEANUP_OWNERSHIP_RELEASE) {
+        if (cleanup_fault == M17_CLEANUP_OWNERSHIP_RELEASE) {
             struct sigaction action;
 
             memset(&action, 0, sizeof(action));
@@ -726,19 +767,44 @@ static int m17_run_cli_with_cleanup_fault(
         _exit(rc);
     }
     (void)close(observed_pipe[1]);
-    {
-        char observed = '0';
-        ssize_t got;
-
-        do {
-            got = read(observed_pipe[0], &observed, 1U);
-        } while (got < 0 && errno == EINTR);
-        if (fault_observed && got == 1) {
-            *fault_observed = observed == '1';
-        }
+    do {
+        got = read(observed_pipe[0], &observed_marker, 1U);
+    } while (got < 0 && errno == EINTR);
+    if (fault_observed && got == 1) {
+        *fault_observed = observed_marker == '1';
     }
     (void)close(observed_pipe[0]);
     status = m17_wait_status(child);
+    if (fault != M17_FAULT_NONE &&
+        (got != 1 || observed_marker != '1')) {
+        m17_bytes_t output = {0};
+        int saved_errno = errno;
+
+        fprintf(stderr,
+                "m17 expected fault was not observed: command=%d fault=%d "
+                "cleanup=%d path_index=%zu pipe_bytes=%zd marker=%d "
+                "status=%d exited=%d exit_status=%d\n",
+                (int)command, (int)fault, (int)cleanup_fault,
+                fault_path_index, got,
+                got == 1 ? (int)observed_marker : -1,
+                status, status >= 0 && WIFEXITED(status),
+                status >= 0 && WIFEXITED(status) ? WEXITSTATUS(status) : -1);
+        if (m17_read_bytes(fixture->output_path, &output) == 0) {
+            fprintf(stderr, "m17 child output (%zu bytes):\n",
+                    output.length);
+            if (output.length > 0U) {
+                (void)fwrite(output.data, 1U, output.length, stderr);
+                if (output.data[output.length - 1U] != '\n') {
+                    (void)fputc('\n', stderr);
+                }
+            }
+            m17_bytes_clear(&output);
+        } else {
+            fprintf(stderr, "m17 child output could not be read: errno=%d\n",
+                    errno);
+        }
+        errno = saved_errno;
+    }
     return status;
 }
 
