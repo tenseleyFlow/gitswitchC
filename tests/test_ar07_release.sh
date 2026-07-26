@@ -3146,8 +3146,9 @@ EOF
     # remove the private workspace it actually created, and be reaped with that
     # exact signal before the outer publisher performs its own cleanup/death.
     internal_signal=TERM
-    internal_signal_number=$(kill -l "$internal_signal") ||
-        fail "cannot resolve internal archive fixture signal"
+    # POSIX kill -l accepts a numeric exit status; accepting a symbolic signal
+    # name is a bash extension that Ubuntu's /bin/sh (dash) rejects.
+    internal_signal_number=15
     internal_archive_tmp=$tmp/internal-archive-tmp
     internal_archive_ready=$tmp/internal-archive.ready
     internal_archive_cleanup=$tmp/internal-archive.cleanup
