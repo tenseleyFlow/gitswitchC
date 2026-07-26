@@ -110,6 +110,7 @@ typedef struct {
     char ssh_dir[MAX_PATH_LEN];
     char ssh_config[MAX_PATH_LEN];
     char ssh_command[PUBLICATION_SSH_COMMAND_MAX];
+    account_t account;
     publication_record_t record;
     publication_record_t shared_record;
     publication_record_t no_op_record;
@@ -413,6 +414,26 @@ static void m18_bytes_clear(m18_bytes_t *bytes) {
     memset(bytes, 0, sizeof(*bytes));
 }
 
+static int m18_build_ssh_command(m18_fixture_t *fixture) {
+    const char *path = getenv("PATH");
+    char *saved_path = path ? strdup(path) : NULL;
+    int result = -1;
+    int restore_result;
+
+    if (!fixture || (path && !saved_path) ||
+        setenv("PATH", fixture->home, 1) != 0) {
+        free(saved_path);
+        return -1;
+    }
+    result = git_expected_ssh_command(
+        &fixture->account, fixture->ssh_command,
+        sizeof(fixture->ssh_command));
+    restore_result = path ? setenv("PATH", saved_path, 1)
+                          : unsetenv("PATH");
+    free(saved_path);
+    return restore_result == 0 ? result : -1;
+}
+
 static bool m18_file_equals(const char *path,
                             const m18_bytes_t *expected) {
     m18_bytes_t observed = {0};
@@ -488,10 +509,6 @@ static int m18_fixture_setup(m18_fixture_t *fixture) {
         "  printf '%s\\n' \"$*\" >> \"$GITSWITCH_TEST_GIT_TRACE\"\n"
         "fi\n"
         "exec git \"$@\"\n";
-    /* The real runner rejects executables below a world-writable /tmp ancestor.
-     * Keep this fixture under the checked-out, same-uid workspace so its
-     * private git wrapper exercises the production trusted-PATH resolver. */
-    char root_template[] = ".gsw-ar11-m18-XXXXXX";
     char config_body[2U * MAX_PATH_LEN];
     char git_body[PUBLICATION_SSH_COMMAND_MAX + 128U];
     struct stat st;
@@ -499,9 +516,8 @@ static int m18_fixture_setup(m18_fixture_t *fixture) {
 
     if (!fixture) return -1;
     memset(fixture, 0, sizeof(*fixture));
-    if (!ts_mkdtemp(root_template) ||
-        safe_strncpy(fixture->root, root_template,
-                     sizeof(fixture->root)) != 0 ||
+    if (!ts_mkdtemp_trusted(fixture->root, sizeof(fixture->root),
+                            "gsw-ar11-m18") ||
         ts_canonicalize_dir_path(fixture->root,
                                  sizeof(fixture->root)) != 0 ||
         safe_snprintf(fixture->home, sizeof(fixture->home),
@@ -541,7 +557,7 @@ static int m18_fixture_setup(m18_fixture_t *fixture) {
                       "%s/git", fixture->home) != 0 ||
         safe_snprintf(fixture->ssh_program,
                       sizeof(fixture->ssh_program),
-                      "%s/ssh-program", fixture->home) != 0 ||
+                      "%s/ssh", fixture->home) != 0 ||
         safe_snprintf(fixture->ssh_key, sizeof(fixture->ssh_key),
                       "%s/id_key", fixture->home) != 0 ||
         safe_snprintf(fixture->ssh_dir, sizeof(fixture->ssh_dir),
@@ -559,11 +575,13 @@ static int m18_fixture_setup(m18_fixture_t *fixture) {
         m18_write_file(fixture->ssh_program, ssh_program_body,
                        sizeof(ssh_program_body) - 1U, 0700) != 0 ||
         m18_write_file(fixture->git_trace_path, "", 0U, 0600) != 0 ||
-        m18_generate_ssh_key(fixture->ssh_key) != 0 ||
-        safe_snprintf(fixture->ssh_command,
-                      sizeof(fixture->ssh_command),
-                      "'%s' -i '%s' -o IdentitiesOnly=yes",
-                      fixture->ssh_program, fixture->ssh_key) != 0) {
+        m18_generate_ssh_key(fixture->ssh_key) != 0) {
+        return -1;
+    }
+    fixture->account.ssh_enabled = true;
+    if (safe_strncpy(fixture->account.ssh_key_path, fixture->ssh_key,
+                     sizeof(fixture->account.ssh_key_path)) != 0 ||
+        m18_build_ssh_command(fixture) != 0) {
         return -1;
     }
     written = snprintf(git_body, sizeof(git_body),
