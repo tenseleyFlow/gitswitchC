@@ -255,6 +255,32 @@ static int m17_generate_ssh_key(const char *path) {
     return run_argv_real(argv, &opts, &result);
 }
 
+static int m17_build_ssh_command(m17_fixture_t *fixture) {
+    account_t account;
+    const char *path = getenv("PATH");
+    char *saved_path = path ? strdup(path) : NULL;
+    int result = -1;
+    int restore_result;
+
+    if (!fixture || (path && !saved_path) ||
+        setenv("PATH", fixture->root, 1) != 0) {
+        free(saved_path);
+        return -1;
+    }
+    memset(&account, 0, sizeof(account));
+    account.ssh_enabled = true;
+    if (safe_strncpy(account.ssh_key_path, fixture->ssh_key,
+                     sizeof(account.ssh_key_path)) == 0) {
+        result = git_expected_ssh_command(
+            &account, fixture->ssh_command,
+            sizeof(fixture->ssh_command));
+    }
+    restore_result = path ? setenv("PATH", saved_path, 1)
+                          : unsetenv("PATH");
+    free(saved_path);
+    return restore_result == 0 ? result : -1;
+}
+
 static int m17_make_record(m17_fixture_t *fixture, size_t index) {
     publication_record_t *record;
     struct stat st;
@@ -342,15 +368,13 @@ static int m17_fixture_setup(m17_fixture_t *fixture,
     static const char git_marker[] = "[fixture]\n\tmarker = keep\n";
     static const char replacement[] =
         "[fixture]\n\tmarker = external-replacement\n";
-    char root_template[] = "/tmp/gsw-ar11-m17-XXXXXX";
     char config_body[2U * MAX_PATH_LEN];
     int written;
 
     if (!fixture || (with_ledger && !credentialled)) return -1;
     memset(fixture, 0, sizeof(*fixture));
-    if (!ts_mkdtemp(root_template) ||
-        safe_strncpy(fixture->root, root_template,
-                     sizeof(fixture->root)) != 0 ||
+    if (!ts_mkdtemp_trusted(fixture->root, sizeof(fixture->root),
+                            "gsw-ar11-m17") ||
         ts_canonicalize_dir_path(fixture->root,
                                  sizeof(fixture->root)) != 0 ||
         safe_snprintf(fixture->home, sizeof(fixture->home),
@@ -377,7 +401,7 @@ static int m17_fixture_setup(m17_fixture_t *fixture,
                       "%s/.gitconfig-replacement", fixture->home) != 0 ||
         safe_snprintf(fixture->ssh_program,
                       sizeof(fixture->ssh_program),
-                      "%s/ssh-program", fixture->home) != 0 ||
+                      "%s/ssh", fixture->root) != 0 ||
         safe_snprintf(fixture->ssh_key, sizeof(fixture->ssh_key),
                       "%s/id_key", fixture->home) != 0 ||
         m17_make_dir(fixture->home) != 0 ||
@@ -397,10 +421,7 @@ static int m17_fixture_setup(m17_fixture_t *fixture,
     if (m17_write_file(fixture->ssh_program, ssh_program_body,
                        sizeof(ssh_program_body) - 1U, 0700) != 0 ||
         (credentialled && m17_generate_ssh_key(fixture->ssh_key) != 0) ||
-        safe_snprintf(fixture->ssh_command,
-                      sizeof(fixture->ssh_command),
-                      "'%s' -i '%s' -o IdentitiesOnly=yes",
-                      fixture->ssh_program, fixture->ssh_key) != 0) {
+        (credentialled && m17_build_ssh_command(fixture) != 0)) {
         return -1;
     }
     for (size_t i = 0U; i < 2U; i++) {
