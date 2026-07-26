@@ -17,7 +17,7 @@ typedef enum {
 
 /* Keep manager identities on the shared account/Git key-ID contract. */
 #define GPG_FINGERPRINT_BUFSIZE MAX_GPG_FINGERPRINT_LEN
-#define GPG_QUARANTINE_NAME_LEN 96
+#define GPG_QUARANTINE_NAME_LEN 128
 
 typedef struct {
     struct stat st;
@@ -125,6 +125,20 @@ typedef enum {
 typedef int (*gpg_reset_quarantine_hook_fn)(
     int base_fd, gpg_reset_quarantine_hook_stage_t stage,
     const char *quarantine);
+/* Full-reset recovery retirement seam. It runs after an orphan was moved to
+ * its unpredictable private quarantine and synchronized, immediately before
+ * the final identity check and unlink. */
+typedef int (*gpg_reset_retire_hook_fn)(int base_fd,
+                                        const char *quarantine);
+/* Runs after the final pathname identity validation. A replacement installed
+ * here must survive descriptor-bound retirement or trigger fail-closed
+ * preservation on platforms without that primitive. */
+typedef int (*gpg_reset_postvalidate_hook_fn)(int base_fd,
+                                              const char *quarantine);
+/* Test/provider seam for platforms with a descriptor-bound conditional unlink.
+ * Production uses FreeBSD funlinkat(2); NULL is fail-closed elsewhere. */
+typedef int (*gpg_identity_unlink_fn)(int dir_fd, const char *name,
+                                      const struct stat *expected);
 /* Deterministic mount-identity and managed-writer durability seams. NULL
  * restores the native statx/fsid and fsync implementations. */
 typedef int (*gpg_mount_identity_probe_fn)(int fd, uint64_t *identity);
@@ -168,6 +182,14 @@ gpg_reset_current_hook_fn
 gpg_manager_set_reset_current_hook_fn(gpg_reset_current_hook_fn fn);
 gpg_reset_quarantine_hook_fn
 gpg_manager_set_reset_quarantine_hook_fn(gpg_reset_quarantine_hook_fn fn);
+gpg_reset_retire_hook_fn
+gpg_manager_set_reset_retire_hook_fn(gpg_reset_retire_hook_fn fn);
+gpg_reset_postvalidate_hook_fn
+gpg_manager_set_reset_postvalidate_hook_fn(
+    gpg_reset_postvalidate_hook_fn fn);
+gpg_identity_unlink_fn
+gpg_manager_set_identity_unlink_fn(gpg_identity_unlink_fn fn);
+bool gpg_manager_set_process_generation_failure_for_test(bool fail);
 gpg_mount_identity_probe_fn
 gpg_manager_set_mount_identity_probe_fn(gpg_mount_identity_probe_fn fn);
 gpg_agent_conf_sync_fn

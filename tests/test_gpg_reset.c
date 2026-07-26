@@ -309,6 +309,24 @@ static int g_reset_sync_calls;
 static bool g_fail_reset_sync;
 static int g_reset_sync_errno = EIO;
 
+#if !defined(__FreeBSD__)
+static int identity_unlink_for_test(int dir_fd, const char *name,
+                                    const struct stat *expected) {
+    struct stat observed;
+    if (!expected ||
+        fstatat(dir_fd, name, &observed, AT_SYMLINK_NOFOLLOW) != 0 ||
+        observed.st_dev != expected->st_dev ||
+        observed.st_ino != expected->st_ino ||
+        observed.st_mode != expected->st_mode ||
+        observed.st_uid != expected->st_uid ||
+        observed.st_size != expected->st_size) {
+        errno = ESTALE;
+        return -1;
+    }
+    return unlinkat(dir_fd, name, 0);
+}
+#endif
+
 static int record_reset_sync(int base_fd) {
     struct stat st;
     g_reset_sync_calls++;
@@ -1142,7 +1160,9 @@ TEST(full_reset_forward_quarantine_sync_failure_is_retryable) {
 
     g_fail_reset_sync = false;
     CHECK_EQ_INT(gpg_manager_reset(NULL), 0);
-    CHECK_EQ_INT(g_reset_sync_calls, 4);
+    /* Identity-bound recovery retirement durably publishes each private
+     * no-replace quarantine before its final unlink. */
+    CHECK_EQ_INT(g_reset_sync_calls, 8);
     gpg_manager_set_sync_base_fn(old_sync);
     CHECK(lstat(candidate, &st) != 0 && errno == ENOENT);
     CHECK(lstat(witness, &st) != 0 && errno == ENOENT);
@@ -1410,7 +1430,9 @@ TEST(full_reset_sync_failure_is_retryable) {
 
     g_fail_reset_sync = false;
     CHECK_EQ_INT(gpg_manager_reset(NULL), 0);
-    CHECK_EQ_INT(g_reset_sync_calls, 8);
+    /* Full-reset recovery retirement durably publishes its private
+     * no-replace quarantine before final unlink. */
+    CHECK_EQ_INT(g_reset_sync_calls, 9);
     CHECK(lstat(current, &st) != 0 && errno == ENOENT);
     run_set_runner(previous);
     gpg_manager_set_sync_base_fn(old_sync);
@@ -1691,6 +1713,9 @@ TEST_MAIN_BEGIN()
     ts_trusted_command_fixture_t command_fixture = {0};
 
     error_init(LOG_LEVEL_ERROR, NULL);
+#if !defined(__FreeBSD__)
+    gpg_manager_set_identity_unlink_fn(identity_unlink_for_test);
+#endif
     if (ts_trusted_command_fixture_install(
             &command_fixture, "gsw-ar11-gpg-reset", trusted_commands) != 0) {
         fprintf(stderr,

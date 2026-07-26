@@ -27,10 +27,21 @@
 #include <limits.h>
 #include <time.h>
 #include <stdarg.h>
+#include <stdint.h>
 #ifdef __linux__
 #include <sys/syscall.h>
 #include <sys/vfs.h>
 #include <linux/stat.h>
+#elif defined(__APPLE__) || defined(__FreeBSD__)
+#include <sys/param.h>
+#include <sys/mount.h>
+#include <sys/sysctl.h>
+#include <sys/time.h>
+#if defined(__APPLE__)
+#include <sys/proc.h>
+#else
+#include <sys/user.h>
+#endif
 #else
 #include <sys/param.h>
 #include <sys/mount.h>
@@ -205,6 +216,10 @@ static gpg_cleanup_predelete_fn g_cleanup_predelete;
 static gpg_reset_final_hook_fn g_reset_final_hook;
 static gpg_reset_current_hook_fn g_reset_current_hook;
 static gpg_reset_quarantine_hook_fn g_reset_quarantine_hook;
+static gpg_reset_retire_hook_fn g_reset_retire_hook;
+static gpg_reset_postvalidate_hook_fn g_reset_postvalidate_hook;
+static gpg_identity_unlink_fn g_identity_unlink;
+static bool g_process_generation_failure_for_test;
 static gpg_mount_identity_probe_fn g_mount_identity_probe;
 static gpg_agent_conf_sync_fn g_agent_conf_sync =
     gpg_default_agent_conf_sync;
@@ -349,6 +364,34 @@ gpg_reset_quarantine_hook_fn
 gpg_manager_set_reset_quarantine_hook_fn(gpg_reset_quarantine_hook_fn fn) {
     gpg_reset_quarantine_hook_fn previous = g_reset_quarantine_hook;
     g_reset_quarantine_hook = fn;
+    return previous;
+}
+
+gpg_reset_retire_hook_fn
+gpg_manager_set_reset_retire_hook_fn(gpg_reset_retire_hook_fn fn) {
+    gpg_reset_retire_hook_fn previous = g_reset_retire_hook;
+    g_reset_retire_hook = fn;
+    return previous;
+}
+
+gpg_reset_postvalidate_hook_fn
+gpg_manager_set_reset_postvalidate_hook_fn(
+    gpg_reset_postvalidate_hook_fn fn) {
+    gpg_reset_postvalidate_hook_fn previous = g_reset_postvalidate_hook;
+    g_reset_postvalidate_hook = fn;
+    return previous;
+}
+
+gpg_identity_unlink_fn
+gpg_manager_set_identity_unlink_fn(gpg_identity_unlink_fn fn) {
+    gpg_identity_unlink_fn previous = g_identity_unlink;
+    g_identity_unlink = fn;
+    return previous;
+}
+
+bool gpg_manager_set_process_generation_failure_for_test(bool fail) {
+    bool previous = g_process_generation_failure_for_test;
+    g_process_generation_failure_for_test = fail;
     return previous;
 }
 
@@ -1912,6 +1955,325 @@ static bool gpg_forward_name_belongs_to_stem(const char *name,
            name[stem_length + 2U] == '\0';
 }
 
+typedef enum {
+    GPG_PRIVATE_NAME_INVALID = 0,
+    GPG_PRIVATE_NAME_LEGACY,
+    GPG_PRIVATE_NAME_GENERATION
+} gpg_private_name_format_t;
+
+typedef struct {
+    uint8_t kind;
+    uint64_t boot_hi;
+    uint64_t boot_lo;
+    uint64_t start_hi;
+    uint64_t start_lo;
+} gpg_process_generation_t;
+
+static void gpg_store_u64_be(unsigned char *destination, uint64_t value) {
+    for (size_t i = 0; i < 8U; i++) {
+        destination[7U - i] = (unsigned char)(value & 0xffU);
+        value >>= 8U;
+    }
+}
+
+static uint64_t gpg_load_u64_be(const unsigned char *source) {
+    uint64_t value = 0U;
+    for (size_t i = 0; i < 8U; i++) {
+        value = (value << 8U) | source[i];
+    }
+    return value;
+}
+
+static int gpg_base64url_value(unsigned char c) {
+    if (c >= 'A' && c <= 'Z') return (int)(c - 'A');
+    if (c >= 'a' && c <= 'z') return (int)(c - 'a') + 26;
+    if (c >= '0' && c <= '9') return (int)(c - '0') + 52;
+    if (c == '-') return 62;
+    if (c == '_') return 63;
+    return -1;
+}
+
+static void gpg_encode_generation_bytes(const unsigned char bytes[33],
+                                        char token[45]) {
+    static const char alphabet[] =
+        "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789-_";
+    size_t input = 0U;
+    size_t output = 0U;
+
+    while (input < 33U) {
+        uint32_t value = ((uint32_t)bytes[input] << 16U) |
+                         ((uint32_t)bytes[input + 1U] << 8U) |
+                         bytes[input + 2U];
+        token[output++] = alphabet[(value >> 18U) & 0x3fU];
+        token[output++] = alphabet[(value >> 12U) & 0x3fU];
+        token[output++] = alphabet[(value >> 6U) & 0x3fU];
+        token[output++] = alphabet[value & 0x3fU];
+        input += 3U;
+    }
+    token[output] = '\0';
+}
+
+static bool gpg_valid_generation_token(const char *token) {
+    unsigned char bytes[33];
+    char canonical[45];
+    size_t input = 0U;
+    size_t output = 0U;
+
+    if (!token) return false;
+    while (input < 44U) {
+        int a = gpg_base64url_value((unsigned char)token[input++]);
+        int b = gpg_base64url_value((unsigned char)token[input++]);
+        int c = gpg_base64url_value((unsigned char)token[input++]);
+        int d = gpg_base64url_value((unsigned char)token[input++]);
+        uint32_t value;
+        if (a < 0 || b < 0 || c < 0 || d < 0) return false;
+        value = ((uint32_t)a << 18U) | ((uint32_t)b << 12U) |
+                ((uint32_t)c << 6U) | (uint32_t)d;
+        bytes[output++] = (unsigned char)(value >> 16U);
+        bytes[output++] = (unsigned char)(value >> 8U);
+        bytes[output++] = (unsigned char)value;
+    }
+    if (output != sizeof(bytes) ||
+        bytes[0] < 1U || bytes[0] > 3U ||
+        (gpg_load_u64_be(bytes + 1U) |
+         gpg_load_u64_be(bytes + 9U)) == 0U ||
+        (gpg_load_u64_be(bytes + 17U) |
+         gpg_load_u64_be(bytes + 25U)) == 0U) {
+        return false;
+    }
+    gpg_encode_generation_bytes(bytes, canonical);
+    return memcmp(token, canonical, 44U) == 0;
+}
+
+static int gpg_encode_process_generation(
+    const gpg_process_generation_t *generation, char *token, size_t size) {
+    unsigned char bytes[33];
+
+    if (!generation || !token || size < 45U || generation->kind == 0U ||
+        (generation->boot_hi | generation->boot_lo) == 0U ||
+        (generation->start_hi | generation->start_lo) == 0U) {
+        errno = EINVAL;
+        return -1;
+    }
+    bytes[0] = generation->kind;
+    gpg_store_u64_be(bytes + 1U, generation->boot_hi);
+    gpg_store_u64_be(bytes + 9U, generation->boot_lo);
+    gpg_store_u64_be(bytes + 17U, generation->start_hi);
+    gpg_store_u64_be(bytes + 25U, generation->start_lo);
+    gpg_encode_generation_bytes(bytes, token);
+    return 0;
+}
+
+#ifdef __linux__
+static int gpg_read_process_file(const char *path, char *buffer, size_t size,
+                                 size_t *used_out) {
+    int fd;
+    size_t used = 0U;
+
+    if (!path || !buffer || size < 2U || !used_out) {
+        errno = EINVAL;
+        return -1;
+    }
+    fd = open(path, O_RDONLY | O_CLOEXEC);
+    if (fd < 0) return -1;
+    while (used + 1U < size) {
+        ssize_t count = read(fd, buffer + used, size - used - 1U);
+        if (count > 0) {
+            used += (size_t)count;
+            continue;
+        }
+        if (count == 0) break;
+        if (errno == EINTR) continue;
+        {
+            int saved_errno = errno;
+            close(fd);
+            errno = saved_errno;
+            return -1;
+        }
+    }
+    if (used + 1U == size) {
+        char extra;
+        ssize_t count;
+        do {
+            count = read(fd, &extra, 1U);
+        } while (count < 0 && errno == EINTR);
+        if (count != 0) {
+            close(fd);
+            errno = EOVERFLOW;
+            return -1;
+        }
+    }
+    if (close(fd) != 0) return -1;
+    buffer[used] = '\0';
+    *used_out = used;
+    return 0;
+}
+
+static int gpg_parse_hex_u64(const char *text, uint64_t *value_out) {
+    uint64_t value = 0U;
+    if (!text || !value_out) return -1;
+    for (size_t i = 0; i < 16U; i++) {
+        unsigned char c = (unsigned char)text[i];
+        unsigned int digit;
+        if (c >= '0' && c <= '9') {
+            digit = (unsigned int)(c - '0');
+        } else if (c >= 'a' && c <= 'f') {
+            digit = (unsigned int)(c - 'a') + 10U;
+        } else {
+            return -1;
+        }
+        value = (value << 4U) | digit;
+    }
+    *value_out = value;
+    return 0;
+}
+#endif
+
+static int gpg_capture_process_generation(
+    pid_t pid, gpg_process_generation_t *generation) {
+    if (g_process_generation_failure_for_test) {
+        errno = EIO;
+        return -1;
+    }
+    if (pid <= 1 || !generation) {
+        errno = EINVAL;
+        return -1;
+    }
+    memset(generation, 0, sizeof(*generation));
+#ifdef __linux__
+    {
+        char boot[64];
+        char compact[33];
+        char stat_path[64];
+        char stat_data[4096];
+        char *cursor;
+        char *end;
+        size_t boot_size;
+        size_t stat_size;
+        size_t compact_size = 0U;
+        unsigned long long start;
+
+        if (gpg_read_process_file("/proc/sys/kernel/random/boot_id",
+                                  boot, sizeof(boot), &boot_size) != 0) {
+            return -1;
+        }
+        for (size_t i = 0; i < boot_size; i++) {
+            if (boot[i] == '-' || boot[i] == '\n') continue;
+            if (compact_size >= 32U ||
+                !((boot[i] >= '0' && boot[i] <= '9') ||
+                  (boot[i] >= 'a' && boot[i] <= 'f'))) {
+                errno = EINVAL;
+                return -1;
+            }
+            compact[compact_size++] = boot[i];
+        }
+        compact[compact_size] = '\0';
+        if (compact_size != 32U ||
+            gpg_parse_hex_u64(compact, &generation->boot_hi) != 0 ||
+            gpg_parse_hex_u64(compact + 16U, &generation->boot_lo) != 0) {
+            errno = EINVAL;
+            return -1;
+        }
+        snprintf(stat_path, sizeof(stat_path), "/proc/%ld/stat", (long)pid);
+        if (gpg_read_process_file(stat_path, stat_data, sizeof(stat_data),
+                                  &stat_size) != 0 ||
+            stat_size == 0U) {
+            return -1;
+        }
+        cursor = stat_data + stat_size;
+        while (cursor > stat_data && cursor[-1] != ')') cursor--;
+        if (cursor == stat_data || cursor >= stat_data + stat_size ||
+            *cursor != ' ') {
+            errno = EINVAL;
+            return -1;
+        }
+        cursor++;
+        for (unsigned int field = 3U; field < 22U; field++) {
+            while (cursor < stat_data + stat_size &&
+                   *cursor != ' ' && *cursor != '\n') {
+                cursor++;
+            }
+            while (cursor < stat_data + stat_size && *cursor == ' ') cursor++;
+            if (cursor >= stat_data + stat_size) {
+                errno = EINVAL;
+                return -1;
+            }
+        }
+        errno = 0;
+        start = strtoull(cursor, &end, 10);
+        if (errno != 0 || end == cursor || start == 0ULL ||
+            (*end != ' ' && *end != '\n' && *end != '\0')) {
+            errno = EINVAL;
+            return -1;
+        }
+        generation->kind = 1U;
+        generation->start_lo = (uint64_t)start;
+        return 0;
+    }
+#elif defined(__APPLE__) || defined(__FreeBSD__)
+    {
+        int boot_mib[2] = {CTL_KERN, KERN_BOOTTIME};
+        struct timeval boot;
+        size_t boot_size = sizeof(boot);
+        if (sysctl(boot_mib, 2, &boot, &boot_size, NULL, 0) != 0 ||
+            boot_size != sizeof(boot) || boot.tv_sec <= 0 ||
+            boot.tv_usec < 0 || boot.tv_usec > 999999) {
+            return -1;
+        }
+        generation->boot_hi = (uint64_t)boot.tv_sec;
+        generation->boot_lo = (uint64_t)boot.tv_usec;
+#if defined(__APPLE__)
+        {
+            int mib[4] = {CTL_KERN, KERN_PROC, KERN_PROC_PID, (int)pid};
+            struct kinfo_proc info;
+            size_t length = sizeof(info);
+            if (sysctl(mib, 4, &info, &length, NULL, 0) != 0 ||
+                length != sizeof(info) || info.kp_proc.p_pid != pid ||
+                info.kp_proc.p_starttime.tv_sec <= 0 ||
+                info.kp_proc.p_starttime.tv_usec < 0 ||
+                info.kp_proc.p_starttime.tv_usec > 999999) {
+                memset(generation, 0, sizeof(*generation));
+                return -1;
+            }
+            generation->kind = 2U;
+            generation->start_hi =
+                (uint64_t)info.kp_proc.p_starttime.tv_sec;
+            generation->start_lo =
+                (uint64_t)info.kp_proc.p_starttime.tv_usec;
+        }
+#else
+        {
+            int mib[4] = {CTL_KERN, KERN_PROC, KERN_PROC_PID, (int)pid};
+            struct kinfo_proc info;
+            size_t length = sizeof(info);
+            if (sysctl(mib, 4, &info, &length, NULL, 0) != 0 ||
+                length != sizeof(info) || info.ki_pid != pid ||
+                info.ki_start.tv_sec <= 0 || info.ki_start.tv_usec < 0 ||
+                info.ki_start.tv_usec > 999999) {
+                memset(generation, 0, sizeof(*generation));
+                return -1;
+            }
+            generation->kind = 3U;
+            generation->start_hi = (uint64_t)info.ki_start.tv_sec;
+            generation->start_lo = (uint64_t)info.ki_start.tv_usec;
+        }
+#endif
+        return 0;
+    }
+#else
+    (void)pid;
+    errno = ENOTSUP;
+    return -1;
+#endif
+}
+
+static int gpg_capture_process_generation_token(pid_t pid, char *token,
+                                                size_t size) {
+    gpg_process_generation_t generation;
+    if (gpg_capture_process_generation(pid, &generation) != 0) return -1;
+    return gpg_encode_process_generation(&generation, token, size);
+}
+
 /* A quarantine without an in-memory transaction token may contain a symlink
  * displaced by an interrupted process. Never guess at its ownership. */
 static int gpg_reject_stale_quarantines_locked(int base_fd,
@@ -1977,15 +2339,23 @@ static int gpg_reject_stale_quarantines_locked(int base_fd,
 
 static int gpg_make_private_name(char *name, size_t size,
                                  const char *prefix) {
+    char generation[45];
     char random[17];
     int written;
 
-    if (!name || size == 0 || !prefix ||
-        generate_random_string(random, sizeof(random),
+    if (!name || size == 0 || !prefix) return -1;
+    if (gpg_capture_process_generation_token(getpid(), generation,
+                                             sizeof(generation)) != 0) {
+        set_system_error(ERR_FILE_IO,
+                         "Cannot capture GPG private-name process generation");
+        return -1;
+    }
+    if (generate_random_string(random, sizeof(random),
                                "0123456789abcdef") != 0) {
         return -1;
     }
-    written = snprintf(name, size, "%s%ld.%s", prefix, (long)getpid(), random);
+    written = snprintf(name, size, "%s%ld.v1.%s.%s", prefix,
+                       (long)getpid(), generation, random);
     if (written < 0 || (size_t)written >= size) {
         set_error(ERR_INVALID_PATH, "GPG private runtime name is too long");
         return -1;
@@ -2000,69 +2370,123 @@ typedef struct {
     char witness[GPG_QUARANTINE_NAME_LEN];
 } gpg_reset_retry_state_t;
 
-static bool gpg_valid_private_name(const char *name, const char *prefix) {
+static gpg_private_name_format_t gpg_parse_private_name(
+    const char *name, const char *prefix, pid_t *pid_out,
+    const char **generation_out) {
     const char *cursor;
+    const char *token;
     const char *random;
+    uintmax_t value = 0U;
     size_t prefix_len;
 
-    if (!name || !prefix) return false;
+    if (!name || !prefix) return GPG_PRIVATE_NAME_INVALID;
     prefix_len = strlen(prefix);
-    if (strncmp(name, prefix, prefix_len) != 0) return false;
+    if (strncmp(name, prefix, prefix_len) != 0) {
+        return GPG_PRIVATE_NAME_INVALID;
+    }
     cursor = name + prefix_len;
-    if (*cursor < '1' || *cursor > '9') return false;
-    while (isdigit((unsigned char)*cursor)) cursor++;
-    if (*cursor != '.') return false;
-    random = ++cursor;
-    if (strlen(random) != 16U) return false;
-    for (size_t i = 0; i < 16U; i++) {
-        if (!strchr("0123456789abcdef", random[i])) return false;
-    }
-    return true;
-}
-
-/* Private runtime names bind recovery ownership to the process that created
- * them. A different still-live owner may hold in-memory settlement state even
- * after releasing the base lock, so full reset must preserve its names. */
-static int gpg_private_name_owner_is_live(const char *name,
-                                          const char *prefix,
-                                          bool *live) {
-    const char *cursor;
-    uintmax_t value = 0U;
-    pid_t pid;
-
-    if (!name || !prefix || !live ||
-        !gpg_valid_private_name(name, prefix)) {
-        set_error(ERR_INVALID_ARGS, "Invalid GPG private runtime name");
-        return -1;
-    }
-    *live = false;
-    cursor = name + strlen(prefix);
+    if (*cursor < '1' || *cursor > '9') return GPG_PRIVATE_NAME_INVALID;
     while (isdigit((unsigned char)*cursor)) {
         unsigned int digit = (unsigned int)(*cursor - '0');
         if (value > (UINTMAX_MAX - digit) / 10U) {
-            set_error(ERR_FILE_IO,
-                      "GPG runtime owner pid exceeds its bounded grammar: %s",
-                      name);
-            return -1;
+            return GPG_PRIVATE_NAME_INVALID;
         }
         value = value * 10U + digit;
         cursor++;
     }
-    pid = (pid_t)value;
-    if (pid <= 0 || (uintmax_t)pid != value) {
-        set_error(ERR_FILE_IO, "Invalid GPG runtime owner pid: %s", name);
+    if (*cursor != '.' || (pid_t)value <= 0 ||
+        (uintmax_t)(pid_t)value != value) {
+        return GPG_PRIVATE_NAME_INVALID;
+    }
+    if (pid_out) *pid_out = (pid_t)value;
+    random = ++cursor;
+    if (strlen(random) == 16U) {
+        for (size_t i = 0; i < 16U; i++) {
+            if (!strchr("0123456789abcdef", random[i])) {
+                return GPG_PRIVATE_NAME_INVALID;
+            }
+        }
+        if (generation_out) *generation_out = NULL;
+        return GPG_PRIVATE_NAME_LEGACY;
+    }
+    if (strncmp(random, "v1.", 3U) != 0) {
+        return GPG_PRIVATE_NAME_INVALID;
+    }
+    token = random + 3U;
+    if (strlen(token) != 44U + 1U + 16U || token[44] != '.') {
+        return GPG_PRIVATE_NAME_INVALID;
+    }
+    if (!gpg_valid_generation_token(token)) {
+        return GPG_PRIVATE_NAME_INVALID;
+    }
+    random = token + 45U;
+    if (strlen(random) != 16U) return GPG_PRIVATE_NAME_INVALID;
+    for (size_t i = 0; i < 16U; i++) {
+        if (!strchr("0123456789abcdef", random[i])) {
+            return GPG_PRIVATE_NAME_INVALID;
+        }
+    }
+    if (generation_out) *generation_out = token;
+    return GPG_PRIVATE_NAME_GENERATION;
+}
+
+static bool gpg_valid_private_name(const char *name, const char *prefix) {
+    return gpg_parse_private_name(name, prefix, NULL, NULL) ==
+           GPG_PRIVATE_NAME_GENERATION;
+}
+
+/* Generation-bound names remain live only while both the PID and its freshly
+ * captured kernel generation match. PID reuse therefore proves the original
+ * owner gone. Legacy names are admitted only by explicit full reset: the held
+ * GPG lock permits this process's own legacy residue, while another live PID
+ * remains fail-closed. */
+static int gpg_private_name_owner_is_live(const char *name,
+                                          const char *prefix,
+                                          bool allow_legacy,
+                                          bool *live) {
+    char observed[45];
+    const char *recorded = NULL;
+    gpg_private_name_format_t format;
+    pid_t pid;
+
+    if (!live) {
+        set_error(ERR_INVALID_ARGS, "Invalid GPG private owner result");
         return -1;
     }
+    *live = false;
+    format = gpg_parse_private_name(name, prefix, &pid, &recorded);
+    if (format == GPG_PRIVATE_NAME_INVALID ||
+        (format == GPG_PRIVATE_NAME_LEGACY && !allow_legacy)) {
+        set_error(ERR_INVALID_ARGS, "Invalid GPG private runtime name");
+        return -1;
+    }
+    if (format == GPG_PRIVATE_NAME_LEGACY) {
+        if (pid == getpid()) return 0;
+        errno = 0;
+        if (kill(pid, 0) == 0 || errno == EPERM) {
+            *live = true;
+            return 0;
+        }
+        if (errno == ESRCH) return 0;
+        set_system_error(ERR_FILE_IO,
+                         "Cannot determine legacy GPG runtime owner state: %s",
+                         name);
+        return -1;
+    }
+    /* The held private GPG lock is explicit authority for this process to
+     * reconcile a retry artifact left by its own preceding failed operation.
+     * Generation matching protects a different live process, not stale
+     * in-process retry state that only this lock holder can settle. */
     if (pid == getpid()) return 0;
-
     errno = 0;
-    if (kill(pid, 0) == 0 || errno == EPERM) {
-        *live = true;
+    if (gpg_capture_process_generation_token(pid, observed,
+                                             sizeof(observed)) == 0) {
+        *live = strncmp(recorded, observed, 44U) == 0;
         return 0;
     }
-    if (errno == ESRCH) return 0;
+    if (errno == ENOENT || errno == ESRCH) return 0;
     set_system_error(ERR_FILE_IO,
-                     "Cannot determine GPG runtime owner state: %s", name);
+                     "Cannot verify GPG runtime owner generation: %s", name);
     return -1;
 }
 
@@ -4517,6 +4941,7 @@ typedef struct {
     bool current_present;
     gpg_link_identity_t current;
     char reset_stem[GPG_QUARANTINE_NAME_LEN];
+    bool reset_malformed;
     size_t reset_quarantine;
     size_t reset_witness;
     char forward_stem[GPG_QUARANTINE_NAME_LEN];
@@ -4654,7 +5079,9 @@ static int gpg_reset_plan_require_orphan_owner(
     const char *name, const char *stem, const char *prefix) {
     bool live = false;
 
-    if (gpg_private_name_owner_is_live(stem, prefix, &live) != 0) return -1;
+    if (gpg_private_name_owner_is_live(stem, prefix, true, &live) != 0) {
+        return -1;
+    }
     if (live) {
         set_error(ERR_FILE_IO,
                   "Refusing to retire GPG recovery state held by a live "
@@ -4663,6 +5090,61 @@ static int gpg_reset_plan_require_orphan_owner(
         return -1;
     }
     return 0;
+}
+
+/* Historical reset crashes could leave a reserved-prefix stem outside both
+ * the legacy and v1 grammars. Such a stem is never trusted by shape alone:
+ * extract only its bounded creator PID, require that PID definitely absent,
+ * then let group validation demand a byte-for-byte hard-link witness before
+ * either alias becomes eligible for identity-bound retirement. */
+static int gpg_reset_plan_require_malformed_owner_absent(
+    const char *name, const char *stem) {
+    const char *cursor;
+    uintmax_t value = 0U;
+    pid_t pid;
+
+    if (!name || !stem ||
+        !gpg_name_has_prefix(stem, GPG_RESET_PREFIX)) {
+        return -1;
+    }
+    cursor = stem + strlen(GPG_RESET_PREFIX);
+    if (*cursor < '1' || *cursor > '9') {
+        set_error(ERR_FILE_IO,
+                  "Malformed GPG reset recovery entry blocks reset: %s",
+                  name);
+        return -1;
+    }
+    while (isdigit((unsigned char)*cursor)) {
+        unsigned int digit = (unsigned int)(*cursor - '0');
+        if (value > (UINTMAX_MAX - digit) / 10U) {
+            set_error(ERR_FILE_IO,
+                      "Malformed GPG reset owner pid is unbounded: %s", name);
+            return -1;
+        }
+        value = value * 10U + digit;
+        cursor++;
+    }
+    pid = (pid_t)value;
+    if (*cursor != '.' || cursor[1] == '\0' || pid <= 0 ||
+        (uintmax_t)pid != value || pid == getpid()) {
+        set_error(ERR_FILE_IO,
+                  "Malformed GPG reset recovery entry blocks reset: %s",
+                  name);
+        return -1;
+    }
+    errno = 0;
+    if (kill(pid, 0) == 0 || errno == EPERM) {
+        set_error(ERR_FILE_IO,
+                  "Refusing malformed GPG reset state attributed to a live "
+                  "process: %s",
+                  name);
+        return -1;
+    }
+    if (errno == ESRCH) return 0;
+    set_system_error(ERR_FILE_IO,
+                     "Cannot verify malformed GPG reset owner absence: %s",
+                     name);
+    return -1;
 }
 
 static int gpg_reset_plan_classify_residue(
@@ -4676,12 +5158,14 @@ static int gpg_reset_plan_classify_residue(
 
     if (gpg_name_has_prefix(name, GPG_ROLLBACK_PREFIX) ||
         gpg_name_has_prefix(name, GPG_PUBLISH_PREFIX)) {
+        gpg_private_name_format_t format;
         bool rollback =
             gpg_name_has_prefix(name, GPG_ROLLBACK_PREFIX);
         prefix = rollback ? GPG_ROLLBACK_PREFIX : GPG_PUBLISH_PREFIX;
         kind = rollback ? GPG_RESET_PLAN_ROLLBACK
                         : GPG_RESET_PLAN_PUBLISH;
-        if (!gpg_valid_private_name(name, prefix)) {
+        format = gpg_parse_private_name(name, prefix, NULL, NULL);
+        if (format == GPG_PRIVATE_NAME_INVALID) {
             set_error(ERR_FILE_IO,
                       "Malformed GPG orphan recovery entry blocks reset: %s",
                       name);
@@ -4714,32 +5198,49 @@ static int gpg_reset_plan_classify_residue(
         }
         memcpy(stem, name, length);
         stem[length] = '\0';
-        if (!gpg_valid_private_name(stem, GPG_RESET_PREFIX) ||
-            (plan->reset_stem[0] &&
-             strcmp(plan->reset_stem, stem) != 0)) {
-            set_error(ERR_FILE_IO,
-                      "Ambiguous GPG reset recovery state blocks reset: %s",
-                      name);
-            return -1;
-        }
-        if (gpg_reset_plan_require_orphan_owner(
-                name, stem, GPG_RESET_PREFIX) != 0 ||
-            safe_strncpy(plan->reset_stem, stem,
-                         sizeof(plan->reset_stem)) != 0) {
-            return -1;
-        }
-        if ((kind == GPG_RESET_PLAN_RESET_QUARANTINE &&
-             plan->reset_quarantine != SIZE_MAX) ||
-            (kind == GPG_RESET_PLAN_RESET_WITNESS &&
-             plan->reset_witness != SIZE_MAX)) {
-            set_error(ERR_FILE_IO,
-                      "Duplicate GPG reset recovery entry blocks reset: %s",
-                      name);
-            return -1;
-        }
-        if (gpg_reset_plan_add_residue(base_fd, plan, name, kind,
-                                       &index) != 0) {
-            return -1;
+        {
+            bool group_exists = plan->reset_stem[0] != '\0';
+            gpg_private_name_format_t format =
+                gpg_parse_private_name(stem, GPG_RESET_PREFIX, NULL, NULL);
+            if (group_exists &&
+                strcmp(plan->reset_stem, stem) != 0) {
+                set_error(ERR_FILE_IO,
+                          "Ambiguous GPG reset recovery state blocks reset: %s",
+                          name);
+                return -1;
+            }
+            if ((format == GPG_PRIVATE_NAME_INVALID
+                     ? gpg_reset_plan_require_malformed_owner_absent(
+                           name, stem)
+                     : gpg_reset_plan_require_orphan_owner(
+                           name, stem, GPG_RESET_PREFIX)) != 0 ||
+                safe_strncpy(plan->reset_stem, stem,
+                             sizeof(plan->reset_stem)) != 0) {
+                return -1;
+            }
+            if (group_exists &&
+                plan->reset_malformed !=
+                    (format == GPG_PRIVATE_NAME_INVALID)) {
+                set_error(ERR_FILE_IO,
+                          "Ambiguous GPG reset recovery grammar blocks reset: %s",
+                          name);
+                return -1;
+            }
+            plan->reset_malformed =
+                format == GPG_PRIVATE_NAME_INVALID;
+            if ((kind == GPG_RESET_PLAN_RESET_QUARANTINE &&
+                 plan->reset_quarantine != SIZE_MAX) ||
+                (kind == GPG_RESET_PLAN_RESET_WITNESS &&
+                 plan->reset_witness != SIZE_MAX)) {
+                set_error(ERR_FILE_IO,
+                          "Duplicate GPG reset recovery entry blocks reset: %s",
+                          name);
+                return -1;
+            }
+            if (gpg_reset_plan_add_residue(base_fd, plan, name, kind,
+                                           &index) != 0) {
+                return -1;
+            }
         }
         if (kind == GPG_RESET_PLAN_RESET_QUARANTINE) {
             plan->reset_quarantine = index;
@@ -4766,40 +5267,48 @@ static int gpg_reset_plan_classify_residue(
     }
     memcpy(stem, name, length - 2U);
     stem[length - 2U] = '\0';
-    if (!gpg_valid_private_name(stem, GPG_FORWARD_PREFIX) ||
+    {
+        gpg_private_name_format_t format =
+            gpg_parse_private_name(stem, GPG_FORWARD_PREFIX, NULL, NULL);
+        if (format == GPG_PRIVATE_NAME_INVALID ||
         (plan->forward_stem[0] &&
-         strcmp(plan->forward_stem, stem) != 0)) {
-        set_error(ERR_FILE_IO,
-                  "Ambiguous GPG forward recovery state blocks reset: %s",
-                  name);
-        return -1;
-    }
-    if (gpg_reset_plan_require_orphan_owner(
-            name, stem, GPG_FORWARD_PREFIX) != 0 ||
-        safe_strncpy(plan->forward_stem, stem,
-                     sizeof(plan->forward_stem)) != 0) {
-        return -1;
-    }
-    if (name[length - 1U] == 'p') {
-        kind = GPG_RESET_PLAN_FORWARD_CANDIDATE;
-        if (plan->forward_candidate != SIZE_MAX) index = plan->forward_candidate;
-    } else if (name[length - 1U] == 'w') {
-        kind = GPG_RESET_PLAN_FORWARD_WITNESS;
-        if (plan->forward_witness != SIZE_MAX) index = plan->forward_witness;
-    } else {
-        kind = GPG_RESET_PLAN_FORWARD_QUARANTINE;
-        if (plan->forward_quarantine != SIZE_MAX) {
-            index = plan->forward_quarantine;
+             strcmp(plan->forward_stem, stem) != 0)) {
+            set_error(ERR_FILE_IO,
+                      "Ambiguous GPG forward recovery state blocks reset: %s",
+                      name);
+            return -1;
         }
-    }
-    if (index != SIZE_MAX) {
-        set_error(ERR_FILE_IO,
-                  "Duplicate GPG forward recovery entry blocks reset: %s",
-                  name);
-        return -1;
-    }
-    if (gpg_reset_plan_add_residue(base_fd, plan, name, kind, &index) != 0) {
-        return -1;
+        if (gpg_reset_plan_require_orphan_owner(
+                name, stem, GPG_FORWARD_PREFIX) != 0 ||
+            safe_strncpy(plan->forward_stem, stem,
+                         sizeof(plan->forward_stem)) != 0) {
+            return -1;
+        }
+        if (name[length - 1U] == 'p') {
+            kind = GPG_RESET_PLAN_FORWARD_CANDIDATE;
+            if (plan->forward_candidate != SIZE_MAX) {
+                index = plan->forward_candidate;
+            }
+        } else if (name[length - 1U] == 'w') {
+            kind = GPG_RESET_PLAN_FORWARD_WITNESS;
+            if (plan->forward_witness != SIZE_MAX) {
+                index = plan->forward_witness;
+            }
+        } else {
+            kind = GPG_RESET_PLAN_FORWARD_QUARANTINE;
+            if (plan->forward_quarantine != SIZE_MAX) {
+                index = plan->forward_quarantine;
+            }
+        }
+        if (index != SIZE_MAX) {
+            set_error(ERR_FILE_IO,
+                      "Duplicate GPG forward recovery entry blocks reset: %s",
+                      name);
+            return -1;
+        }
+        if (gpg_reset_plan_add_residue(base_fd, plan, name, kind, &index) != 0) {
+            return -1;
+        }
     }
     if (kind == GPG_RESET_PLAN_FORWARD_CANDIDATE) {
         plan->forward_candidate = index;
@@ -4813,14 +5322,21 @@ static int gpg_reset_plan_classify_residue(
 
 static int gpg_reset_plan_validate_groups(
     const gpg_reset_all_plan_t *plan) {
-    if (plan->reset_quarantine != SIZE_MAX &&
-        plan->reset_witness == SIZE_MAX) {
+    if (plan->reset_malformed &&
+        (plan->reset_quarantine == SIZE_MAX ||
+         plan->reset_witness == SIZE_MAX)) {
         set_error(ERR_FILE_IO,
-                  "Unwitnessed GPG reset quarantine preserved: %s",
-                  plan->residues[plan->reset_quarantine].name);
+                  "Malformed GPG reset recovery entry lacks an exact witness");
         return -1;
     }
+    /* Discovery has either required an exact private-name grammar and proved
+     * the recorded owner absent/replaced, or paired a malformed historical
+     * stem with a dead PID and exact witness above. Under the held full-reset
+     * lock, an exact orphan may reach identity-bound no-replace retirement.
+     * Targeted mutation remains stricter and preserves unwitnessed retry
+     * artifacts. */
     if (plan->reset_quarantine != SIZE_MAX &&
+        plan->reset_witness != SIZE_MAX &&
         !gpg_same_link(
             &plan->residues[plan->reset_quarantine].identity,
             &plan->residues[plan->reset_witness].identity)) {
@@ -5226,7 +5742,13 @@ static unsigned int gpg_reset_plan_residue_priority(
 
 static int gpg_retire_planned_reset_residue_locked(
     int base_fd, const gpg_reset_plan_residue_t *residue) {
+    char quarantine[GPG_QUARANTINE_NAME_LEN];
     gpg_link_identity_t observed;
+    int renamed = 0;
+#if defined(__FreeBSD__)
+    struct stat pinned;
+    int pinned_fd = -1;
+#endif
 
     if (gpg_capture_link_at(base_fd, residue->name, &observed) != 0 ||
         !gpg_same_link(&observed, &residue->identity)) {
@@ -5235,9 +5757,131 @@ static int gpg_retire_planned_reset_residue_locked(
                   residue->name);
         return -1;
     }
-    if (unlinkat(base_fd, residue->name, 0) != 0) {
+    for (unsigned int attempt = 0U; attempt < 4U; attempt++) {
+        if (gpg_make_private_name(quarantine, sizeof(quarantine),
+                                  GPG_RESET_PREFIX) != 0) {
+            return -1;
+        }
+        if (g_rename_noreplace(base_fd, residue->name, base_fd,
+                               quarantine) == 0) {
+            renamed = 1;
+            break;
+        }
+        if (errno != EEXIST) break;
+    }
+    if (!renamed) {
         set_system_error(ERR_FILE_IO,
-                         "Cannot retire planned GPG recovery entry: %s",
+                         "Cannot quarantine planned GPG recovery entry: %s",
+                         residue->name);
+        return -1;
+    }
+    if (gpg_capture_link_at(base_fd, quarantine, &observed) != 0 ||
+        !gpg_same_link(&observed, &residue->identity)) {
+        int saved_errno = errno;
+        if (g_rename_noreplace(base_fd, quarantine, base_fd,
+                               residue->name) != 0) {
+            set_error(ERR_FILE_IO,
+                      "GPG recovery entry changed during quarantine; "
+                      "replacement retained privately: %s",
+                      residue->name);
+        } else {
+            errno = saved_errno;
+            set_error(ERR_FILE_IO,
+                      "GPG recovery entry changed during quarantine; "
+                      "replacement restored: %s",
+                      residue->name);
+        }
+        return -1;
+    }
+    if (g_sync_base(base_fd) != 0) {
+        set_system_error(ERR_FILE_IO,
+                         "Cannot synchronize GPG recovery quarantine: %s",
+                         residue->name);
+        return -1;
+    }
+    if (g_reset_retire_hook &&
+        g_reset_retire_hook(base_fd, quarantine) != 0) {
+        set_error(ERR_FILE_IO,
+                  "GPG recovery retirement hook failed: %s",
+                  residue->name);
+        return -1;
+    }
+    if (gpg_capture_link_at(base_fd, quarantine, &observed) != 0 ||
+        !gpg_same_link(&observed, &residue->identity)) {
+        set_error(ERR_FILE_IO,
+                  "GPG recovery quarantine changed; preserving replacement: %s",
+                  residue->name);
+        return -1;
+    }
+#if defined(__FreeBSD__)
+    if (!g_identity_unlink) {
+        pinned_fd = openat(base_fd, quarantine,
+                           O_PATH | O_NOFOLLOW | O_CLOEXEC);
+        if (pinned_fd < 0 || fstat(pinned_fd, &pinned) != 0 ||
+            pinned.st_dev != observed.st.st_dev ||
+            pinned.st_ino != observed.st.st_ino ||
+            pinned.st_mode != observed.st.st_mode ||
+            pinned.st_uid != observed.st.st_uid ||
+            pinned.st_size != observed.st.st_size) {
+            if (pinned_fd >= 0) close(pinned_fd);
+            set_error(ERR_FILE_IO,
+                      "Cannot descriptor-pin GPG recovery quarantine: %s",
+                      residue->name);
+            return -1;
+        }
+    }
+#endif
+    if (g_reset_postvalidate_hook &&
+        g_reset_postvalidate_hook(base_fd, quarantine) != 0) {
+#if defined(__FreeBSD__)
+        if (pinned_fd >= 0) close(pinned_fd);
+#endif
+        set_error(ERR_FILE_IO,
+                  "GPG recovery post-validation hook failed: %s",
+                  residue->name);
+        return -1;
+    }
+    if (g_identity_unlink) {
+        if (g_identity_unlink(base_fd, quarantine,
+                              &observed.st) != 0) {
+            set_error(ERR_FILE_IO,
+                      "Descriptor-bound GPG recovery retirement rejected a "
+                      "changed entry: %s",
+                      residue->name);
+            return -1;
+        }
+#if defined(__FreeBSD__)
+    } else if (funlinkat(base_fd, quarantine, pinned_fd, 0) == 0) {
+        close(pinned_fd);
+        pinned_fd = -1;
+#endif
+    } else {
+#if defined(__FreeBSD__)
+        int saved_errno = errno;
+        if (pinned_fd >= 0) close(pinned_fd);
+        errno = saved_errno;
+        set_system_error(ERR_FILE_IO,
+                         "Cannot descriptor-unlink GPG recovery quarantine: %s",
+                         residue->name);
+#else
+        int restore_rc = g_rename_noreplace(
+            base_fd, quarantine, base_fd, residue->name);
+        set_error(
+            ERR_FILE_IO,
+            "Platform lacks descriptor-bound GPG recovery retirement; "
+            "artifact %s: %s",
+            restore_rc == 0 ? "restored" : "retained in quarantine",
+            residue->name);
+#endif
+        return -1;
+    }
+#if defined(__FreeBSD__)
+    if (pinned_fd >= 0) close(pinned_fd);
+#endif
+    if (fstatat(base_fd, quarantine, &(struct stat){0},
+                AT_SYMLINK_NOFOLLOW) == 0 || errno != ENOENT) {
+        set_system_error(ERR_FILE_IO,
+                         "Descriptor-bound GPG recovery entry survived retirement: %s",
                          residue->name);
         return -1;
     }
