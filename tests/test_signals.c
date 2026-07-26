@@ -1035,9 +1035,10 @@ static int exercise_atomic_reap_retirement(void) {
     signals_test_set_post_wait_hook(NULL);
     if (run_rc != 0 || !result.spawned || result.exit_code != 0) return 42;
     if (!post_wait_hook_called || !post_wait_hook_guarded_masked) return 43;
-    if (!signals_pending()) return 44;
+    if (signals_test_published_child() != 0) return 44;
+    if (!signals_pending()) return 45;
     signals_rollback_end();
-    if (signals_guard_end() != 0) return 45;
+    if (signals_guard_end() != 0) return 46;
     return 0;
 }
 
