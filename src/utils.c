@@ -3710,7 +3710,10 @@ static void runner_group_signal_relay(int signal_number) {
     int saved_errno = errno;
     unsigned char byte = (unsigned char)signal_number;
     int fd = (int)g_runner_relay_fd;
-    if (fd >= 0) (void)write(fd, &byte, 1U);
+    if (fd >= 0) {
+        ssize_t ignored = write(fd, &byte, 1U);
+        (void)ignored;
+    }
     errno = saved_errno;
 }
 
