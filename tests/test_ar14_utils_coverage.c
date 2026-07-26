@@ -121,6 +121,143 @@ TEST(environment_helpers_reject_invalid_arguments_and_small_buffers) {
     CHECK_EQ_INT(unset_env_var(""), -1);
 }
 
+TEST(string_helpers_cover_null_empty_case_and_boundary_contracts) {
+    char blank[] = " \t\n ";
+    char empty[] = "";
+    char padded[] = "\t Alpha Beta \n";
+
+    CHECK(trim_whitespace(NULL) == NULL);
+    CHECK_STR_EQ(trim_whitespace(empty), "");
+    CHECK_STR_EQ(trim_whitespace(blank), "");
+    CHECK_STR_EQ(trim_whitespace(padded), "Alpha Beta");
+
+    CHECK(string_empty(NULL));
+    CHECK(string_empty(""));
+    CHECK(!string_empty("value"));
+
+    CHECK(string_equals(NULL, NULL));
+    CHECK(!string_equals(NULL, "value"));
+    CHECK(!string_equals("value", NULL));
+    CHECK(string_equals("value", "value"));
+    CHECK(!string_equals("value", "other"));
+
+    CHECK(string_ascii_case_equal(NULL, NULL));
+    CHECK(!string_ascii_case_equal(NULL, "alpha"));
+    CHECK(!string_ascii_case_equal("alpha", NULL));
+    CHECK(string_ascii_case_equal("", ""));
+    CHECK(string_ascii_case_equal("Alpha-Z", "aLPHA-z"));
+    CHECK(!string_ascii_case_equal("alpha", "alph"));
+    CHECK(!string_ascii_case_equal("alph", "alpha"));
+    CHECK(!string_ascii_case_equal("alpha", "alpHa!"));
+
+    CHECK(!string_starts_with(NULL, "prefix"));
+    CHECK(!string_starts_with("prefix", NULL));
+    CHECK(string_starts_with("prefix-value", ""));
+    CHECK(string_starts_with("prefix-value", "prefix"));
+    CHECK(!string_starts_with("prefix-value", "value"));
+
+    CHECK(!string_ends_with(NULL, "suffix"));
+    CHECK(!string_ends_with("suffix", NULL));
+    CHECK(string_ends_with("value-suffix", ""));
+    CHECK(string_ends_with("value-suffix", "suffix"));
+    CHECK(!string_ends_with("short", "longer-suffix"));
+    CHECK(!string_ends_with("value-suffix", "value"));
+}
+
+TEST(string_replace_reports_invalid_missing_overflow_and_success) {
+    char unchanged[32] = "alpha beta";
+    char overflow[8] = "alpha";
+    char shorter[32] = "alpha beta";
+    char longer[32] = "alpha beta";
+
+    CHECK_EQ_INT(string_replace(NULL, 0, "alpha", "beta"), -1);
+    CHECK_EQ_INT(string_replace(unchanged, sizeof(unchanged), NULL, "beta"),
+                 -1);
+    CHECK_EQ_INT(string_replace(unchanged, sizeof(unchanged), "alpha", NULL),
+                 -1);
+    CHECK_EQ_INT(string_replace(unchanged, sizeof(unchanged), "missing", "x"),
+                 0);
+    CHECK_STR_EQ(unchanged, "alpha beta");
+
+    CHECK_EQ_INT(string_replace(overflow, sizeof(overflow), "alpha",
+                                "overflow"), -1);
+    CHECK_STR_EQ(overflow, "alpha");
+
+    CHECK_EQ_INT(string_replace(shorter, sizeof(shorter), "alpha", "a"), 1);
+    CHECK_STR_EQ(shorter, "a beta");
+    CHECK_EQ_INT(string_replace(longer, sizeof(longer), "beta",
+                                "longer-value"), 1);
+    CHECK_STR_EQ(longer, "alpha longer-value");
+}
+
+TEST(path_helpers_cover_tilde_separators_types_and_bounds) {
+    char root[] = "/tmp/gitswitch-ar14-utils-path-XXXXXX";
+    char regular[MAX_PATH_LEN];
+    char missing[MAX_PATH_LEN];
+    char expanded[MAX_PATH_LEN];
+    char joined[MAX_PATH_LEN];
+    char tiny[4] = "";
+    saved_env_t saved_home;
+    bool environment_saved = save_env("HOME", &saved_home);
+
+    CHECK(environment_saved);
+    if (!environment_saved) return;
+    if (!ts_mkdtemp(root)) {
+        CHECK(!"failed to create isolated path fixture");
+        CHECK(restore_env("HOME", &saved_home));
+        return;
+    }
+    CHECK_EQ_INT(safe_snprintf(regular, sizeof(regular), "%s/value", root), 0);
+    CHECK_EQ_INT(safe_snprintf(missing, sizeof(missing), "%s/missing", root),
+                 0);
+    CHECK(make_regular_file(regular, 0600));
+    CHECK_EQ_INT(setenv("HOME", root, 1), 0);
+
+    CHECK_EQ_INT(expand_path(NULL, expanded, sizeof(expanded)), -1);
+    CHECK_EQ_INT(expand_path("/value", NULL, sizeof(expanded)), -1);
+    CHECK_EQ_INT(expand_path("/value", expanded, 0), -1);
+    CHECK_EQ_INT(expand_path("~someone/value", expanded, sizeof(expanded)),
+                 -1);
+    CHECK_EQ_INT(expand_path("~", expanded, sizeof(expanded)), 0);
+    CHECK_EQ_INT(safe_snprintf(joined, sizeof(joined), "%s/", root), 0);
+    CHECK_STR_EQ(expanded, joined);
+    CHECK_EQ_INT(expand_path("~/value", expanded, sizeof(expanded)), 0);
+    CHECK_STR_EQ(expanded, regular);
+    CHECK_EQ_INT(expand_path("/value", tiny, sizeof(tiny)), -1);
+    CHECK_EQ_INT(expand_path("/value", expanded, sizeof(expanded)), 0);
+    CHECK_STR_EQ(expanded, "/value");
+    CHECK_EQ_INT(get_home_directory(tiny, sizeof(tiny)), -1);
+
+    CHECK_EQ_INT(join_path(NULL, sizeof(joined), root, "value"), -1);
+    CHECK_EQ_INT(join_path(joined, sizeof(joined), NULL, "value"), -1);
+    CHECK_EQ_INT(join_path(joined, sizeof(joined), root, NULL), -1);
+    CHECK_EQ_INT(join_path(joined, 0, root, "value"), -1);
+    CHECK_EQ_INT(join_path(tiny, sizeof(tiny), root, "value"), -1);
+    CHECK_EQ_INT(join_path(joined, sizeof(joined), root, "value"), 0);
+    CHECK_STR_EQ(joined, regular);
+    CHECK_EQ_INT(join_path(joined, sizeof(joined), root, "/value"), 0);
+    CHECK_STR_EQ(joined, regular);
+    CHECK_EQ_INT(safe_snprintf(expanded, sizeof(expanded), "%s/", root), 0);
+    CHECK_EQ_INT(join_path(joined, sizeof(joined), expanded, "value"), 0);
+    CHECK_STR_EQ(joined, regular);
+    CHECK_EQ_INT(join_path(joined, sizeof(joined), "", "value"), 0);
+    CHECK_STR_EQ(joined, "value");
+
+    CHECK(!path_exists(NULL));
+    CHECK(path_exists(root));
+    CHECK(path_exists(regular));
+    CHECK(!path_exists(missing));
+    CHECK(!is_directory(NULL));
+    CHECK(is_directory(root));
+    CHECK(!is_directory(regular));
+    CHECK(!is_directory(missing));
+    CHECK(!is_regular_file(NULL));
+    CHECK(!is_regular_file(root));
+    CHECK(is_regular_file(regular));
+    CHECK(!is_regular_file(missing));
+    CHECK(restore_env("HOME", &saved_home));
+}
+
 TEST(file_validation_distinguishes_existing_missing_and_invalid_paths) {
     char root[] = "/tmp/gitswitch-ar14-utils-file-XXXXXX";
     char file[MAX_PATH_LEN];
@@ -410,6 +547,9 @@ TEST_MAIN_BEGIN()
     RUN_TEST(process_liveness_rejects_invalid_pid_and_accepts_self);
     RUN_TEST(environment_helpers_round_trip_and_honor_overwrite);
     RUN_TEST(environment_helpers_reject_invalid_arguments_and_small_buffers);
+    RUN_TEST(string_helpers_cover_null_empty_case_and_boundary_contracts);
+    RUN_TEST(string_replace_reports_invalid_missing_overflow_and_success);
+    RUN_TEST(path_helpers_cover_tilde_separators_types_and_bounds);
     RUN_TEST(file_validation_distinguishes_existing_missing_and_invalid_paths);
     RUN_TEST(permission_validation_requires_the_exact_requested_mode);
     RUN_TEST(config_directory_creation_is_isolated_and_idempotent);
