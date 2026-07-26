@@ -22,6 +22,7 @@
 #include <limits.h>
 #include <signal.h>
 #include <sys/wait.h>
+#include <time.h>
 
 typedef void (*switch_abort_test_hook_fn)(gitswitch_ctx_t *ctx);
 typedef void (*switch_prepare_failure_test_hook_fn)(void);
@@ -608,7 +609,19 @@ static size_t h1_read_bounded_file(
     return total;
 }
 
-static bool h1_same_file_state(
+static bool h1_same_ctime(
+    const struct stat *left, const struct stat *right) {
+    if (!left || !right) return false;
+#if defined(__APPLE__)
+    return left->st_ctimespec.tv_sec == right->st_ctimespec.tv_sec &&
+           left->st_ctimespec.tv_nsec == right->st_ctimespec.tv_nsec;
+#else
+    return left->st_ctim.tv_sec == right->st_ctim.tv_sec &&
+           left->st_ctim.tv_nsec == right->st_ctim.tv_nsec;
+#endif
+}
+
+static bool h1_same_file_state_without_ctime(
     const struct stat *left, const struct stat *right) {
     if (!left || !right ||
         !ts_same_identity(left, right) ||
@@ -621,15 +634,45 @@ static bool h1_same_file_state(
     }
 #if defined(__APPLE__)
     return left->st_mtimespec.tv_sec == right->st_mtimespec.tv_sec &&
-           left->st_mtimespec.tv_nsec == right->st_mtimespec.tv_nsec &&
-           left->st_ctimespec.tv_sec == right->st_ctimespec.tv_sec &&
-           left->st_ctimespec.tv_nsec == right->st_ctimespec.tv_nsec;
+           left->st_mtimespec.tv_nsec == right->st_mtimespec.tv_nsec;
 #else
     return left->st_mtim.tv_sec == right->st_mtim.tv_sec &&
-           left->st_mtim.tv_nsec == right->st_mtim.tv_nsec &&
-           left->st_ctim.tv_sec == right->st_ctim.tv_sec &&
-           left->st_ctim.tv_nsec == right->st_ctim.tv_nsec;
+           left->st_mtim.tv_nsec == right->st_mtim.tv_nsec;
 #endif
+}
+
+static bool h1_same_file_state(
+    const struct stat *left, const struct stat *right) {
+    return h1_same_file_state_without_ctime(left, right) &&
+           h1_same_ctime(left, right);
+}
+
+static int h1_force_ctime_only_drift(
+    const char *path, const struct stat *expected,
+    struct stat *current) {
+    const struct timespec retry = {
+        .tv_sec = 0, .tv_nsec = 1000000L
+    };
+
+    if (!path || !expected || !current) {
+        errno = EINVAL;
+        return -1;
+    }
+    for (size_t attempt = 0U; attempt < 128U; attempt++) {
+        if (lstat(path, current) != 0 ||
+            !h1_same_file_state_without_ctime(expected, current)) {
+            errno = ESTALE;
+            return -1;
+        }
+        if (!h1_same_ctime(expected, current)) return 0;
+        if (chmod(path, 0400) != 0 ||
+            chmod(path, 0600) != 0) {
+            return -1;
+        }
+        (void)nanosleep(&retry, NULL);
+    }
+    errno = ETIMEDOUT;
+    return -1;
 }
 
 static int fixture_setup(cli_owner_fixture_t *fixture) {
@@ -3700,6 +3743,117 @@ TEST(parent_guard_initial_fstat_failure_preserves_replacement_for_retry) {
     ts_rm_rf(fixture.root);
 }
 
+TEST(parent_guard_clear_accepts_exact_ctime_only_marker_drift) {
+    cli_owner_fixture_t fixture = {0};
+    h1_guard_case_t guard_case = {0};
+    struct stat before_state = {0};
+    struct stat after_state = {0};
+    struct stat state = {0};
+    int begin_result = -1;
+    int fixture_result;
+
+    fixture_result = h1_fixture_setup(&fixture);
+    CHECK_EQ_INT(fixture_result, 0);
+    if (fixture_result == 0) {
+        begin_result = h1_guard_case_begin(&fixture, &guard_case);
+    }
+    CHECK_EQ_INT(begin_result, 0);
+    if (begin_result == 0) {
+        CHECK_EQ_INT(
+            config_switch_guard_install_or_adopt(
+                guard_case.ctx, guard_case.target, GIT_SCOPE_GLOBAL,
+                guard_case.destinations, guard_case.destination_count,
+                &guard_case.guard),
+            0);
+        CHECK(guard_case.guard != NULL);
+        CHECK_EQ_INT(
+            lstat(fixture.switch_fence, &before_state), 0);
+        CHECK_EQ_INT(
+            h1_force_ctime_only_drift(
+                fixture.switch_fence, &before_state, &after_state),
+            0);
+        CHECK(h1_same_file_state_without_ctime(
+            &before_state, &after_state));
+        CHECK(!h1_same_ctime(&before_state, &after_state));
+        CHECK_EQ_INT(
+            config_switch_guard_clear(&guard_case.guard), 0);
+        CHECK(!guard_case.guard);
+        errno = 0;
+        CHECK(lstat(fixture.switch_fence, &state) != 0 &&
+              errno == ENOENT);
+    }
+    h1_guard_case_end(&guard_case);
+    ts_rm_rf(fixture.root);
+}
+
+TEST(parent_guard_clear_rejects_same_bytes_on_replacement_inode) {
+    char marker_before[16384] = {0};
+    unsigned char marker_after[sizeof(marker_before)] = {0};
+    cli_owner_fixture_t fixture = {0};
+    h1_guard_case_t guard_case = {0};
+    struct stat before_state = {0};
+    struct stat replacement_state = {0};
+    struct stat after_state = {0};
+    size_t before_length = 0U;
+    size_t after_length = 0U;
+    int begin_result = -1;
+    int fixture_result;
+
+    fixture_result = h1_fixture_setup(&fixture);
+    CHECK_EQ_INT(fixture_result, 0);
+    if (fixture_result == 0) {
+        begin_result = h1_guard_case_begin(&fixture, &guard_case);
+    }
+    CHECK_EQ_INT(begin_result, 0);
+    if (begin_result == 0) {
+        CHECK_EQ_INT(
+            config_switch_guard_install_or_adopt(
+                guard_case.ctx, guard_case.target, GIT_SCOPE_GLOBAL,
+                guard_case.destinations, guard_case.destination_count,
+                &guard_case.guard),
+            0);
+        CHECK(guard_case.guard != NULL);
+        before_length = h1_read_bounded_file(
+            fixture.switch_fence,
+            (unsigned char *)marker_before,
+            sizeof(marker_before) - 1U, &before_state);
+        CHECK(before_length > 0U);
+        CHECK(memchr(marker_before, '\0', before_length) == NULL);
+        if (before_length > 0U &&
+            before_length < sizeof(marker_before) &&
+            memchr(marker_before, '\0', before_length) == NULL) {
+            marker_before[before_length] = '\0';
+            CHECK_EQ_INT(
+                replace_private_atomically(
+                    fixture.switch_fence, marker_before),
+                0);
+            CHECK_EQ_INT(
+                lstat(fixture.switch_fence, &replacement_state), 0);
+            CHECK(!ts_same_identity(
+                &before_state, &replacement_state));
+            CHECK_EQ_INT(
+                config_switch_guard_clear(&guard_case.guard), -1);
+            CHECK(guard_case.guard != NULL);
+            CHECK_EQ_INT(errno, ESTALE);
+            after_length = h1_read_bounded_file(
+                fixture.switch_fence, marker_after,
+                sizeof(marker_after), &after_state);
+            CHECK_EQ_INT(
+                (int)after_length, (int)before_length);
+            if (after_length == before_length) {
+                CHECK(memcmp(
+                    marker_before, marker_after, after_length) == 0);
+            }
+            CHECK(ts_same_identity(
+                &replacement_state, &after_state));
+        }
+    }
+    h1_guard_case_end(&guard_case);
+    secure_zero_memory(marker_before, sizeof(marker_before));
+    secure_zero_memory(marker_after, sizeof(marker_after));
+    ts_rm_rf(fixture.root);
+}
+
 TEST(parent_guard_abandon_then_adopt_reuses_exact_authority) {
     unsigned char marker_before[16384] = {0};
     unsigned char marker_after[sizeof(marker_before)] = {0};
@@ -3874,6 +4028,8 @@ TEST_MAIN_BEGIN()
     RUN_TEST(parent_guard_stage_failure_removes_exact_fresh_stage);
     RUN_TEST(
         parent_guard_initial_fstat_failure_preserves_replacement_for_retry);
+    RUN_TEST(parent_guard_clear_accepts_exact_ctime_only_marker_drift);
+    RUN_TEST(parent_guard_clear_rejects_same_bytes_on_replacement_inode);
     RUN_TEST(parent_guard_abandon_then_adopt_reuses_exact_authority);
     RUN_TEST(parent_guard_retain_republishes_exact_unlinked_marker);
 TEST_MAIN_END()

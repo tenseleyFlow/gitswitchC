@@ -1646,6 +1646,16 @@ static bool config_metadata_ctime_only_change(const struct stat *before,
     return same_without_ctime && same_mtime && !same_ctime;
 }
 
+/* Use only after a complete, independently bounded byte comparison has
+ * proved the file contents. This admits FreeBSD UFS's delayed ctime
+ * materialization without accepting a replacement inode or any ownership,
+ * mode, link-count, size, or mtime change. */
+static bool config_metadata_matches_after_exact_content_proof(
+    const struct stat *before, const struct stat *after) {
+    return config_metadata_snapshot_same(before, after) ||
+           config_metadata_ctime_only_change(before, after);
+}
+
 static bool config_metadata_dir_is_safe(const struct stat *st) {
     return S_ISDIR(st->st_mode) && st->st_uid == getuid() &&
            (st->st_mode & (S_IWGRP | S_IWOTH)) == 0;
@@ -6105,6 +6115,7 @@ static int config_switch_guard_read_named_at(
     struct stat opened;
     struct stat descriptor_after;
     struct stat named_after;
+    struct stat named_closed;
     unsigned char *buffer = NULL;
     unsigned char trailing;
     ssize_t trailing_count;
@@ -6199,7 +6210,27 @@ static int config_switch_guard_read_named_at(
         goto read_fail;
     }
     fd = -1;
-    *identity = named_after;
+
+    /* FreeBSD UFS may materialize a reader-induced ctime update only after
+     * close. The complete marker bytes and canonical model were just proved
+     * through this descriptor, so refresh the pathname generation while
+     * admitting only that narrow metadata transition. */
+    errno = 0;
+    if (fstatat(
+            directory_fd, CONFIG_SWITCH_GUARD_NAME, &named_closed,
+            AT_SYMLINK_NOFOLLOW) != 0) {
+        failure_errno = config_is_namespace_change_errno(errno)
+                            ? ESTALE
+                            : (errno ? errno : EIO);
+        goto read_fail;
+    }
+    if (!config_metadata_file_is_safe(&named_closed, true) ||
+        !config_metadata_matches_after_exact_content_proof(
+            &descriptor_after, &named_closed)) {
+        failure_errno = ESTALE;
+        goto read_fail;
+    }
+    *identity = named_closed;
     *data = buffer;
     return 0;
 
@@ -6266,6 +6297,9 @@ static int config_switch_guard_snapshot_read_at(
         errno = ESTALE;
         goto snapshot_fail;
     }
+    /* Expected-absent namespace probes use ENOENT internally. Do not leak
+     * that stale success-path value into a later generation-mismatch error. */
+    errno = 0;
     return 0;
 
 snapshot_fail:
@@ -6523,16 +6557,16 @@ static bool config_switch_guard_matches_handle(
     const config_switch_guard_snapshot_t *snapshot) {
     return guard && snapshot && !snapshot->stage_present &&
            !snapshot->marker_absent &&
-           config_metadata_snapshot_same(
-               &guard->marker_identity,
-               &snapshot->marker_identity) &&
            guard->marker_length == snapshot->marker_length &&
            memcmp(
                guard->marker_data, snapshot->marker_data,
                guard->marker_length) == 0 &&
            strcmp(
                guard->token,
-               snapshot->marker_model.token) == 0;
+               snapshot->marker_model.token) == 0 &&
+           config_metadata_matches_after_exact_content_proof(
+               &guard->marker_identity,
+               &snapshot->marker_identity);
 }
 
 static void config_switch_guard_free(config_switch_guard_t *guard) {
@@ -6957,13 +6991,13 @@ int config_switch_guard_install_or_adopt(
                 directory_fd, revalidated) != 0 ||
             revalidated->stage_present ||
             revalidated->marker_absent ||
-            !config_metadata_snapshot_same(
-                &snapshot->marker_identity,
-                &revalidated->marker_identity) ||
             revalidated->marker_length != expected_length ||
             memcmp(
                 revalidated->marker_data, expected_data,
                 expected_length) != 0 ||
+            !config_metadata_matches_after_exact_content_proof(
+                &snapshot->marker_identity,
+                &revalidated->marker_identity) ||
             config_switch_guard_source_matches_at(
                 directory_fd, config_name,
                 &expected->source_generation) != 0 ||
