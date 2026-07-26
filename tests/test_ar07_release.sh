@@ -1990,8 +1990,9 @@ EOF
         for private_fork_signal in HUP INT QUIT TERM; do
             private_fork_label=$private_fork_target-$private_fork_signal
             private_fork_report=$tmp/private-fork-$private_fork_label.report
+            private_fork_cleanup=$tmp/private-fork-$private_fork_label.cleanup
             rm -f "$private_capture" "$private_marker" "$private_release" \
-                "$private_fork_report" \
+                "$private_fork_report" "$private_fork_cleanup" \
                 "$private_consume_root/build/dist"/.archive.tar.gz.tmp.*
             private_fork_status=0
             # The selected producer child, not this test shell, expands its
@@ -2004,6 +2005,7 @@ EOF
                 GITSWITCH_RELEASE_TEST_FORK_SIGNAL=$private_fork_signal \
                 GITSWITCH_RELEASE_TEST_FORK_REPORT_FD=9 \
                 GITSWITCH_RELEASE_TEST_FORK_TARGET=$private_fork_target \
+                GITSWITCH_RELEASE_TEST_SIGNAL_CLEANUP_MARKER=$private_fork_cleanup \
                 "$named_publish_helper" --internal-release-tree-consume-v1 \
                 "$private_consume_root" build dist archive.tar.gz -- \
                 /bin/sh -c '
@@ -2060,17 +2062,29 @@ EOF
             [ ! -e "$private_consume_root/build/dist/archive.tar.gz" ] &&
             [ ! -L "$private_consume_root/build/dist/archive.tar.gz" ] ||
                 private_fork_violations="$private_fork_violations $private_fork_label-published"
+            cmp -s "$private_fork_cleanup" - <<'EOF' ||
+cleanup
+EOF
+                private_fork_violations="$private_fork_violations $private_fork_label-cleanup-owner"
             set -- "$private_consume_root/build/dist"/.archive.tar.gz.tmp.*
-            if [ "$#" -ne 1 ] || [ ! -f "$1" ] || [ -L "$1" ]; then
-                private_fork_violations="$private_fork_violations $private_fork_label-temp-shape"
-            else
-                if [ "$private_fork_target" = consumer ] &&
-                   [ "$(cat "$1")" != private-consume-payload ]; then
-                    private_fork_violations="$private_fork_violations $private_fork_label-temp-bytes"
-                fi
-                rm -f "$1" ||
-                    private_fork_violations="$private_fork_violations $private_fork_label-temp-cleanup"
-            fi
+            case $copy_platform in
+                FreeBSD)
+                    { [ "$#" -eq 1 ] && [ ! -e "$1" ] && [ ! -L "$1" ]; } ||
+                        private_fork_violations="$private_fork_violations $private_fork_label-temp-residue"
+                    ;;
+                *)
+                    if [ "$#" -ne 1 ] || [ ! -f "$1" ] || [ -L "$1" ]; then
+                        private_fork_violations="$private_fork_violations $private_fork_label-temp-shape"
+                    else
+                        if [ "$private_fork_target" = consumer ] &&
+                           [ "$(cat "$1")" != private-consume-payload ]; then
+                            private_fork_violations="$private_fork_violations $private_fork_label-temp-bytes"
+                        fi
+                        rm -f "$1" ||
+                            private_fork_violations="$private_fork_violations $private_fork_label-temp-cleanup"
+                    fi
+                    ;;
+            esac
         done
     done
     [ -z "$private_fork_violations" ] ||
@@ -2188,8 +2202,11 @@ EOF
     rm -f "$private_temp" "$private_original"
 
     rm -f "$private_capture" "$private_marker" "$private_release"
+    private_signal_cleanup=$tmp/private-signal.cleanup
+    rm -f "$private_signal_cleanup"
     AR11_PRIVATE_MODE=signal AR11_PRIVATE_CAPTURE=$private_capture \
     AR11_PRIVATE_MARKER=$private_marker \
+    GITSWITCH_RELEASE_TEST_SIGNAL_CLEANUP_MARKER=$private_signal_cleanup \
         "$named_publish_helper" --internal-release-tree-consume-v1 \
         "$private_consume_root" build dist archive.tar.gz -- \
         /bin/sh -c 'printf private-consume-payload' \
@@ -2236,15 +2253,28 @@ EOF
         fail "private archive helper did not preserve TERM status"
     [ "$(cat "$private_capture")" = private-consume-payload ] ||
         fail "signalled private consumer received wrong archive bytes"
+    cmp -s "$private_signal_cleanup" - <<'EOF' ||
+cleanup
+EOF
+        fail "signalled private consumer bypassed normal cleanup ownership"
     set -- "$private_consume_root/build/dist"/.archive.tar.gz.tmp.*
-    { [ "$#" -eq 1 ] && [ -f "$1" ] && [ ! -L "$1" ]; } ||
-        fail "signalled named private archive was not safely retained"
-    [ "$(cat "$1")" = private-consume-payload ] ||
-        fail "signalled named private archive changed bytes"
+    case $copy_platform in
+        FreeBSD)
+            { [ "$#" -eq 1 ] && [ ! -e "$1" ] && [ ! -L "$1" ]; } ||
+                fail "signalled named private archive left staging residue"
+            ;;
+        *)
+            { [ "$#" -eq 1 ] && [ -f "$1" ] && [ ! -L "$1" ]; } ||
+                fail "signalled named private archive was not safely retained"
+            [ "$(cat "$1")" = private-consume-payload ] ||
+                fail "signalled named private archive changed bytes"
+            rm -f "$1" ||
+                fail "cannot retire signalled private archive fixture"
+            ;;
+    esac
     [ ! -e "$private_consume_root/build/dist/archive.tar.gz" ] &&
     [ ! -L "$private_consume_root/build/dist/archive.tar.gz" ] ||
         fail "signalled private consumer published a canonical name"
-    rm -f "$1" || fail "cannot retire signalled private archive fixture"
 
     # AR-11 M46: the publisher owns the fixed repository -> build -> dist
     # hierarchy.  A fresh root proves both components are created through the
@@ -2753,22 +2783,25 @@ EOF
     for copy_signal in HUP INT QUIT TERM; do
         copy_signal_pid_file=$tmp/copy-signal-$copy_signal.pid
         copy_signal_delayed=$tmp/copy-signal-$copy_signal.delayed
+        copy_signal_cleanup=$tmp/copy-signal-$copy_signal.cleanup
         copy_signal_producer_pid=
         rm -f "$copy_signal_pid_file" "$copy_signal_delayed" \
+            "$copy_signal_cleanup" \
             "$copy_archive" "$copy_dir"/.archive.tar.gz.tmp.*
-        copy_signal_status=0
         if AR11_COPY_SIGNAL=$copy_signal \
             AR11_COPY_SIGNAL_PID=$copy_signal_pid_file \
             AR11_COPY_SIGNAL_DELAYED=$copy_signal_delayed \
             AR11_COPY_SIGNAL_DIR=$copy_dir \
             AR11_COPY_SIGNAL_EXPECTED=$copy_signal_expected \
             GITSWITCH_RELEASE_TEST_FATAL_DEFAULTS=1 \
+            GITSWITCH_RELEASE_TEST_SIGNAL_CLEANUP_MARKER=$copy_signal_cleanup \
+            "$named_publish_helper" --test-wait-signal "$copy_signal" -- \
             "$named_publish_helper" "$copy_dir" "$copy_canonical" \
                 archive.tar.gz -- /bin/sh -c "$copy_signal_command" \
                 >"$out" 2>&1; then
-            copy_signal_status=0
+            :
         else
-            copy_signal_status=$?
+            copy_signal_violations="$copy_signal_violations $copy_signal-waitpid-status"
         fi
         if [ ! -s "$copy_signal_pid_file" ]; then
             copy_signal_violations="$copy_signal_violations $copy_signal-no-pid"
@@ -2778,17 +2811,6 @@ EOF
             case $copy_signal_producer_pid in
                 ''|0|*[!0-9]*)
                     fail "$copy_signal fixture published an invalid producer PID"
-                    ;;
-            esac
-        fi
-        if [ "$copy_signal_status" -le 128 ]; then
-            copy_signal_violations="$copy_signal_violations $copy_signal-status-$copy_signal_status"
-        else
-            copy_signal_observed=$(kill -l "$copy_signal_status" 2>/dev/null || :)
-            case $copy_signal_observed in
-                "$copy_signal"|"SIG$copy_signal") ;;
-                *)
-                    copy_signal_violations="$copy_signal_violations $copy_signal-status-$copy_signal_status"
                     ;;
             esac
         fi
@@ -2811,22 +2833,180 @@ EOF
         copy_signal_producer_pid=
         { [ ! -e "$copy_archive" ] && [ ! -L "$copy_archive" ]; } ||
             copy_signal_violations="$copy_signal_violations $copy_signal-published"
+        cmp -s "$copy_signal_cleanup" - <<'EOF' ||
+cleanup
+EOF
+            copy_signal_violations="$copy_signal_violations $copy_signal-cleanup-owner"
         set -- "$copy_dir"/.archive.tar.gz.tmp.*
-        if [ "$#" -ne 1 ] || [ ! -f "$1" ]; then
-            copy_signal_violations="$copy_signal_violations $copy_signal-temp-shape"
-        else
-            cmp -s "$copy_signal_expected" "$1" ||
-                copy_signal_violations="$copy_signal_violations $copy_signal-temp-bytes"
-            [ "$(find "$1" -prune -type f -perm 0600 -print)" = "$1" ] ||
-                copy_signal_violations="$copy_signal_violations $copy_signal-temp-mode"
-        fi
-        rm -f "$copy_archive" "$copy_dir"/.archive.tar.gz.tmp.*
-        set -- "$copy_dir"/.archive.tar.gz.tmp.*
-        { [ "$#" -eq 1 ] && [ ! -e "$1" ] && [ ! -L "$1" ]; } ||
-            copy_signal_violations="$copy_signal_violations $copy_signal-temp-residue"
+        case $copy_platform in
+            FreeBSD)
+                { [ "$#" -eq 1 ] && [ ! -e "$1" ] && [ ! -L "$1" ]; } ||
+                    copy_signal_violations="$copy_signal_violations $copy_signal-temp-residue"
+                ;;
+            *)
+                if [ "$#" -ne 1 ] || [ ! -f "$1" ]; then
+                    copy_signal_violations="$copy_signal_violations $copy_signal-temp-shape"
+                else
+                    cmp -s "$copy_signal_expected" "$1" ||
+                        copy_signal_violations="$copy_signal_violations $copy_signal-temp-bytes"
+                    [ "$(find "$1" -prune -type f -perm 0600 -print)" = "$1" ] ||
+                        copy_signal_violations="$copy_signal_violations $copy_signal-temp-mode"
+                    rm -f "$1" ||
+                        copy_signal_violations="$copy_signal_violations $copy_signal-temp-cleanup"
+                fi
+                ;;
+        esac
     done
     [ -z "$copy_signal_violations" ] ||
         fail "fatal-signal forwarding violations:$copy_signal_violations"
+
+    # A fatal signal made pending inside the blocked publication critical
+    # section must be observed before the no-replace link/clone can commit.
+    publication_signal_final=publication-signal.tar
+    publication_signal_cleanup=$tmp/publication-signal.cleanup
+    rm -f "$publication_signal_cleanup" \
+        "$copy_dir/$publication_signal_final" \
+        "$copy_dir"/."$publication_signal_final".tmp.*
+    if ! GITSWITCH_RELEASE_TEST_FATAL_DEFAULTS=1 \
+        GITSWITCH_RELEASE_TEST_PUBLICATION_SIGNAL=TERM \
+        GITSWITCH_RELEASE_TEST_SIGNAL_CLEANUP_MARKER=$publication_signal_cleanup \
+        "$named_publish_helper" --test-wait-signal TERM -- \
+        "$named_publish_helper" "$copy_dir" "$copy_canonical" \
+            "$publication_signal_final" -- \
+            /bin/sh -c 'printf publication-signal-payload' \
+            >"$out" 2>&1; then
+        fail "waitpid oracle rejected publication-critical signal termination"
+    fi
+    cmp -s "$publication_signal_cleanup" - <<'EOF' ||
+cleanup
+EOF
+        fail "publication-critical signal bypassed normal cleanup"
+    [ ! -e "$copy_dir/$publication_signal_final" ] &&
+    [ ! -L "$copy_dir/$publication_signal_final" ] ||
+        fail "pending fatal signal crossed the canonical publication commit"
+    set -- "$copy_dir"/."$publication_signal_final".tmp.*
+    case $copy_platform in
+        FreeBSD)
+            { [ "$#" -eq 1 ] && [ ! -e "$1" ] && [ ! -L "$1" ]; } ||
+                fail "publication-critical signal left FreeBSD staging residue"
+            ;;
+        *)
+            { [ "$#" -eq 1 ] && [ -f "$1" ] && [ ! -L "$1" ]; } ||
+                fail "publication-critical signal did not safely retain staging"
+            rm -f "$1" ||
+                fail "cannot retire publication-critical signal fixture"
+            ;;
+    esac
+
+    # The real internal archive controller must receive the original signal,
+    # remove the private workspace it actually created, and be reaped with that
+    # exact signal before the outer publisher performs its own cleanup/death.
+    internal_signal=TERM
+    internal_signal_number=$(kill -l "$internal_signal") ||
+        fail "cannot resolve internal archive fixture signal"
+    internal_archive_tmp=$tmp/internal-archive-tmp
+    internal_archive_ready=$tmp/internal-archive.ready
+    internal_archive_cleanup=$tmp/internal-archive.cleanup
+    internal_archive_reap=$tmp/internal-archive.reap
+    internal_archive_oracle_pid=$tmp/internal-archive.oracle-pid
+    internal_archive_outer_cleanup=$tmp/internal-archive.outer-cleanup
+    internal_archive_final=internal-signal.tar
+    internal_archive_repo=$tmp/internal-archive-repo
+    internal_archive_dist=$internal_archive_repo/build/dist
+    mkdir -m 0700 "$internal_archive_tmp" ||
+        fail "cannot create internal archive fixture TMPDIR"
+    git clone --quiet "$root" "$internal_archive_repo" ||
+        fail "cannot clone internal archive signal fixture"
+    rm -f "$internal_archive_ready" "$internal_archive_cleanup" \
+        "$internal_archive_reap" "$internal_archive_oracle_pid" \
+        "$internal_archive_outer_cleanup" \
+        "$internal_archive_dist/$internal_archive_final" \
+        "$internal_archive_dist"/."$internal_archive_final".tmp.*
+    internal_archive_commit=$(git -C "$internal_archive_repo" rev-parse HEAD) ||
+        fail "cannot resolve internal archive fixture commit"
+    TMPDIR=$internal_archive_tmp \
+    GITSWITCH_RELEASE_TEST_FATAL_DEFAULTS=1 \
+    GITSWITCH_RELEASE_TEST_WAIT_ORACLE_PID_REPORT=$internal_archive_oracle_pid \
+    GITSWITCH_RELEASE_TEST_INTERNAL_ARCHIVE_READY=$internal_archive_ready \
+    GITSWITCH_RELEASE_TEST_INTERNAL_ARCHIVE_CLEANUP_REPORT=$internal_archive_cleanup \
+    GITSWITCH_RELEASE_TEST_INTERNAL_ARCHIVE_REAP_REPORT=$internal_archive_reap \
+    GITSWITCH_RELEASE_TEST_SIGNAL_CLEANUP_MARKER=$internal_archive_outer_cleanup \
+        "$named_publish_helper" --test-wait-signal "$internal_signal" -- \
+        "$named_publish_helper" --internal-release-tree-v1 \
+            "$internal_archive_repo" build dist "$internal_archive_final" -- \
+            --internal-release-archive-v1 "$internal_archive_repo" \
+            "$internal_archive_commit" internal-signal-proof -- VERSION \
+            >"$out" 2>&1 &
+    copy_pid=$!
+    attempt=0
+    while { [ ! -s "$internal_archive_oracle_pid" ] ||
+            [ ! -s "$internal_archive_ready" ]; } &&
+          kill -0 "$copy_pid" 2>/dev/null && [ "$attempt" -lt 300 ]; do
+        sleep 0.1
+        attempt=$((attempt + 1))
+    done
+    { [ -s "$internal_archive_oracle_pid" ] &&
+      [ -s "$internal_archive_ready" ]; } ||
+        fail "internal archive controller did not reach its workspace boundary"
+    IFS= read -r copy_signal_producer_pid <"$internal_archive_oracle_pid" ||
+        fail "cannot read internal archive outer publisher PID"
+    internal_archive_pid=$(sed -n 's/^pid=//p' "$internal_archive_ready")
+    internal_archive_workspace=$(sed -n 's/^workspace=//p' \
+        "$internal_archive_ready")
+    case $copy_signal_producer_pid:$internal_archive_pid in
+        *[!0-9:]*|:*|*:) fail "internal archive fixture reported invalid PIDs" ;;
+    esac
+    [ -n "$internal_archive_workspace" ] ||
+        fail "internal archive fixture did not report its workspace"
+    kill -s "$internal_signal" "$copy_signal_producer_pid" ||
+        fail "cannot signal internal archive outer publisher"
+    if ! wait "$copy_pid"; then
+        copy_pid=
+        fail "waitpid oracle rejected internal archive signal termination"
+    fi
+    copy_pid=
+    copy_signal_producer_pid=
+    grep -Fx "pid=$internal_archive_pid" "$internal_archive_cleanup" \
+        >/dev/null ||
+        fail "internal archive cleanup proof came from the wrong role"
+    grep -Fx "signal=$internal_signal_number" "$internal_archive_cleanup" \
+        >/dev/null ||
+        fail "internal archive controller did not receive the original signal"
+    grep -Fx 'cleanup=ok' "$internal_archive_cleanup" >/dev/null ||
+        fail "internal archive workspace cleanup did not succeed"
+    grep -Fx "workspace=$internal_archive_workspace" \
+        "$internal_archive_cleanup" >/dev/null ||
+        fail "internal archive cleanup proof changed workspace identity"
+    [ ! -e "$internal_archive_workspace" ] &&
+    [ ! -L "$internal_archive_workspace" ] ||
+        fail "internal archive private workspace survived deferred cleanup"
+    grep -Fx "pid=$internal_archive_pid" "$internal_archive_reap" >/dev/null ||
+        fail "outer publisher reaped a different internal archive controller"
+    grep -Fx 'signaled=1' "$internal_archive_reap" >/dev/null ||
+        fail "internal archive controller was not reaped as signal-terminated"
+    grep -Fx "signal=$internal_signal_number" "$internal_archive_reap" \
+        >/dev/null ||
+        fail "internal archive controller was reaped with the wrong signal"
+    cmp -s "$internal_archive_outer_cleanup" - <<'EOF' ||
+cleanup
+EOF
+        fail "internal archive outer publisher bypassed normal cleanup"
+    [ ! -e "$internal_archive_dist/$internal_archive_final" ] &&
+    [ ! -L "$internal_archive_dist/$internal_archive_final" ] ||
+        fail "signalled internal archive published a canonical artifact"
+    set -- "$internal_archive_dist"/."$internal_archive_final".tmp.*
+    case $copy_platform in
+        FreeBSD)
+            { [ "$#" -eq 1 ] && [ ! -e "$1" ] && [ ! -L "$1" ]; } ||
+                fail "signalled internal archive left FreeBSD staging residue"
+            ;;
+        *)
+            { [ "$#" -eq 1 ] && [ -f "$1" ] && [ ! -L "$1" ]; } ||
+                fail "signalled internal archive did not safely retain staging"
+            rm -f "$1" ||
+                fail "cannot retire internal archive signal fixture"
+            ;;
+    esac
 
     # An ignored disposition is an intentional caller policy (for example,
     # nohup), not a request for the publisher to install a forwarding handler.
@@ -3281,12 +3461,14 @@ EOF
     copy_reap_violations=
     for copy_reap_signal in HUP INT QUIT TERM; do
         copy_reap_report=$tmp/copy-reap-$copy_reap_signal.report
-        rm -f "$copy_reap_report" "$copy_archive" \
+        copy_reap_cleanup=$tmp/copy-reap-$copy_reap_signal.cleanup
+        rm -f "$copy_reap_report" "$copy_reap_cleanup" "$copy_archive" \
             "$copy_dir"/.archive.tar.gz.tmp.*
         copy_reap_status=0
         if GITSWITCH_RELEASE_TEST_FATAL_DEFAULTS=1 \
             GITSWITCH_RELEASE_TEST_REAP_SIGNAL=$copy_reap_signal \
             GITSWITCH_RELEASE_TEST_REAP_REPORT_FD=9 \
+            GITSWITCH_RELEASE_TEST_SIGNAL_CLEANUP_MARKER=$copy_reap_cleanup \
             "$named_publish_helper" "$copy_dir" "$copy_canonical" \
                 archive.tar.gz -- /bin/sh -c \
                 'printf reap-transition-payload' \
@@ -3308,21 +3490,31 @@ EOF
         fi
         cmp -s "$copy_reap_report_expected" "$copy_reap_report" ||
             copy_reap_violations="$copy_reap_violations $copy_reap_signal-guard"
+        cmp -s "$copy_reap_cleanup" - <<'EOF' ||
+cleanup
+EOF
+            copy_reap_violations="$copy_reap_violations $copy_reap_signal-cleanup-owner"
         { [ ! -e "$copy_archive" ] && [ ! -L "$copy_archive" ]; } ||
             copy_reap_violations="$copy_reap_violations $copy_reap_signal-published"
         set -- "$copy_dir"/.archive.tar.gz.tmp.*
-        if [ "$#" -ne 1 ] || [ ! -f "$1" ]; then
-            copy_reap_violations="$copy_reap_violations $copy_reap_signal-temp-shape"
-        else
-            cmp -s "$copy_reap_expected" "$1" ||
-                copy_reap_violations="$copy_reap_violations $copy_reap_signal-temp-bytes"
-            [ "$(find "$1" -prune -type f -perm 0600 -print)" = "$1" ] ||
-                copy_reap_violations="$copy_reap_violations $copy_reap_signal-temp-mode"
-        fi
-        rm -f "$copy_archive" "$copy_dir"/.archive.tar.gz.tmp.*
-        set -- "$copy_dir"/.archive.tar.gz.tmp.*
-        { [ "$#" -eq 1 ] && [ ! -e "$1" ] && [ ! -L "$1" ]; } ||
-            copy_reap_violations="$copy_reap_violations $copy_reap_signal-temp-residue"
+        case $copy_platform in
+            FreeBSD)
+                { [ "$#" -eq 1 ] && [ ! -e "$1" ] && [ ! -L "$1" ]; } ||
+                    copy_reap_violations="$copy_reap_violations $copy_reap_signal-temp-residue"
+                ;;
+            *)
+                if [ "$#" -ne 1 ] || [ ! -f "$1" ]; then
+                    copy_reap_violations="$copy_reap_violations $copy_reap_signal-temp-shape"
+                else
+                    cmp -s "$copy_reap_expected" "$1" ||
+                        copy_reap_violations="$copy_reap_violations $copy_reap_signal-temp-bytes"
+                    [ "$(find "$1" -prune -type f -perm 0600 -print)" = "$1" ] ||
+                        copy_reap_violations="$copy_reap_violations $copy_reap_signal-temp-mode"
+                    rm -f "$1" ||
+                        copy_reap_violations="$copy_reap_violations $copy_reap_signal-temp-cleanup"
+                fi
+                ;;
+        esac
     done
     [ -z "$copy_reap_violations" ] ||
         fail "guarded producer-reap violations:$copy_reap_violations"
@@ -3331,7 +3523,8 @@ EOF
     # and may auto-reap children. The publisher must establish its own wait
     # ownership before fork so the same guarded retirement proof still runs.
     copy_reap_chld_report=$tmp/copy-reap-sigchld.report
-    rm -f "$copy_reap_chld_report" "$copy_archive" \
+    copy_reap_chld_cleanup=$tmp/copy-reap-sigchld.cleanup
+    rm -f "$copy_reap_chld_report" "$copy_reap_chld_cleanup" "$copy_archive" \
         "$copy_dir"/.archive.tar.gz.tmp.*
     copy_reap_status=0
     if (
@@ -3339,9 +3532,11 @@ EOF
         GITSWITCH_RELEASE_TEST_FATAL_DEFAULTS=1
         GITSWITCH_RELEASE_TEST_REAP_SIGNAL=TERM
         GITSWITCH_RELEASE_TEST_REAP_REPORT_FD=9
+        GITSWITCH_RELEASE_TEST_SIGNAL_CLEANUP_MARKER=$copy_reap_chld_cleanup
         export GITSWITCH_RELEASE_TEST_FATAL_DEFAULTS
         export GITSWITCH_RELEASE_TEST_REAP_SIGNAL
         export GITSWITCH_RELEASE_TEST_REAP_REPORT_FD
+        export GITSWITCH_RELEASE_TEST_SIGNAL_CLEANUP_MARKER
         exec "$named_publish_helper" "$copy_dir" "$copy_canonical" \
             archive.tar.gz -- /bin/sh -c 'printf reap-transition-payload' \
             9>"$copy_reap_chld_report" >"$out" 2>&1
@@ -3361,16 +3556,28 @@ EOF
     esac
     cmp -s "$copy_reap_report_expected" "$copy_reap_chld_report" ||
         fail "inherited SIGCHLD bypassed guarded producer retirement"
+    cmp -s "$copy_reap_chld_cleanup" - <<'EOF' ||
+cleanup
+EOF
+        fail "inherited SIGCHLD bypassed normal cleanup ownership"
     { [ ! -e "$copy_archive" ] && [ ! -L "$copy_archive" ]; } ||
         fail "inherited-SIGCHLD transition left a canonical artifact"
     set -- "$copy_dir"/.archive.tar.gz.tmp.*
-    { [ "$#" -eq 1 ] && [ -f "$1" ]; } ||
-        fail "inherited-SIGCHLD transition did not retain one private temporary"
-    cmp -s "$copy_reap_expected" "$1" ||
-        fail "inherited-SIGCHLD transition changed captured bytes"
-    [ "$(find "$1" -prune -type f -perm 0600 -print)" = "$1" ] ||
-        fail "inherited-SIGCHLD transition left a non-private temporary"
-    rm -f "$copy_archive" "$copy_dir"/.archive.tar.gz.tmp.*
+    case $copy_platform in
+        FreeBSD)
+            { [ "$#" -eq 1 ] && [ ! -e "$1" ] && [ ! -L "$1" ]; } ||
+                fail "inherited-SIGCHLD transition left private staging residue"
+            ;;
+        *)
+            { [ "$#" -eq 1 ] && [ -f "$1" ]; } ||
+                fail "inherited-SIGCHLD transition did not retain one private temporary"
+            cmp -s "$copy_reap_expected" "$1" ||
+                fail "inherited-SIGCHLD transition changed captured bytes"
+            [ "$(find "$1" -prune -type f -perm 0600 -print)" = "$1" ] ||
+                fail "inherited-SIGCHLD transition left a non-private temporary"
+            rm -f "$1"
+            ;;
+    esac
 
     # Restoring the exact entry mask matters: a signal blocked by the caller
     # must remain pending and blocked after retirement, not be unconditionally
@@ -3418,10 +3625,12 @@ EOF
     copy_reap_terminate_expected=$tmp/copy-reap-terminate.expected
     copy_reap_terminate_report=$tmp/copy-reap-terminate.report
     copy_reap_terminate_delayed=$tmp/copy-reap-terminate.delayed
+    copy_reap_terminate_cleanup=$tmp/copy-reap-terminate.cleanup
     printf '%s' reap-terminate-payload >"$copy_reap_terminate_expected" ||
         fail "cannot create terminate-reap expected payload"
     rm -f "$copy_reap_terminate_report" \
-        "$copy_reap_terminate_delayed" "$copy_archive" \
+        "$copy_reap_terminate_delayed" "$copy_reap_terminate_cleanup" \
+        "$copy_archive" \
         "$copy_dir"/.archive.tar.gz.tmp.*
     copy_reap_status=0
     # The producer, not this parent shell, expands the fixture variables.
@@ -3430,6 +3639,7 @@ EOF
         GITSWITCH_RELEASE_TEST_FATAL_DEFAULTS=1 \
         GITSWITCH_RELEASE_TEST_REAP_SIGNAL=TERM \
         GITSWITCH_RELEASE_TEST_REAP_REPORT_FD=9 \
+        GITSWITCH_RELEASE_TEST_SIGNAL_CLEANUP_MARKER=$copy_reap_terminate_cleanup \
         "$named_publish_helper" "$copy_dir" "$copy_canonical" \
             archive.tar.gz -- /bin/sh -c '
                 printf reap-terminate-payload
@@ -3450,21 +3660,30 @@ EOF
     esac
     cmp -s "$copy_reap_report_expected" "$copy_reap_terminate_report" ||
         fail "terminate-reap transition exposed stale producer ownership"
+    cmp -s "$copy_reap_terminate_cleanup" - <<'EOF' ||
+cleanup
+EOF
+        fail "terminate-reap transition bypassed normal cleanup ownership"
     [ ! -e "$copy_reap_terminate_delayed" ] ||
         fail "terminate-reap producer survived group teardown"
     { [ ! -e "$copy_archive" ] && [ ! -L "$copy_archive" ]; } ||
         fail "terminate-reap transition left a canonical artifact"
     set -- "$copy_dir"/.archive.tar.gz.tmp.*
-    { [ "$#" -eq 1 ] && [ -f "$1" ]; } ||
-        fail "terminate-reap transition did not retain one private temporary"
-    cmp -s "$copy_reap_terminate_expected" "$1" ||
-        fail "terminate-reap transition changed captured bytes"
-    [ "$(find "$1" -prune -type f -perm 0600 -print)" = "$1" ] ||
-        fail "terminate-reap transition left a non-private temporary"
-    rm -f "$copy_archive" "$copy_dir"/.archive.tar.gz.tmp.*
-    set -- "$copy_dir"/.archive.tar.gz.tmp.*
-    { [ "$#" -eq 1 ] && [ ! -e "$1" ] && [ ! -L "$1" ]; } ||
-        fail "terminate-reap transition left temporary residue"
+    case $copy_platform in
+        FreeBSD)
+            { [ "$#" -eq 1 ] && [ ! -e "$1" ] && [ ! -L "$1" ]; } ||
+                fail "terminate-reap transition left temporary residue"
+            ;;
+        *)
+            { [ "$#" -eq 1 ] && [ -f "$1" ]; } ||
+                fail "terminate-reap transition did not retain one private temporary"
+            cmp -s "$copy_reap_terminate_expected" "$1" ||
+                fail "terminate-reap transition changed captured bytes"
+            [ "$(find "$1" -prune -type f -perm 0600 -print)" = "$1" ] ||
+                fail "terminate-reap transition left a non-private temporary"
+            rm -f "$1"
+            ;;
+    esac
 
     # A descendant that never closes the inherited stream must not hang the
     # release indefinitely or leave a canonical artifact. The named test

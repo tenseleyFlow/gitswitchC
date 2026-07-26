@@ -1951,6 +1951,13 @@ static int archive_workspace_cleanup(archive_workspace_t *workspace)
     return 0;
 }
 
+static void report_deferred_fatal_cleanup(void);
+static int finish_deferred_fatal_signal(void);
+static int run_internal_archive_signal_test_hook(
+    const archive_workspace_t *workspace);
+static void report_internal_archive_signal_cleanup(
+    const archive_workspace_t *workspace, int cleanup_result);
+
 static int archive_write_minimal_git_config(
     const archive_workspace_t *workspace, archive_object_format_t format)
 {
@@ -2824,6 +2831,12 @@ static int run_internal_release_archive(char *const arguments[])
                 strerror(errno));
         goto cleanup;
     }
+    if (run_internal_archive_signal_test_hook(&workspace) != 0) {
+        fprintf(stderr,
+                "release-archive: ERROR: cannot complete internal signal fixture: %s\n",
+                strerror(errno));
+        goto cleanup;
+    }
     if (archive_set_clean_environment(path_copy, &workspace) != 0 ||
         archive_resolve_object_database(resolved_root, &workspace) != 0) {
         fprintf(stderr,
@@ -2900,6 +2913,9 @@ cleanup:
                 strerror(errno));
         result = EXIT_FAILURE;
     }
+    report_internal_archive_signal_cleanup(&workspace, cleanup_result);
+    report_deferred_fatal_cleanup();
+    (void)finish_deferred_fatal_signal();
     return result;
 }
 
@@ -2907,11 +2923,22 @@ cleanup:
  * retained. In particular, a successful direct child can become waitable
  * while a descendant still owns the output pipe. */
 static volatile sig_atomic_t fatal_signal_producer = 0;
+static volatile sig_atomic_t fatal_signal_producer_defers_cleanup = 0;
+static volatile sig_atomic_t fatal_signal_pending = 0;
 _Static_assert(sizeof(sig_atomic_t) >= sizeof(pid_t),
                "pid_t must fit in sig_atomic_t for release-child publication");
 static const int forwarded_fatal_signals[] = {
     SIGINT, SIGTERM, SIGHUP, SIGQUIT
 };
+static struct sigaction saved_fatal_actions[
+    sizeof(forwarded_fatal_signals) / sizeof(forwarded_fatal_signals[0])];
+static bool fatal_action_installed[
+    sizeof(forwarded_fatal_signals) / sizeof(forwarded_fatal_signals[0])];
+static sigset_t saved_fatal_mask;
+static bool fatal_signal_state_saved = false;
+#if defined(GITSWITCH_RELEASE_TEST_SIGNAL_DEFAULT)
+static char internal_archive_cleanup_report_path[PATH_MAX];
+#endif
 #if defined(GITSWITCH_RELEASE_TEST_REAP_TRANSITION)
 static volatile sig_atomic_t test_reap_transition_active = 0;
 static int test_reap_transition_signal = 0;
@@ -3134,6 +3161,7 @@ static producer_reap_result_t reap_and_retire_producer(pid_t child,
          (result.waited < 0 && result.wait_errno == ECHILD)) &&
         (pid_t)fatal_signal_producer == child) {
         fatal_signal_producer = 0;
+        fatal_signal_producer_defers_cleanup = 0;
     }
     if (sigprocmask(SIG_SETMASK, &saved_mask, NULL) != 0) {
         result.mask_errno = errno;
@@ -3439,18 +3467,27 @@ static producer_stream_result_t copy_producer_stream(int input_fd,
     }
 }
 
-/* AR-10 L30: the producer runs in its own process group as the helper's
+/* AR-10 L30 / AR-14 L21: the producer runs in its own process group as the
  * lifetime boundary — which also removes it from the terminal's foreground
- * group, so a fatal signal delivered to the helper used to kill only the
- * helper and abandon the still-running producer group. The handler covers
- * SIGINT, SIGTERM, SIGHUP, and SIGQUIT: kill the group, then die by the same
- * signal with default disposition so the caller observes a truthful
- * signal-death status. kill/signal/raise are all async-signal-safe. */
+ * group. The handler records only the first fatal signal. The internal archive
+ * producer receives that exact signal so its own normal flow can remove its
+ * private workspace; an arbitrary external producer/consumer receives SIGKILL
+ * because it may ignore the requested fatal signal. The handler then returns:
+ * parent-owned staging cleanup and exact signal reproduction belong to normal
+ * control flow. */
 
 static void forward_fatal_signal(int signal_number)
 {
+    int saved_errno = errno;
     pid_t child = (pid_t)fatal_signal_producer;
+    int producer_signal =
+        fatal_signal_producer_defers_cleanup != 0 ? signal_number : SIGKILL;
 
+    if (fatal_signal_pending != 0) {
+        errno = saved_errno;
+        return;
+    }
+    fatal_signal_pending = (sig_atomic_t)signal_number;
     if (child > 0) {
 #if defined(GITSWITCH_RELEASE_TEST_REAP_TRANSITION)
         if (test_reap_transition_active != 0) {
@@ -3459,17 +3496,103 @@ static void forward_fatal_signal(int signal_number)
             report_reap_transition(stale_ownership);
             /* Never let the deliberate test mutant signal a numeric identity
              * after waitpid has made it reusable. */
-            _exit(90);
+            errno = saved_errno;
+            return;
         }
 #endif
-        (void)kill(-child, SIGKILL);
-        (void)kill(child, SIGKILL);
+        (void)kill(-child, producer_signal);
+        (void)kill(child, producer_signal);
     }
-    (void)signal(signal_number, SIG_DFL);
-    (void)raise(signal_number);
+    errno = saved_errno;
 }
 
 #if defined(GITSWITCH_RELEASE_TEST_SIGNAL_DEFAULT)
+static int write_signal_test_report(const char *path,
+                                    const unsigned char *bytes, size_t size)
+{
+    int report_fd;
+    int saved_errno;
+
+    report_fd = open(path, O_WRONLY | O_CREAT | O_EXCL | O_NOFOLLOW |
+                               O_CLOEXEC,
+                     S_IRUSR | S_IWUSR);
+    if (report_fd < 0) {
+        return -1;
+    }
+    if (write_all(report_fd, bytes, size) != 0) {
+        saved_errno = errno;
+        (void)close(report_fd);
+        errno = saved_errno;
+        return -1;
+    }
+    return close(report_fd);
+}
+
+static int run_internal_archive_signal_test_hook(
+    const archive_workspace_t *workspace)
+{
+    const char *ready_path =
+        getenv("GITSWITCH_RELEASE_TEST_INTERNAL_ARCHIVE_READY"); /* Flawfinder: ignore — named-fixture-only report path */
+    const char *cleanup_path =
+        getenv("GITSWITCH_RELEASE_TEST_INTERNAL_ARCHIVE_CLEANUP_REPORT"); /* Flawfinder: ignore — named-fixture-only report path */
+    char report[PATH_MAX + 64U];
+    struct timespec interval = {0, 10 * 1000 * 1000};
+    int length;
+    int attempts;
+
+    if (ready_path == NULL && cleanup_path == NULL) {
+        return 0;
+    }
+    if (ready_path == NULL || ready_path[0] == '\0' ||
+        cleanup_path == NULL || cleanup_path[0] == '\0' ||
+        strlen(cleanup_path) >= sizeof(internal_archive_cleanup_report_path)) {
+        errno = EINVAL;
+        return -1;
+    }
+    memcpy(internal_archive_cleanup_report_path, cleanup_path,
+           strlen(cleanup_path) + 1U);
+    length = snprintf(report, sizeof(report), "pid=%ld\nworkspace=%s\n",
+                      (long)getpid(), workspace->root);
+    if (length < 0 || (size_t)length >= sizeof(report) ||
+        write_signal_test_report(
+            ready_path, (const unsigned char *)report, (size_t)length) != 0) {
+        return -1;
+    }
+    for (attempts = 0; fatal_signal_pending == 0 && attempts < 3000;
+         attempts++) {
+        if (nanosleep(&interval, NULL) != 0 && errno != EINTR) {
+            return -1;
+        }
+    }
+    if (fatal_signal_pending == 0) {
+        errno = ETIMEDOUT;
+        return -1;
+    }
+    return 0;
+}
+
+static void report_internal_archive_signal_cleanup(
+    const archive_workspace_t *workspace, int cleanup_result)
+{
+    char report[PATH_MAX + 96U];
+    int length;
+
+    if (internal_archive_cleanup_report_path[0] == '\0') {
+        return;
+    }
+    length = snprintf(report, sizeof(report),
+                      "pid=%ld\nsignal=%d\ncleanup=%s\nworkspace=%s\n",
+                      (long)getpid(), (int)fatal_signal_pending,
+                      cleanup_result == 0 ? "ok" : "failed",
+                      workspace->root);
+    if (length < 0 || (size_t)length >= sizeof(report)) {
+        return;
+    }
+    (void)write_signal_test_report(
+        internal_archive_cleanup_report_path,
+        (const unsigned char *)report, (size_t)length);
+}
+
 /* A shell cannot restore a signal that was ignored when the shell started.
  * The named-temp test helper uses this opt-in seam to give the fatal-signal
  * contract a deterministic default, unblocked starting state in every CI
@@ -3503,9 +3626,24 @@ static int reset_fatal_signals_for_test(void)
     }
     return sigprocmask(SIG_UNBLOCK, &fatal_set, NULL);
 }
+#else
+static int run_internal_archive_signal_test_hook(
+    const archive_workspace_t *workspace)
+{
+    (void)workspace;
+    return 0;
+}
+
+static void report_internal_archive_signal_cleanup(
+    const archive_workspace_t *workspace, int cleanup_result)
+{
+    (void)workspace;
+    (void)cleanup_result;
+}
 #endif
 
-#if defined(GITSWITCH_RELEASE_TEST_REAP_TRANSITION) || \
+#if defined(GITSWITCH_RELEASE_TEST_SIGNAL_DEFAULT) || \
+    defined(GITSWITCH_RELEASE_TEST_REAP_TRANSITION) || \
     defined(GITSWITCH_RELEASE_TEST_FORK_TRANSITION)
 static int parse_fatal_test_signal(const char *signal_name,
                                    int *selected_signal)
@@ -3523,6 +3661,111 @@ static int parse_fatal_test_signal(const char *signal_name,
         return -1;
     }
     return 0;
+}
+#endif
+
+#if defined(GITSWITCH_RELEASE_TEST_SIGNAL_DEFAULT)
+static int run_signal_wait_oracle(int argc, char **argv)
+{
+    const char *pid_report =
+        getenv("GITSWITCH_RELEASE_TEST_WAIT_ORACLE_PID_REPORT"); /* Flawfinder: ignore — named-fixture-only report path */
+    char report[64];
+    int expected_signal;
+    int length;
+    int status;
+    pid_t child;
+    pid_t waited;
+
+    if (argc < 5 || strcmp(argv[3], "--") != 0 ||
+        parse_fatal_test_signal(argv[2], &expected_signal) != 0) {
+        fprintf(stderr,
+                "ERROR: signal wait oracle requires SIGNAL -- COMMAND\n");
+        return EXIT_FAILURE;
+    }
+    child = fork();
+    if (child < 0) {
+        fprintf(stderr, "ERROR: signal wait oracle cannot fork: %s\n",
+                strerror(errno));
+        return EXIT_FAILURE;
+    }
+    if (child == 0) {
+        execvp(argv[4], &argv[4]); /* Flawfinder: ignore — named-fixture-only exact argv oracle */
+        _exit(errno == ENOENT ? 127 : 126);
+    }
+    if (pid_report != NULL) {
+        length = snprintf(report, sizeof(report), "%ld\n", (long)child);
+        if (pid_report[0] == '\0' || length < 0 ||
+            (size_t)length >= sizeof(report) ||
+            write_signal_test_report(
+                pid_report, (const unsigned char *)report,
+                (size_t)length) != 0) {
+            int saved_errno = errno;
+
+            (void)kill(child, SIGKILL);
+            do {
+                waited = waitpid(child, &status, 0);
+            } while (waited < 0 && errno == EINTR);
+            fprintf(stderr,
+                    "ERROR: signal wait oracle cannot publish child PID: %s\n",
+                    strerror(saved_errno));
+            return EXIT_FAILURE;
+        }
+    }
+    do {
+        waited = waitpid(child, &status, 0);
+    } while (waited < 0 && errno == EINTR);
+    if (waited != child) {
+        fprintf(stderr, "ERROR: signal wait oracle cannot reap child: %s\n",
+                strerror(errno));
+        return EXIT_FAILURE;
+    }
+    if (!WIFSIGNALED(status) || WTERMSIG(status) != expected_signal) {
+        if (WIFEXITED(status)) {
+            fprintf(stderr,
+                    "ERROR: signal wait oracle observed exit status %d, expected signal %d\n",
+                    WEXITSTATUS(status), expected_signal);
+        } else if (WIFSIGNALED(status)) {
+            fprintf(stderr,
+                    "ERROR: signal wait oracle observed signal %d, expected %d\n",
+                    WTERMSIG(status), expected_signal);
+        } else {
+            fprintf(stderr,
+                    "ERROR: signal wait oracle observed non-terminal status\n");
+        }
+        return EXIT_FAILURE;
+    }
+    return EXIT_SUCCESS;
+}
+
+static void report_internal_archive_reap(char *const command[], pid_t child,
+                                         int status)
+{
+    const char *report_path =
+        getenv("GITSWITCH_RELEASE_TEST_INTERNAL_ARCHIVE_REAP_REPORT"); /* Flawfinder: ignore — named-fixture-only report path */
+    char report[96];
+    int length;
+
+    if (report_path == NULL ||
+        strcmp(command[0], ARCHIVE_INTERNAL_TOKEN) != 0) {
+        return;
+    }
+    length = snprintf(report, sizeof(report),
+                      "pid=%ld\nsignaled=%d\nsignal=%d\n",
+                      (long)child, WIFSIGNALED(status) ? 1 : 0,
+                      WIFSIGNALED(status) ? WTERMSIG(status) : 0);
+    if (length < 0 || (size_t)length >= sizeof(report)) {
+        return;
+    }
+    (void)write_signal_test_report(
+        report_path, (const unsigned char *)report, (size_t)length);
+}
+#else
+static void report_internal_archive_reap(char *const command[], pid_t child,
+                                         int status)
+{
+    (void)command;
+    (void)child;
+    (void)status;
 }
 #endif
 
@@ -3630,31 +3873,276 @@ static int establish_producer_wait_ownership(void)
 /* Preserve an inherited SIG_IGN (nohup semantics); otherwise forward. */
 static int install_fatal_signal_forwarding(void)
 {
+    sigset_t fatal_set;
     size_t index;
 
+    if (build_forwarded_fatal_signal_set(&fatal_set) != 0 ||
+        sigprocmask(SIG_SETMASK, NULL, &saved_fatal_mask) != 0) {
+        return -1;
+    }
+    fatal_signal_state_saved = true;
     for (index = 0;
          index < sizeof(forwarded_fatal_signals) /
                      sizeof(forwarded_fatal_signals[0]);
          index++) {
-        struct sigaction current;
         struct sigaction forwarding;
 
-        if (sigaction(forwarded_fatal_signals[index], NULL, &current) != 0) {
-            return -1;
+        if (sigaction(forwarded_fatal_signals[index], NULL,
+                      &saved_fatal_actions[index]) != 0) {
+            break;
         }
-        if (current.sa_handler == SIG_IGN) {
+        if (saved_fatal_actions[index].sa_handler == SIG_IGN) {
             continue;
         }
         memset(&forwarding, 0, sizeof(forwarding));
         forwarding.sa_handler = forward_fatal_signal;
-        if (sigemptyset(&forwarding.sa_mask) != 0 ||
-            sigaction(forwarded_fatal_signals[index], &forwarding, NULL) !=
-                0) {
-            return -1;
+        forwarding.sa_mask = fatal_set;
+        if (sigaction(forwarded_fatal_signals[index], &forwarding, NULL) != 0) {
+            break;
         }
+        fatal_action_installed[index] = true;
+    }
+    if (index != sizeof(forwarded_fatal_signals) /
+                     sizeof(forwarded_fatal_signals[0])) {
+        int saved_errno = errno;
+
+        while (index > 0U) {
+            index--;
+            if (fatal_action_installed[index]) {
+                (void)sigaction(forwarded_fatal_signals[index],
+                                &saved_fatal_actions[index], NULL);
+                fatal_action_installed[index] = false;
+            }
+        }
+        fatal_signal_state_saved = false;
+        errno = saved_errno;
+        return -1;
     }
     return 0;
 }
+
+static int restore_fatal_signal_forwarding(void)
+{
+    size_t index;
+    int first_errno = 0;
+
+    if (!fatal_signal_state_saved) {
+        return 0;
+    }
+    for (index = 0;
+         index < sizeof(forwarded_fatal_signals) /
+                     sizeof(forwarded_fatal_signals[0]);
+         index++) {
+        if (fatal_action_installed[index] &&
+            sigaction(forwarded_fatal_signals[index],
+                      &saved_fatal_actions[index], NULL) != 0 &&
+            first_errno == 0) {
+            first_errno = errno;
+        }
+        fatal_action_installed[index] = false;
+    }
+    fatal_signal_state_saved = false;
+    if (first_errno != 0) {
+        errno = first_errno;
+        return -1;
+    }
+    return 0;
+}
+
+#if defined(GITSWITCH_RELEASE_TEST_SIGNAL_DEFAULT)
+static void report_deferred_fatal_cleanup(void)
+{
+    static const unsigned char proof[] = "cleanup\n";
+    const char *marker =
+        getenv("GITSWITCH_RELEASE_TEST_SIGNAL_CLEANUP_MARKER"); /* Flawfinder: ignore — named-fixture-only cleanup proof path */
+    int marker_fd;
+
+    if (fatal_signal_pending == 0 || marker == NULL || marker[0] == '\0') {
+        return;
+    }
+    marker_fd = open(marker, O_WRONLY | O_CREAT | O_EXCL | O_NOFOLLOW |
+                                O_CLOEXEC,
+                     S_IRUSR | S_IWUSR);
+    if (marker_fd < 0) {
+        return;
+    }
+    (void)write_all(marker_fd, proof, sizeof(proof) - 1U);
+    (void)close(marker_fd);
+}
+#else
+static void report_deferred_fatal_cleanup(void)
+{
+}
+#endif
+
+/* Block the forwarding set across the final pending-state sample so a signal
+ * arriving after cleanup cannot slip between the sample and handler restore.
+ * A handler-recorded signal is reproduced with its exact number and default
+ * disposition only after the saved dispositions/mask have been restored. */
+static int finish_deferred_fatal_signal(void)
+{
+    sigset_t fatal_set;
+    sigset_t blocked_mask;
+    sigset_t delivery_mask;
+    struct sigaction default_action;
+    int signal_number;
+
+    if (!fatal_signal_state_saved) {
+        return 0;
+    }
+    if (build_forwarded_fatal_signal_set(&fatal_set) != 0 ||
+        sigprocmask(SIG_BLOCK, &fatal_set, &blocked_mask) != 0) {
+        return -1;
+    }
+    (void)blocked_mask;
+    signal_number = (int)fatal_signal_pending;
+    if (restore_fatal_signal_forwarding() != 0) {
+        return -1;
+    }
+    if (signal_number == 0) {
+        return sigprocmask(SIG_SETMASK, &saved_fatal_mask, NULL);
+    }
+
+    delivery_mask = saved_fatal_mask;
+    if (sigaddset(&delivery_mask, signal_number) != 0 ||
+        sigprocmask(SIG_SETMASK, &delivery_mask, NULL) != 0) {
+        _exit(128 + signal_number);
+    }
+    memset(&default_action, 0, sizeof(default_action));
+    default_action.sa_handler = SIG_DFL;
+    if (sigemptyset(&default_action.sa_mask) != 0 ||
+        sigaction(signal_number, &default_action, NULL) != 0 ||
+        sigdelset(&delivery_mask, signal_number) != 0 ||
+        sigprocmask(SIG_SETMASK, &delivery_mask, NULL) != 0) {
+        _exit(128 + signal_number);
+    }
+    (void)kill(getpid(), signal_number);
+    _exit(128 + signal_number);
+}
+
+/* Fatal delivery is a publication boundary, not merely an error check. Block
+ * the complete forwarding set, reject every signal already recorded by the
+ * handler (and every newly pending signal that the caller did not itself keep
+ * blocked), then keep the set blocked through the one no-replace namespace
+ * syscall. A signal arriving after that sample is delivered only after the
+ * canonical commit has linearized. */
+static int begin_fatal_publication_guard(sigset_t *saved_mask)
+{
+    sigset_t fatal_set;
+    sigset_t pending_set;
+    size_t index;
+    int abort_publication;
+
+    if (build_forwarded_fatal_signal_set(&fatal_set) != 0 ||
+        sigprocmask(SIG_BLOCK, &fatal_set, saved_mask) != 0) {
+        return -1;
+    }
+#if defined(GITSWITCH_RELEASE_TEST_SIGNAL_DEFAULT)
+    {
+        static bool publication_signal_used;
+        const char *publication_signal =
+            getenv("GITSWITCH_RELEASE_TEST_PUBLICATION_SIGNAL"); /* Flawfinder: ignore — named-fixture-only exact signal selector */
+
+        if (!publication_signal_used && publication_signal != NULL) {
+            if (strcmp(publication_signal, "TERM") != 0) {
+                int saved_errno = EINVAL;
+
+                (void)sigprocmask(SIG_SETMASK, saved_mask, NULL);
+                errno = saved_errno;
+                return -1;
+            }
+            publication_signal_used = true;
+            if (raise(SIGTERM) != 0) {
+                int saved_errno = errno;
+
+                (void)sigprocmask(SIG_SETMASK, saved_mask, NULL);
+                errno = saved_errno;
+                return -1;
+            }
+        }
+    }
+#endif
+    abort_publication = fatal_signal_pending != 0;
+    if (sigpending(&pending_set) != 0) {
+        int saved_errno = errno;
+
+        (void)sigprocmask(SIG_SETMASK, saved_mask, NULL);
+        errno = saved_errno;
+        return -1;
+    }
+    for (index = 0U;
+         !abort_publication &&
+         index < sizeof(forwarded_fatal_signals) /
+                     sizeof(forwarded_fatal_signals[0]);
+         index++) {
+        int signal_number = forwarded_fatal_signals[index];
+
+        if (sigismember(&saved_fatal_mask, signal_number) == 0 &&
+            sigismember(&pending_set, signal_number) == 1) {
+            abort_publication = 1;
+        }
+    }
+    if (abort_publication) {
+        int restore_result = sigprocmask(SIG_SETMASK, saved_mask, NULL);
+
+        if (restore_result == 0) {
+            errno = EINTR;
+        }
+        return -1;
+    }
+    return 0;
+}
+
+/* Return 1 only when the canonical commit succeeded but exact mask restoration
+ * failed, matching publish_output's existing post-commit uncertainty result. */
+static int finish_fatal_publication_guard(const sigset_t *saved_mask,
+                                          int commit_result,
+                                          int commit_errno)
+{
+    if (sigprocmask(SIG_SETMASK, saved_mask, NULL) != 0) {
+        return commit_result == 0 ? 1 : -1;
+    }
+    errno = commit_errno;
+    return commit_result;
+}
+
+#if !defined(__APPLE__)
+static int commit_linkat_without_pending_fatal(
+    int old_directory_fd, const char *old_path, int new_directory_fd,
+    const char *new_path, int flags)
+{
+    sigset_t saved_mask;
+    int commit_result;
+    int commit_errno;
+
+    if (begin_fatal_publication_guard(&saved_mask) != 0) {
+        return -1;
+    }
+    commit_result = linkat(old_directory_fd, old_path, new_directory_fd,
+                           new_path, flags);
+    commit_errno = errno;
+    return finish_fatal_publication_guard(&saved_mask, commit_result,
+                                          commit_errno);
+}
+#endif
+
+#if defined(__APPLE__)
+static int commit_clone_without_pending_fatal(int source_fd, int directory_fd,
+                                              const char *final_name)
+{
+    sigset_t saved_mask;
+    int commit_result;
+    int commit_errno;
+
+    if (begin_fatal_publication_guard(&saved_mask) != 0) {
+        return -1;
+    }
+    commit_result = fclonefileat(source_fd, directory_fd, final_name, 0);
+    commit_errno = errno;
+    return finish_fatal_publication_guard(&saved_mask, commit_result,
+                                          commit_errno);
+}
+#endif
 
 static int wait_for_producer(pid_t child, int64_t deadline, int *status)
 {
@@ -3843,6 +4331,8 @@ static int run_to_descriptor(int output_fd, int directory_fd,
 #endif
     /* Publish the producer while every forwarding signal remains blocked.
      * Exact-mask restoration below is the first point that can deliver one. */
+    fatal_signal_producer_defers_cleanup =
+        strcmp(command[0], ARCHIVE_INTERNAL_TOKEN) == 0 ? 1 : 0;
     fatal_signal_producer = (sig_atomic_t)child;
     (void)close(pipe_fds[1]);
     /* Close the fork/setpgid race from the parent side as well. EACCES/ESRCH
@@ -3878,6 +4368,7 @@ static int run_to_descriptor(int output_fd, int directory_fd,
         saved_errno = errno;
         (void)close(pipe_fds[0]);
         if (stream_result == PRODUCER_STREAM_FAILURE) {
+            report_internal_archive_reap(command, child, status);
             report_producer_failure(status);
             errno = EIO;
             return -1;
@@ -3915,6 +4406,7 @@ static int run_to_descriptor(int output_fd, int directory_fd,
         terminate_producer(child);
         return -1;
     }
+    report_internal_archive_reap(command, child, status);
     /* The complete inherited stream is captured, group-directed SIGKILL was
      * issued while the direct PID still pinned the owned group identity, and
      * the guarded reap retired handler ownership before making it reusable. */
@@ -3946,12 +4438,21 @@ static int link_descriptor(int source_fd, int directory_fd,
         run_publication_race_hook() != 0) {
         return -1;
     }
-    return linkat(directory_fd, source_name, directory_fd, final_name, 0);
+    return commit_linkat_without_pending_fatal(
+        directory_fd, source_name, directory_fd, final_name, 0);
 #else
     (void)source_name;
 #if defined(AT_EMPTY_PATH) && AT_EMPTY_PATH != 0
-    if (linkat(source_fd, "", directory_fd, final_name, AT_EMPTY_PATH) == 0) {
-        return 0;
+    {
+        int commit_result = commit_linkat_without_pending_fatal(
+            source_fd, "", directory_fd, final_name, AT_EMPTY_PATH);
+
+        if (commit_result == 0) {
+            return 0;
+        }
+        if (commit_result > 0) {
+            return 1;
+        }
     }
     if (errno == EEXIST) {
         return -1;
@@ -3967,8 +4468,9 @@ static int link_descriptor(int source_fd, int directory_fd,
             errno = ENAMETOOLONG;
             return -1;
         }
-        return linkat(AT_FDCWD, descriptor_path, directory_fd, final_name,
-                      AT_SYMLINK_FOLLOW);
+        return commit_linkat_without_pending_fatal(
+            AT_FDCWD, descriptor_path, directory_fd, final_name,
+            AT_SYMLINK_FOLLOW);
     }
 #else
     (void)source_fd;
@@ -5028,14 +5530,19 @@ static int publish_descriptor_clone(int source_fd, int directory_fd,
         return -1;
     }
 #endif
-    if (fclonefileat(source_fd, directory_fd, final_name, 0) != 0) {
-        saved_errno = errno;
+    {
+        int commit_result = commit_clone_without_pending_fatal(
+            source_fd, directory_fd, final_name);
+
+        if (commit_result != 0) {
+            saved_errno = errno;
 #if defined(GITSWITCH_RELEASE_TEST_FD_PRESSURE)
-        (void)setrlimit(RLIMIT_NOFILE, &saved_limit);
+            (void)setrlimit(RLIMIT_NOFILE, &saved_limit);
 #endif
-        (void)close(reserve_fd);
-        errno = saved_errno;
-        return -1;
+            (void)close(reserve_fd);
+            errno = saved_errno;
+            return commit_result;
+        }
     }
     (void)close(reserve_fd);
     if (run_adoption_race_hook() != 0) {
@@ -5099,9 +5606,13 @@ static int publish_output(int source_fd, int directory_fd,
     return publish_descriptor_clone(source_fd, directory_fd, final_name,
                                     published_fd);
 #else
-    if (link_descriptor(source_fd, directory_fd, source_name,
-                        final_name) != 0) {
-        return -1;
+    {
+        int commit_result = link_descriptor(source_fd, directory_fd,
+                                            source_name, final_name);
+
+        if (commit_result != 0) {
+            return commit_result;
+        }
     }
     *published_fd = source_fd;
     return 0;
@@ -5197,6 +5708,7 @@ static int run_private_consumer(int archive_fd, int directory_fd,
 #else
     saved_errno = 0;
 #endif
+    fatal_signal_producer_defers_cleanup = 0;
     fatal_signal_producer = (sig_atomic_t)child;
     (void)setpgid(child, child);
     if (restore_fatal_fork_guard(&saved_mask) != 0 && saved_errno == 0) {
@@ -5302,6 +5814,11 @@ int main(int argc, char **argv)
     if (reserve_standard_descriptors() != 0) {
         return EXIT_FAILURE;
     }
+#if defined(GITSWITCH_RELEASE_TEST_SIGNAL_DEFAULT)
+    if (argc >= 2 && strcmp(argv[1], "--test-wait-signal") == 0) {
+        return run_signal_wait_oracle(argc, argv);
+    }
+#endif
     if (argc >= 2 &&
         strcmp(argv[1], "--internal-retire-tree-v1") == 0) {
         if (argc != 6) {
@@ -5417,7 +5934,7 @@ int main(int argc, char **argv)
                 if (consumer_index >= 0 || index == command_index ||
                     index + 1 >= argc) {
                     usage(argv[0]);
-                    return EXIT_FAILURE;
+                    goto cleanup;
                 }
                 consumer_index = index + 1;
                 argv[index] = NULL;
@@ -5425,7 +5942,7 @@ int main(int argc, char **argv)
         }
         if (consumer_index < 0) {
             usage(argv[0]);
-            return EXIT_FAILURE;
+            goto cleanup;
         }
     } else if (argc >= 8 &&
         strcmp(argv[1], "--internal-release-tree-v1") == 0 &&
@@ -5443,23 +5960,23 @@ int main(int argc, char **argv)
         command_index = 5;
     } else {
         usage(argv[0]);
-        return EXIT_FAILURE;
+        goto cleanup;
     }
     if (final_name[0] == '\0' || strcmp(final_name, ".") == 0 ||
         strcmp(final_name, "..") == 0 || strchr(final_name, '/') != NULL) {
         fprintf(stderr, "ERROR: final archive name is not a single component\n");
-        return EXIT_FAILURE;
+        goto cleanup;
     }
     if (source_directory_mode &&
         !valid_rpm_component(final_name, true)) {
         fprintf(stderr,
                 "ERROR: staged RPM name is not a safe RPM component\n");
-        return EXIT_FAILURE;
+        goto cleanup;
     }
     if (!source_directory_mode && establish_producer_wait_ownership() != 0) {
         fprintf(stderr, "ERROR: cannot establish archive-child ownership: %s\n",
                 strerror(errno));
-        return EXIT_FAILURE;
+        goto cleanup;
     }
 
     if (tree_mode) {
@@ -5612,6 +6129,10 @@ int main(int argc, char **argv)
             goto cleanup;
         }
     }
+    if (fatal_signal_pending != 0) {
+        errno = EINTR;
+        goto cleanup;
+    }
     if (fstat(output_fd, &output_stat) != 0 ||
         !S_ISREG(output_stat.st_mode) || output_stat.st_size <= 0) {
         fprintf(stderr, "ERROR: archive command produced no regular output\n");
@@ -5658,6 +6179,10 @@ int main(int argc, char **argv)
         }
         if (run_private_consumer(output_fd, directory_fd,
                                  &argv[consumer_index]) != 0) {
+            goto cleanup;
+        }
+        if (fatal_signal_pending != 0) {
+            errno = EINTR;
             goto cleanup;
         }
         if (digest_read_only_regular_descriptor(output_fd,
@@ -5873,6 +6398,10 @@ cleanup:
         result = EXIT_FAILURE;
     }
     if (root_fd >= 0 && close(root_fd) != 0) {
+        result = EXIT_FAILURE;
+    }
+    report_deferred_fatal_cleanup();
+    if (finish_deferred_fatal_signal() != 0) {
         result = EXIT_FAILURE;
     }
     return result;
