@@ -3277,6 +3277,7 @@ static void stop_process(pid_t pid) {
     if (kill(pid, 0) == 0) (void)kill(pid, SIGKILL);
 }
 
+#ifdef __linux__
 static int wait_process_absent(pid_t pid) {
     struct timespec pause_time = {.tv_sec = 0, .tv_nsec = 10000000L};
 
@@ -3287,6 +3288,7 @@ static int wait_process_absent(pid_t pid) {
     errno = ETIMEDOUT;
     return -1;
 }
+#endif
 
 TEST(runtime_root_provenance_prevents_cross_root_reap) {
     ssh_fixture_t first;
