@@ -158,9 +158,9 @@ static void raise_second_rollback_signal_before_pid_publication(void) {
     sigset_t current;
     sigset_t expected = g_expected_parent_mask;
 
-    /* The ownership window keeps SIGCHLD blocked, and the spawn window adds
-     * every guard-INSTALLED signal: SIGINT, SIGTERM, and (AR-10 L16)
-     * SIGQUIT. SIGHUP is SIG_IGN here, so the guard deliberately skipped it. */
+    /* The ownership window keeps SIGCHLD blocked. After fork the parent
+     * immediately restores the exact guard-installed set while the child
+     * retains the complete relay set inherited at fork. */
     sigaddset(&expected, SIGCHLD);
     sigaddset(&expected, SIGINT);
     sigaddset(&expected, SIGTERM);

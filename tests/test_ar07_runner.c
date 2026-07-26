@@ -121,6 +121,8 @@ static bool sigpipe_round_trip_passes(sigpipe_disposition_t disposition) {
            WEXITSTATUS(status) == 0;
 }
 
+static bool reap_within(pid_t pid, int timeout_ms, int *status_out);
+
 static bool isolated_runner_check_passes(int (*check)(void)) {
     int status = 0;
 
@@ -128,7 +130,7 @@ static bool isolated_runner_check_passes(int (*check)(void)) {
     pid_t worker = fork();
     if (worker < 0) return false;
     if (worker == 0) _exit(check());
-    if (waitpid(worker, &status, 0) != worker) return false;
+    if (!reap_within(worker, 2000, &status)) return false;
     if (!WIFEXITED(status) || WEXITSTATUS(status) != 0) {
         fprintf(stderr, "  isolated runner worker status=%d\n", status);
         return false;
@@ -463,6 +465,161 @@ TEST(process_group_supervisor_setup_failure_is_truthful_and_reaped) {
     CHECK_EQ_INT(retry.exit_code, 0);
 }
 
+TEST(supervisor_stage_failures_are_truthful_reaped_and_one_shot) {
+    static const struct {
+        run_test_supervisor_failure_stage_t stage;
+        int system_errno;
+    } cases[] = {
+        {RUN_TEST_SUPERVISOR_FAILURE_WORKER_RELEASE_PIPE, EMFILE},
+        {RUN_TEST_SUPERVISOR_FAILURE_INNER_FORK, EAGAIN},
+        {RUN_TEST_SUPERVISOR_FAILURE_REPLAY, EIO},
+        {RUN_TEST_SUPERVISOR_FAILURE_RELEASE_WRITE, EPIPE}
+    };
+    const char *argv[] = {"true", NULL};
+
+    for (size_t i = 0U; i < sizeof(cases) / sizeof(cases[0]); i++) {
+        run_result_t failed;
+        run_result_t retry;
+        int64_t started = test_monotonic_ms();
+
+        run_test_set_supervisor_failure(
+            cases[i].stage, cases[i].system_errno);
+        clear_error();
+        errno = 0;
+        CHECK_EQ_INT(run_argv(argv, NULL, &failed), -1);
+        int returned_errno = errno;
+        int64_t elapsed = test_monotonic_ms() - started;
+
+        CHECK_EQ_INT(returned_errno, cases[i].system_errno);
+        CHECK(failed.spawned);
+        CHECK_EQ_INT(failed.exit_code, 126);
+        CHECK(elapsed >= 0 && elapsed < 1000);
+        CHECK(strstr(get_last_error()->message,
+                     "process-group supervisor setup failed") != NULL);
+
+        errno = 0;
+        CHECK_EQ_INT(waitpid(-1, NULL, WNOHANG), -1);
+        CHECK_EQ_INT(errno, ECHILD);
+        CHECK_EQ_INT(run_argv(argv, NULL, &retry), 0);
+        CHECK(retry.spawned);
+        CHECK_EQ_INT(retry.exit_code, 0);
+    }
+}
+
+static volatile sig_atomic_t g_pre_release_hook_called;
+static volatile sig_atomic_t g_pre_release_hook_rollback_active;
+static volatile sig_atomic_t g_pre_release_hook_waited;
+
+static void kill_gated_supervisor_before_release(pid_t supervisor_pid) {
+    siginfo_t info;
+    struct timespec pause = {.tv_sec = 0, .tv_nsec = 10000000L};
+    int64_t started;
+
+    g_pre_release_hook_called = 1;
+    g_pre_release_hook_rollback_active =
+        signals_rollback_active() ? 1 : 0;
+    if (raise(SIGTERM) != 0 || raise(SIGTERM) != 0) return;
+    started = test_monotonic_ms();
+    while (started >= 0) {
+        int64_t now;
+        int wait_rc;
+
+        memset(&info, 0, sizeof(info));
+        wait_rc = waitid(P_PID, (id_t)supervisor_pid, &info,
+                         WEXITED | WNOWAIT | WNOHANG);
+        if (wait_rc == 0 && info.si_pid == supervisor_pid) {
+            g_pre_release_hook_waited = 1;
+            return;
+        }
+        if (wait_rc != 0 && errno != EINTR) return;
+        now = test_monotonic_ms();
+        if (now < 0 || now - started >= 1000) return;
+        (void)nanosleep(&pause, NULL);
+    }
+}
+
+static int pre_release_sigpipe_worker(void) {
+    const char *argv[] = {"true", NULL};
+    struct sigaction original_action;
+    struct sigaction installed_action;
+    struct sigaction after_action;
+    sigset_t original_mask;
+    sigset_t configured_mask;
+    sigset_t after_mask;
+    sigset_t pending;
+    run_result_t failed;
+    run_result_t retry;
+    int64_t started;
+
+    if (install_sigpipe_disposition(SIGPIPE_DISPOSITION_CUSTOM,
+                                    &original_action,
+                                    &installed_action) != 0 ||
+        sigprocmask(SIG_SETMASK, NULL, &original_mask) != 0) {
+        return 31;
+    }
+    configured_mask = original_mask;
+    if (sigdelset(&configured_mask, SIGPIPE) != 0 ||
+        sigdelset(&configured_mask, SIGTERM) != 0 ||
+        sigaddset(&configured_mask, SIGUSR2) != 0 ||
+        sigprocmask(SIG_SETMASK, &configured_mask, NULL) != 0 ||
+        signals_guard_begin() != 0) {
+        return 32;
+    }
+    signals_rollback_begin();
+    g_pre_release_hook_called = 0;
+    g_pre_release_hook_rollback_active = 0;
+    g_pre_release_hook_waited = 0;
+    g_sigpipe_witness_calls = 0;
+    run_test_set_pre_group_release_hook(
+        kill_gated_supervisor_before_release);
+    clear_error();
+    errno = 0;
+    started = test_monotonic_ms();
+    int run_rc = run_argv(argv, NULL, &failed);
+    int returned_errno = errno;
+    int64_t elapsed = test_monotonic_ms() - started;
+    run_test_set_pre_group_release_hook(NULL);
+    if (sigaction(SIGPIPE, NULL, &after_action) != 0 ||
+        sigprocmask(SIG_SETMASK, NULL, &after_mask) != 0 ||
+        sigpending(&pending) != 0) {
+        return 33;
+    }
+    errno = 0;
+    int unreaped = waitpid(-1, NULL, WNOHANG);
+    int unreaped_errno = errno;
+    int retry_rc = run_argv(argv, NULL, &retry);
+    signals_rollback_end();
+    int guard_rc = signals_guard_end();
+    int action_restore = sigaction(SIGPIPE, &original_action, NULL);
+    int mask_restore =
+        sigprocmask(SIG_SETMASK, &original_mask, NULL);
+
+    return run_rc == -1 && returned_errno == EPIPE &&
+                   failed.spawned &&
+                   elapsed >= 0 && elapsed < 1000 &&
+                   g_pre_release_hook_called == 1 &&
+                   g_pre_release_hook_rollback_active == 1 &&
+                   g_pre_release_hook_waited == 1 &&
+                   strstr(get_last_error()->message,
+                          "cannot release child process-group gate") != NULL &&
+                   sigactions_semantically_equal(
+                       &installed_action, &after_action) &&
+                   sigsets_semantically_equal(
+                       &configured_mask, &after_mask) &&
+                   sigismember(&pending, SIGPIPE) == 0 &&
+                   g_sigpipe_witness_calls == 0 &&
+                   unreaped == -1 && unreaped_errno == ECHILD &&
+                   retry_rc == 0 && retry.spawned &&
+                   retry.exit_code == 0 &&
+                   guard_rc == 0 && action_restore == 0 &&
+                   mask_restore == 0
+               ? 0 : 34;
+}
+
+TEST(pre_release_group_death_cannot_sigpipe_parent) {
+    CHECK(isolated_runner_check_passes(pre_release_sigpipe_worker));
+}
+
 /* M30: accepting only a prefix into the kernel pipe is not successful input
  * delivery when the helper closes stdin and exits zero. */
 TEST(early_stdin_close_is_a_runner_failure) {
@@ -742,8 +899,7 @@ static int rollback_group_signal_worker(void) {
     run_result_t result;
     pid_t signaler;
 
-    if (signals_guard_begin() != 0 || raise(SIGTERM) != 0 ||
-        !signals_pending()) {
+    if (signals_guard_begin() != 0) {
         return 70;
     }
     signals_rollback_begin();
@@ -773,6 +929,220 @@ static int rollback_group_signal_worker(void) {
 
 TEST(repeated_rollback_signal_terminates_group_descendant) {
     CHECK(isolated_runner_check_passes(rollback_group_signal_worker));
+}
+
+static int supervisor_termination_worker(int signal_number,
+                                         bool post_replay) {
+    const char *argv[] = {"sleep", "30", NULL};
+    sigset_t original_mask;
+    sigset_t configured_mask;
+    sigset_t after_mask;
+    run_opts_t opts;
+    run_result_t result;
+    int rc;
+
+    if (sigprocmask(SIG_SETMASK, NULL, &original_mask) != 0) return 73;
+    configured_mask = original_mask;
+    if (sigdelset(&configured_mask, signal_number) != 0 ||
+        sigaddset(&configured_mask, SIGUSR1) != 0 ||
+        sigprocmask(SIG_SETMASK, &configured_mask, NULL) != 0) {
+        return 74;
+    }
+    if (signals_guard_begin() != 0) return 75;
+    memset(&opts, 0, sizeof(opts));
+    if (run_deadline_after_millis(1000, &opts.deadline_millis) != 0) {
+        return 76;
+    }
+    opts.use_deadline = true;
+    if (post_replay) {
+        run_test_set_post_replay_signal(signal_number);
+    } else {
+        run_test_set_supervisor_pending_signal(signal_number);
+    }
+    rc = run_argv(argv, &opts, &result);
+    run_test_set_supervisor_pending_signal(0);
+    run_test_set_post_replay_signal(0);
+    if (sigprocmask(SIG_SETMASK, NULL, &after_mask) != 0) return 77;
+    bool correct =
+        rc == -1 && result.spawned && !result.timed_out &&
+        result.exit_code == -1 && result.term_signal == signal_number &&
+        signals_pending_signal() == signal_number &&
+        sigsets_semantically_equal(&configured_mask, &after_mask);
+    int guard_rc = signals_guard_end();
+    int restore_rc =
+        sigprocmask(SIG_SETMASK, &original_mask, NULL);
+    return correct && guard_rc == 0 && restore_rc == 0 ? 0 : 78;
+}
+
+static int supervisor_pending_sigterm_worker(void) {
+    return supervisor_termination_worker(SIGTERM, false);
+}
+
+static int supervisor_pending_sigint_worker(void) {
+    return supervisor_termination_worker(SIGINT, false);
+}
+
+static int post_replay_group_sigterm_worker(void) {
+    return supervisor_termination_worker(SIGTERM, true);
+}
+
+static int post_replay_group_sigint_worker(void) {
+    return supervisor_termination_worker(SIGINT, true);
+}
+
+TEST(supervisor_only_pending_termination_reaches_gated_worker_once) {
+    CHECK(isolated_runner_check_passes(supervisor_pending_sigterm_worker));
+    CHECK(isolated_runner_check_passes(supervisor_pending_sigint_worker));
+}
+
+TEST(post_replay_group_termination_reaches_worker_once) {
+    CHECK(isolated_runner_check_passes(
+        post_replay_group_sigterm_worker));
+    CHECK(isolated_runner_check_passes(
+        post_replay_group_sigint_worker));
+}
+
+static int supervisor_stop_worker(bool post_replay) {
+    const char *argv[] = {"sleep", "30", NULL};
+    sigset_t before_mask;
+    sigset_t after_mask;
+    run_opts_t opts;
+    run_result_t result;
+    int64_t started;
+
+    if (sigprocmask(SIG_SETMASK, NULL, &before_mask) != 0 ||
+        sigdelset(&before_mask, SIGTSTP) != 0 ||
+        sigprocmask(SIG_SETMASK, &before_mask, NULL) != 0) {
+        return 79;
+    }
+    memset(&opts, 0, sizeof(opts));
+    if (run_deadline_after_millis(1000, &opts.deadline_millis) != 0) {
+        return 80;
+    }
+    opts.use_deadline = true;
+    started = test_monotonic_ms();
+    if (post_replay) {
+        run_test_set_post_replay_signal(SIGTSTP);
+    } else {
+        run_test_set_supervisor_pending_signal(SIGTSTP);
+    }
+    int rc = run_argv(argv, &opts, &result);
+    run_test_set_supervisor_pending_signal(0);
+    run_test_set_post_replay_signal(0);
+    int64_t elapsed = test_monotonic_ms() - started;
+    if (sigprocmask(SIG_SETMASK, NULL, &after_mask) != 0) return 81;
+    return rc == -1 && result.spawned && !result.timed_out &&
+                   result.exit_code == -1 &&
+                   result.term_signal == SIGKILL &&
+                   elapsed >= 0 && elapsed < 1000 &&
+                   sigsets_semantically_equal(&before_mask, &after_mask)
+               ? 0 : 82;
+}
+
+static int supervisor_pending_stop_worker(void) {
+    return supervisor_stop_worker(false);
+}
+
+static int supervisor_post_replay_stop_worker(void) {
+    return supervisor_stop_worker(true);
+}
+
+TEST(supervisor_only_pending_stop_fails_closed_without_hanging) {
+    CHECK(isolated_runner_check_passes(supervisor_pending_stop_worker));
+}
+
+TEST(post_replay_supervisor_stop_handler_fails_group_closed) {
+    CHECK(isolated_runner_check_passes(
+        supervisor_post_replay_stop_worker));
+}
+
+static int supervisor_ignored_hup_worker(void) {
+    const char *argv[] = {"true", NULL};
+    struct sigaction original_action;
+    struct sigaction ignored_action;
+    struct sigaction installed_action;
+    struct sigaction after_action;
+    run_result_t result;
+
+    if (sigaction(SIGHUP, NULL, &original_action) != 0) return 83;
+    memset(&ignored_action, 0, sizeof(ignored_action));
+    ignored_action.sa_handler = SIG_IGN;
+    if (sigemptyset(&ignored_action.sa_mask) != 0 ||
+        sigaction(SIGHUP, &ignored_action, NULL) != 0 ||
+        sigaction(SIGHUP, NULL, &installed_action) != 0) {
+        return 84;
+    }
+    run_test_set_supervisor_pending_signal(SIGHUP);
+    int rc = run_argv(argv, NULL, &result);
+    run_test_set_supervisor_pending_signal(0);
+    int query_rc = sigaction(SIGHUP, NULL, &after_action);
+    int restore_rc = sigaction(SIGHUP, &original_action, NULL);
+    return rc == 0 && result.spawned && result.exit_code == 0 &&
+                   query_rc == 0 && restore_rc == 0 &&
+                   sigactions_semantically_equal(
+                       &installed_action, &after_action)
+               ? 0 : 85;
+}
+
+TEST(supervisor_injection_preserves_inherited_ignored_signal) {
+    CHECK(isolated_runner_check_passes(supervisor_ignored_hup_worker));
+}
+
+static int pending_signal_mask_probe_main(void) {
+    sigset_t current;
+    sigset_t pending;
+
+    if (sigprocmask(SIG_SETMASK, NULL, &current) != 0 ||
+        sigpending(&pending) != 0) {
+        return 86;
+    }
+    return sigismember(&current, SIGTERM) == 1 &&
+                   sigismember(&current, SIGUSR1) == 1 &&
+                   sigismember(&current, SIGINT) == 0 &&
+                   sigismember(&current, SIGHUP) == 0 &&
+                   sigismember(&current, SIGQUIT) == 0 &&
+                   sigismember(&current, SIGTSTP) == 0 &&
+                   sigismember(&pending, SIGTERM) == 1
+               ? 0 : 87;
+}
+
+static int supervisor_pending_blocked_signal_worker(void) {
+    const char *argv[] = {
+        g_self_path, "--ar14-pending-signal-mask-probe", NULL
+    };
+    sigset_t original_mask;
+    sigset_t configured_mask;
+    sigset_t after_mask;
+    run_result_t result;
+
+    if (sigprocmask(SIG_SETMASK, NULL, &original_mask) != 0) return 88;
+    configured_mask = original_mask;
+    if (sigaddset(&configured_mask, SIGTERM) != 0 ||
+        sigaddset(&configured_mask, SIGUSR1) != 0 ||
+        sigdelset(&configured_mask, SIGINT) != 0 ||
+        sigdelset(&configured_mask, SIGHUP) != 0 ||
+        sigdelset(&configured_mask, SIGQUIT) != 0 ||
+        sigdelset(&configured_mask, SIGTSTP) != 0 ||
+        sigprocmask(SIG_SETMASK, &configured_mask, NULL) != 0) {
+        return 89;
+    }
+    run_test_set_supervisor_pending_signal(SIGTERM);
+    int rc = run_argv(argv, NULL, &result);
+    run_test_set_supervisor_pending_signal(0);
+    int query_rc = sigprocmask(SIG_SETMASK, NULL, &after_mask);
+    int restore_rc =
+        sigprocmask(SIG_SETMASK, &original_mask, NULL);
+    return rc == 0 && result.spawned && result.exit_code == 0 &&
+                   result.term_signal == 0 && query_rc == 0 &&
+                   restore_rc == 0 &&
+                   sigsets_semantically_equal(
+                       &configured_mask, &after_mask)
+               ? 0 : 90;
+}
+
+TEST(supervisor_only_pending_blocked_signal_survives_exec) {
+    CHECK(isolated_runner_check_passes(
+        supervisor_pending_blocked_signal_worker));
 }
 
 static int pty_foreground_signal_worker(int slave_fd, int ready_fd,
@@ -1678,6 +2048,10 @@ int main(int argc, char **argv) {
         strcmp(argv[1], "--ar14-deadline-close-stdout") == 0) {
         return deadline_pause_main(true);
     }
+    if (argc == 2 &&
+        strcmp(argv[1], "--ar14-pending-signal-mask-probe") == 0) {
+        return pending_signal_mask_probe_main();
+    }
 
     error_init(LOG_LEVEL_WARNING, NULL);
     if (argc != 1 || !realpath(argv[0], g_self_path)) {
@@ -1693,6 +2067,8 @@ int main(int argc, char **argv) {
     RUN_TEST(runner_fails_before_spawn_under_fd_exhaustion);
     RUN_TEST(child_setup_status_is_reported_explicitly);
     RUN_TEST(process_group_supervisor_setup_failure_is_truthful_and_reaped);
+    RUN_TEST(supervisor_stage_failures_are_truthful_reaped_and_one_shot);
+    RUN_TEST(pre_release_group_death_cannot_sigpipe_parent);
     RUN_TEST(early_stdin_close_is_a_runner_failure);
     RUN_TEST(full_binary_stdin_delivery_remains_successful);
     RUN_TEST(intentional_zero_byte_input_delivers_eof_successfully);
@@ -1703,6 +2079,12 @@ int main(int argc, char **argv) {
     RUN_TEST(successful_leader_with_stdout_holder_kills_group_before_pid_release);
     RUN_TEST(closed_stdio_daemon_like_descendant_remains_supported);
     RUN_TEST(repeated_rollback_signal_terminates_group_descendant);
+    RUN_TEST(supervisor_only_pending_termination_reaches_gated_worker_once);
+    RUN_TEST(post_replay_group_termination_reaches_worker_once);
+    RUN_TEST(supervisor_only_pending_stop_fails_closed_without_hanging);
+    RUN_TEST(post_replay_supervisor_stop_handler_fails_group_closed);
+    RUN_TEST(supervisor_injection_preserves_inherited_ignored_signal);
+    RUN_TEST(supervisor_only_pending_blocked_signal_survives_exec);
     RUN_TEST(pty_interrupt_targets_child_group_and_restores_foreground_owner);
     RUN_TEST(pty_stop_fails_closed_without_hanging_and_restores_foreground_owner);
     RUN_TEST(interrupted_poll_still_advances_child_capture_deadline);

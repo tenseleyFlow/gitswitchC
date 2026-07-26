@@ -47,6 +47,10 @@
 
 #ifdef GITSWITCH_TESTING
 void run_test_set_child_process_group_failure(int system_errno);
+void run_test_set_supervisor_pending_signal(int signal_number);
+void run_test_set_post_replay_signal(int signal_number);
+void run_test_set_supervisor_failure(
+    run_test_supervisor_failure_stage_t stage, int system_errno);
 #endif
 
 /* POSIX exposes the process environment through this external object, but
@@ -3257,6 +3261,13 @@ static run_test_post_fork_pre_publish_hook_fn
 static int g_test_fork_failure_errno;
 #ifdef GITSWITCH_TESTING
 static int g_test_child_process_group_failure_errno;
+static int g_test_supervisor_pending_signal;
+static int g_test_post_replay_signal;
+static run_test_supervisor_failure_stage_t
+    g_test_supervisor_failure_stage;
+static int g_test_supervisor_failure_errno;
+static run_test_pre_group_release_hook_fn
+    g_test_pre_group_release_hook;
 static unsigned int g_test_path_candidate_failure_ordinal;
 static int g_test_path_candidate_failure_errno;
 static unsigned int g_test_directory_open_failure_ordinal;
@@ -3468,6 +3479,55 @@ void run_test_set_fork_failure(int system_errno) {
 void run_test_set_child_process_group_failure(int system_errno) {
     g_test_child_process_group_failure_errno =
         system_errno > 0 ? system_errno : 0;
+}
+
+void run_test_set_supervisor_pending_signal(int signal_number) {
+    switch (signal_number) {
+        case SIGINT:
+        case SIGTERM:
+        case SIGHUP:
+        case SIGQUIT:
+        case SIGTSTP:
+            g_test_supervisor_pending_signal = signal_number;
+            break;
+        default:
+            g_test_supervisor_pending_signal = 0;
+            break;
+    }
+}
+
+void run_test_set_post_replay_signal(int signal_number) {
+    switch (signal_number) {
+        case SIGINT:
+        case SIGTERM:
+        case SIGHUP:
+        case SIGQUIT:
+        case SIGTSTP:
+            g_test_post_replay_signal = signal_number;
+            break;
+        default:
+            g_test_post_replay_signal = 0;
+            break;
+    }
+}
+
+void run_test_set_supervisor_failure(
+    run_test_supervisor_failure_stage_t stage, int system_errno) {
+    if (stage < RUN_TEST_SUPERVISOR_FAILURE_WORKER_RELEASE_PIPE ||
+        stage > RUN_TEST_SUPERVISOR_FAILURE_RELEASE_WRITE ||
+        system_errno <= 0) {
+        g_test_supervisor_failure_stage =
+            RUN_TEST_SUPERVISOR_FAILURE_NONE;
+        g_test_supervisor_failure_errno = 0;
+        return;
+    }
+    g_test_supervisor_failure_stage = stage;
+    g_test_supervisor_failure_errno = system_errno;
+}
+
+void run_test_set_pre_group_release_hook(
+    run_test_pre_group_release_hook_fn hook) {
+    g_test_pre_group_release_hook = hook;
 }
 
 void run_test_set_exec_parse_failure(unsigned int parse_ordinal,
@@ -3705,6 +3765,11 @@ static void runner_accept_group_relay(pid_t pid, bool group_proven,
 }
 
 static volatile sig_atomic_t g_runner_relay_fd = -1;
+static const int g_runner_relay_signals[] = {
+    SIGINT, SIGTERM, SIGHUP, SIGQUIT, SIGTSTP
+};
+#define RUNNER_RELAY_SIGNAL_COUNT \
+    (sizeof(g_runner_relay_signals) / sizeof(g_runner_relay_signals[0]))
 
 static void runner_group_signal_relay(int signal_number) {
     int saved_errno = errno;
@@ -3714,16 +3779,34 @@ static void runner_group_signal_relay(int signal_number) {
         ssize_t ignored = write(fd, &byte, 1U);
         (void)ignored;
     }
+    if (signal_number == SIGTSTP) {
+        /* Once the worker is released, stopping both members of the isolated
+         * group can strand the parent in its setup-status read forever. The
+         * inherited-mask contract still wins: this handler cannot run while
+         * SIGTSTP was caller-blocked. For an unblocked stop request, report
+         * the relay and fail the complete group closed. */
+        (void)kill(0, SIGCONT);
+        (void)kill(0, SIGKILL);
+    }
     errno = saved_errno;
 }
 
-static int runner_install_group_relay(int relay_fd) {
-    static const int relayed[] = {
-        SIGINT, SIGTERM, SIGHUP, SIGQUIT, SIGTSTP
-    };
+static int runner_build_group_relay_set(sigset_t *relay_set) {
+    if (!relay_set || sigemptyset(relay_set) != 0) return -1;
+    for (size_t i = 0U; i < RUNNER_RELAY_SIGNAL_COUNT; i++) {
+        if (sigaddset(relay_set, g_runner_relay_signals[i]) != 0) {
+            return -1;
+        }
+    }
+    return 0;
+}
+
+static int runner_install_group_relay(int relay_fd,
+                                      sigset_t *installed_set) {
     struct sigaction current;
     struct sigaction relay;
 
+    if (!installed_set || sigemptyset(installed_set) != 0) return -1;
     memset(&relay, 0, sizeof(relay));
     relay.sa_handler = runner_group_signal_relay;
     if (sigemptyset(&relay.sa_mask) != 0) return -1;
@@ -3731,11 +3814,24 @@ static int runner_install_group_relay(int relay_fd) {
     if (flags < 0 || fcntl(relay_fd, F_SETFL, flags | O_NONBLOCK) != 0) {
         return -1;
     }
-    g_runner_relay_fd = (sig_atomic_t)relay_fd;
-    for (size_t i = 0U; i < sizeof(relayed) / sizeof(relayed[0]); i++) {
-        if (sigaction(relayed[i], NULL, &current) != 0) return -1;
+    for (size_t i = 0U; i < RUNNER_RELAY_SIGNAL_COUNT; i++) {
+        int signal_number = g_runner_relay_signals[i];
+        if (sigaction(signal_number, NULL, &current) != 0) return -1;
         if (current.sa_handler != SIG_IGN &&
-            sigaction(relayed[i], &relay, NULL) != 0) {
+            sigaddset(installed_set, signal_number) != 0) {
+            return -1;
+        }
+    }
+    /* The outer child blocked every relay candidate before beginning process
+     * setup. Capture only dispositions we actually replace; inherited
+     * SIG_IGN remains untouched and the worker restores the caller's mask. */
+    g_runner_relay_fd = (sig_atomic_t)relay_fd;
+    for (size_t i = 0U; i < RUNNER_RELAY_SIGNAL_COUNT; i++) {
+        int signal_number = g_runner_relay_signals[i];
+        int installed = sigismember(installed_set, signal_number);
+        if (installed < 0) return -1;
+        if (installed == 1 &&
+            sigaction(signal_number, &relay, NULL) != 0) {
             return -1;
         }
     }
@@ -3743,22 +3839,115 @@ static int runner_install_group_relay(int relay_fd) {
 }
 
 static void runner_reset_group_relay_for_exec(void) {
-    static const int relayed[] = {
-        SIGINT, SIGTERM, SIGHUP, SIGQUIT, SIGTSTP
-    };
     struct sigaction current;
     struct sigaction action;
 
     memset(&action, 0, sizeof(action));
     action.sa_handler = SIG_DFL;
     (void)sigemptyset(&action.sa_mask);
-    for (size_t i = 0U; i < sizeof(relayed) / sizeof(relayed[0]); i++) {
-        if (sigaction(relayed[i], NULL, &current) == 0 &&
+    for (size_t i = 0U; i < RUNNER_RELAY_SIGNAL_COUNT; i++) {
+        int signal_number = g_runner_relay_signals[i];
+        if (sigaction(signal_number, NULL, &current) == 0 &&
             current.sa_handler == runner_group_signal_relay) {
-            (void)sigaction(relayed[i], &action, NULL);
+            (void)sigaction(signal_number, &action, NULL);
         }
     }
     g_runner_relay_fd = -1;
+}
+
+static int runner_consume_pending_signal(int signal_number) {
+    sigset_t one_signal;
+    int consumed = 0;
+    int wait_error;
+
+    if (sigemptyset(&one_signal) != 0 ||
+        sigaddset(&one_signal, signal_number) != 0) {
+        return -1;
+    }
+    do {
+        wait_error = sigwait(&one_signal, &consumed);
+    } while (wait_error == EINTR);
+    if (wait_error != 0) {
+        errno = wait_error;
+        return -1;
+    }
+    if (consumed != signal_number) {
+        errno = EIO;
+        return -1;
+    }
+    return 0;
+}
+
+/* The process-group leader can receive a blocked group signal before it has
+ * forked the actual exec worker. Transfer each such supervisor-only pending
+ * instance while the worker is held behind a private pipe. Signals already
+ * pending in the worker coalesce normally, so this never creates two
+ * deliveries there. A caller-blocked signal remains blocked and pending
+ * across exec; an unblocked signal additionally receives one parent-visible
+ * relay credit in place of the supervisor handler we synchronously consume. */
+static int runner_replay_pending_group_signals(
+    pid_t worker, int relay_fd, const sigset_t *installed_set,
+    const sigset_t *inherited_mask, bool *worker_killed) {
+    sigset_t pending;
+
+    if (!installed_set || !inherited_mask || !worker_killed) {
+        errno = EINVAL;
+        return -1;
+    }
+    *worker_killed = false;
+    if (sigpending(&pending) != 0) return -1;
+    for (size_t i = 0U; i < RUNNER_RELAY_SIGNAL_COUNT; i++) {
+        int signal_number = g_runner_relay_signals[i];
+        int installed = sigismember(installed_set, signal_number);
+        int is_pending = sigismember(&pending, signal_number);
+        int inherited_blocked =
+            sigismember(inherited_mask, signal_number);
+
+        if (installed < 0 || is_pending < 0 || inherited_blocked < 0) {
+            return -1;
+        }
+        if (installed == 0 || is_pending == 0) continue;
+        if (runner_consume_pending_signal(signal_number) != 0) return -1;
+
+        if (signal_number == SIGTSTP && inherited_blocked == 0) {
+            if (runner_write_byte(
+                    relay_fd, (unsigned char)signal_number) != 0) {
+                return -1;
+            }
+            (void)kill(worker, SIGCONT);
+            if (kill(worker, SIGKILL) != 0) return -1;
+            *worker_killed = true;
+            continue;
+        }
+        if (kill(worker, signal_number) != 0) return -1;
+        if (inherited_blocked == 0 &&
+            runner_write_byte(relay_fd,
+                              (unsigned char)signal_number) != 0) {
+            return -1;
+        }
+    }
+    return 0;
+}
+
+static void runner_kill_and_reap_worker(pid_t worker,
+                                        const sigset_t *relay_set) {
+    sigset_t previous_mask;
+    pid_t waited;
+
+    if (!relay_set ||
+        sigprocmask(SIG_BLOCK, relay_set, &previous_mask) != 0) {
+        (void)kill(worker, SIGKILL);
+        do {
+            waited = waitpid(worker, NULL, 0);
+        } while (waited < 0 && errno == EINTR);
+        return;
+    }
+    (void)kill(worker, SIGKILL);
+    do {
+        waited = waitpid(worker, NULL, 0);
+    } while (waited < 0 && errno == EINTR);
+    if (waited != worker) return;
+    (void)sigprocmask(SIG_SETMASK, &previous_mask, NULL);
 }
 
 static void runner_supervisor_exit_for_status(pid_t child, int status) {
@@ -4477,6 +4666,8 @@ static int run_argv_real_impl(
     }
 
     sigset_t pre_spawn_mask;
+    sigset_t guarded_spawn_mask;
+    sigset_t relay_block_set;
     if (signals_block_for_child_spawn(&pre_spawn_mask) != 0) {
         int block_errno = errno;
         int ownership_restore_errno = 0;
@@ -4506,6 +4697,45 @@ static int run_argv_real_impl(
         } else {
             set_system_error(ERR_SYSTEM_CALL,
                              "run_argv: cannot block guarded signals before fork");
+        }
+        errno = block_errno;
+        return -1;
+    }
+    if (runner_build_group_relay_set(&relay_block_set) != 0 ||
+        sigprocmask(SIG_BLOCK, &relay_block_set, &guarded_spawn_mask) != 0) {
+        int block_errno = errno;
+        int mask_restore_errno = 0;
+        int wait_mask_restore_errno = 0;
+        if (signals_restore_after_child_spawn(&pre_spawn_mask) != 0) {
+            mask_restore_errno = errno;
+        }
+        if (signals_child_wait_end(&pre_wait_mask) != 0) {
+            wait_mask_restore_errno = errno;
+        }
+        if (devnull >= 0) close(devnull);
+        if (pipe_input) { close(in_pipe[0]); close(in_pipe[1]); }
+        if (want_out) { close(out_pipe[0]); close(out_pipe[1]); }
+        close(status_pipe[0]);
+        close(status_pipe[1]);
+        close(group_ready_pipe[0]);
+        close(group_ready_pipe[1]);
+        close(group_release_pipe[0]);
+        close(group_release_pipe[1]);
+        close(signal_relay_pipe[0]);
+        close(signal_relay_pipe[1]);
+        free(fd_snapshot.fds);
+        close(exec_fd);
+        trusted_script_launch_cleanup(&script_launch);
+        errno = block_errno;
+        if (mask_restore_errno != 0 || wait_mask_restore_errno != 0) {
+            set_system_error(
+                ERR_SYSTEM_CALL,
+                "run_argv: cannot block process-group relay signals before fork; also failed to restore parent signal state (spawn restore errno=%d, wait restore errno=%d)",
+                mask_restore_errno, wait_mask_restore_errno);
+        } else {
+            set_system_error(
+                ERR_SYSTEM_CALL,
+                "run_argv: cannot block process-group relay signals before fork");
         }
         errno = block_errno;
         return -1;
@@ -4572,7 +4802,16 @@ static int run_argv_real_impl(
     if (pid == 0) {
         /* ---- child ---- */
         int child_status_fd = status_pipe[1];
+        sigset_t installed_relay_set;
 
+#ifdef GITSWITCH_TESTING
+        int injected_signal = g_test_supervisor_pending_signal;
+        g_test_supervisor_pending_signal = 0;
+        if (injected_signal != 0 && raise(injected_signal) != 0) {
+            child_report_failure(child_status_fd,
+                                 CHILD_STAGE_PROCESS_GROUP, errno, 126);
+        }
+#endif
         close(group_ready_pipe[0]);
         close(group_release_pipe[1]);
         close(signal_relay_pipe[0]);
@@ -4590,7 +4829,8 @@ static int run_argv_real_impl(
             child_report_failure(child_status_fd,
                                  CHILD_STAGE_PROCESS_GROUP, errno, 126);
         }
-        if (runner_install_group_relay(signal_relay_pipe[1]) != 0) {
+        if (runner_install_group_relay(
+                signal_relay_pipe[1], &installed_relay_set) != 0) {
             child_report_failure(child_status_fd,
                                  CHILD_STAGE_PROCESS_GROUP, errno, 126);
         }
@@ -4601,24 +4841,57 @@ static int run_argv_real_impl(
         }
         close(group_ready_pipe[1]);
         close(group_release_pipe[0]);
-        if (sigprocmask(SIG_SETMASK, &pre_wait_mask, NULL) != 0) {
+
+        int worker_release_pipe[2] = {-1, -1};
+#ifdef GITSWITCH_TESTING
+        if (g_test_supervisor_failure_stage ==
+            RUN_TEST_SUPERVISOR_FAILURE_WORKER_RELEASE_PIPE) {
+            int injected_errno = g_test_supervisor_failure_errno;
+            g_test_supervisor_failure_stage =
+                RUN_TEST_SUPERVISOR_FAILURE_NONE;
+            g_test_supervisor_failure_errno = 0;
+            child_report_failure(child_status_fd,
+                                 CHILD_STAGE_PROCESS_GROUP,
+                                 injected_errno, 126);
+        }
+#endif
+        if (make_internal_pipe(worker_release_pipe) != 0) {
             child_report_failure(child_status_fd,
                                  CHILD_STAGE_PROCESS_GROUP, errno, 126);
         }
 
-        pid_t exec_child = fork();
+        pid_t exec_child;
+#ifdef GITSWITCH_TESTING
+        if (g_test_supervisor_failure_stage ==
+            RUN_TEST_SUPERVISOR_FAILURE_INNER_FORK) {
+            int injected_errno = g_test_supervisor_failure_errno;
+            g_test_supervisor_failure_stage =
+                RUN_TEST_SUPERVISOR_FAILURE_NONE;
+            g_test_supervisor_failure_errno = 0;
+            errno = injected_errno;
+            exec_child = -1;
+        } else
+#endif
+        {
+            exec_child = fork();
+        }
         if (exec_child < 0) {
+            int fork_errno = errno;
+            close(worker_release_pipe[0]);
+            close(worker_release_pipe[1]);
             child_report_failure(child_status_fd,
-                                 CHILD_STAGE_PROCESS_GROUP, errno, 126);
+                                 CHILD_STAGE_PROCESS_GROUP,
+                                 fork_errno, 126);
         }
         if (exec_child > 0) {
             int exec_status = 0;
             pid_t waited;
             run_test_fd_close_observation_t supervisor_close_observation;
             int supervisor_relay_fd = STDERR_FILENO + 1;
+            bool worker_killed = false;
 
+            close(worker_release_pipe[0]);
             close(status_pipe[0]);
-            close(status_pipe[1]);
             if (in_pipe[0] >= 0) close(in_pipe[0]);
             if (in_pipe[1] >= 0) close(in_pipe[1]);
             if (out_pipe[0] >= 0) close(out_pipe[0]);
@@ -4630,12 +4903,95 @@ static int run_argv_real_impl(
             }
             if (signal_relay_pipe[1] != supervisor_relay_fd) {
                 if (dup2(signal_relay_pipe[1], supervisor_relay_fd) < 0) {
-                    (void)kill(exec_child, SIGKILL);
-                    _exit(127);
+                    int setup_errno = errno;
+                    close(worker_release_pipe[1]);
+                    runner_kill_and_reap_worker(
+                        exec_child, &relay_block_set);
+                    child_report_failure(
+                        child_status_fd, CHILD_STAGE_PROCESS_GROUP,
+                        setup_errno, 126);
                 }
                 close(signal_relay_pipe[1]);
             }
             g_runner_relay_fd = (sig_atomic_t)supervisor_relay_fd;
+#ifdef GITSWITCH_TESTING
+            if (g_test_supervisor_failure_stage ==
+                RUN_TEST_SUPERVISOR_FAILURE_REPLAY) {
+                int injected_errno = g_test_supervisor_failure_errno;
+                g_test_supervisor_failure_stage =
+                    RUN_TEST_SUPERVISOR_FAILURE_NONE;
+                g_test_supervisor_failure_errno = 0;
+                close(worker_release_pipe[1]);
+                runner_kill_and_reap_worker(
+                    exec_child, &relay_block_set);
+                child_report_failure(
+                    child_status_fd, CHILD_STAGE_PROCESS_GROUP,
+                    injected_errno, 126);
+            }
+#endif
+            if (runner_replay_pending_group_signals(
+                    exec_child, supervisor_relay_fd,
+                    &installed_relay_set, &pre_wait_mask,
+                    &worker_killed) != 0) {
+                int setup_errno = errno;
+                close(worker_release_pipe[1]);
+                runner_kill_and_reap_worker(
+                    exec_child, &relay_block_set);
+                child_report_failure(
+                    child_status_fd, CHILD_STAGE_PROCESS_GROUP,
+                    setup_errno, 126);
+            }
+#ifdef GITSWITCH_TESTING
+            if (g_test_supervisor_failure_stage ==
+                RUN_TEST_SUPERVISOR_FAILURE_RELEASE_WRITE) {
+                int injected_errno = g_test_supervisor_failure_errno;
+                g_test_supervisor_failure_stage =
+                    RUN_TEST_SUPERVISOR_FAILURE_NONE;
+                g_test_supervisor_failure_errno = 0;
+                close(worker_release_pipe[1]);
+                runner_kill_and_reap_worker(
+                    exec_child, &relay_block_set);
+                child_report_failure(
+                    child_status_fd, CHILD_STAGE_PROCESS_GROUP,
+                    injected_errno, 126);
+            }
+#endif
+            if (!worker_killed &&
+                runner_write_byte(worker_release_pipe[1], 0x45U) != 0) {
+                int setup_errno = errno;
+                close(worker_release_pipe[1]);
+                runner_kill_and_reap_worker(
+                    exec_child, &relay_block_set);
+                child_report_failure(
+                    child_status_fd, CHILD_STAGE_PROCESS_GROUP,
+                    setup_errno, 126);
+            }
+            close(worker_release_pipe[1]);
+#ifdef GITSWITCH_TESTING
+            int post_replay_signal =
+                g_test_post_replay_signal;
+            g_test_post_replay_signal = 0;
+            if (post_replay_signal != 0 &&
+                (post_replay_signal == SIGTSTP
+                     ? raise(post_replay_signal)
+                     : kill(0, post_replay_signal)) != 0) {
+                int setup_errno = errno;
+                runner_kill_and_reap_worker(
+                    exec_child, &relay_block_set);
+                child_report_failure(
+                    child_status_fd, CHILD_STAGE_PROCESS_GROUP,
+                    setup_errno, 126);
+            }
+#endif
+            if (sigprocmask(SIG_SETMASK, &pre_wait_mask, NULL) != 0) {
+                int setup_errno = errno;
+                runner_kill_and_reap_worker(
+                    exec_child, &relay_block_set);
+                child_report_failure(
+                    child_status_fd, CHILD_STAGE_PROCESS_GROUP,
+                    setup_errno, 126);
+            }
+            close(status_pipe[1]);
             close(STDIN_FILENO);
             close(STDOUT_FILENO);
             close(STDERR_FILENO);
@@ -4649,15 +5005,28 @@ static int run_argv_real_impl(
                     supervisor_relay_fd + 1, use_bulk_close, false,
                     &fd_snapshot,
                     &supervisor_close_observation) != 0) {
-                (void)kill(exec_child, SIGKILL);
+                runner_kill_and_reap_worker(
+                    exec_child, &relay_block_set);
                 _exit(127);
             }
+            /* run_argv publishes only the independently proven process group,
+             * never this private worker PID. Once the worker exists, normal
+             * cancellation and terminal signals target that group, so the
+             * kernel delivers them to both members. The supervisor must not
+             * re-forward them or one group signal could reach the worker
+             * twice after it resets its disposition. */
             do {
                 waited = waitpid(exec_child, &exec_status, 0);
             } while (waited < 0 && errno == EINTR);
             if (waited != exec_child) _exit(127);
             runner_supervisor_exit_for_status(exec_child, exec_status);
         }
+        close(worker_release_pipe[1]);
+        if (runner_read_byte(worker_release_pipe[0], 0x45U) != 0) {
+            child_report_failure(child_status_fd,
+                                 CHILD_STAGE_PROCESS_GROUP, errno, 126);
+        }
+        close(worker_release_pipe[0]);
         close(signal_relay_pipe[1]);
         runner_reset_group_relay_for_exec();
 
@@ -4964,7 +5333,62 @@ static int run_argv_real_impl(
     result->spawned = true;
 #ifdef GITSWITCH_TESTING
     g_test_child_process_group_failure_errno = 0;
+    g_test_supervisor_pending_signal = 0;
+    g_test_post_replay_signal = 0;
+    g_test_supervisor_failure_stage =
+        RUN_TEST_SUPERVISOR_FAILURE_NONE;
+    g_test_supervisor_failure_errno = 0;
 #endif
+    if (signals_restore_after_child_spawn(&guarded_spawn_mask) != 0) {
+        int restore_errno = errno;
+        int cleanup_wait_errno = 0;
+        int wait_mask_restore_errno = 0;
+        signals_child_wait_result_t wait_result;
+
+        close(group_ready_pipe[0]);
+        close(group_ready_pipe[1]);
+        close(group_release_pipe[0]);
+        close(group_release_pipe[1]);
+        close(signal_relay_pipe[0]);
+        close(signal_relay_pipe[1]);
+        runner_signal_child(pid, false, SIGKILL);
+        do {
+            wait_result = signals_wait_child(pid, NULL, 0);
+        } while (wait_result.waited < 0 &&
+                 wait_result.wait_errno == EINTR &&
+                 wait_result.mask_errno == 0);
+        if (wait_result.waited != pid) {
+            cleanup_wait_errno = wait_result.wait_errno != 0
+                                     ? wait_result.wait_errno
+                                     : ECHILD;
+        }
+        if (signals_child_wait_end(&pre_wait_mask) != 0) {
+            wait_mask_restore_errno = errno;
+        }
+        if (devnull >= 0) close(devnull);
+        if (pipe_input) { close(in_pipe[0]); close(in_pipe[1]); }
+        if (want_out) { close(out_pipe[0]); close(out_pipe[1]); }
+        close(status_pipe[0]);
+        close(status_pipe[1]);
+        free(fd_snapshot.fds);
+        close(exec_fd);
+        trusted_script_launch_cleanup(&script_launch);
+        errno = restore_errno;
+        if (cleanup_wait_errno != 0 || wait_result.mask_errno != 0 ||
+            wait_mask_restore_errno != 0) {
+            set_system_error(
+                ERR_SYSTEM_CALL,
+                "run_argv: cannot restore guarded parent signal mask after fork; child cleanup also failed (reap errno=%d, wait-mask errno=%d, final-mask errno=%d)",
+                cleanup_wait_errno, wait_result.mask_errno,
+                wait_mask_restore_errno);
+        } else {
+            set_system_error(
+                ERR_SYSTEM_CALL,
+                "run_argv: cannot restore guarded parent signal mask after fork");
+        }
+        errno = restore_errno;
+        return -1;
+    }
     bool group_proven = false;
     runner_tty_state_t tty_state;
     memset(&tty_state, 0, sizeof(tty_state));
@@ -5084,8 +5508,13 @@ static int run_argv_real_impl(
     /* Publish only the independently proven group, then release the
      * supervisor to fork/exec descendants. */
     signals_child_group_spawned(pid, pid);
-    if (runner_write_byte(group_release_pipe[1], 0x52U) != 0) {
-        int release_errno = errno;
+    run_sigpipe_state_t release_sigpipe_state;
+    sigset_t pre_release_mask = pre_spawn_mask;
+    memset(&release_sigpipe_state, 0, sizeof(release_sigpipe_state));
+    if (sigaddset(&pre_release_mask, SIGPIPE) != 0 ||
+        run_sigpipe_begin(&release_sigpipe_state) != 0) {
+        int sigpipe_errno = errno;
+
         close(group_release_pipe[1]);
         runner_signal_child(pid, true, SIGKILL);
         (void)runner_tty_restore(&tty_state);
@@ -5101,21 +5530,31 @@ static int run_argv_real_impl(
         free(fd_snapshot.fds);
         close(exec_fd);
         trusted_script_launch_cleanup(&script_launch);
-        errno = release_errno;
-        set_system_error(ERR_SYSTEM_CALL,
-                         "run_argv: cannot release child process-group gate");
-        errno = release_errno;
+        errno = sigpipe_errno;
+        set_system_error(
+            ERR_SYSTEM_CALL,
+            "run_argv: cannot protect child process-group gate release");
+        errno = sigpipe_errno;
         return -1;
     }
-    close(group_release_pipe[1]);
-    if (signals_restore_after_child_spawn(&pre_spawn_mask) != 0) {
+    /* run_sigpipe_begin() captured the guarded spawn mask. The release
+     * window instead ends at the exact pre-spawn mask, so keep SIGPIPE
+     * blocked while guarded signals are delivered and have the scoped
+     * finalizer restore that exact destination. */
+    release_sigpipe_state.saved_mask = pre_spawn_mask;
+    if (signals_restore_after_child_spawn(&pre_release_mask) != 0) {
         int restore_errno = errno;
         int cleanup_wait_errno = 0;
+        int sigpipe_cleanup_errno = 0;
         int wait_mask_restore_errno = 0;
         signals_child_wait_result_t wait_result;
 
+        close(group_release_pipe[1]);
         runner_signal_child(pid, true, SIGKILL);
         (void)runner_tty_restore(&tty_state);
+        if (run_sigpipe_end(&release_sigpipe_state) != 0) {
+            sigpipe_cleanup_errno = errno;
+        }
         do {
             wait_result = signals_wait_child(pid, NULL, 0);
         } while (wait_result.waited < 0 &&
@@ -5139,20 +5578,77 @@ static int run_argv_real_impl(
         close(exec_fd);
         trusted_script_launch_cleanup(&script_launch);
         errno = restore_errno;
-        if (cleanup_wait_errno != 0 || wait_result.mask_errno != 0 ||
+        if (cleanup_wait_errno != 0 || sigpipe_cleanup_errno != 0 ||
+            wait_result.mask_errno != 0 ||
             wait_mask_restore_errno != 0) {
             set_system_error(
                 ERR_SYSTEM_CALL,
-                "run_argv: cannot restore parent signal mask after fork; child cleanup also failed (reap errno=%d, wait-mask errno=%d, final-mask errno=%d)",
-                cleanup_wait_errno, wait_result.mask_errno,
+                "run_argv: cannot restore parent signal mask before releasing child group; child cleanup also failed (reap errno=%d, SIGPIPE-mask errno=%d, wait-mask errno=%d, final-mask errno=%d)",
+                cleanup_wait_errno, sigpipe_cleanup_errno,
+                wait_result.mask_errno,
                 wait_mask_restore_errno);
         } else {
-            set_system_error(ERR_SYSTEM_CALL,
-                             "run_argv: cannot restore parent signal mask after fork");
+            set_system_error(
+                ERR_SYSTEM_CALL,
+                "run_argv: cannot restore parent signal mask before releasing child group");
         }
         errno = restore_errno;
         return -1;
     }
+#ifdef GITSWITCH_TESTING
+    if (g_test_pre_group_release_hook) {
+        run_test_pre_group_release_hook_fn hook =
+            g_test_pre_group_release_hook;
+        g_test_pre_group_release_hook = NULL;
+        hook(pid);
+    }
+#endif
+    int release_rc = runner_write_byte(group_release_pipe[1], 0x52U);
+    int release_errno = release_rc == 0 ? 0 : errno;
+    if (release_errno == EPIPE) {
+        release_sigpipe_state.saw_epipe = true;
+    }
+    int release_sigpipe_errno = 0;
+    if (run_sigpipe_end(&release_sigpipe_state) != 0) {
+        release_sigpipe_errno = errno;
+    }
+    if (release_rc != 0 || release_sigpipe_errno != 0) {
+        int primary_errno =
+            release_rc != 0 ? release_errno : release_sigpipe_errno;
+
+        close(group_release_pipe[1]);
+        runner_signal_child(pid, true, SIGKILL);
+        (void)runner_tty_restore(&tty_state);
+        (void)signals_wait_child(pid, NULL, 0);
+        (void)signals_child_wait_end(&pre_wait_mask);
+        close(signal_relay_pipe[0]);
+        if (devnull >= 0) close(devnull);
+        if (pipe_input) { close(in_pipe[0]); close(in_pipe[1]); }
+        if (want_out) { close(out_pipe[0]); close(out_pipe[1]); }
+        close(status_pipe[0]);
+        close(status_pipe[1]);
+        free(fd_snapshot.fds);
+        close(exec_fd);
+        trusted_script_launch_cleanup(&script_launch);
+        errno = primary_errno;
+        if (release_rc != 0 && release_sigpipe_errno != 0) {
+            set_system_error(
+                ERR_SYSTEM_CALL,
+                "run_argv: cannot release child process-group gate; also failed to restore SIGPIPE state (restore errno=%d)",
+                release_sigpipe_errno);
+        } else if (release_rc != 0) {
+            set_system_error(
+                ERR_SYSTEM_CALL,
+                "run_argv: cannot release child process-group gate");
+        } else {
+            set_system_error(
+                ERR_SYSTEM_CALL,
+                "run_argv: cannot restore SIGPIPE state after releasing child process-group gate");
+        }
+        errno = primary_errno;
+        return -1;
+    }
+    close(group_release_pipe[1]);
     free(fd_snapshot.fds);
     close(exec_fd);
     trusted_script_launch_cleanup(&script_launch);

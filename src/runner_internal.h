@@ -27,9 +27,31 @@ void run_test_set_monotonic_timespec(unsigned int call_ordinal,
 void run_test_set_poll_failure(unsigned int call_ordinal,
                                int system_errno);
 void run_test_set_child_setup_delay(int64_t delay_millis);
+typedef enum {
+    RUN_TEST_SUPERVISOR_FAILURE_NONE = 0,
+    RUN_TEST_SUPERVISOR_FAILURE_WORKER_RELEASE_PIPE,
+    RUN_TEST_SUPERVISOR_FAILURE_INNER_FORK,
+    RUN_TEST_SUPERVISOR_FAILURE_REPLAY,
+    RUN_TEST_SUPERVISOR_FAILURE_RELEASE_WRITE
+} run_test_supervisor_failure_stage_t;
+/* Parent-side seam after the proven group is published and guarded signals
+ * are restored, but before its private release gate is written. */
+typedef void (*run_test_pre_group_release_hook_fn)(pid_t supervisor_pid);
+void run_test_set_pre_group_release_hook(
+    run_test_pre_group_release_hook_fn hook);
 #ifdef GITSWITCH_RUNNER_GROUP_TEST_API
 /* One-shot child-supervisor setpgid(2) failure before GROUP_READY. */
 void run_test_set_child_process_group_failure(int system_errno);
+/* Raise one signal only in the process-group supervisor after its worker fork
+ * while the relay set is still blocked. */
+void run_test_set_supervisor_pending_signal(int signal_number);
+/* Inject one signal after worker release but before the supervisor restores
+ * its inherited mask. Normal signals target the complete process group;
+ * SIGTSTP targets the supervisor to exercise its local fail-closed handler. */
+void run_test_set_post_replay_signal(int signal_number);
+/* One-shot supervisor-stage failure with exact errno propagation. */
+void run_test_set_supervisor_failure(
+    run_test_supervisor_failure_stage_t stage, int system_errno);
 #endif
 #endif
 
