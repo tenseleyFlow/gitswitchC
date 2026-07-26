@@ -1992,6 +1992,61 @@ static ssh_process_outcome_t verify_expected_process_generation(
                : SSH_PROCESS_REPLACED;
 }
 
+static ssh_process_outcome_t probe_pidfd_liveness(int pidfd) {
+    struct pollfd alive_check = {.fd = pidfd, .events = POLLIN};
+
+    for (int attempts = 0;; attempts++) {
+        int rc;
+
+        alive_check.revents = 0;
+        rc = poll(&alive_check, 1, 0);
+        if (rc == 0) break;
+        if (rc > 0) {
+            return (alive_check.revents & (POLLIN | POLLHUP)) != 0
+                       ? SSH_PROCESS_GONE
+                       : SSH_PROCESS_INDETERMINATE;
+        }
+        if (errno == EINTR && attempts < 16) continue;
+        return SSH_PROCESS_INDETERMINATE;
+    }
+
+    for (int attempts = 0;; attempts++) {
+        if (g_reap_ops.pidfd_signal(pidfd, 0) == 0) {
+            return SSH_PROCESS_OWNED;
+        }
+        if (errno == EINTR && attempts < 16) continue;
+        return errno == ESRCH ? SSH_PROCESS_GONE
+                              : SSH_PROCESS_INDETERMINATE;
+    }
+}
+
+static ssh_process_outcome_t verify_expected_process_generation_with_pidfd(
+    const ssh_agent_record_t *record, int pidfd) {
+    ssh_process_outcome_t observed;
+    ssh_process_outcome_t pinned = probe_pidfd_liveness(pidfd);
+
+    if (pinned != SSH_PROCESS_OWNED) return pinned;
+    observed = verify_expected_process_generation(record);
+    pinned = probe_pidfd_liveness(pidfd);
+    if (pinned != SSH_PROCESS_OWNED) return pinned;
+    return observed == SSH_PROCESS_GONE ? SSH_PROCESS_INDETERMINATE
+                                        : observed;
+}
+
+static ssh_process_outcome_t inspect_process_identity_with_pidfd(
+    const ssh_agent_record_t *record, const char *sock, int runtime_dir_fd,
+    int pidfd) {
+    ssh_process_outcome_t observed;
+    ssh_process_outcome_t pinned = probe_pidfd_liveness(pidfd);
+
+    if (pinned != SSH_PROCESS_OWNED) return pinned;
+    observed = g_reap_ops.identity(record, sock, runtime_dir_fd);
+    pinned = probe_pidfd_liveness(pidfd);
+    if (pinned != SSH_PROCESS_OWNED) return pinned;
+    return observed == SSH_PROCESS_GONE ? SSH_PROCESS_INDETERMINATE
+                                        : observed;
+}
+
 static ssh_process_outcome_t reap_ssh_agent(
     const ssh_agent_record_t *record, const char *sock, int runtime_dir_fd) {
     ssh_process_outcome_t identity;
@@ -2008,27 +2063,23 @@ static ssh_process_outcome_t reap_ssh_agent(
     pidfd = g_reap_ops.pidfd_open(record->pid);
     open_errno = errno;
     if (pidfd >= 0) {
-        struct pollfd alive_check = {.fd = pidfd, .events = POLLIN};
-        identity = verify_expected_process_generation(record);
+        identity =
+            verify_expected_process_generation_with_pidfd(record, pidfd);
         if (identity != SSH_PROCESS_OWNED) {
             close(pidfd);
             return identity;
         }
-        identity = g_reap_ops.identity(record, sock, runtime_dir_fd);
+        identity = inspect_process_identity_with_pidfd(
+            record, sock, runtime_dir_fd, pidfd);
         if (identity != SSH_PROCESS_OWNED) {
             close(pidfd);
             return identity;
         }
-        identity = verify_expected_process_generation(record);
+        identity =
+            verify_expected_process_generation_with_pidfd(record, pidfd);
         if (identity != SSH_PROCESS_OWNED) {
             close(pidfd);
             return identity;
-        }
-        if (poll(&alive_check, 1, 0) != 0) {
-            close(pidfd);
-            return alive_check.revents & (POLLIN | POLLHUP | POLLERR)
-                       ? SSH_PROCESS_GONE
-                       : SSH_PROCESS_INDETERMINATE;
         }
         for (int attempts = 0;; attempts++) {
             if (g_reap_ops.pidfd_signal(pidfd, SIGTERM) == 0) {
@@ -2042,9 +2093,6 @@ static ssh_process_outcome_t reap_ssh_agent(
         }
         if (outcome == SSH_PROCESS_OWNED) {
             outcome = wait_pidfd_gone(pidfd, 500);
-        }
-        if (outcome == SSH_PROCESS_OWNED) {
-            outcome = verify_expected_process_generation(record);
         }
         if (outcome == SSH_PROCESS_OWNED) {
             log_warning("ssh-agent PID %ld ignored SIGTERM; escalating to SIGKILL",

@@ -659,7 +659,9 @@ static int g_generation_calls;
 static int g_term_calls;
 static int g_kill_calls;
 static int g_presence_calls;
+static int g_numeric_calls_after_term;
 static bool g_replace_generation_after_term;
+static bool g_die_during_generation;
 static bool g_process_gone_after_kill;
 static int g_pidfd_keepalive = -1;
 static bool g_pidfd_open_saw_generation;
@@ -678,6 +680,14 @@ static int generation_from_fixture(
     }
     g_generation_calls++;
     *generation = g_observed_generation;
+    if (g_term_calls > 0) g_numeric_calls_after_term++;
+    if (g_die_during_generation && g_generation_calls == 2) {
+        *generation = replacement_generation();
+        if (g_pidfd_keepalive >= 0) {
+            close(g_pidfd_keepalive);
+            g_pidfd_keepalive = -1;
+        }
+    }
     return 0;
 }
 
@@ -687,6 +697,32 @@ static int generation_inspection_fails(
     (void)generation;
     g_generation_calls++;
     errno = EIO;
+    return -1;
+}
+
+static int generation_disappears_after_pidfd_open(
+    pid_t pid, ssh_process_generation_t *generation) {
+    if (pid != TEST_PID || !generation) {
+        errno = EINVAL;
+        return -1;
+    }
+    g_generation_calls++;
+    if (g_generation_calls == 1) {
+        *generation = g_test_generation;
+        return 0;
+    }
+    errno = ESRCH;
+    return -1;
+}
+
+static int numeric_presence_reports_gone(pid_t pid, int signal_number) {
+    if (pid != TEST_PID || signal_number != 0) {
+        errno = EINVAL;
+        return -1;
+    }
+    g_signal_calls++;
+    g_last_signal = signal_number;
+    errno = ESRCH;
     return -1;
 }
 
@@ -730,6 +766,17 @@ static int pidfd_open_pipe(pid_t pid) {
     return fds[0];
 }
 
+static int pidfd_open_pollerr(pid_t pid) {
+    int fds[2];
+
+    if (pid != TEST_PID || pipe(fds) != 0) return -1;
+    if (close(fds[0]) != 0) {
+        close(fds[1]);
+        return -1;
+    }
+    return fds[1];
+}
+
 static int pidfd_open_flips_numeric_generation(pid_t pid) {
     if (pid != TEST_PID) {
         errno = ESRCH;
@@ -737,7 +784,7 @@ static int pidfd_open_flips_numeric_generation(pid_t pid) {
     }
     g_pidfd_open_saw_generation = g_generation_calls > 0;
     g_observed_generation = replacement_generation();
-    return open("/dev/null", O_RDONLY | O_CLOEXEC);
+    return pidfd_open_pipe(pid);
 }
 
 static void reset_generation_harness(void) {
@@ -748,7 +795,9 @@ static void reset_generation_harness(void) {
     g_term_calls = 0;
     g_kill_calls = 0;
     g_presence_calls = 0;
+    g_numeric_calls_after_term = 0;
     g_replace_generation_after_term = false;
+    g_die_during_generation = false;
     g_process_gone_after_kill = false;
     g_pidfd_open_saw_generation = false;
     if (g_pidfd_keepalive >= 0) {
@@ -773,6 +822,22 @@ static ssh_process_outcome_t identity_owned(const ssh_agent_record_t *record,
     (void)socket_arg;
     (void)runtime_dir_fd;
     return SSH_PROCESS_OWNED;
+}
+
+static ssh_process_outcome_t identity_owned_counted(
+    const ssh_agent_record_t *record, const char *socket_arg,
+    int runtime_dir_fd) {
+    if (g_term_calls > 0) g_numeric_calls_after_term++;
+    return identity_owned(record, socket_arg, runtime_dir_fd);
+}
+
+static ssh_process_outcome_t identity_reports_gone(
+    const ssh_agent_record_t *record, const char *socket_arg,
+    int runtime_dir_fd) {
+    (void)record;
+    (void)socket_arg;
+    (void)runtime_dir_fd;
+    return SSH_PROCESS_GONE;
 }
 
 typedef enum {
@@ -1121,15 +1186,11 @@ TEST(permission_denied_presence_probe_is_indeterminate) {
     close(fixture.dir_fd);
 }
 
-static int pidfd_open_devnull(pid_t pid) {
-    (void)pid;
-    return open("/dev/null", O_RDONLY | O_CLOEXEC);
-}
-
 static int pidfd_signal_permission_denied(int pidfd, int signal_number) {
     (void)pidfd;
     g_signal_calls++;
     g_last_signal = signal_number;
+    if (signal_number == 0) return 0;
     errno = EPERM;
     return -1;
 }
@@ -1158,7 +1219,7 @@ TEST(failed_pidfd_signal_retains_retry_sidecar) {
         g_pidfd_keepalive = -1;
     }
 
-    CHECK_EQ_INT(g_signal_calls, 1);
+    CHECK_EQ_INT(g_signal_calls, 7);
     CHECK_EQ_INT(g_last_signal, SIGTERM);
     CHECK(path_exists(fixture.sidecar));
     cleanup_retained_fixture(&fixture);
@@ -1175,7 +1236,7 @@ static void exercise_preterm_generation_mismatch(bool use_pidfd,
         .identity = identity_owned,
         .generation = generation_from_fixture,
         .signal = record_generation_signal,
-        .pidfd_open = use_pidfd ? pidfd_open_devnull : pidfd_unavailable,
+        .pidfd_open = use_pidfd ? pidfd_open_pipe : pidfd_unavailable,
         .pidfd_signal = record_generation_pidfd_signal
     };
     ssh_reap_test_ops_t previous;
@@ -1211,6 +1272,10 @@ static void exercise_preterm_generation_mismatch(bool use_pidfd,
     CHECK(artifact_matches_snapshot(fixture.socket, &socket_before));
     CHECK(artifact_matches_snapshot(fixture.current, &current_before));
 
+    if (g_pidfd_keepalive >= 0) {
+        CHECK_EQ_INT(close(g_pidfd_keepalive), 0);
+        g_pidfd_keepalive = -1;
+    }
     cleanup_retained_fixture(&fixture);
     close(fixture.dir_fd);
 }
@@ -1252,9 +1317,164 @@ TEST(generation_is_verified_before_pidfd_open_and_reverified_afterward) {
 
     CHECK(g_pidfd_open_saw_generation);
     CHECK(g_generation_calls >= 2);
+    CHECK_EQ_INT(g_presence_calls, 2);
     CHECK_EQ_INT(g_term_calls, 0);
     CHECK_EQ_INT(g_kill_calls, 0);
     CHECK(artifact_matches_snapshot(fixture.sidecar, &sidecar_before));
+    if (g_pidfd_keepalive >= 0) {
+        CHECK_EQ_INT(close(g_pidfd_keepalive), 0);
+        g_pidfd_keepalive = -1;
+    }
+    cleanup_retained_fixture(&fixture);
+    close(fixture.dir_fd);
+}
+
+TEST(pidfd_death_during_numeric_inspection_discards_replacement_result) {
+    ssh_fixture_t fixture;
+    ssh_reap_test_ops_t ops = {
+        .identity = identity_owned,
+        .generation = generation_from_fixture,
+        .signal = record_generation_signal,
+        .pidfd_open = pidfd_open_pipe,
+        .pidfd_signal = record_generation_pidfd_signal
+    };
+    ssh_reap_test_ops_t previous;
+
+    CHECK_EQ_INT(make_fixture(&fixture, "gsar14genpidfddeath"), 0);
+    if (fixture.dir_fd < 0) return;
+    CHECK_EQ_INT(publish_sidecar(&fixture, TEST_PID), 0);
+    CHECK_EQ_INT(bind_stale_socket(fixture.socket), 0);
+
+    reset_generation_harness();
+    g_die_during_generation = true;
+    previous = ssh_manager_set_reap_test_ops(&ops);
+    CHECK_EQ_INT(ssh_manager_reset("work"), 0);
+    ssh_manager_set_reap_test_ops(&previous);
+
+    CHECK_EQ_INT(g_generation_calls, 2);
+    CHECK_EQ_INT(g_term_calls, 0);
+    CHECK_EQ_INT(g_kill_calls, 0);
+    CHECK(!path_exists(fixture.sidecar));
+    CHECK(!path_exists(fixture.socket));
+    close(fixture.dir_fd);
+    ts_rm_rf(fixture.xdg);
+}
+
+TEST(live_pidfd_rejects_contradictory_numeric_generation_gone) {
+    ssh_fixture_t fixture;
+    artifact_snapshot_t sidecar_before = {0};
+    artifact_snapshot_t socket_before = {0};
+    ssh_reap_test_ops_t ops = {
+        .identity = identity_owned,
+        .generation = generation_disappears_after_pidfd_open,
+        .signal = numeric_presence_reports_gone,
+        .pidfd_open = pidfd_open_pipe,
+        .pidfd_signal = record_generation_pidfd_signal
+    };
+    ssh_reap_test_ops_t previous;
+
+    CHECK_EQ_INT(make_fixture(&fixture, "gsar14pidfdgencontradiction"), 0);
+    if (fixture.dir_fd < 0) return;
+    CHECK_EQ_INT(publish_sidecar(&fixture, TEST_PID), 0);
+    CHECK_EQ_INT(bind_stale_socket(fixture.socket), 0);
+    CHECK_EQ_INT(capture_artifact_snapshot(fixture.sidecar,
+                                           &sidecar_before), 0);
+    CHECK_EQ_INT(capture_artifact_snapshot(fixture.socket,
+                                           &socket_before), 0);
+
+    reset_generation_harness();
+    previous = ssh_manager_set_reap_test_ops(&ops);
+    CHECK_EQ_INT(ssh_manager_reset("work"), -1);
+    ssh_manager_set_reap_test_ops(&previous);
+
+    CHECK_EQ_INT(g_generation_calls, 2);
+    CHECK_EQ_INT(g_signal_calls, 1);
+    CHECK_EQ_INT(g_last_signal, 0);
+    CHECK_EQ_INT(g_term_calls, 0);
+    CHECK_EQ_INT(g_kill_calls, 0);
+    CHECK(artifact_matches_snapshot(fixture.sidecar, &sidecar_before));
+    CHECK(artifact_matches_snapshot(fixture.socket, &socket_before));
+    if (g_pidfd_keepalive >= 0) {
+        CHECK_EQ_INT(close(g_pidfd_keepalive), 0);
+        g_pidfd_keepalive = -1;
+    }
+    cleanup_retained_fixture(&fixture);
+    close(fixture.dir_fd);
+}
+
+TEST(live_pidfd_rejects_contradictory_numeric_identity_gone) {
+    ssh_fixture_t fixture;
+    artifact_snapshot_t sidecar_before = {0};
+    artifact_snapshot_t socket_before = {0};
+    ssh_reap_test_ops_t ops = {
+        .identity = identity_reports_gone,
+        .generation = generation_from_fixture,
+        .signal = record_generation_signal,
+        .pidfd_open = pidfd_open_pipe,
+        .pidfd_signal = record_generation_pidfd_signal
+    };
+    ssh_reap_test_ops_t previous;
+
+    CHECK_EQ_INT(make_fixture(&fixture, "gsar14pidfdidcontradiction"), 0);
+    if (fixture.dir_fd < 0) return;
+    CHECK_EQ_INT(publish_sidecar(&fixture, TEST_PID), 0);
+    CHECK_EQ_INT(bind_stale_socket(fixture.socket), 0);
+    CHECK_EQ_INT(capture_artifact_snapshot(fixture.sidecar,
+                                           &sidecar_before), 0);
+    CHECK_EQ_INT(capture_artifact_snapshot(fixture.socket,
+                                           &socket_before), 0);
+
+    reset_generation_harness();
+    previous = ssh_manager_set_reap_test_ops(&ops);
+    CHECK_EQ_INT(ssh_manager_reset("work"), -1);
+    ssh_manager_set_reap_test_ops(&previous);
+
+    CHECK_EQ_INT(g_generation_calls, 2);
+    CHECK_EQ_INT(g_term_calls, 0);
+    CHECK_EQ_INT(g_kill_calls, 0);
+    CHECK(artifact_matches_snapshot(fixture.sidecar, &sidecar_before));
+    CHECK(artifact_matches_snapshot(fixture.socket, &socket_before));
+    if (g_pidfd_keepalive >= 0) {
+        CHECK_EQ_INT(close(g_pidfd_keepalive), 0);
+        g_pidfd_keepalive = -1;
+    }
+    cleanup_retained_fixture(&fixture);
+    close(fixture.dir_fd);
+}
+
+TEST(pidfd_pollerr_is_indeterminate_and_retains_retry_tuple) {
+    ssh_fixture_t fixture;
+    artifact_snapshot_t sidecar_before = {0};
+    artifact_snapshot_t socket_before = {0};
+    ssh_reap_test_ops_t ops = {
+        .identity = identity_owned,
+        .generation = generation_from_fixture,
+        .signal = record_generation_signal,
+        .pidfd_open = pidfd_open_pollerr,
+        .pidfd_signal = record_generation_pidfd_signal
+    };
+    ssh_reap_test_ops_t previous;
+
+    CHECK_EQ_INT(make_fixture(&fixture, "gsar14pidfdpollerr"), 0);
+    if (fixture.dir_fd < 0) return;
+    CHECK_EQ_INT(publish_sidecar(&fixture, TEST_PID), 0);
+    CHECK_EQ_INT(bind_stale_socket(fixture.socket), 0);
+    CHECK_EQ_INT(capture_artifact_snapshot(fixture.sidecar,
+                                           &sidecar_before), 0);
+    CHECK_EQ_INT(capture_artifact_snapshot(fixture.socket,
+                                           &socket_before), 0);
+
+    reset_generation_harness();
+    previous = ssh_manager_set_reap_test_ops(&ops);
+    CHECK_EQ_INT(ssh_manager_reset("work"), -1);
+    ssh_manager_set_reap_test_ops(&previous);
+
+    CHECK_EQ_INT(g_generation_calls, 1);
+    CHECK_EQ_INT(g_presence_calls, 0);
+    CHECK_EQ_INT(g_term_calls, 0);
+    CHECK_EQ_INT(g_kill_calls, 0);
+    CHECK(artifact_matches_snapshot(fixture.sidecar, &sidecar_before));
+    CHECK(artifact_matches_snapshot(fixture.socket, &socket_before));
     cleanup_retained_fixture(&fixture);
     close(fixture.dir_fd);
 }
@@ -1264,7 +1484,7 @@ static void exercise_generation_change_after_term(bool use_pidfd) {
     artifact_snapshot_t sidecar_before = {0};
     artifact_snapshot_t socket_before = {0};
     ssh_reap_test_ops_t ops = {
-        .identity = identity_owned,
+        .identity = identity_owned_counted,
         .generation = generation_from_fixture,
         .signal = record_generation_signal,
         .pidfd_open = use_pidfd ? pidfd_open_pipe : pidfd_unavailable,
@@ -1296,7 +1516,8 @@ static void exercise_generation_change_after_term(bool use_pidfd) {
 
     CHECK(g_generation_calls >= 2);
     CHECK_EQ_INT(g_term_calls, 1);
-    CHECK_EQ_INT(g_kill_calls, 0);
+    CHECK_EQ_INT(g_kill_calls, use_pidfd ? 1 : 0);
+    CHECK_EQ_INT(g_numeric_calls_after_term, use_pidfd ? 0 : 1);
     CHECK(artifact_matches_snapshot(fixture.sidecar, &sidecar_before));
     CHECK(artifact_matches_snapshot(fixture.socket, &socket_before));
 
@@ -1308,7 +1529,7 @@ TEST(fallback_generation_change_after_term_prevents_kill) {
     exercise_generation_change_after_term(false);
 }
 
-TEST(pidfd_generation_change_after_term_prevents_kill) {
+TEST(pidfd_escalation_never_returns_to_numeric_process_inspection) {
     exercise_generation_change_after_term(true);
 }
 
@@ -2925,8 +3146,12 @@ TEST_MAIN_BEGIN()
     RUN_TEST(pidfd_generation_mismatch_before_term_preserves_retry_tuple);
     RUN_TEST(reset_all_generation_mismatch_before_term_preserves_retry_tuple);
     RUN_TEST(generation_is_verified_before_pidfd_open_and_reverified_afterward);
+    RUN_TEST(pidfd_death_during_numeric_inspection_discards_replacement_result);
+    RUN_TEST(live_pidfd_rejects_contradictory_numeric_generation_gone);
+    RUN_TEST(live_pidfd_rejects_contradictory_numeric_identity_gone);
+    RUN_TEST(pidfd_pollerr_is_indeterminate_and_retains_retry_tuple);
     RUN_TEST(fallback_generation_change_after_term_prevents_kill);
-    RUN_TEST(pidfd_generation_change_after_term_prevents_kill);
+    RUN_TEST(pidfd_escalation_never_returns_to_numeric_process_inspection);
     RUN_TEST(exact_generation_allows_term_kill_and_cleanup);
     RUN_TEST(generation_inspection_error_never_terminates_or_consumes_tuple);
     RUN_TEST(legacy_live_sidecar_is_retained_without_reap);
