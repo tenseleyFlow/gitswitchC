@@ -343,6 +343,7 @@ TEST(all_retained_public_apis_compile_and_link) {
     REQUIRE_PUBLIC_API(run_test_set_monotonic_rollback);
     REQUIRE_PUBLIC_API(run_test_set_monotonic_timespec);
     REQUIRE_PUBLIC_API(run_test_set_poll_failure);
+    REQUIRE_PUBLIC_API(run_test_set_pre_group_release_hook);
     REQUIRE_PUBLIC_API(run_test_set_exec_parse_failure);
     REQUIRE_PUBLIC_API(run_test_set_path_candidate_failure);
     REQUIRE_PUBLIC_API(run_test_set_directory_open_failure);
