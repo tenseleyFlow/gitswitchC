@@ -1377,6 +1377,22 @@ TEST(bash_tab_completion_preserves_active_quote_argv) {
     static const char quoted_redirect_name[] =
         "m35-quoted $M35_REDIRECT $(touch M35_REDIRECT_CS) "
         "`touch M35_REDIRECT_BT` output";
+    static const char *const fallback_compound_lines[] = {
+        "gitswitch edit PRIOR;gitswitch edit M35C:Par\t",
+        "gitswitch edit PRIOR&&gitswitch edit M35C:Par\t",
+        "false||gitswitch edit M35C:Par\t",
+        "printf x|gitswitch edit M35C:Par\t",
+        "true&gitswitch edit M35C:Par\t",
+        "gitswitch edit PRIOR\ngitswitch edit M35C:Par\t",
+        "printf '%s' 'old;old&&old||old|old&old';"
+        "gitswitch edit M35C:Par\t",
+        "printf %s $(case x in x) printf y;; esac);"
+        "gitswitch edit M35C:Par\t",
+        "printf %s $(printf \"%s\" \"$(date)\");"
+        "gitswitch edit M35C:Par\t",
+        "printf %s `printf \"%s\" \"\\`date\\`\"`;"
+        "gitswitch edit M35C:Par\t"
+    };
     static const char stub_body[] =
         "#!/bin/sh\n"
         "if [ \"$#\" -eq 2 ] && [ \"$1\" = --names ] && "
@@ -1600,6 +1616,16 @@ TEST(bash_tab_completion_preserves_active_quote_argv) {
         goto cleanup;
     }
     fallback_retry = strstr(bash_proc.out, "M35-RETRY") != NULL;
+    for (size_t i = 0;
+         i < sizeof(fallback_compound_lines) /
+                 sizeof(fallback_compound_lines[0]);
+         i++) {
+        if (bash_complete_and_capture(
+                &bash_proc, &sb, fallback_compound_lines[i], "M35CTAIL",
+                colon_name, NULL, 0) != 0) {
+            goto cleanup;
+        }
+    }
     if (bash_complete_redirect_and_cancel(
             &bash_proc, "gitswitch edit > m35-redir-ou\t",
             "m35-redir-output") != 0 ||
