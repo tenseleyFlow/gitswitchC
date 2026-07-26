@@ -22,6 +22,7 @@
 /* glibc-only: on macOS and the BSDs the strict macros hide default-namespace
  * declarations (mkdtemp, sockets) — the trap documented in ssh_manager.c. */
 #ifdef __linux__
+#define _GNU_SOURCE
 #define _POSIX_C_SOURCE 200809L
 #define _DEFAULT_SOURCE
 #endif
@@ -30,10 +31,13 @@
 #include "gitswitch.h"
 #include "ssh_manager.h"
 #include "utils.h"
+#include "runner_internal.h"
 #include "error.h"
 
 #include <errno.h>
 #include <fcntl.h>
+#include <inttypes.h>
+#include <limits.h>
 #include <signal.h>
 #include <stdio.h>
 #include <stdlib.h>
@@ -55,6 +59,55 @@ static char g_xdg[64]; /* short: socket paths must fit sun_path (~108) */
 static int  g_agent_start_attempts;   /* execs of ssh-agent */
 static bool g_agent_argv_had_dash_s;  /* H1: -s present in the spawn argv */
 static char g_first_probe[32];        /* L18: first ssh-add/ssh-keygen exec */
+static ssh_process_image_t g_l29_image;
+static int g_l29_denied_errno;
+static ssh_process_generation_t g_l29_observed_generation;
+
+static int l29_exact_image(pid_t pid, ssh_process_image_t *image) {
+    (void)pid;
+    if (!image) return -1;
+    *image = g_l29_image;
+    return 0;
+}
+
+static int l29_wrong_image(pid_t pid, ssh_process_image_t *image) {
+    (void)pid;
+    if (!image) return -1;
+    *image = g_l29_image;
+    image->executable_identity.st_ino++;
+    return 0;
+}
+
+static int l29_wrong_uid(pid_t pid, ssh_process_image_t *image) {
+    (void)pid;
+    if (!image) return -1;
+    *image = g_l29_image;
+    image->effective_uid =
+        g_l29_image.effective_uid == (uid_t)0 ? (uid_t)1 : (uid_t)0;
+    return 0;
+}
+
+static int l29_inaccessible_image(pid_t pid, ssh_process_image_t *image) {
+    (void)pid;
+    (void)image;
+    errno = EIO;
+    return -1;
+}
+
+static int l29_denied_image(pid_t pid, ssh_process_image_t *image) {
+    (void)pid;
+    (void)image;
+    errno = g_l29_denied_errno;
+    return -1;
+}
+
+static int l29_wrong_generation(
+    pid_t pid, ssh_process_generation_t *generation) {
+    (void)pid;
+    if (!generation) return -1;
+    *generation = g_l29_observed_generation;
+    return 0;
+}
 
 /* Find "-a <path>" wherever it sits in argv: the H1 fix inserts -s ahead of
  * it, so fakes must not assume a fixed position (and pre-fix argv still
@@ -234,11 +287,16 @@ static int fake_csh_agent_runner(const char *const argv[], const run_opts_t *opt
         }
         return 0;
     }
-    if (strcmp(argv[0], "ssh-agent") == 0) {
+    if (strcmp(ts_command_basename(argv[0]), "ssh-agent") == 0) {
         const char *sock = argv_sock_path(argv);
         g_agent_start_attempts++;
         g_agent_argv_had_dash_s = argv_has(argv, "-s");
         if (!sock || bind_sock_for_runner(sock, 0600, opts) != 0) return -1;
+        if (result &&
+            !run_launch_witness_capture(
+                argv[0], &result->launch_witness)) {
+            return -1;
+        }
         if (opts && opts->out) {
             snprintf(opts->out, opts->out_size,
                      "setenv SSH_AUTH_SOCK %s;\n"
@@ -302,10 +360,15 @@ static int fake_badperm_agent_runner(const char *const argv[], const run_opts_t 
         }
         return 0;
     }
-    if (strcmp(argv[0], "ssh-agent") == 0) {
+    if (strcmp(ts_command_basename(argv[0]), "ssh-agent") == 0) {
         const char *sock = argv_sock_path(argv);
         g_agent_start_attempts++;
         if (!sock || bind_sock_for_runner(sock, 0644, opts) != 0) return -1;
+        if (result &&
+            !run_launch_witness_capture(
+                argv[0], &result->launch_witness)) {
+            return -1;
+        }
         if (opts && opts->out) {
             /* PID far above any pid_max: reap_ssh_agent's identity check can
              * never find (let alone signal) a real process behind it. */
@@ -376,7 +439,7 @@ static int fake_two_key_agent_runner(const char *const argv[], const run_opts_t 
         }
         return 0;
     }
-    if (strcmp(argv[0], "ssh-agent") == 0) {
+    if (strcmp(ts_command_basename(argv[0]), "ssh-agent") == 0) {
         g_agent_start_attempts++;
         if (result) result->exit_code = 1;
         return -1; /* end the test deterministically at the restart */
@@ -441,7 +504,7 @@ static int fake_prefix_token_agent_runner(const char *const argv[], const run_op
         }
         return 0;
     }
-    if (strcmp(argv[0], "ssh-agent") == 0) {
+    if (strcmp(ts_command_basename(argv[0]), "ssh-agent") == 0) {
         g_agent_start_attempts++;
         if (result) result->exit_code = 1;
         return -1;
@@ -504,7 +567,7 @@ static int fake_recording_adopt_runner(const char *const argv[], const run_opts_
         }
         return 0;
     }
-    if (strcmp(argv[0], "ssh-agent") == 0) {
+    if (strcmp(ts_command_basename(argv[0]), "ssh-agent") == 0) {
         g_agent_start_attempts++;
         if (result) result->exit_code = 1;
         return -1;
@@ -546,7 +609,7 @@ static int fake_live_validation_launch_failure_runner(
                   "causal live-agent fingerprint launch failure");
         return -1;
     }
-    if (strcmp(argv[0], "ssh-agent") == 0) {
+    if (strcmp(ts_command_basename(argv[0]), "ssh-agent") == 0) {
         g_agent_start_attempts++;
         if (result) {
             result->spawned = true;
@@ -630,6 +693,538 @@ TEST(live_agent_fingerprint_launch_failure_preserves_socket_and_diagnostic) {
 /* ---- T3: reap_ssh_agent positive kill path (real agent, Linux-gated) ------ */
 
 #if defined(__linux__)
+static int capture_linux_socket_peer(
+    const char *path, pid_t *peer_pid, uid_t *peer_uid) {
+    struct sockaddr_un address;
+    struct ucred credential;
+    socklen_t credential_size = sizeof(credential);
+    int fd;
+    int rc = -1;
+
+    if (!path || !peer_pid || !peer_uid ||
+        strlen(path) >= sizeof(address.sun_path)) {
+        errno = EINVAL;
+        return -1;
+    }
+    fd = socket(AF_UNIX, SOCK_STREAM, 0);
+    if (fd < 0) return -1;
+    memset(&address, 0, sizeof(address));
+    address.sun_family = AF_UNIX;
+    memcpy(address.sun_path, path, strlen(path) + 1U);
+    if (connect(fd, (struct sockaddr *)(void *)&address,
+                sizeof(address)) == 0 &&
+        getsockopt(fd, SOL_SOCKET, SO_PEERCRED, &credential,
+                   &credential_size) == 0 &&
+        credential_size == sizeof(credential) &&
+        credential.pid > 1) {
+        *peer_pid = credential.pid;
+        *peer_uid = credential.uid;
+        rc = 0;
+    }
+    {
+        int saved_errno = errno;
+        close(fd);
+        errno = saved_errno;
+    }
+    return rc;
+}
+
+static int saturate_unix_listener(
+    const char *path, int *listener_out, int clients[], size_t client_capacity,
+    size_t *client_count_out) {
+    struct sockaddr_un address;
+    int listener = -1;
+    size_t client_count = 0;
+    bool saturated = false;
+
+    if (!path || !listener_out || !clients || client_capacity == 0 ||
+        !client_count_out || strlen(path) >= sizeof(address.sun_path)) {
+        errno = EINVAL;
+        return -1;
+    }
+    memset(&address, 0, sizeof(address));
+    address.sun_family = AF_UNIX;
+    memcpy(address.sun_path, path, strlen(path) + 1U);
+    listener = socket(AF_UNIX, SOCK_STREAM, 0);
+    if (listener < 0 ||
+        fcntl(listener, F_SETFD, FD_CLOEXEC) != 0 ||
+        bind(listener, (struct sockaddr *)(void *)&address,
+             sizeof(address)) != 0 ||
+        chmod(path, 0600) != 0 ||
+        listen(listener, 0) != 0) {
+        goto fail;
+    }
+    while (client_count < client_capacity) {
+        int client = socket(AF_UNIX, SOCK_STREAM, 0);
+        int flags;
+
+        if (client < 0 ||
+            fcntl(client, F_SETFD, FD_CLOEXEC) != 0 ||
+            (flags = fcntl(client, F_GETFL, 0)) < 0 ||
+            fcntl(client, F_SETFL, flags | O_NONBLOCK) != 0) {
+            if (client >= 0) close(client);
+            goto fail;
+        }
+        if (connect(client, (struct sockaddr *)(void *)&address,
+                    sizeof(address)) == 0) {
+            clients[client_count++] = client;
+            continue;
+        }
+        if (errno == EAGAIN
+#if EWOULDBLOCK != EAGAIN
+            || errno == EWOULDBLOCK
+#endif
+        ) {
+            close(client);
+            saturated = true;
+            break;
+        }
+        close(client);
+        goto fail;
+    }
+    if (!saturated) {
+        errno = EBUSY;
+        goto fail;
+    }
+    *listener_out = listener;
+    *client_count_out = client_count;
+    return 0;
+
+fail:
+    {
+        int saved_errno = errno;
+        for (size_t i = 0; i < client_count; i++) close(clients[i]);
+        if (listener >= 0) close(listener);
+        (void)unlink(path);
+        errno = saved_errno;
+    }
+    return -1;
+}
+
+static int start_real_recorded_agent(const char *sock,
+                                     ssh_agent_record_t *record) {
+    char output[2048];
+    char *pid_assignment;
+    char trusted_path[MAX_PATH_LEN];
+    run_opts_t opts;
+    run_result_t result;
+    const char *argv[] = {"ssh-agent", "-s", "-a", sock, NULL};
+
+    if (!record ||
+        find_command_path("ssh-agent", trusted_path,
+                          sizeof(trusted_path)) != 0 ||
+        stat(trusted_path, &g_l29_image.executable_identity) != 0 ||
+        safe_strncpy(g_l29_image.executable_path, trusted_path,
+                     sizeof(g_l29_image.executable_path)) != 0) {
+        return -1;
+    }
+    g_l29_image.effective_uid = geteuid();
+    g_l29_image.valid = true;
+    memset(&opts, 0, sizeof(opts));
+    memset(&result, 0, sizeof(result));
+    opts.out = output;
+    opts.out_size = sizeof(output);
+    opts.stderr_to_devnull = true;
+    if (run_argv(argv, &opts, &result) != 0) return -1;
+    pid_assignment = strstr(output, "SSH_AGENT_PID=");
+    if (!pid_assignment) return -1;
+    memset(record, 0, sizeof(*record));
+    record->pid =
+        (pid_t)atol(pid_assignment + strlen("SSH_AGENT_PID="));
+    if (record->pid <= 1 ||
+        ssh_manager_test_capture_process_generation(
+            record->pid, &record->generation) != 0 ||
+        capture_linux_socket_peer(
+            sock, &g_l29_image.socket_peer_pid,
+            &g_l29_image.socket_peer_uid) != 0) {
+        if (record->pid > 1) (void)kill(record->pid, SIGKILL);
+        return -1;
+    }
+    record->image = g_l29_image;
+    return 0;
+}
+
+/* L29: generation plus an exact managed -a argument is still insufficient
+ * signaling authority. Keep a genuine agent's argv/generation fixed while
+ * independently corrupting its kernel image evidence, effective credential,
+ * and evidence availability. Only the exact trusted native image may become
+ * OWNED; every other case fails closed before reaping can signal it. */
+TEST(process_identity_requires_trusted_image_and_effective_uid) {
+    char dir[128], sock[256], pid_path[256];
+    ssh_agent_record_t record;
+    ssh_reap_test_ops_t ops;
+    ssh_reap_test_ops_t previous;
+    int dir_fd;
+
+    if (!command_exists("ssh-agent")) {
+        TS_SKIP("openssh", "ssh-agent unavailable in trusted PATH");
+    }
+    CHECK_EQ_INT(make_xdg_agent_dir(dir, sizeof(dir)), 0);
+    snprintf(sock, sizeof(sock), "%s/ssh-agent.work.sock", dir);
+    snprintf(pid_path, sizeof(pid_path), "%s/ssh-agent.work.pid", dir);
+    memset(&record, 0, sizeof(record));
+    CHECK_EQ_INT(start_real_recorded_agent(sock, &record), 0);
+    if (record.pid <= 1) return;
+    dir_fd = open(dir, O_RDONLY | O_DIRECTORY | O_CLOEXEC);
+    CHECK(dir_fd >= 0);
+    if (dir_fd < 0) {
+        (void)kill(record.pid, SIGKILL);
+        return;
+    }
+    CHECK_EQ_INT(ssh_manager_test_write_pid_sidecar(
+                     dir_fd, "ssh-agent.work.pid", &record), 0);
+    CHECK_EQ_INT(close(dir_fd), 0);
+
+    memset(&ops, 0, sizeof(ops));
+    ops.image = l29_wrong_image;
+    previous = ssh_manager_set_reap_test_ops(&ops);
+    CHECK_EQ_INT(ssh_manager_reset("work"), -1);
+    CHECK_EQ_INT(kill(record.pid, 0), 0);
+    CHECK(path_exists(pid_path));
+
+    ops.image = l29_wrong_uid;
+    (void)ssh_manager_set_reap_test_ops(&ops);
+    CHECK_EQ_INT(ssh_manager_reset("work"), -1);
+    CHECK_EQ_INT(kill(record.pid, 0), 0);
+    CHECK(path_exists(pid_path));
+
+    ops.image = l29_inaccessible_image;
+    (void)ssh_manager_set_reap_test_ops(&ops);
+    CHECK_EQ_INT(ssh_manager_reset("work"), -1);
+    CHECK_EQ_INT(kill(record.pid, 0), 0);
+    CHECK(path_exists(pid_path));
+
+    ops.image = l29_exact_image;
+    (void)ssh_manager_set_reap_test_ops(&ops);
+    CHECK_EQ_INT(kill(record.pid, 0), 0);
+
+    CHECK_EQ_INT(ssh_manager_reset("work"), 0);
+    ssh_manager_set_reap_test_ops(&previous);
+    if (kill(record.pid, 0) == 0) (void)kill(record.pid, SIGKILL);
+}
+
+static void cleanup_l29_agent(const ssh_agent_record_t *record,
+                              const char *socket_path,
+                              const char *sidecar_path) {
+    if (record && record->pid > 1 && kill(record->pid, 0) == 0) {
+        (void)kill(record->pid, SIGKILL);
+    }
+    if (sidecar_path) (void)unlink(sidecar_path);
+    if (socket_path) (void)unlink(socket_path);
+}
+
+/* OpenSSH's nondumpable daemon may deny /proc/PID/exe after launch. That
+ * denial is not authority by itself: only the complete persisted launch
+ * image, exact generation, argv, and kernel socket-peer tuple may use the
+ * fallback. Exercise both expected denial errors and causal tuple failures. */
+TEST(nondumpable_fallback_requires_complete_exact_tuple) {
+    const int denied_errors[] = {EACCES, EPERM};
+
+    if (!command_exists("ssh-agent")) {
+        TS_SKIP("openssh", "ssh-agent unavailable in trusted PATH");
+    }
+    for (size_t i = 0;
+         i < sizeof(denied_errors) / sizeof(denied_errors[0]); i++) {
+        char dir[128], sock[256];
+        ssh_agent_record_t record;
+        ssh_reap_test_ops_t ops;
+        ssh_reap_test_ops_t previous;
+        int dir_fd;
+
+        CHECK_EQ_INT(make_xdg_agent_dir(dir, sizeof(dir)), 0);
+        snprintf(sock, sizeof(sock), "%s/ssh-agent.work.sock", dir);
+        memset(&record, 0, sizeof(record));
+        CHECK_EQ_INT(start_real_recorded_agent(sock, &record), 0);
+        if (record.pid <= 1) continue;
+        dir_fd = open(dir, O_RDONLY | O_DIRECTORY | O_CLOEXEC);
+        CHECK(dir_fd >= 0);
+        if (dir_fd < 0) {
+            cleanup_l29_agent(&record, sock, NULL);
+            continue;
+        }
+        CHECK_EQ_INT(ssh_manager_test_write_pid_sidecar(
+                         dir_fd, "ssh-agent.work.pid", &record), 0);
+        CHECK_EQ_INT(close(dir_fd), 0);
+        memset(&ops, 0, sizeof(ops));
+        g_l29_denied_errno = denied_errors[i];
+        ops.image = l29_denied_image;
+        previous = ssh_manager_set_reap_test_ops(&ops);
+        CHECK_EQ_INT(ssh_manager_reset("work"), 0);
+        (void)ssh_manager_set_reap_test_ops(&previous);
+        cleanup_l29_agent(&record, sock, NULL);
+    }
+
+    {
+        char dir[128], sock[256], pid_path[256];
+        ssh_agent_record_t record;
+        ssh_reap_test_ops_t ops;
+        ssh_reap_test_ops_t previous;
+        int dir_fd;
+
+        CHECK_EQ_INT(make_xdg_agent_dir(dir, sizeof(dir)), 0);
+        snprintf(sock, sizeof(sock), "%s/ssh-agent.work.sock", dir);
+        snprintf(pid_path, sizeof(pid_path), "%s/ssh-agent.work.pid", dir);
+        memset(&record, 0, sizeof(record));
+        CHECK_EQ_INT(start_real_recorded_agent(sock, &record), 0);
+        if (record.pid <= 1) return;
+        record.image.socket_peer_pid =
+            record.image.socket_peer_pid == INT_MAX
+                ? record.image.socket_peer_pid - 1
+                : record.image.socket_peer_pid + 1;
+        dir_fd = open(dir, O_RDONLY | O_DIRECTORY | O_CLOEXEC);
+        CHECK(dir_fd >= 0);
+        if (dir_fd < 0) {
+            cleanup_l29_agent(&record, sock, pid_path);
+            return;
+        }
+        CHECK_EQ_INT(ssh_manager_test_write_pid_sidecar(
+                         dir_fd, "ssh-agent.work.pid", &record), 0);
+        CHECK_EQ_INT(close(dir_fd), 0);
+        memset(&ops, 0, sizeof(ops));
+        g_l29_denied_errno = EACCES;
+        ops.image = l29_denied_image;
+        previous = ssh_manager_set_reap_test_ops(&ops);
+        CHECK_EQ_INT(ssh_manager_reset("work"), -1);
+        CHECK_EQ_INT(kill(record.pid, 0), 0);
+        CHECK(path_exists(pid_path));
+        (void)ssh_manager_set_reap_test_ops(&previous);
+        cleanup_l29_agent(&record, sock, pid_path);
+    }
+
+    {
+        char dir[128], sock[256], pid_path[256];
+        ssh_agent_record_t record;
+        ssh_reap_test_ops_t ops;
+        ssh_reap_test_ops_t previous;
+        int dir_fd;
+
+        CHECK_EQ_INT(make_xdg_agent_dir(dir, sizeof(dir)), 0);
+        snprintf(sock, sizeof(sock), "%s/ssh-agent.work.sock", dir);
+        snprintf(pid_path, sizeof(pid_path), "%s/ssh-agent.work.pid", dir);
+        memset(&record, 0, sizeof(record));
+        CHECK_EQ_INT(start_real_recorded_agent(sock, &record), 0);
+        if (record.pid <= 1) return;
+        dir_fd = open(dir, O_RDONLY | O_DIRECTORY | O_CLOEXEC);
+        CHECK(dir_fd >= 0);
+        if (dir_fd < 0) {
+            cleanup_l29_agent(&record, sock, pid_path);
+            return;
+        }
+        CHECK_EQ_INT(ssh_manager_test_write_pid_sidecar(
+                         dir_fd, "ssh-agent.work.pid", &record), 0);
+        CHECK_EQ_INT(close(dir_fd), 0);
+        g_l29_observed_generation = record.generation;
+        g_l29_observed_generation.start_lo ^= UINT64_C(1);
+        memset(&ops, 0, sizeof(ops));
+        g_l29_denied_errno = EPERM;
+        ops.generation = l29_wrong_generation;
+        ops.image = l29_denied_image;
+        previous = ssh_manager_set_reap_test_ops(&ops);
+        CHECK_EQ_INT(ssh_manager_reset("work"), -1);
+        CHECK_EQ_INT(kill(record.pid, 0), 0);
+        CHECK(path_exists(pid_path));
+        (void)ssh_manager_set_reap_test_ops(&previous);
+        cleanup_l29_agent(&record, sock, pid_path);
+    }
+}
+
+TEST(saturated_peer_backlog_fails_bounded_without_signaling) {
+    char dir[128], sock[256], moved_sock[256], pid_path[256];
+    ssh_agent_record_t record;
+    struct stat saturated_before;
+    struct stat saturated_after;
+    struct timespec started;
+    struct timespec finished;
+    int clients[16];
+    size_t client_count = 0;
+    int listener = -1;
+    int dir_fd;
+    long elapsed_ms;
+
+    if (!command_exists("ssh-agent")) {
+        TS_SKIP("openssh", "ssh-agent unavailable in trusted PATH");
+    }
+    CHECK_EQ_INT(make_xdg_agent_dir(dir, sizeof(dir)), 0);
+    snprintf(sock, sizeof(sock), "%s/ssh-agent.work.sock", dir);
+    snprintf(moved_sock, sizeof(moved_sock), "%s/original.sock", dir);
+    snprintf(pid_path, sizeof(pid_path), "%s/ssh-agent.work.pid", dir);
+    memset(&record, 0, sizeof(record));
+    CHECK_EQ_INT(start_real_recorded_agent(sock, &record), 0);
+    if (record.pid <= 1) return;
+    dir_fd = open(dir, O_RDONLY | O_DIRECTORY | O_CLOEXEC);
+    CHECK(dir_fd >= 0);
+    if (dir_fd < 0) {
+        cleanup_l29_agent(&record, sock, pid_path);
+        return;
+    }
+    CHECK_EQ_INT(ssh_manager_test_write_pid_sidecar(
+                     dir_fd, "ssh-agent.work.pid", &record), 0);
+    CHECK_EQ_INT(close(dir_fd), 0);
+    CHECK_EQ_INT(rename(sock, moved_sock), 0);
+    CHECK_EQ_INT(saturate_unix_listener(
+                     sock, &listener, clients,
+                     sizeof(clients) / sizeof(clients[0]),
+                     &client_count), 0);
+    if (listener < 0) {
+        cleanup_l29_agent(&record, moved_sock, pid_path);
+        return;
+    }
+    CHECK_EQ_INT(lstat(sock, &saturated_before), 0);
+    CHECK_EQ_INT(clock_gettime(CLOCK_MONOTONIC, &started), 0);
+    CHECK_EQ_INT(ssh_manager_reset("work"), -1);
+    CHECK_EQ_INT(clock_gettime(CLOCK_MONOTONIC, &finished), 0);
+    elapsed_ms = (finished.tv_sec - started.tv_sec) * 1000 +
+                 (finished.tv_nsec - started.tv_nsec) / 1000000;
+    CHECK(elapsed_ms < 1000);
+    CHECK_EQ_INT(kill(record.pid, 0), 0);
+    CHECK(path_exists(pid_path));
+    CHECK_EQ_INT(lstat(sock, &saturated_after), 0);
+    CHECK(saturated_before.st_dev == saturated_after.st_dev);
+    CHECK(saturated_before.st_ino == saturated_after.st_ino);
+
+    for (size_t i = 0; i < client_count; i++) close(clients[i]);
+    close(listener);
+    (void)unlink(sock);
+    cleanup_l29_agent(&record, moved_sock, pid_path);
+}
+
+TEST(v2_record_rejects_unterminated_executable_path) {
+    char dir[128], pid_path[256];
+    ssh_agent_record_t record;
+    int dir_fd;
+
+    CHECK_EQ_INT(make_xdg_agent_dir(dir, sizeof(dir)), 0);
+    snprintf(pid_path, sizeof(pid_path), "%s/ssh-agent.work.pid", dir);
+    memset(&record, 0, sizeof(record));
+    record.pid = getpid();
+    CHECK_EQ_INT(ssh_manager_test_capture_process_generation(
+                     record.pid, &record.generation), 0);
+    record.image.valid = true;
+    record.image.effective_uid = geteuid();
+    record.image.socket_peer_pid = getpid();
+    record.image.socket_peer_uid = geteuid();
+    record.image.executable_identity.st_mode = S_IFREG | 0755;
+    record.image.executable_identity.st_dev = 1;
+    record.image.executable_identity.st_ino = 1;
+    memset(record.image.executable_path, 'x',
+           sizeof(record.image.executable_path));
+    dir_fd = open(dir, O_RDONLY | O_DIRECTORY | O_CLOEXEC);
+    CHECK(dir_fd >= 0);
+    if (dir_fd < 0) return;
+    CHECK_EQ_INT(ssh_manager_test_write_pid_sidecar(
+                     dir_fd, "ssh-agent.work.pid", &record), -1);
+    CHECK_EQ_INT(close(dir_fd), 0);
+    CHECK(!path_exists(pid_path));
+}
+
+TEST(v2_record_rejects_fully_shaped_numeric_overflow) {
+    char dir[128], sock[256], pid_path[256], text[1024];
+    ssh_agent_record_t record;
+    size_t executable_size;
+    int written;
+
+    if (!command_exists("ssh-agent")) {
+        TS_SKIP("openssh", "ssh-agent unavailable in trusted PATH");
+    }
+    CHECK_EQ_INT(make_xdg_agent_dir(dir, sizeof(dir)), 0);
+    snprintf(sock, sizeof(sock), "%s/ssh-agent.work.sock", dir);
+    snprintf(pid_path, sizeof(pid_path), "%s/ssh-agent.work.pid", dir);
+    memset(&record, 0, sizeof(record));
+    CHECK_EQ_INT(start_real_recorded_agent(sock, &record), 0);
+    if (record.pid <= 1) return;
+    executable_size = strlen(record.image.executable_path);
+
+    written = snprintf(
+        text, sizeof(text),
+        "v2 184467440737095516160 %" PRIu64
+        " %016" PRIx64 "%016" PRIx64
+        " %016" PRIx64 "%016" PRIx64
+        " %ju %ju %ju %jx %jx %zu\n%s\n",
+        record.generation.kind,
+        record.generation.boot_hi, record.generation.boot_lo,
+        record.generation.start_hi, record.generation.start_lo,
+        (uintmax_t)record.image.effective_uid,
+        (uintmax_t)record.image.socket_peer_pid,
+        (uintmax_t)record.image.socket_peer_uid,
+        (uintmax_t)record.image.executable_identity.st_dev,
+        (uintmax_t)record.image.executable_identity.st_ino,
+        executable_size, record.image.executable_path);
+    CHECK(written > 0 && (size_t)written < sizeof(text));
+    if (written <= 0 || (size_t)written >= sizeof(text)) {
+        cleanup_l29_agent(&record, sock, pid_path);
+        return;
+    }
+    CHECK_EQ_INT(write_string_to_file(pid_path, text, 0600), 0);
+    CHECK_EQ_INT(ssh_manager_reset("work"), -1);
+    CHECK_EQ_INT(kill(record.pid, 0), 0);
+    CHECK(path_exists(pid_path));
+
+    written = snprintf(
+        text, sizeof(text),
+        "v2 %ld %" PRIu64
+        " %016" PRIx64 "%016" PRIx64
+        " %016" PRIx64 "%016" PRIx64
+        " %ju %ju %ju 10000000000000000 %jx %zu\n%s\n",
+        (long)record.pid, record.generation.kind,
+        record.generation.boot_hi, record.generation.boot_lo,
+        record.generation.start_hi, record.generation.start_lo,
+        (uintmax_t)record.image.effective_uid,
+        (uintmax_t)record.image.socket_peer_pid,
+        (uintmax_t)record.image.socket_peer_uid,
+        (uintmax_t)record.image.executable_identity.st_ino,
+        executable_size, record.image.executable_path);
+    CHECK(written > 0 && (size_t)written < sizeof(text));
+    if (written > 0 && (size_t)written < sizeof(text)) {
+        CHECK_EQ_INT(write_string_to_file(pid_path, text, 0600), 0);
+        CHECK_EQ_INT(ssh_manager_reset("work"), -1);
+        CHECK_EQ_INT(kill(record.pid, 0), 0);
+        CHECK(path_exists(pid_path));
+    }
+    cleanup_l29_agent(&record, sock, pid_path);
+}
+
+/* A pre-L29 v1 sidecar lacks launch-image and socket-peer provenance. Even
+ * when its PID, generation, argv, and socket all describe a genuine agent,
+ * it is migration data rather than signaling authority and must be retained
+ * for an explicit retry/cleanup decision. */
+TEST(legacy_v1_record_never_authorizes_signaling) {
+    char dir[128], sock[256], pid_path[256], record_text[192];
+    ssh_agent_record_t record;
+    int record_size;
+
+    if (!command_exists("ssh-agent")) {
+        TS_SKIP("openssh", "ssh-agent unavailable in trusted PATH");
+    }
+    CHECK_EQ_INT(make_xdg_agent_dir(dir, sizeof(dir)), 0);
+    snprintf(sock, sizeof(sock), "%s/ssh-agent.work.sock", dir);
+    snprintf(pid_path, sizeof(pid_path), "%s/ssh-agent.work.pid", dir);
+    memset(&record, 0, sizeof(record));
+    CHECK_EQ_INT(start_real_recorded_agent(sock, &record), 0);
+    if (record.pid <= 1) return;
+    record_size = snprintf(
+        record_text, sizeof(record_text),
+        "v1 %ld %" PRIu64 " %016" PRIx64 "%016" PRIx64
+        " %016" PRIx64 "%016" PRIx64 "\n",
+        (long)record.pid, record.generation.kind,
+        record.generation.boot_hi, record.generation.boot_lo,
+        record.generation.start_hi, record.generation.start_lo);
+    CHECK(record_size > 0 && (size_t)record_size < sizeof(record_text));
+    if (record_size <= 0 || (size_t)record_size >= sizeof(record_text)) {
+        (void)kill(record.pid, SIGKILL);
+        return;
+    }
+    CHECK_EQ_INT(write_string_to_file(pid_path, record_text, 0600), 0);
+
+    CHECK_EQ_INT(ssh_manager_reset("work"), -1);
+    CHECK_EQ_INT(kill(record.pid, 0), 0);
+    CHECK(path_exists(pid_path));
+    CHECK(path_exists(sock));
+
+    (void)kill(record.pid, SIGKILL);
+    (void)unlink(pid_path);
+    (void)unlink(sock);
+}
+
 /* Every prior test approaches reap_ssh_agent from the refusal side (bystander
  * PID, above-pid_max PID, no sidecar). This drives the positive path end to
  * end: real ssh-agent, real sidecar, ssh_manager_reset — the agent must be
@@ -876,6 +1471,12 @@ TEST_MAIN_BEGIN()
     RUN_TEST(
         live_agent_fingerprint_launch_failure_preserves_socket_and_diagnostic);
 #if defined(__linux__)
+    RUN_TEST(process_identity_requires_trusted_image_and_effective_uid);
+    RUN_TEST(nondumpable_fallback_requires_complete_exact_tuple);
+    RUN_TEST(saturated_peer_backlog_fails_bounded_without_signaling);
+    RUN_TEST(v2_record_rejects_unterminated_executable_path);
+    RUN_TEST(v2_record_rejects_fully_shaped_numeric_overflow);
+    RUN_TEST(legacy_v1_record_never_authorizes_signaling);
     RUN_TEST(reset_reaps_real_recorded_agent);
 #endif
     RUN_TEST(reset_refuses_unsafe_socket_dir);

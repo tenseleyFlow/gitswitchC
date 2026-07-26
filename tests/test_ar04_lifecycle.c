@@ -1439,12 +1439,15 @@ TEST(remove_save_failure_keeps_retry_handle_after_runtime_teardown) {
     slurp(pid_path, contents, sizeof(contents));
     {
         char *pid_end = NULL;
+        const char *pid_text = contents;
         long parsed_pid;
 
+        if (strncmp(contents, "v1 ", 3) == 0 ||
+            strncmp(contents, "v2 ", 3) == 0) {
+            pid_text += 3;
+        }
         errno = 0;
-        parsed_pid = strtol(
-            strncmp(contents, "v1 ", 3) == 0 ? contents + 3 : contents,
-            &pid_end, 10);
+        parsed_pid = strtol(pid_text, &pid_end, 10);
         if (errno == 0 && pid_end &&
             (*pid_end == ' ' || *pid_end == '\n' || *pid_end == '\0') &&
             parsed_pid > 1 && (long)(pid_t)parsed_pid == parsed_pid) {

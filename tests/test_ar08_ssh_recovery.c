@@ -22,6 +22,7 @@
 #include "gitswitch.h"
 #include "scratch_registry_test.h"
 #include "ssh_manager.h"
+#include "runner_internal.h"
 #include "utils.h"
 
 #include <dirent.h>
@@ -55,6 +56,38 @@ static const ssh_process_generation_t g_test_generation = {
     .start_hi = 0,
     .start_lo = UINT64_C(0x2122232425262728)
 };
+static int g_runner_listener = -1;
+
+static bool is_ssh_agent_command(const char *path) {
+    const char *base;
+
+    if (!path || !*path) return false;
+    base = strrchr(path, '/');
+    return strcmp(base ? base + 1 : path, "ssh-agent") == 0;
+}
+
+static int certify_agent_launch(const char *path, run_result_t *result) {
+    if (!path || !result ||
+        !run_launch_witness_capture(path, &result->launch_witness)) {
+        return -1;
+    }
+    return 0;
+}
+
+static bool is_v2_test_record(const char *text) {
+    const char *path;
+    const char *base;
+
+    if (!text ||
+        strncmp(text, "v2 1073741824 ",
+                strlen("v2 1073741824 ")) != 0) {
+        return false;
+    }
+    path = strchr(text, '\n');
+    if (!path || path[1] != '/') return false;
+    base = strrchr(path + 1, '/');
+    return base && strcmp(base + 1, "ssh-agent\n") == 0;
+}
 
 typedef struct {
     char xdg[64];
@@ -112,11 +145,36 @@ static int make_fixture(ssh_fixture_t *fixture, const char *stem) {
     return 0;
 }
 
+static int complete_synthetic_record_image(ssh_agent_record_t *record) {
+    run_launch_witness_t witness;
+    char agent_path[MAX_PATH_LEN];
+
+    if (!record || record->pid <= 1) return -1;
+    memset(&witness, 0, sizeof(witness));
+    if (find_command_path("ssh-agent", agent_path,
+                          sizeof(agent_path)) != 0 ||
+        !run_launch_witness_capture(agent_path, &witness) ||
+        !witness.valid || witness.is_script ||
+        safe_strncpy(record->image.executable_path,
+                     witness.executable_path,
+                     sizeof(record->image.executable_path)) != 0) {
+        return -1;
+    }
+    record->image.valid = true;
+    record->image.executable_identity = witness.executable_identity;
+    record->image.effective_uid = geteuid();
+    record->image.socket_peer_pid = record->pid;
+    record->image.socket_peer_uid = geteuid();
+    return 0;
+}
+
 static int publish_sidecar(const ssh_fixture_t *fixture, pid_t pid) {
     ssh_agent_record_t record = {
         .pid = pid,
         .generation = g_test_generation
     };
+
+    if (complete_synthetic_record_image(&record) != 0) return -1;
     return ssh_manager_test_write_pid_sidecar(
         fixture->dir_fd, "ssh-agent.work.pid", &record);
 }
@@ -138,6 +196,10 @@ static ssh_process_outcome_t reap_gone(const ssh_agent_record_t *record,
     (void)record;
     (void)socket_arg;
     (void)runtime_dir_fd;
+    if (g_runner_listener >= 0) {
+        close(g_runner_listener);
+        g_runner_listener = -1;
+    }
     return SSH_PROCESS_GONE;
 }
 
@@ -1383,6 +1445,7 @@ TEST(stopped_session_preserves_same_pid_replacement_generation) {
 
     CHECK_EQ_INT(make_fixture(&fixture, "gsar14stopreplacement"), 0);
     if (fixture.dir_fd < 0) return;
+    CHECK_EQ_INT(complete_synthetic_record_image(&replacement), 0);
     CHECK_EQ_INT(ssh_manager_test_write_pid_sidecar(
                      fixture.dir_fd, "ssh-agent.work.pid",
                      &replacement), 0);
@@ -1526,7 +1589,7 @@ TEST(runtime_namespace_replacement_fails_without_mutating_either_tree) {
     ssh_reap_fn previous;
     char moved_socket[256];
     char moved_sidecar[256];
-    char content[160];
+    char content[512];
 
     CHECK_EQ_INT(make_fixture(&fixture, "gsar08namespace"), 0);
     if (fixture.dir_fd < 0) return;
@@ -1785,7 +1848,7 @@ TEST(portable_restore_retirement_substitution_is_preserved) {
     ssh_dirsync_fn previous_dirsync;
     bool previous_portable;
     char quarantine_path[320];
-    char content[160];
+    char content[512];
 
     CHECK_EQ_INT(make_fixture(&fixture, "gsar08restore"), 0);
     if (fixture.dir_fd < 0) return;
@@ -1812,7 +1875,7 @@ TEST(portable_restore_retirement_substitution_is_preserved) {
     CHECK_EQ_INT(g_retire_mutations, 1);
     CHECK(path_exists(fixture.sidecar));
     CHECK(read_file_to_string(fixture.sidecar, content, sizeof(content)) > 0);
-    CHECK_STR_EQ(content, TEST_RECORD_TEXT);
+    CHECK(is_v2_test_record(content));
     CHECK_EQ_INT(safe_snprintf(quarantine_path, sizeof(quarantine_path),
                                "%s/%s", fixture.runtime,
                                g_retire_quarantine), 0);
@@ -1825,6 +1888,7 @@ TEST(portable_restore_retirement_substitution_is_preserved) {
 
 TEST(unrelated_live_pid_is_not_signaled) {
     ssh_fixture_t fixture;
+    char legacy_pid[64];
     pid_t child;
     int status = 0;
 
@@ -1840,7 +1904,10 @@ TEST(unrelated_live_pid_is_not_signaled) {
         for (;;) pause();
     }
 
-    CHECK_EQ_INT(publish_sidecar_for_process(&fixture, child), 0);
+    CHECK(snprintf(legacy_pid, sizeof(legacy_pid), "%ld\n",
+                   (long)child) > 0);
+    CHECK_EQ_INT(write_sidecar_bytes(
+                     &fixture, legacy_pid, strlen(legacy_pid), 0600), 0);
     CHECK_EQ_INT(ssh_manager_reset("work"), 0);
     CHECK_EQ_INT(kill(child, 0), 0);
     CHECK(!path_exists(fixture.sidecar));
@@ -2010,7 +2077,11 @@ TEST(runtime_root_provenance_prevents_cross_root_reap) {
     CHECK(path_exists(first.socket));
 
     if (pid > 1) {
-        CHECK_EQ_INT(publish_sidecar_for_process(&second, pid), 0);
+        char legacy_pid[64];
+        CHECK(snprintf(legacy_pid, sizeof(legacy_pid), "%ld\n",
+                       (long)pid) > 0);
+        CHECK_EQ_INT(write_sidecar_bytes(
+                         &second, legacy_pid, strlen(legacy_pid), 0600), 0);
         CHECK_EQ_INT(setenv("XDG_RUNTIME_DIR", second.xdg, 1), 0);
         CHECK_EQ_INT(ssh_manager_reset("work"), 0);
         CHECK_EQ_INT(kill(pid, 0), 0);
@@ -2053,13 +2124,20 @@ static int bind_runner_socket(const char *path, mode_t mode,
     }
     socket_fd = socket(AF_UNIX, SOCK_STREAM, 0);
     if (socket_fd < 0) goto done;
+    if (g_runner_listener >= 0) {
+        close(g_runner_listener);
+        g_runner_listener = -1;
+    }
     memset(&address, 0, sizeof(address));
     address.sun_family = AF_UNIX;
     memcpy(address.sun_path, path, strlen(path) + 1U);
     if (bind(socket_fd, (struct sockaddr *)&address, sizeof(address)) != 0 ||
+        listen(socket_fd, 8) != 0 ||
         chmod(path, mode) != 0) {
         goto done;
     }
+    g_runner_listener = socket_fd;
+    socket_fd = -1;
     rc = 0;
 
 done:
@@ -2069,6 +2147,13 @@ done:
         close(saved_cwd);
     }
     return rc;
+}
+
+static void make_runner_socket_stale(void) {
+    if (g_runner_listener >= 0) {
+        close(g_runner_listener);
+        g_runner_listener = -1;
+    }
 }
 
 static bool is_key_fingerprint_command(const char *const argv[]) {
@@ -2107,7 +2192,8 @@ static int bad_permission_agent_runner(const char *const argv[],
         result->spawned = true;
     }
     if (opts && opts->out && opts->out_size > 0) opts->out[0] = '\0';
-    if (!argv || !argv[0] || strcmp(argv[0], "ssh-agent") != 0) return 0;
+    if (!argv || !argv[0] || !is_ssh_agent_command(argv[0])) return 0;
+    if (certify_agent_launch(argv[0], result) != 0) return -1;
 
     socket_arg = runner_socket_arg(argv);
     if (!socket_arg || bind_runner_socket(socket_arg, 0644, opts) != 0) {
@@ -2139,12 +2225,14 @@ static int missing_pid_agent_runner(const char *const argv[],
         result->spawned = true;
     }
     if (opts && opts->out && opts->out_size > 0) opts->out[0] = '\0';
-    if (!argv || !argv[0] || strcmp(argv[0], "ssh-agent") != 0) return 0;
+    if (!argv || !argv[0] || !is_ssh_agent_command(argv[0])) return 0;
+    if (certify_agent_launch(argv[0], result) != 0) return -1;
 
     socket_arg = runner_socket_arg(argv);
     if (!socket_arg || bind_runner_socket(socket_arg, 0600, opts) != 0) {
         return -1;
     }
+    make_runner_socket_stale();
     if (opts && opts->out) {
         int written = snprintf(
             opts->out, opts->out_size,
@@ -2171,7 +2259,8 @@ static int failed_after_agent_spawn_runner(const char *const argv[],
         result->exit_code = 0;
     }
     if (opts && opts->out && opts->out_size > 0) opts->out[0] = '\0';
-    if (!argv || !argv[0] || strcmp(argv[0], "ssh-agent") != 0) return 0;
+    if (!argv || !argv[0] || !is_ssh_agent_command(argv[0])) return 0;
+    if (certify_agent_launch(argv[0], result) != 0) return -1;
 
     socket_arg = runner_socket_arg(argv);
     if (!socket_arg || bind_runner_socket(socket_arg, 0600, opts) != 0) {
@@ -2202,12 +2291,14 @@ static int failed_with_truncated_pid_and_socket_runner(
         result->out_truncated = true;
     }
     if (opts && opts->out && opts->out_size > 0) opts->out[0] = '\0';
-    if (!argv || !argv[0] || strcmp(argv[0], "ssh-agent") != 0) return 0;
+    if (!argv || !argv[0] || !is_ssh_agent_command(argv[0])) return 0;
+    if (certify_agent_launch(argv[0], result) != 0) return -1;
 
     socket_arg = runner_socket_arg(argv);
     if (!socket_arg || bind_runner_socket(socket_arg, 0600, opts) != 0) {
         return -1;
     }
+    make_runner_socket_stale();
     if (opts && opts->out) {
         int written = snprintf(opts->out, opts->out_size,
                                "SSH_AGENT_PID=%ld",
@@ -2233,7 +2324,8 @@ static int successful_agent_runner(const char *const argv[],
     if (!argv || !argv[0] || !opts || !opts->out || opts->out_size == 0U) {
         return -1;
     }
-    if (strcmp(argv[0], "ssh-agent") == 0) {
+    if (is_ssh_agent_command(argv[0])) {
+        if (certify_agent_launch(argv[0], result) != 0) return -1;
         socket_arg = runner_socket_arg(argv);
         if (!socket_arg || bind_runner_socket(socket_arg, 0600, opts) != 0) {
             return -1;
@@ -2292,7 +2384,7 @@ TEST(unrecorded_launch_cleanup_keeps_original_captured_generation) {
         .generation = generation_replaced_after_launch_capture
     };
     ssh_reap_test_ops_t previous_ops;
-    char sidecar_text[160];
+    char sidecar_text[512];
 
     CHECK_EQ_INT(make_fixture(&fixture, "gsar14launchgeneration"), 0);
     if (fixture.dir_fd < 0) return;
@@ -2332,7 +2424,7 @@ TEST(unrecorded_launch_cleanup_keeps_original_captured_generation) {
     CHECK(path_exists(fixture.sidecar));
     CHECK(read_file_to_string(fixture.sidecar, sidecar_text,
                               sizeof(sidecar_text)) > 0);
-    CHECK_STR_EQ(sidecar_text, TEST_RECORD_TEXT);
+    CHECK(is_v2_test_record(sidecar_text));
 
     ssh_manager_set_reap_fn(reap_gone);
     CHECK_EQ_INT(ssh_manager_reset("work"), 0);
@@ -2349,7 +2441,7 @@ TEST(runner_failure_indeterminate_reap_publishes_retry_tuple) {
     ssh_reap_test_ops_t ops = {.generation = generation_matches_record};
     ssh_reap_test_ops_t previous_ops;
     char current[192];
-    char sidecar_text[160];
+    char sidecar_text[512];
 
     CHECK_EQ_INT(make_fixture(&fixture, "gsar11runretry"), 0);
     if (fixture.dir_fd < 0) return;
@@ -2379,7 +2471,7 @@ TEST(runner_failure_indeterminate_reap_publishes_retry_tuple) {
     CHECK(path_exists(fixture.sidecar));
     CHECK(read_file_to_string(fixture.sidecar, sidecar_text,
                               sizeof(sidecar_text)) > 0);
-    CHECK_STR_EQ(sidecar_text, TEST_RECORD_TEXT);
+    CHECK(is_v2_test_record(sidecar_text));
     CHECK(strstr(get_last_error()->message,
                  "runtime durably retained for retry") != NULL);
     CHECK((size_t)snprintf(current, sizeof(current), "%s/current.sock",
@@ -2401,6 +2493,7 @@ TEST(runner_failure_indeterminate_reap_publishes_retry_tuple) {
     CHECK(path_exists(fixture.socket));
     CHECK(path_exists(fixture.sidecar));
     CHECK(path_exists(current));
+    make_runner_socket_stale();
     CHECK_EQ_INT(ssh_manager_reset("work"), 0);
     CHECK(!path_exists(fixture.socket));
     CHECK(!path_exists(fixture.sidecar));
@@ -2456,7 +2549,7 @@ TEST(pre_sidecar_failed_reap_publishes_retry_tuple) {
     ssh_reap_fn previous_reap;
     ssh_reap_test_ops_t ops = {.generation = generation_matches_record};
     ssh_reap_test_ops_t previous_ops;
-    char sidecar_text[160];
+    char sidecar_text[512];
 
     CHECK_EQ_INT(make_fixture(&fixture, "gsar08retry"), 0);
     if (fixture.dir_fd < 0) return;
@@ -2486,7 +2579,7 @@ TEST(pre_sidecar_failed_reap_publishes_retry_tuple) {
     CHECK(path_exists(fixture.sidecar));
     CHECK(read_file_to_string(fixture.sidecar, sidecar_text,
                               sizeof(sidecar_text)) > 0);
-    CHECK_STR_EQ(sidecar_text, TEST_RECORD_TEXT);
+    CHECK(is_v2_test_record(sidecar_text));
 
     CHECK_EQ_INT(ssh_manager_reset("work"), 0);
     ssh_manager_set_reap_fn(previous_reap);
@@ -2599,7 +2692,7 @@ TEST(exact_durable_sidecar_recovery_retains_agent_ownership) {
     ssh_reap_test_ops_t ops = {.generation = generation_matches_record};
     ssh_reap_test_ops_t previous_ops;
     ssh_pid_commit_hook_fn previous_postrename;
-    char sidecar_text[160];
+    char sidecar_text[512];
 
     CHECK_EQ_INT(make_fixture(&fixture, "gsar14exactrecovery"), 0);
     if (fixture.dir_fd < 0) return;
@@ -2640,7 +2733,7 @@ TEST(exact_durable_sidecar_recovery_retains_agent_ownership) {
     CHECK(!path_exists(fixture.current));
     CHECK(read_file_to_string(fixture.sidecar, sidecar_text,
                               sizeof(sidecar_text)) > 0);
-    CHECK_STR_EQ(sidecar_text, TEST_RECORD_TEXT);
+    CHECK(is_v2_test_record(sidecar_text));
     CHECK(strstr(get_last_error()->message,
                  "exact durable record recovered") != NULL);
 

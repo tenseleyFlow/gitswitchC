@@ -227,7 +227,21 @@ static ssh_agent_record_t synthetic_agent_record(pid_t pid) {
             .start_hi = UINT64_C(0x2122232425262728),
             .start_lo = UINT64_C(0x3132333435363738),
         },
+        .image = {
+            .valid = true,
+            .executable_identity = {
+                .st_dev = (dev_t)0x1234,
+                .st_ino = (ino_t)0x5678,
+                .st_mode = S_IFREG | 0700,
+            },
+            .socket_peer_pid = (pid_t)54321,
+        },
     };
+    record.image.effective_uid = geteuid();
+    record.image.socket_peer_uid = geteuid();
+    CHECK_EQ_INT(safe_strncpy(record.image.executable_path,
+                              "/test-only/ssh-agent",
+                              sizeof(record.image.executable_path)), 0);
     return record;
 }
 
@@ -650,8 +664,10 @@ TEST(pid_sidecar_sync_failure_retains_complete_recovery_record) {
     char xdg[64];
     char dir[96];
     char sidecar[160];
-    char content[128];
+    char content[512];
+    char expected[512];
     ssh_agent_record_t record = synthetic_agent_record((pid_t)12345);
+    int expected_len;
     int parent_fd = make_private_dir(xdg, sizeof(xdg));
     int dir_fd;
     ssh_dirsync_fn previous;
@@ -678,10 +694,16 @@ TEST(pid_sidecar_sync_failure_retains_complete_recovery_record) {
 
     CHECK_EQ_INT(g_dirsync_calls, 1);
     snprintf(sidecar, sizeof(sidecar), "%s/ssh-agent.work.pid", dir);
-    CHECK_EQ_INT(read_file_to_string(sidecar, content, sizeof(content)), 77);
-    CHECK_STR_EQ(content,
-                 "v1 12345 1 01020304050607081112131415161718 "
-                 "21222324252627283132333435363738\n");
+    expected_len = snprintf(
+        expected, sizeof(expected),
+        "v2 12345 1 01020304050607081112131415161718 "
+        "21222324252627283132333435363738 %ju 54321 %ju 1234 5678 20\n"
+        "/test-only/ssh-agent\n",
+        (uintmax_t)geteuid(), (uintmax_t)geteuid());
+    CHECK(expected_len > 0 && (size_t)expected_len < sizeof(expected));
+    CHECK_EQ_INT(read_file_to_string(sidecar, content, sizeof(content)),
+                 expected_len);
+    CHECK_STR_EQ(content, expected);
     close(dir_fd);
     close(parent_fd);
 

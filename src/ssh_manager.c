@@ -40,6 +40,7 @@
 #include <sys/sysctl.h>
 #endif
 #ifdef __FreeBSD__
+#include <sys/ucred.h>
 #include <sys/user.h>
 #endif
 
@@ -48,6 +49,7 @@
 #undef GITSWITCH_INTERNAL_API
 #include "error.h"
 #include "utils.h"
+#include "runner_internal.h"
 #include "display.h"
 #include "signals.h"
 #include "toml_parser.h"
@@ -95,8 +97,6 @@ typedef enum {
  * makes va_start on a type that undergoes default argument promotion
  * (bool -> int) undefined behavior — clang rejects it under -Wvarargs. */
 static int ssh_run(char *output, size_t output_size, int merge_stderr, ...);
-static int ssh_run_in_dir(int cwd_fd, char *output, size_t output_size,
-                          run_result_t *result, int merge_stderr, ...);
 static int ssh_add_key_pinned(int dir_fd, const char *socket_arg,
                               const char *key_path,
                               const ssh_key_snapshot_t *snapshot);
@@ -210,6 +210,7 @@ static ssh_process_outcome_t pid_is_our_ssh_agent(
                                                    int runtime_dir_fd);
 static int capture_process_generation(
     pid_t pid, ssh_process_generation_t *generation);
+static int inspect_process_image_real(pid_t pid, ssh_process_image_t *image);
 static int ssh_process_signal_real(pid_t pid, int signal_number);
 static int ssh_pidfd_open_real(pid_t pid);
 static int ssh_pidfd_signal_real(int pidfd, int signal_number);
@@ -245,6 +246,7 @@ static ssh_reap_fn g_ssh_reap = reap_ssh_agent;
 static ssh_reap_test_ops_t g_reap_ops = {
     .identity = pid_is_our_ssh_agent,
     .generation = capture_process_generation,
+    .image = inspect_process_image_real,
     .signal = ssh_process_signal_real,
     .pidfd_open = ssh_pidfd_open_real,
     .pidfd_signal = ssh_pidfd_signal_real
@@ -331,6 +333,9 @@ ssh_reap_test_ops_t ssh_manager_set_reap_test_ops(
     g_reap_ops.generation = ops && ops->generation
                                 ? ops->generation
                                 : capture_process_generation;
+    g_reap_ops.image = ops && ops->image
+                           ? ops->image
+                           : inspect_process_image_real;
     g_reap_ops.signal = ops && ops->signal
                             ? ops->signal
                             : ssh_process_signal_real;
@@ -859,6 +864,548 @@ static int read_proc_file(const char *path, char **data_out,
 }
 #endif
 
+static bool same_process_executable_identity(const struct stat *left,
+                                             const struct stat *right) {
+    return left && right && S_ISREG(left->st_mode) &&
+           S_ISREG(right->st_mode) &&
+           left->st_dev == right->st_dev &&
+           left->st_ino == right->st_ino;
+}
+
+static bool ssh_process_image_equal(const ssh_process_image_t *left,
+                                    const ssh_process_image_t *right) {
+    size_t left_path_size;
+    size_t right_path_size;
+
+    if (!left || !right || !left->valid || !right->valid) return false;
+    left_path_size = strnlen(
+        left->executable_path, sizeof(left->executable_path));
+    right_path_size = strnlen(
+        right->executable_path, sizeof(right->executable_path));
+    if (left_path_size == sizeof(left->executable_path) ||
+        right_path_size == sizeof(right->executable_path) ||
+        left_path_size != right_path_size) {
+        return false;
+    }
+    return same_process_executable_identity(
+               &left->executable_identity, &right->executable_identity) &&
+           left->effective_uid == right->effective_uid &&
+           left->socket_peer_pid == right->socket_peer_pid &&
+           left->socket_peer_uid == right->socket_peer_uid &&
+           memcmp(left->executable_path, right->executable_path,
+                  left_path_size) == 0;
+}
+
+static bool process_image_from_launch_witness(
+    const run_launch_witness_t *witness, ssh_process_image_t *image) {
+    if (image) memset(image, 0, sizeof(*image));
+    if (!witness || !image || !witness->valid || witness->is_script ||
+        witness->executable_path[0] != '/' ||
+        !S_ISREG(witness->executable_identity.st_mode) ||
+        safe_strncpy(image->executable_path, witness->executable_path,
+                     sizeof(image->executable_path)) != 0) {
+        errno = EINVAL;
+        return false;
+    }
+    image->executable_identity = witness->executable_identity;
+    image->effective_uid = geteuid();
+    image->valid = true;
+    return true;
+}
+
+#define SSH_PEER_CONNECT_TIMEOUT_MS 100
+
+static int wait_for_socket_connection(int fd, int timeout_ms) {
+    int64_t started;
+    int64_t deadline;
+
+    if (fd < 0 || timeout_ms < 0) {
+        errno = EINVAL;
+        return -1;
+    }
+    started = ssh_probe_clock_real();
+    if (started < 0 || started > INT64_MAX - timeout_ms) {
+        if (started >= 0) errno = EOVERFLOW;
+        return -1;
+    }
+    deadline = started + timeout_ms;
+    for (;;) {
+        struct pollfd pfd;
+        int64_t now = ssh_probe_clock_real();
+        int64_t remaining;
+        int timeout;
+        int poll_rc;
+
+        if (now < 0) return -1;
+        if (now < started) {
+            errno = ERANGE;
+            return -1;
+        }
+        if (now >= deadline) {
+            errno = ETIMEDOUT;
+            return -1;
+        }
+        remaining = deadline - now;
+        timeout = remaining > INT_MAX ? INT_MAX : (int)remaining;
+        memset(&pfd, 0, sizeof(pfd));
+        pfd.fd = fd;
+        pfd.events = POLLOUT;
+        poll_rc = poll(&pfd, 1, timeout);
+        if (poll_rc > 0) {
+            int socket_error = 0;
+            socklen_t error_size = sizeof(socket_error);
+
+            if ((pfd.revents & (POLLOUT | POLLERR | POLLHUP)) == 0 ||
+                (pfd.revents & POLLNVAL) != 0) {
+                errno = EIO;
+                return -1;
+            }
+            if (getsockopt(fd, SOL_SOCKET, SO_ERROR, &socket_error,
+                           &error_size) != 0) {
+                return -1;
+            }
+            if (error_size != sizeof(socket_error)) {
+                errno = EIO;
+                return -1;
+            }
+            if (socket_error != 0) {
+                errno = socket_error;
+                return -1;
+            }
+            return 0;
+        }
+        if (poll_rc == 0) {
+            errno = ETIMEDOUT;
+            return -1;
+        }
+        if (errno != EINTR) return -1;
+    }
+}
+
+static int inspect_socket_peer(const char *socket_arg, int runtime_dir_fd,
+                               pid_t *peer_pid, uid_t *peer_uid) {
+    struct sockaddr_un address;
+    struct stat held_dir;
+    char anchored_path[MAX_PATH_LEN];
+    char pinned_dir_path[MAX_PATH_LEN];
+    const char *connect_path = socket_arg;
+    bool anchored = false;
+    int fd = -1;
+    int flags;
+    int rc = -1;
+
+    if (!socket_arg || !*socket_arg || !peer_pid || !peer_uid) {
+        errno = EINVAL;
+        return -1;
+    }
+    if (runtime_dir_fd >= 0) {
+        const char *leaf = strrchr(socket_arg, '/');
+        struct stat named_dir;
+        int written;
+
+        leaf = leaf ? leaf + 1 : socket_arg;
+        if (!*leaf || strchr(leaf, '/') ||
+            fstat(runtime_dir_fd, &held_dir) != 0) {
+            errno = EINVAL;
+            return -1;
+        }
+#ifdef __linux__
+        written = snprintf(pinned_dir_path, sizeof(pinned_dir_path),
+                           "/proc/self/fd/%d", runtime_dir_fd);
+        if (written <= 0 ||
+            (size_t)written >= sizeof(pinned_dir_path)) {
+            errno = ENAMETOOLONG;
+            return -1;
+        }
+#elif defined(__APPLE__)
+        if (fcntl(runtime_dir_fd, F_GETPATH, pinned_dir_path) != 0) {
+            return -1;
+        }
+#elif defined(__FreeBSD__) && defined(F_KINFO)
+        {
+            struct kinfo_file info;
+            memset(&info, 0, sizeof(info));
+            info.kf_structsize = sizeof(info);
+            if (fcntl(runtime_dir_fd, F_KINFO, &info) != 0 ||
+                info.kf_path[0] == '\0' ||
+                safe_strncpy(pinned_dir_path, info.kf_path,
+                             sizeof(pinned_dir_path)) != 0) {
+                return -1;
+            }
+        }
+#else
+        errno = ENOTSUP;
+        return -1;
+#endif
+        if (stat(pinned_dir_path, &named_dir) != 0 ||
+            !same_runtime_identity(&held_dir, &named_dir)) {
+            errno = ESTALE;
+            return -1;
+        }
+        written = snprintf(anchored_path, sizeof(anchored_path),
+                           "%s/%s", pinned_dir_path, leaf);
+        if (written <= 0 || (size_t)written >= sizeof(anchored_path)) {
+            errno = ENAMETOOLONG;
+            return -1;
+        }
+        connect_path = anchored_path;
+        anchored = true;
+    } else if (socket_arg[0] != '/') {
+        errno = EINVAL;
+        return -1;
+    }
+    if (strlen(connect_path) >= sizeof(address.sun_path)) {
+        errno = ENAMETOOLONG;
+        goto out;
+    }
+    fd = socket(AF_UNIX, SOCK_STREAM, 0);
+    if (fd < 0) goto out;
+    if (fcntl(fd, F_SETFD, FD_CLOEXEC) != 0 ||
+        (flags = fcntl(fd, F_GETFL, 0)) < 0 ||
+        fcntl(fd, F_SETFL, flags | O_NONBLOCK) != 0) {
+        goto out;
+    }
+    memset(&address, 0, sizeof(address));
+    address.sun_family = AF_UNIX;
+    if (safe_strncpy(address.sun_path, connect_path,
+                     sizeof(address.sun_path)) != 0) {
+        goto out;
+    }
+    if (connect(fd, (struct sockaddr *)(void *)&address,
+                sizeof(address)) != 0) {
+        if (errno != EINPROGRESS && errno != EAGAIN &&
+            errno != EWOULDBLOCK) {
+            goto out;
+        }
+        if (wait_for_socket_connection(
+                fd, SSH_PEER_CONNECT_TIMEOUT_MS) != 0) {
+            goto out;
+        }
+    }
+    if (anchored) {
+        struct stat held_after;
+        struct stat named_after;
+        if (fstat(runtime_dir_fd, &held_after) != 0 ||
+            stat(pinned_dir_path, &named_after) != 0 ||
+            !same_runtime_identity(&held_dir, &held_after) ||
+            !same_runtime_identity(&held_dir, &named_after)) {
+            errno = ESTALE;
+            goto out;
+        }
+    }
+#ifdef __linux__
+    {
+        struct ucred credential;
+        socklen_t credential_size = sizeof(credential);
+        if (getsockopt(fd, SOL_SOCKET, SO_PEERCRED, &credential,
+                       &credential_size) != 0 ||
+            credential_size != sizeof(credential) ||
+            credential.pid <= 1) {
+            goto out;
+        }
+        *peer_pid = credential.pid;
+        *peer_uid = credential.uid;
+    }
+#elif defined(__FreeBSD__)
+    {
+        struct xucred credential;
+        socklen_t credential_size = sizeof(credential);
+
+        memset(&credential, 0, sizeof(credential));
+        if (getsockopt(fd, SOL_LOCAL, LOCAL_PEERCRED, &credential,
+                       &credential_size) != 0 ||
+            credential_size != sizeof(credential) ||
+            credential.cr_version != XUCRED_VERSION ||
+            credential.cr_pid <= 1) {
+            goto out;
+        }
+        *peer_pid = credential.cr_pid;
+        *peer_uid = credential.cr_uid;
+    }
+#elif defined(__APPLE__)
+    {
+        uid_t effective_uid;
+        gid_t effective_gid;
+#ifdef LOCAL_PEERPID
+        pid_t process_id = -1;
+        socklen_t process_id_size = sizeof(process_id);
+#endif
+        if (getpeereid(fd, &effective_uid, &effective_gid) != 0) goto out;
+        (void)effective_gid;
+#ifdef LOCAL_PEERPID
+        if (getsockopt(fd, SOL_LOCAL, LOCAL_PEERPID, &process_id,
+                       &process_id_size) != 0 ||
+            process_id_size != sizeof(process_id) || process_id <= 1) {
+            goto out;
+        }
+        *peer_pid = process_id;
+        *peer_uid = effective_uid;
+#else
+        errno = ENOTSUP;
+        goto out;
+#endif
+    }
+#else
+    errno = ENOTSUP;
+    goto out;
+#endif
+    rc = 0;
+out:
+    {
+        int saved_errno = errno;
+        if (fd >= 0) close(fd);
+        errno = saved_errno;
+    }
+    return rc;
+}
+
+#ifdef __linux__
+static int parse_linux_effective_uid(const char *status, size_t status_size,
+                                     uid_t *effective_uid) {
+    static const char prefix[] = "Uid:";
+    size_t offset = 0;
+
+    if (!status || !effective_uid) {
+        errno = EINVAL;
+        return -1;
+    }
+    while (offset < status_size) {
+        size_t line_size = 0;
+        const char *line = status + offset;
+        const char *cursor;
+        char *end;
+        uintmax_t value = 0;
+
+        while (offset + line_size < status_size &&
+               status[offset + line_size] != '\n') {
+            line_size++;
+        }
+        if (line_size < sizeof(prefix) - 1U ||
+            memcmp(line, prefix, sizeof(prefix) - 1U) != 0) {
+            offset += line_size + (offset + line_size < status_size);
+            continue;
+        }
+        cursor = line + sizeof(prefix) - 1U;
+        for (int field = 0; field < 2; field++) {
+            while (cursor < line + line_size &&
+                   isspace((unsigned char)*cursor)) {
+                cursor++;
+            }
+            if (cursor == line + line_size) {
+                errno = EINVAL;
+                return -1;
+            }
+            errno = 0;
+            value = strtoumax(cursor, &end, 10);
+            if (errno != 0 || end == cursor || end > line + line_size ||
+                (end < line + line_size &&
+                 !isspace((unsigned char)*end))) {
+                errno = EINVAL;
+                return -1;
+            }
+            cursor = end;
+        }
+        if ((uintmax_t)(uid_t)value != value) {
+            errno = EOVERFLOW;
+            return -1;
+        }
+        *effective_uid = (uid_t)value;
+        return 0;
+    }
+    errno = EINVAL;
+    return -1;
+}
+#endif
+
+/* Capture kernel-owned executable and credential evidence for one live PID.
+ * Linux exposes the loaded executable object itself through /proc/PID/exe.
+ * Darwin and FreeBSD expose the executable spelling and effective credential
+ * through native process sysctls. BSD signaling relies on the descriptor-
+ * trusted launch witness plus native socket credentials instead, because
+ * those pathname interfaces do not identify the loaded executable object. */
+static int inspect_process_image_real(pid_t pid, ssh_process_image_t *image) {
+    if (pid <= 1 || !image) {
+        errno = EINVAL;
+        return -1;
+    }
+    memset(image, 0, sizeof(*image));
+#ifdef __linux__
+    {
+        char proc_path[64];
+        char *status = NULL;
+        size_t status_size = 0;
+        int fd;
+
+        snprintf(proc_path, sizeof(proc_path), "/proc/%ld/exe", (long)pid);
+        fd = open(proc_path, O_RDONLY | O_CLOEXEC);
+        if (fd < 0) return -1;
+        if (fstat(fd, &image->executable_identity) != 0) {
+            int saved_errno = errno;
+            close(fd);
+            errno = saved_errno;
+            return -1;
+        }
+        close(fd);
+
+        snprintf(proc_path, sizeof(proc_path), "/proc/%ld/status", (long)pid);
+        if (read_proc_file(proc_path, &status, &status_size) != 0 ||
+            parse_linux_effective_uid(status, status_size,
+                                      &image->effective_uid) != 0) {
+            int saved_errno = errno ? errno : EIO;
+            free(status);
+            errno = saved_errno;
+            return -1;
+        }
+        free(status);
+        image->valid = true;
+        return 0;
+    }
+#elif defined(__APPLE__)
+    {
+        int process_mib[3] = {CTL_KERN, KERN_PROCARGS2, (int)pid};
+        int proc_mib[4] = {CTL_KERN, KERN_PROC, KERN_PROC_PID, (int)pid};
+        int argmax_mib[2] = {CTL_KERN, KERN_ARGMAX};
+        struct kinfo_proc info;
+        size_t info_size = sizeof(info);
+        size_t argmax_size = sizeof(argmax);
+        int argmax = 0;
+        char *args = NULL;
+        char *canonical = NULL;
+        size_t args_size;
+        size_t executable_size;
+        int rc = -1;
+
+        if (sysctl(proc_mib, 4, &info, &info_size, NULL, 0) != 0 ||
+            info_size != sizeof(info) || info.kp_proc.p_pid != pid ||
+            sysctl(argmax_mib, 2, &argmax, &argmax_size, NULL, 0) != 0 ||
+            argmax_size != sizeof(argmax) ||
+            argmax <= (int)sizeof(int)) {
+            return -1;
+        }
+        args_size = (size_t)argmax;
+        args = malloc(args_size);
+        if (!args) return -1;
+        if (sysctl(process_mib, 3, args, &args_size, NULL, 0) != 0 ||
+            args_size <= sizeof(int)) {
+            goto out;
+        }
+        executable_size = strnlen(args + sizeof(int),
+                                  args_size - sizeof(int));
+        if (executable_size == 0 ||
+            executable_size == args_size - sizeof(int)) {
+            errno = EINVAL;
+            goto out;
+        }
+        canonical = realpath(args + sizeof(int), NULL);
+        if (!canonical ||
+            safe_strncpy(image->executable_path, canonical,
+                         sizeof(image->executable_path)) != 0 ||
+            stat(canonical, &image->executable_identity) != 0) {
+            goto out;
+        }
+        image->effective_uid = info.kp_eproc.e_ucred.cr_uid;
+        image->valid = true;
+        rc = 0;
+out:
+        {
+            int saved_errno = errno;
+            free(canonical);
+            free(args);
+            errno = saved_errno;
+        }
+        return rc;
+    }
+#elif defined(__FreeBSD__)
+    {
+        int path_mib[4] = {
+            CTL_KERN, KERN_PROC, KERN_PROC_PATHNAME, (int)pid
+        };
+        int proc_mib[4] = {CTL_KERN, KERN_PROC, KERN_PROC_PID, (int)pid};
+        struct kinfo_proc info;
+        size_t info_size = sizeof(info);
+        char kernel_path[MAX_PATH_LEN];
+        size_t kernel_path_size = sizeof(kernel_path);
+        char *canonical;
+
+        if (sysctl(proc_mib, 4, &info, &info_size, NULL, 0) != 0 ||
+            info_size != sizeof(info) || info.ki_pid != pid ||
+            sysctl(path_mib, 4, kernel_path, &kernel_path_size, NULL, 0) != 0 ||
+            kernel_path_size == 0 ||
+            !memchr(kernel_path, '\0', kernel_path_size)) {
+            return -1;
+        }
+        canonical = realpath(kernel_path, NULL);
+        if (!canonical) return -1;
+        if (safe_strncpy(image->executable_path, canonical,
+                         sizeof(image->executable_path)) != 0 ||
+            stat(canonical, &image->executable_identity) != 0) {
+            int saved_errno = errno;
+            free(canonical);
+            errno = saved_errno;
+            return -1;
+        }
+        free(canonical);
+        image->effective_uid = info.ki_uid;
+        image->valid = true;
+        return 0;
+    }
+#else
+    (void)pid;
+    errno = ENOTSUP;
+    return -1;
+#endif
+}
+
+static ssh_process_outcome_t inspect_pid_ssh_agent_image(
+    const ssh_agent_record_t *record, const char *socket_arg,
+    int runtime_dir_fd) {
+#ifdef __linux__
+    ssh_process_image_t observed;
+#endif
+    pid_t peer_pid = -1;
+    uid_t peer_uid = (uid_t)-1;
+
+    if (!record || record->pid <= 1 || !record->image.valid ||
+        record->image.executable_path[0] != '/' ||
+        record->image.effective_uid != geteuid()) {
+        return SSH_PROCESS_INDETERMINATE;
+    }
+    if (inspect_socket_peer(socket_arg, runtime_dir_fd,
+                            &peer_pid, &peer_uid) != 0) {
+        return inspection_failure_outcome(record->pid);
+    }
+    if (peer_pid != record->image.socket_peer_pid ||
+        peer_uid != record->image.socket_peer_uid) {
+        return SSH_PROCESS_UNRELATED;
+    }
+#if !defined(__linux__)
+    /* The BSD process pathname interfaces name the executable but do not
+     * identify the loaded executable object. The descriptor-trusted launch
+     * witness persisted in v2, the unchanged process generation, and native
+     * socket peer credentials are the authoritative tuple there. */
+    return SSH_PROCESS_OWNED;
+#else
+    if (g_reap_ops.image(record->pid, &observed) != 0) {
+        /* OpenSSH deliberately becomes nondumpable, denying /proc/PID/exe
+         * even to its launcher. The durable trusted launch image, unchanged
+         * process generation, and kernel-authenticated socket peer remain the
+         * exact usable proof. Other call sites still fail closed if any part
+         * of that tuple is absent. */
+        return errno == EACCES || errno == EPERM
+                   ? SSH_PROCESS_OWNED
+                   : inspection_failure_outcome(record->pid);
+    }
+    if (!observed.valid ||
+        observed.effective_uid != record->image.effective_uid ||
+        !same_process_executable_identity(
+            &observed.executable_identity,
+            &record->image.executable_identity)) {
+        return SSH_PROCESS_UNRELATED;
+    }
+    return SSH_PROCESS_OWNED;
+#endif
+}
+
 static void ssh_process_generation_clear(
     ssh_process_generation_t *generation) {
     if (generation) memset(generation, 0, sizeof(*generation));
@@ -921,6 +1468,48 @@ static int parse_bounded_decimal_u64(const char *text, size_t length,
         value = value * 10U + digit;
     }
     *value_out = value;
+    return 0;
+}
+
+static int parse_bounded_hex_u64(const char *text, size_t length,
+                                 uint64_t *value_out) {
+    uint64_t value = 0;
+
+    if (!text || !value_out || length == 0 || length > 16U) return -1;
+    for (size_t i = 0; i < length; i++) {
+        unsigned char c = (unsigned char)text[i];
+        unsigned digit;
+
+        if (c >= '0' && c <= '9') {
+            digit = (unsigned)(c - '0');
+        } else if (c >= 'a' && c <= 'f') {
+            digit = (unsigned)(c - 'a') + 10U;
+        } else {
+            return -1;
+        }
+        if (value > (UINT64_MAX - digit) / 16U) return -1;
+        value = value * 16U + digit;
+    }
+    *value_out = value;
+    return 0;
+}
+
+static int next_bounded_record_field(
+    const char *text, size_t text_size, size_t *offset, char delimiter,
+    const char **field, size_t *field_size) {
+    const char *end;
+    size_t remaining;
+
+    if (!text || !offset || !field || !field_size ||
+        *offset >= text_size) {
+        return -1;
+    }
+    remaining = text_size - *offset;
+    end = memchr(text + *offset, delimiter, remaining);
+    if (!end || end == text + *offset) return -1;
+    *field = text + *offset;
+    *field_size = (size_t)(end - *field);
+    *offset += *field_size + 1U;
     return 0;
 }
 
@@ -1235,6 +1824,9 @@ static ssh_process_outcome_t pid_is_our_ssh_agent(
     if (!ssh_process_generation_equal(&record->generation, &observed)) {
         return SSH_PROCESS_REPLACED;
     }
+    outcome = inspect_pid_ssh_agent_image(record, expected_sock,
+                                          runtime_dir_fd);
+    if (outcome != SSH_PROCESS_OWNED) return outcome;
     outcome = inspect_pid_ssh_agent_argv(record->pid, expected_sock,
                                          runtime_dir_fd);
     if (outcome != SSH_PROCESS_OWNED) return outcome;
@@ -1535,6 +2127,8 @@ static void apply_unrecorded_result(ssh_config_t *ssh_config,
     if (!ssh_config->agent_owned) {
         ssh_config->agent_pid = -1;
         ssh_process_generation_clear(&ssh_config->agent_generation);
+        memset(&ssh_config->agent_image, 0,
+               sizeof(ssh_config->agent_image));
     }
     if (result == SSH_UNRECORDED_CLEANED) {
         ssh_config->agent_socket_path[0] = '\0';
@@ -1571,22 +2165,35 @@ static ssh_unrecorded_result_t reap_unrecorded_agent(
     bool socket_present = false;
     ssh_agent_record_t retry_record;
 
+    (void)socket_arg;
     memset(&retry_record, 0, sizeof(retry_record));
     retry_record.pid = ssh_config ? ssh_config->agent_pid : -1;
-    if (ssh_config) retry_record.generation = ssh_config->agent_generation;
+    if (ssh_config) {
+        retry_record.generation = ssh_config->agent_generation;
+        retry_record.image = ssh_config->agent_image;
+    }
 
     ssh_runtime_pin_init(&socket_pin);
     int socket_rc = pin_ssh_runtime_entry_at(
         dir_fd, socket_name, socket_path, &socket_pin);
     if (socket_rc == 0) {
         socket_present = true;
+        if (retry_record.image.valid &&
+            inspect_socket_peer(
+                socket_path, dir_fd,
+                &retry_record.image.socket_peer_pid,
+                &retry_record.image.socket_peer_uid) != 0) {
+            retry_record.image.valid = false;
+        } else if (retry_record.image.valid && ssh_config) {
+            ssh_config->agent_image = retry_record.image;
+        }
     } else if (socket_rc < 0) {
         return SSH_UNRECORDED_ARTIFACT_RETAINED;
     }
 
     if (retry_record.pid > 1 &&
         ssh_process_generation_valid(&retry_record.generation)) {
-        outcome = g_ssh_reap(&retry_record, socket_arg, dir_fd);
+        outcome = g_ssh_reap(&retry_record, socket_path, dir_fd);
     }
 
     if (ssh_reap_allows_cleanup(outcome)) {
@@ -3115,6 +3722,7 @@ static int ssh_start_isolated_agent_with_key(
     ssh_runtime_pin_t reuse_pin;
     bool reuse_pin_active = false;
     error_context_t causal_match_error;
+    run_launch_witness_t agent_launch_witness;
     bool preserve_causal_match_error = false;
     int causal_match_errno = 0;
     int dir_fd = -1;
@@ -3122,6 +3730,7 @@ static int ssh_start_isolated_agent_with_key(
 
     ssh_runtime_pin_init(&reuse_pin);
     memset(&causal_match_error, 0, sizeof(causal_match_error));
+    memset(&agent_launch_witness, 0, sizeof(agent_launch_witness));
 
     if (!ssh_config || !account || !snapshot) {
         set_error(ERR_INVALID_ARGS, "Invalid arguments to ssh_start_isolated_agent");
@@ -3273,6 +3882,7 @@ static int ssh_start_isolated_agent_with_key(
                      sizeof(adopted.agent_socket_arg));
         adopted.agent_pid = -1;
         ssh_process_generation_clear(&adopted.agent_generation);
+        memset(&adopted.agent_image, 0, sizeof(adopted.agent_image));
         adopted.agent_owned = false;
         adopted.key_already_loaded = true;
         adopted.reused_existing_agent = true;
@@ -3293,22 +3903,16 @@ static int ssh_start_isolated_agent_with_key(
             ssh_pid_sidecar_result_t pid_rc = read_ssh_agent_pid_at(
                 dir_fd, pid_name, pid_path, &record, NULL);
             if (pid_rc == SSH_PID_SIDECAR_VALID) {
-                ssh_process_outcome_t qualified_identity =
-                    pid_is_our_ssh_agent(&record, launch_socket_arg, -1);
-                ssh_process_outcome_t absolute_identity =
-                    qualified_identity == SSH_PROCESS_OWNED
-                        ? SSH_PROCESS_UNRELATED
-                        : pid_is_our_ssh_agent(&record, socket_path, -1);
-                if (qualified_identity == SSH_PROCESS_OWNED ||
-                    absolute_identity == SSH_PROCESS_OWNED) {
+                ssh_process_outcome_t identity =
+                    pid_is_our_ssh_agent(&record, socket_path, -1);
+                if (identity == SSH_PROCESS_OWNED) {
                     adopted.agent_pid = record.pid;
                     adopted.agent_generation = record.generation;
+                    adopted.agent_image = record.image;
                     adopted.agent_owned = true;
                     safe_strncpy(
                         adopted.agent_socket_arg,
-                        qualified_identity == SSH_PROCESS_OWNED
-                            ? launch_socket_arg
-                            : socket_path,
+                        launch_socket_arg,
                         sizeof(adopted.agent_socket_arg));
                 }
             } else if (pid_rc == SSH_PID_SIDECAR_MALFORMED ||
@@ -3448,8 +4052,19 @@ static int ssh_start_isolated_agent_with_key(
         struct stat marker_stat;
         struct stat launched_socket;
         run_result_t launch_result;
+        char agent_program[MAX_PATH_LEN];
         char runner_detail[sizeof(g_last_error.message)] = "";
         int run_rc;
+        if (find_command_path("ssh-agent", agent_program,
+                              sizeof(agent_program)) != 0 ||
+            !run_launch_witness_capture(
+                agent_program, &agent_launch_witness) ||
+            !process_image_from_launch_witness(
+                &agent_launch_witness, &ssh_config->agent_image)) {
+            set_error(ERR_SSH_AGENT_NOT_FOUND,
+                      "No trusted native SSH agent executable is available");
+            goto done;
+        }
         if (mkdirat(dir_fd, provenance_marker, 0700) != 0 && errno != EEXIST) {
             set_system_error(ERR_FILE_IO,
                              "Failed to create SSH provenance marker");
@@ -3476,11 +4091,27 @@ static int ssh_start_isolated_agent_with_key(
         memset(&launch_result, 0, sizeof(launch_result));
         launch_result.exit_code = -1;
         clear_error();
-        run_rc = ssh_run_in_dir(dir_fd, output, sizeof(output),
-                                &launch_result, false,
-                                "ssh-agent", "-s", "-a",
-                                launch_socket_arg,
-                                (const char *)NULL);
+        {
+            const char *const launch_argv[] = {
+                agent_program, "-s", "-a", launch_socket_arg, NULL
+            };
+            run_opts_t launch_opts;
+
+            memset(&launch_opts, 0, sizeof(launch_opts));
+            launch_opts.out = output;
+            launch_opts.out_size = sizeof(output);
+            launch_opts.cwd_fd = dir_fd;
+            launch_opts.use_cwd_fd = true;
+            run_rc = run_argv_with_expected_launch(
+                launch_argv, &launch_opts, &agent_launch_witness,
+                &launch_result);
+            if (launch_result.out_len > 0 &&
+                launch_result.out_len < sizeof(output) &&
+                output[launch_result.out_len - 1U] == '\n') {
+                launch_result.out_len--;
+                output[launch_result.out_len] = '\0';
+            }
+        }
         if (unlinkat(dir_fd, provenance_marker, AT_REMOVEDIR) != 0 &&
             errno != ENOENT) {
             log_warning("Could not remove temporary SSH provenance marker: %s",
@@ -3612,6 +4243,21 @@ static int ssh_start_isolated_agent_with_key(
                   unrecorded_result_summary(recovery));
         goto done;
     }
+    if (inspect_socket_peer(
+            socket_path, dir_fd,
+            &ssh_config->agent_image.socket_peer_pid,
+            &ssh_config->agent_image.socket_peer_uid) != 0 ||
+        ssh_config->agent_image.socket_peer_uid != geteuid()) {
+        ssh_unrecorded_result_t recovery = reap_unrecorded_agent(
+            ssh_config, launch_socket_arg, dir_fd, socket_name,
+            pid_name, pid_path, socket_path, socket_dir);
+        apply_unrecorded_result(ssh_config, recovery);
+        set_error(
+            ERR_SSH_AGENT_START_FAILED,
+            "Cannot bind SSH agent launch to its kernel socket credential; %s",
+            unrecorded_result_summary(recovery));
+        goto done;
+    }
 
     /* The runner used only the pinned cwd + provenance-qualified relative
      * socket entry. If the public directory was replaced while it ran, reap
@@ -3637,7 +4283,8 @@ static int ssh_start_isolated_agent_with_key(
         bool recorded = false;
         ssh_agent_record_t record = {
             .pid = ssh_config->agent_pid,
-            .generation = ssh_config->agent_generation
+            .generation = ssh_config->agent_generation,
+            .image = ssh_config->agent_image
         };
         if ((size_t)snprintf(pid_path, sizeof(pid_path), "%s/ssh-agent.%s.pid",
                              socket_dir, account->name) < sizeof(pid_path)) {
@@ -3667,7 +4314,7 @@ static int ssh_start_isolated_agent_with_key(
                 goto done;
             }
 
-            reap_outcome = g_ssh_reap(&record, launch_socket_arg, dir_fd);
+            reap_outcome = g_ssh_reap(&record, socket_path, dir_fd);
             runtime_cleaned =
                 ssh_reap_allows_cleanup(reap_outcome) &&
                 retire_reaped_socket_if_dead(
@@ -3675,6 +4322,8 @@ static int ssh_start_isolated_agent_with_key(
                     "agent socket cleanup after sidecar failure") == 0;
             ssh_config->agent_pid = -1;
             ssh_process_generation_clear(&ssh_config->agent_generation);
+            memset(&ssh_config->agent_image, 0,
+                   sizeof(ssh_config->agent_image));
             ssh_config->agent_owned = false;
             if (runtime_cleaned) {
                 ssh_config->agent_socket_path[0] = '\0';
@@ -3781,14 +4430,11 @@ fresh_commit_failed:
     if (ssh_config->agent_owned) {
         ssh_agent_record_t record = {
             .pid = ssh_config->agent_pid,
-            .generation = ssh_config->agent_generation
+            .generation = ssh_config->agent_generation,
+            .image = ssh_config->agent_image
         };
         ssh_process_outcome_t reap_outcome = g_ssh_reap(
-            &record,
-            ssh_config->agent_socket_arg[0]
-                ? ssh_config->agent_socket_arg
-                : socket_path,
-            dir_fd);
+            &record, socket_path, dir_fd);
         if (ssh_reap_allows_cleanup(reap_outcome)) {
             if (retire_reaped_socket_if_dead(
                     dir_fd, socket_dir, socket_name, socket_path,
@@ -3812,6 +4458,8 @@ fresh_commit_failed:
     if (!agent_retained) {
         ssh_config->agent_pid = -1;
         ssh_process_generation_clear(&ssh_config->agent_generation);
+        memset(&ssh_config->agent_image, 0,
+               sizeof(ssh_config->agent_image));
         ssh_config->agent_owned = false;
         ssh_config->key_already_loaded = false;
         ssh_config->agent_socket_path[0] = '\0';
@@ -3966,7 +4614,9 @@ static int cleanup_stopped_agent_runtime(ssh_config_t *ssh_config) {
     pid_present = true;
     if (recorded.pid != ssh_config->agent_pid ||
         !ssh_process_generation_equal(
-            &recorded.generation, &ssh_config->agent_generation)) {
+            &recorded.generation, &ssh_config->agent_generation) ||
+        !ssh_process_image_equal(
+            &recorded.image, &ssh_config->agent_image)) {
         set_error(ERR_FILE_IO,
                   "SSH agent process sidecar changed; replacement retained: %s",
                   pid_path);
@@ -3974,11 +4624,7 @@ static int cleanup_stopped_agent_runtime(ssh_config_t *ssh_config) {
     }
     {
         ssh_process_outcome_t reap_outcome = g_ssh_reap(
-            &recorded,
-            ssh_config->agent_socket_arg[0]
-                ? ssh_config->agent_socket_arg
-                : ssh_config->agent_socket_path,
-            dir_fd);
+            &recorded, ssh_config->agent_socket_path, dir_fd);
         if (!ssh_reap_allows_cleanup(reap_outcome)) {
             set_error(ERR_SSH_AGENT_FAILED,
                       "SSH agent PID %ld reap outcome %s; retained for retry",
@@ -4104,6 +4750,11 @@ int ssh_stop_agent(ssh_config_t *ssh_config) {
                   "Owned SSH agent has no verified process generation; retained for retry");
         return -1;
     }
+    if (!ssh_config->agent_image.valid) {
+        set_error(ERR_SSH_AGENT_FAILED,
+                  "Owned SSH agent has no verified launch image; retained for retry");
+        return -1;
+    }
 
     log_info("Stopping SSH agent (PID: %d)", ssh_config->agent_pid);
 
@@ -4121,6 +4772,7 @@ int ssh_stop_agent(ssh_config_t *ssh_config) {
     /* Reset state only after both recovery names are durably absent. */
     ssh_config->agent_pid = -1;
     ssh_process_generation_clear(&ssh_config->agent_generation);
+    memset(&ssh_config->agent_image, 0, sizeof(ssh_config->agent_image));
     ssh_config->agent_owned = false;
     ssh_config->reused_existing_agent = false;
     ssh_config->agent_socket_path[0] = '\0';
@@ -7736,51 +8388,6 @@ static int ssh_run(char *output, size_t output_size, int merge_stderr, ...) {
     return 0;
 }
 
-/* Variant used for descriptor-pinned runtime endpoints. The helper resolves a
- * relative socket argument only after fchdir()ing to the validated directory;
- * a concurrent rename/replacement of its public pathname cannot redirect it. */
-static int ssh_run_in_dir(int cwd_fd, char *output, size_t output_size,
-                          run_result_t *result, int merge_stderr, ...) {
-    const char *argv[16];
-    size_t n = 0;
-    va_list ap;
-    const char *a;
-    run_opts_t opts;
-    run_result_t local_result;
-    run_result_t *res = result ? result : &local_result;
-    int rc;
-
-    va_start(ap, merge_stderr);
-    while ((a = va_arg(ap, const char *)) != NULL) {
-        if (n >= sizeof(argv) / sizeof(argv[0]) - 1) {
-            va_end(ap);
-            set_error(ERR_INVALID_ARGS, "Too many ssh arguments");
-            return -1;
-        }
-        argv[n++] = a;
-    }
-    va_end(ap);
-    argv[n] = NULL;
-
-    memset(&opts, 0, sizeof(opts));
-    memset(res, 0, sizeof(*res));
-    res->exit_code = -1;
-    opts.out = output;
-    opts.out_size = output_size;
-    opts.merge_stderr = merge_stderr;
-    opts.cwd_fd = cwd_fd;
-    opts.use_cwd_fd = true;
-    if (output && output_size > 0) output[0] = '\0';
-    rc = run_argv(argv, &opts, res);
-    if (output && output_size > 0 && res->out_len > 0 &&
-        res->out_len < output_size &&
-        output[res->out_len - 1] == '\n') {
-        res->out_len--;
-        output[res->out_len] = '\0';
-    }
-    return rc == 0 ? 0 : -1;
-}
-
 /* Load a key through a descriptor-pinned relative agent socket. */
 static int ssh_add_key_pinned(int dir_fd, const char *socket_arg,
                               const char *key_path,
@@ -9152,6 +9759,7 @@ static int prove_malformed_pid_socket_dead_at(
         {
             struct kinfo_file info;
             memset(&info, 0, sizeof(info));
+            info.kf_structsize = sizeof(info);
             if (fcntl(dir_fd, F_KINFO, &info) != 0 ||
                 info.kf_path[0] == '\0' ||
                 safe_strncpy(pinned_dir_path, info.kf_path,
@@ -9676,6 +10284,53 @@ int ssh_manager_current_is_live_for_account(const account_t *account,
                                                &present, account, live);
 }
 
+#define SSH_PID_RECORD_MAX_BYTES (MAX_PATH_LEN + 320U)
+
+static int format_ssh_agent_record(const ssh_agent_record_t *record,
+                                   char *buffer, size_t buffer_size) {
+    size_t path_size;
+    int header_size;
+
+    if (!record || !buffer || buffer_size == 0 || record->pid <= 1 ||
+        !ssh_process_generation_valid(&record->generation) ||
+        !record->image.valid ||
+        record->image.executable_path[0] != '/' ||
+        record->image.socket_peer_pid <= 1 ||
+        record->image.socket_peer_uid != record->image.effective_uid ||
+        !S_ISREG(record->image.executable_identity.st_mode)) {
+        errno = EINVAL;
+        return -1;
+    }
+    path_size = strnlen(record->image.executable_path,
+                        sizeof(record->image.executable_path));
+    if (path_size == 0 ||
+        path_size == sizeof(record->image.executable_path)) {
+        errno = EINVAL;
+        return -1;
+    }
+    header_size = snprintf(
+        buffer, buffer_size,
+        "v2 %ld %" PRIu64 " %016" PRIx64 "%016" PRIx64
+        " %016" PRIx64 "%016" PRIx64 " %ju %ju %ju %jx %jx %zu\n",
+        (long)record->pid, record->generation.kind,
+        record->generation.boot_hi, record->generation.boot_lo,
+        record->generation.start_hi, record->generation.start_lo,
+        (uintmax_t)record->image.effective_uid,
+        (uintmax_t)record->image.socket_peer_pid,
+        (uintmax_t)record->image.socket_peer_uid,
+        (uintmax_t)record->image.executable_identity.st_dev,
+        (uintmax_t)record->image.executable_identity.st_ino,
+        path_size);
+    if (header_size <= 0 || (size_t)header_size >= buffer_size ||
+        path_size + 1U > buffer_size - (size_t)header_size) {
+        errno = ENAMETOOLONG;
+        return -1;
+    }
+    memcpy(buffer + header_size, record->image.executable_path, path_size);
+    buffer[(size_t)header_size + path_size] = '\n';
+    return header_size + (int)path_size + 1;
+}
+
 /* Read a PID sidecar without following or accepting a swapped final
  * component. Safe, stable content that cannot encode exactly one PID is
  * returned as MALFORMED with its descriptor pin retained for callers that can
@@ -9687,7 +10342,7 @@ static ssh_pid_sidecar_result_t read_ssh_agent_pid_at(
     struct stat opened;
     struct stat held;
     struct stat entry;
-    char buf[160];
+    char buf[SSH_PID_RECORD_MAX_BYTES];
     size_t used = 0;
     bool oversized = false;
     int fd;
@@ -9829,6 +10484,110 @@ static ssh_pid_sidecar_result_t read_ssh_agent_pid_at(
             return SSH_PID_SIDECAR_LEGACY;
         }
     }
+    if (!oversized && used > 3U && memcmp(buf, "v2 ", 3U) == 0 &&
+        memchr(buf, '\0', used) == NULL) {
+        ssh_agent_record_t parsed_record;
+        const char *fields[10];
+        size_t field_sizes[10];
+        uint64_t parsed_pid;
+        uint64_t parsed_kind;
+        uint64_t parsed_euid;
+        uint64_t parsed_peer_pid;
+        uint64_t parsed_peer_uid;
+        uint64_t parsed_device;
+        uint64_t parsed_inode;
+        uint64_t parsed_path_u64;
+        size_t parsed_path_size;
+        size_t path_offset = 3U;
+        int canonical_size = -1;
+        char canonical[SSH_PID_RECORD_MAX_BYTES];
+        bool fields_valid = true;
+
+        memset(&parsed_record, 0, sizeof(parsed_record));
+        for (size_t i = 0; i < 10U; i++) {
+            char delimiter = i == 9U ? '\n' : ' ';
+            if (next_bounded_record_field(
+                    buf, used, &path_offset, delimiter,
+                    &fields[i], &field_sizes[i]) != 0) {
+                fields_valid = false;
+                break;
+            }
+        }
+        if (fields_valid &&
+            parse_bounded_decimal_u64(
+                fields[0], field_sizes[0], &parsed_pid) == 0 &&
+            parse_bounded_decimal_u64(
+                fields[1], field_sizes[1], &parsed_kind) == 0 &&
+            field_sizes[2] == 32U &&
+            parse_fixed_hex_u64(
+                fields[2], 16U,
+                &parsed_record.generation.boot_hi) == 0 &&
+            parse_fixed_hex_u64(
+                fields[2] + 16U, 16U,
+                &parsed_record.generation.boot_lo) == 0 &&
+            field_sizes[3] == 32U &&
+            parse_fixed_hex_u64(
+                fields[3], 16U,
+                &parsed_record.generation.start_hi) == 0 &&
+            parse_fixed_hex_u64(
+                fields[3] + 16U, 16U,
+                &parsed_record.generation.start_lo) == 0 &&
+            parse_bounded_decimal_u64(
+                fields[4], field_sizes[4], &parsed_euid) == 0 &&
+            parse_bounded_decimal_u64(
+                fields[5], field_sizes[5], &parsed_peer_pid) == 0 &&
+            parse_bounded_decimal_u64(
+                fields[6], field_sizes[6], &parsed_peer_uid) == 0 &&
+            parse_bounded_hex_u64(
+                fields[7], field_sizes[7], &parsed_device) == 0 &&
+            parse_bounded_hex_u64(
+                fields[8], field_sizes[8], &parsed_inode) == 0 &&
+            parse_bounded_decimal_u64(
+                fields[9], field_sizes[9], &parsed_path_u64) == 0 &&
+            parsed_path_u64 <= SIZE_MAX &&
+            parsed_pid > 1 && parsed_pid <= (uint64_t)INT_MAX &&
+            parsed_euid == (uint64_t)(uid_t)parsed_euid &&
+            parsed_peer_pid > 1 &&
+            parsed_peer_pid <= (uint64_t)INT_MAX &&
+            parsed_peer_uid == (uint64_t)(uid_t)parsed_peer_uid &&
+            parsed_peer_uid == parsed_euid &&
+            parsed_device == (uint64_t)(dev_t)parsed_device &&
+            parsed_inode == (uint64_t)(ino_t)parsed_inode &&
+            (parsed_path_size = (size_t)parsed_path_u64) > 0 &&
+            parsed_path_size < sizeof(parsed_record.image.executable_path) &&
+            path_offset + parsed_path_size + 1U == used &&
+            buf[path_offset] == '/' &&
+            buf[used - 1U] == '\n') {
+            parsed_record.pid = (pid_t)parsed_pid;
+            parsed_record.generation.kind = parsed_kind;
+            parsed_record.image.valid = true;
+            parsed_record.image.effective_uid = (uid_t)parsed_euid;
+            parsed_record.image.socket_peer_pid = (pid_t)parsed_peer_pid;
+            parsed_record.image.socket_peer_uid = (uid_t)parsed_peer_uid;
+            parsed_record.image.executable_identity.st_dev =
+                (dev_t)parsed_device;
+            parsed_record.image.executable_identity.st_ino =
+                (ino_t)parsed_inode;
+            parsed_record.image.executable_identity.st_mode = S_IFREG;
+            memcpy(parsed_record.image.executable_path,
+                   buf + path_offset, parsed_path_size);
+            parsed_record.image.executable_path[parsed_path_size] = '\0';
+            canonical_size = format_ssh_agent_record(
+                &parsed_record, canonical, sizeof(canonical));
+            if (ssh_process_generation_valid(&parsed_record.generation) &&
+                canonical_size > 0 && (size_t)canonical_size == used &&
+                memcmp(canonical, buf, used) == 0) {
+                if (record_out) *record_out = parsed_record;
+                if (pin) {
+                    pin->identity = held;
+                    pin->fd = fd;
+                } else {
+                    close(fd);
+                }
+                return SSH_PID_SIDECAR_VALID;
+            }
+        }
+    }
     {
         const char *pid_start = buf + 3;
         const char *pid_end;
@@ -9895,7 +10654,7 @@ static ssh_pid_sidecar_result_t read_ssh_agent_pid_at(
                 } else {
                     close(fd);
                 }
-                return SSH_PID_SIDECAR_VALID;
+                return SSH_PID_SIDECAR_LEGACY;
             }
         }
     }
@@ -9927,19 +10686,14 @@ static int write_all_fd(int fd, const char *buf, size_t size) {
 
 static bool pinned_pid_sidecar_matches_record(
     const ssh_runtime_pin_t *pin, const ssh_agent_record_t *record) {
-    char expected[160];
-    char observed[161];
+    char expected[SSH_PID_RECORD_MAX_BYTES];
+    char observed[SSH_PID_RECORD_MAX_BYTES + 1U];
     int expected_len;
     ssize_t read_len;
 
     if (!pin || pin->fd < 0 || !record) return false;
-    expected_len = snprintf(
-        expected, sizeof(expected),
-        "v1 %ld %" PRIu64 " %016" PRIx64 "%016" PRIx64
-        " %016" PRIx64 "%016" PRIx64 "\n",
-        (long)record->pid, record->generation.kind,
-        record->generation.boot_hi, record->generation.boot_lo,
-        record->generation.start_hi, record->generation.start_lo);
+    expected_len = format_ssh_agent_record(
+        record, expected, sizeof(expected));
     if (expected_len <= 0 || (size_t)expected_len >= sizeof(expected)) {
         return false;
     }
@@ -9981,7 +10735,7 @@ static int resolve_uncertain_pid_publication(int dir_fd, const char *name,
 static int write_ssh_agent_pid_at(
     int dir_fd, const char *name, const ssh_agent_record_t *record) {
     char tmp[MAX_NAME_LEN + 64];
-    char content[160];
+    char content[SSH_PID_RECORD_MAX_BYTES];
     struct stat opened;
     struct stat fd_now;
     struct stat entry;
@@ -9993,17 +10747,12 @@ static int write_ssh_agent_pid_at(
     bool renamed = false;
 
     if (!record || record->pid <= 1 ||
-        !ssh_process_generation_valid(&record->generation)) {
+        !ssh_process_generation_valid(&record->generation) ||
+        !record->image.valid) {
         set_error(ERR_INVALID_ARGS, "Invalid SSH agent process record");
         return -1;
     }
-    len = snprintf(content, sizeof(content),
-                   "v1 %ld %" PRIu64 " %016" PRIx64 "%016" PRIx64
-                   " %016" PRIx64 "%016" PRIx64 "\n",
-                   (long)record->pid, record->generation.kind,
-                   record->generation.boot_hi, record->generation.boot_lo,
-                   record->generation.start_hi,
-                   record->generation.start_lo);
+    len = format_ssh_agent_record(record, content, sizeof(content));
     if (len <= 0 || (size_t)len >= sizeof(content) ||
         (size_t)snprintf(tmp, sizeof(tmp), ".%s.tmp.%d", name,
                          (int)getpid()) >= sizeof(tmp)) {
@@ -10132,7 +10881,37 @@ static bool recover_exact_ssh_agent_record_at(
 
 int ssh_manager_test_write_pid_sidecar(int dir_fd, const char *name,
                                        const ssh_agent_record_t *record) {
-    return write_ssh_agent_pid_at(dir_fd, name, record);
+    ssh_agent_record_t completed;
+    run_launch_witness_t witness;
+    char path[MAX_PATH_LEN];
+    char socket_name[MAX_NAME_LEN + 32];
+    size_t name_size;
+
+    if (!record) return write_ssh_agent_pid_at(dir_fd, name, record);
+    completed = *record;
+    if (!completed.image.valid) {
+        memset(&witness, 0, sizeof(witness));
+        if (find_command_path("ssh-agent", path, sizeof(path)) != 0 ||
+            !run_launch_witness_capture(path, &witness) ||
+            !process_image_from_launch_witness(
+                &witness, &completed.image)) {
+            return -1;
+        }
+    }
+    name_size = name ? strlen(name) : 0;
+    if (completed.image.socket_peer_pid <= 1 &&
+        name_size > 4U && strcmp(name + name_size - 4U, ".pid") == 0 &&
+        name_size + 2U <= sizeof(socket_name)) {
+        memcpy(socket_name, name, name_size - 4U);
+        memcpy(socket_name + name_size - 4U, ".sock", 6U);
+        if (inspect_socket_peer(
+                socket_name, dir_fd,
+                &completed.image.socket_peer_pid,
+                &completed.image.socket_peer_uid) != 0) {
+            return -1;
+        }
+    }
+    return write_ssh_agent_pid_at(dir_fd, name, &completed);
 }
 
 int ssh_manager_test_capture_process_generation(

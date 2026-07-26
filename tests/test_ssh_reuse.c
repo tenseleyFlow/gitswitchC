@@ -20,6 +20,7 @@
 #include "test.h"
 #include "gitswitch.h"
 #include "ssh_manager.h"
+#include "runner_internal.h"
 #include "utils.h"
 #include "error.h"
 
@@ -57,6 +58,23 @@ static const char *g_generation_loaded_fp;
 static char g_generation_key_path[MAX_PATH_LEN];
 static char g_generation_replacement[MAX_PATH_LEN];
 static bool g_keygen_used_admitted_bytes;
+static int g_fake_agent_listener = -1;
+
+static bool is_ssh_agent_command(const char *path) {
+    const char *base;
+
+    if (!path || !*path) return false;
+    base = strrchr(path, '/');
+    return strcmp(base ? base + 1 : path, "ssh-agent") == 0;
+}
+
+static int certify_agent_launch(const char *path, run_result_t *result) {
+    if (!path || !result ||
+        !run_launch_witness_capture(path, &result->launch_witness)) {
+        return -1;
+    }
+    return 0;
+}
 
 static const char *runner_generation_fingerprint(
     const char *const argv[], const run_opts_t *opts) {
@@ -155,12 +173,21 @@ static int bind_and_chmod_socket(const char *path) {
     memset(&addr, 0, sizeof(addr));
     addr.sun_family = AF_UNIX;
     strcpy(addr.sun_path, path);
-    if (bind(fd, (struct sockaddr *)&addr, sizeof(addr)) != 0) {
+    if (g_fake_agent_listener >= 0) {
+        close(g_fake_agent_listener);
+        g_fake_agent_listener = -1;
+    }
+    if (bind(fd, (struct sockaddr *)&addr, sizeof(addr)) != 0 ||
+        listen(fd, 8) != 0) {
         close(fd);
         return -1;
     }
-    close(fd);
-    return chmod(path, 0600);
+    if (chmod(path, 0600) != 0) {
+        close(fd);
+        return -1;
+    }
+    g_fake_agent_listener = fd;
+    return 0;
 }
 
 static ssh_process_outcome_t refuse_agent_reap(
@@ -172,16 +199,21 @@ static ssh_process_outcome_t refuse_agent_reap(
     return SSH_PROCESS_OWNED;
 }
 
+static int g_classify_agent_gone_calls;
+
 static ssh_process_outcome_t classify_agent_gone(
     const ssh_agent_record_t *record, const char *socket_arg,
     int runtime_dir_fd) {
     (void)record;
     (void)socket_arg;
     (void)runtime_dir_fd;
+    g_classify_agent_gone_calls++;
     return SSH_PROCESS_GONE;
 }
 
 static ssh_agent_record_t synthetic_agent_record(pid_t pid, uint64_t nonce) {
+    run_launch_witness_t witness;
+    char agent_path[MAX_PATH_LEN];
     ssh_agent_record_t record = {
         .pid = pid,
         .generation = {
@@ -192,6 +224,21 @@ static ssh_agent_record_t synthetic_agent_record(pid_t pid, uint64_t nonce) {
             .start_lo = nonce,
         },
     };
+
+    memset(&witness, 0, sizeof(witness));
+    if (find_command_path("ssh-agent", agent_path,
+                          sizeof(agent_path)) == 0 &&
+        run_launch_witness_capture(agent_path, &witness) &&
+        witness.valid && !witness.is_script &&
+        safe_strncpy(record.image.executable_path,
+                     witness.executable_path,
+                     sizeof(record.image.executable_path)) == 0) {
+        record.image.valid = true;
+        record.image.executable_identity = witness.executable_identity;
+        record.image.effective_uid = geteuid();
+        record.image.socket_peer_pid = pid;
+        record.image.socket_peer_uid = geteuid();
+    }
     return record;
 }
 
@@ -220,6 +267,10 @@ static int synthetic_agent_is_gone_pidfd_open(pid_t pid) {
     if (pid != (pid_t)12345) {
         errno = EINVAL;
         return -1;
+    }
+    if (g_fake_agent_listener >= 0) {
+        close(g_fake_agent_listener);
+        g_fake_agent_listener = -1;
     }
     errno = ESRCH;
     return -1;
@@ -367,8 +418,9 @@ static int fake_ssh_runner(const char *const argv[], const run_opts_t *opts,
 
     /* ssh-agent: reaching this means reuse was refused. Fail the start so the
      * test ends here deterministically. */
-    if (strcmp(argv[0], "ssh-agent") == 0) {
+    if (is_ssh_agent_command(argv[0])) {
         g_agent_start_attempts++;
+        if (certify_agent_launch(argv[0], result) != 0) return -1;
         if (result) result->exit_code = 1;
         return -1;
     }
@@ -632,7 +684,7 @@ static int fake_quoting_agent_runner(const char *const argv[],
     }
     if (opts && opts->out && opts->out_size > 0) opts->out[0] = '\0';
 
-    if (strcmp(argv[0], "ssh-agent") == 0) {
+    if (is_ssh_agent_command(argv[0])) {
         /* Find "-a <path>" wherever it sits: the AR-03 H1 fix passes an
          * explicit -s ahead of it, so the socket is no longer argv[2]. */
         const char *sock = NULL;
@@ -643,6 +695,7 @@ static int fake_quoting_agent_runner(const char *const argv[],
             }
         }
         if (!sock) return -1;
+        if (certify_agent_launch(argv[0], result) != 0) return -1;
         if (g_replace_dir_on_agent_start) {
             g_replace_dir_on_agent_start = false;
             if (replace_agent_dir_namespace() != 0) return -1;
@@ -924,7 +977,7 @@ TEST(ssh_reuse_refuses_symlinked_pid_sidecar) {
  * directory. Plant a symlink after orphan cleanup but before the write: the
  * link itself must be atomically replaced and its target left untouched. */
 TEST(fresh_agent_sidecar_atomically_replaces_planted_symlink) {
-    char dir[128], pid_path[256], victim[256], content[128];
+    char dir[128], pid_path[256], victim[256], content[512];
     struct stat st;
     ssh_config_t cfg;
     account_t acct;
@@ -959,7 +1012,7 @@ TEST(fresh_agent_sidecar_atomically_replaces_planted_symlink) {
     CHECK(S_ISREG(st.st_mode));
     CHECK_EQ_INT(st.st_mode & 0777, 0600);
     CHECK(read_file_to_string(pid_path, content, sizeof(content)) > 0);
-    CHECK(strncmp(content, "v1 12345 ", strlen("v1 12345 ")) == 0);
+    CHECK(strncmp(content, "v2 12345 ", strlen("v2 12345 ")) == 0);
 }
 
 /* Reuse must stay inside the directory inode it pinned. Replacing the public
@@ -1113,6 +1166,7 @@ TEST(stop_agent_reap_failure_preserves_retry_handle) {
                  sizeof(cfg.agent_socket_arg));
     cfg.agent_pid = 12345;
     cfg.agent_generation = record.generation;
+    cfg.agent_image = record.image;
     cfg.agent_owned = true;
     cfg.key_already_loaded = true;
     cfg.reused_existing_agent = true;
@@ -1168,6 +1222,7 @@ TEST(stop_agent_cleanup_failure_retains_sidecar_until_durable_retry) {
                               sizeof(cfg.agent_socket_arg)), 0);
     cfg.agent_pid = 12345;
     cfg.agent_generation = record.generation;
+    cfg.agent_image = record.image;
     cfg.agent_owned = true;
     cfg.key_already_loaded = true;
 
@@ -1231,6 +1286,7 @@ TEST(stop_agent_missing_exact_record_preserves_retry_handle) {
                               sizeof(cfg.agent_socket_arg)), 0);
     cfg.agent_pid = 12345;
     cfg.agent_generation = record.generation;
+    cfg.agent_image = record.image;
     cfg.agent_owned = true;
     cfg.key_already_loaded = true;
 
@@ -1259,8 +1315,12 @@ TEST(stop_agent_preserves_a_replacement_pid_sidecar) {
     ssh_reap_fn previous_reap;
     ssh_agent_record_t owned =
         synthetic_agent_record((pid_t)12345, UINT64_C(0x3132333435363738));
-    ssh_agent_record_t replacement =
-        synthetic_agent_record((pid_t)54321, UINT64_C(0x4142434445464748));
+    ssh_agent_record_t replacement = owned;
+
+    /* PID and process generation alone are not the durable identity. A
+     * same-generation replacement with a different kernel socket-peer tuple
+     * must not be reaped or consumed as the in-memory owned record. */
+    replacement.image.socket_peer_pid++;
 
     CHECK_EQ_INT(setup_agent_socket("work", sock, sizeof(sock)), 0);
     CHECK_EQ_INT(safe_snprintf(pid_path, sizeof(pid_path),
@@ -1276,11 +1336,14 @@ TEST(stop_agent_preserves_a_replacement_pid_sidecar) {
                               sizeof(cfg.agent_socket_arg)), 0);
     cfg.agent_pid = 12345;
     cfg.agent_generation = owned.generation;
+    cfg.agent_image = owned.image;
     cfg.agent_owned = true;
     cfg.key_already_loaded = true;
 
+    g_classify_agent_gone_calls = 0;
     previous_reap = ssh_manager_set_reap_fn(classify_agent_gone);
     CHECK_EQ_INT(ssh_stop_agent(&cfg), -1);
+    CHECK_EQ_INT(g_classify_agent_gone_calls, 0);
     CHECK(cfg.agent_owned);
     CHECK(cfg.key_already_loaded);
     CHECK_EQ_INT(cfg.agent_pid, 12345);
@@ -1562,8 +1625,8 @@ TEST(host_alias_handles_config_larger_than_64k) {
  * the bystander alive, and drop the sidecar as garbage. */
 TEST(reset_never_signals_bystander_pid_in_sidecar) {
     char dir[128], pid_path[256], sock_path[256];
+    char legacy_pid[64];
     struct timespec ts = { .tv_sec = 0, .tv_nsec = 100000000 }; /* 100ms */
-    ssh_agent_record_t record;
     pid_t pid;
     int status = 0;
 
@@ -1583,12 +1646,9 @@ TEST(reset_never_signals_bystander_pid_in_sidecar) {
 
     snprintf(pid_path, sizeof(pid_path), "%s/ssh-agent.work.pid", dir);
     snprintf(sock_path, sizeof(sock_path), "%s/ssh-agent.work.sock", dir);
-    memset(&record, 0, sizeof(record));
-    record.pid = pid;
-    CHECK_EQ_INT(ssh_manager_test_capture_process_generation(
-                     pid, &record.generation),
-                 0);
-    CHECK_EQ_INT(write_agent_sidecar("work", &record), 0);
+    CHECK(snprintf(legacy_pid, sizeof(legacy_pid), "%ld\n",
+                   (long)pid) > 0);
+    CHECK_EQ_INT(write_string_to_file(pid_path, legacy_pid, 0600), 0);
 
     CHECK_EQ_INT(ssh_manager_reset("work"), 0);
     nanosleep(&ts, NULL); /* let any (wrongly) sent signal land */

@@ -3,7 +3,9 @@
 #ifndef SSH_MANAGER_H
 #define SSH_MANAGER_H
 
+#include <stdbool.h>
 #include <stdint.h>
+#include <sys/stat.h>
 #include <sys/types.h> /* pid_t: don't rely on the includer's chain for it */
 
 #include "gitswitch.h"
@@ -42,8 +44,18 @@ typedef struct {
 } ssh_process_generation_t;
 
 typedef struct {
+    bool valid;
+    struct stat executable_identity;
+    uid_t effective_uid;
+    pid_t socket_peer_pid;
+    uid_t socket_peer_uid;
+    char executable_path[MAX_PATH_LEN];
+} ssh_process_image_t;
+
+typedef struct {
     pid_t pid;
     ssh_process_generation_t generation;
+    ssh_process_image_t image;
 } ssh_agent_record_t;
 
 /* SSH configuration structure */
@@ -53,6 +65,7 @@ typedef struct {
     char agent_socket_arg[MAX_PATH_LEN]; /* exact -a argument used to start it */
     pid_t agent_pid;
     ssh_process_generation_t agent_generation;
+    ssh_process_image_t agent_image;
     bool agent_owned;      /* Whether we started this agent */
     bool key_already_loaded; /* The isolated agent already holds the account key;
                               * reuse avoids a passphrase re-prompt. */
@@ -64,7 +77,9 @@ typedef struct {
  * OWNED means the recorded PID is conclusively the managed ssh-agent and is
  * still alive. UNRELATED means a live PID was conclusively proved to be a
  * different process. GONE means no process remains at that PID. Every failed,
- * inaccessible, truncated, or permission-denied inspection is INDETERMINATE.
+ * inaccessible or truncated inspection is INDETERMINATE. Linux may still
+ * classify a nondumpable OpenSSH agent as OWNED when its complete durable
+ * launch tuple, process generation, argv, and kernel socket peer all match.
  * REPLACED means the numeric PID now denotes a different process generation;
  * it never authorizes signaling, adoption, or recovery-name cleanup. Only
  * UNRELATED and GONE can authorize process-record cleanup, and callers must
@@ -86,12 +101,14 @@ typedef ssh_process_outcome_t (*ssh_process_identity_fn)(
     int runtime_dir_fd);
 typedef int (*ssh_process_generation_fn)(
     pid_t pid, ssh_process_generation_t *generation);
+typedef int (*ssh_process_image_fn)(pid_t pid, ssh_process_image_t *image);
 typedef int (*ssh_process_signal_fn)(pid_t pid, int signal_number);
 typedef int (*ssh_pidfd_open_fn)(pid_t pid);
 typedef int (*ssh_pidfd_signal_fn)(int pidfd, int signal_number);
 typedef struct {
     ssh_process_identity_fn identity;
     ssh_process_generation_fn generation;
+    ssh_process_image_fn image;
     ssh_process_signal_fn signal;
     ssh_pidfd_open_fn pidfd_open;
     ssh_pidfd_signal_fn pidfd_signal;
