@@ -121,6 +121,12 @@ static int g_switch_guard_hook_calls;
 static int g_switch_guard_replacement_rc;
 static struct stat g_switch_guard_displaced_stage;
 static struct stat g_switch_guard_replacement_stage;
+static bool g_switch_guard_drift_source_after_stage_sync;
+static int g_switch_guard_source_drift_calls;
+static int g_switch_guard_source_drift_rc;
+static char g_switch_guard_source_path[PATH_MAX];
+static struct stat g_switch_guard_source_before_drift;
+static struct stat g_switch_guard_source_after_drift;
 static volatile sig_atomic_t g_returning_signal_calls;
 
 typedef enum {
@@ -675,6 +681,28 @@ static int h1_force_ctime_only_drift(
     return -1;
 }
 
+static int drift_switch_guard_source_after_stage_sync(
+    switch_guard_test_stage_t stage, int directory_fd) {
+    (void)directory_fd;
+
+    if (stage != SWITCH_GUARD_INSTALL_AFTER_STAGE_SYNC ||
+        !g_switch_guard_drift_source_after_stage_sync) {
+        return 0;
+    }
+    g_switch_guard_drift_source_after_stage_sync = false;
+    g_switch_guard_source_drift_calls++;
+    g_switch_guard_source_drift_rc = lstat(
+        g_switch_guard_source_path,
+        &g_switch_guard_source_before_drift);
+    if (g_switch_guard_source_drift_rc == 0) {
+        g_switch_guard_source_drift_rc = h1_force_ctime_only_drift(
+            g_switch_guard_source_path,
+            &g_switch_guard_source_before_drift,
+            &g_switch_guard_source_after_drift);
+    }
+    return g_switch_guard_source_drift_rc;
+}
+
 static int fixture_setup(cli_owner_fixture_t *fixture) {
     memset(fixture, 0, sizeof(*fixture));
     if ((size_t)snprintf(fixture->root, sizeof(fixture->root),
@@ -835,6 +863,15 @@ static void h1_guard_case_end(h1_guard_case_t *guard_case) {
            sizeof(g_switch_guard_displaced_stage));
     memset(&g_switch_guard_replacement_stage, 0,
            sizeof(g_switch_guard_replacement_stage));
+    g_switch_guard_drift_source_after_stage_sync = false;
+    g_switch_guard_source_drift_calls = 0;
+    g_switch_guard_source_drift_rc = -1;
+    memset(g_switch_guard_source_path, 0,
+           sizeof(g_switch_guard_source_path));
+    memset(&g_switch_guard_source_before_drift, 0,
+           sizeof(g_switch_guard_source_before_drift));
+    memset(&g_switch_guard_source_after_drift, 0,
+           sizeof(g_switch_guard_source_after_drift));
     if (guard_case->guard) {
         config_switch_guard_abandon(&guard_case->guard);
     }
@@ -3854,6 +3891,77 @@ TEST(parent_guard_clear_rejects_same_bytes_on_replacement_inode) {
     ts_rm_rf(fixture.root);
 }
 
+TEST(parent_guard_probe_recovers_after_source_ctime_drift_and_abandon) {
+    cli_owner_fixture_t fixture = {0};
+    h1_guard_case_t guard_case = {0};
+    config_switch_guard_recovery_t recovery;
+    bool blocked = false;
+    int begin_result = -1;
+    int fixture_result;
+
+    fixture_result = h1_fixture_setup(&fixture);
+    CHECK_EQ_INT(fixture_result, 0);
+    if (fixture_result == 0) {
+        begin_result = h1_guard_case_begin(&fixture, &guard_case);
+    }
+    CHECK_EQ_INT(begin_result, 0);
+    if (begin_result == 0) {
+        CHECK_EQ_INT(
+            safe_strncpy(
+                g_switch_guard_source_path, fixture.config,
+                sizeof(g_switch_guard_source_path)),
+            0);
+        g_switch_guard_drift_source_after_stage_sync = true;
+        g_switch_guard_source_drift_calls = 0;
+        g_switch_guard_source_drift_rc = -1;
+        (void)gitswitch_test_set_switch_guard_hook(
+            drift_switch_guard_source_after_stage_sync);
+        CHECK_EQ_INT(
+            config_switch_guard_install_or_adopt(
+                guard_case.ctx, guard_case.target, GIT_SCOPE_GLOBAL,
+                guard_case.destinations, guard_case.destination_count,
+                &guard_case.guard),
+            0);
+        (void)gitswitch_test_set_switch_guard_hook(NULL);
+        CHECK_EQ_INT(g_switch_guard_source_drift_calls, 1);
+        CHECK_EQ_INT(g_switch_guard_source_drift_rc, 0);
+        CHECK(h1_same_file_state_without_ctime(
+            &g_switch_guard_source_before_drift,
+            &g_switch_guard_source_after_drift));
+        CHECK(!h1_same_ctime(
+            &g_switch_guard_source_before_drift,
+            &g_switch_guard_source_after_drift));
+        CHECK(guard_case.guard != NULL);
+        if (guard_case.guard) {
+            CHECK(config_switch_guard_was_created(guard_case.guard));
+
+            /* Dropping the only live handle models a process stop. The next
+             * probe must recover solely from durable namespace state. */
+            config_switch_guard_abandon(&guard_case.guard);
+            CHECK(!guard_case.guard);
+            memset(&recovery, 0, sizeof(recovery));
+            CHECK_EQ_INT(
+                config_switch_guard_probe(
+                    fixture.config, &blocked, &recovery),
+                0);
+            CHECK(blocked);
+            CHECK(recovery.valid);
+            CHECK_EQ_INT(
+                recovery.target.id, guard_case.target->id);
+            CHECK(strcmp(
+                recovery.target.incarnation,
+                guard_case.target->incarnation) == 0);
+            CHECK_EQ_INT(
+                recovery.effective_scope, GIT_SCOPE_GLOBAL);
+            CHECK_EQ_INT(
+                (int)recovery.destination_count,
+                (int)guard_case.destination_count);
+        }
+    }
+    h1_guard_case_end(&guard_case);
+    ts_rm_rf(fixture.root);
+}
+
 TEST(parent_guard_abandon_then_adopt_reuses_exact_authority) {
     unsigned char marker_before[16384] = {0};
     unsigned char marker_after[sizeof(marker_before)] = {0};
@@ -4030,6 +4138,8 @@ TEST_MAIN_BEGIN()
         parent_guard_initial_fstat_failure_preserves_replacement_for_retry);
     RUN_TEST(parent_guard_clear_accepts_exact_ctime_only_marker_drift);
     RUN_TEST(parent_guard_clear_rejects_same_bytes_on_replacement_inode);
+    RUN_TEST(
+        parent_guard_probe_recovers_after_source_ctime_drift_and_abandon);
     RUN_TEST(parent_guard_abandon_then_adopt_reuses_exact_authority);
     RUN_TEST(parent_guard_retain_republishes_exact_unlinked_marker);
 TEST_MAIN_END()

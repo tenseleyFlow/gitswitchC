@@ -3,6 +3,9 @@
  * main.c is excluded from unit-test links because it owns main(), so these
  * tests execute the built CLI in isolated HOME/XDG_RUNTIME_DIR trees. */
 #include "test.h"
+#include "config.h"
+#include "error.h"
+#include "git_ops.h"
 #include "gitswitch.h"
 #include "publication.h"
 #include "toml_parser.h"
@@ -1716,6 +1719,139 @@ TEST(valid_legacy_switch_migrates_before_publication) {
     unlink(output_path);
 }
 
+static int run_switch_source_generation_proof_case(void) {
+    pid_t child = fork();
+
+    if (child < 0) return -1;
+    if (child == 0) {
+        char home[128] = "", runtime[128] = "", config_dir[4096];
+        char config_path[8192], original_path[8192];
+        char git_config_path[8192], contents[CONFIG_DOCUMENT_MAX_SIZE + 1U];
+        struct stat original;
+        struct timespec times[2];
+        gitswitch_ctx_t *ctx = NULL;
+        publication_record_t *destinations = NULL;
+        account_t *target;
+        config_switch_guard_t *guard = NULL;
+        size_t destination_count = 0U;
+        int result = 210;
+
+        if (make_private_dir(home, sizeof(home),
+                             "gitswitch-ar07-source-home") != 0 ||
+            make_private_dir(runtime, sizeof(runtime),
+                             "gitswitch-ar07-source-run") != 0 ||
+            write_account_config(home, true, config_dir,
+                                 sizeof(config_dir)) != 0 ||
+            (size_t)snprintf(config_path, sizeof(config_path),
+                             "%s/accounts.toml", config_dir) >=
+                sizeof(config_path) ||
+            (size_t)snprintf(original_path, sizeof(original_path),
+                             "%s/accounts.original", config_dir) >=
+                sizeof(original_path) ||
+            (size_t)snprintf(git_config_path, sizeof(git_config_path),
+                             "%s/.gitconfig", home) >=
+                sizeof(git_config_path) ||
+            setenv("HOME", home, 1) != 0 ||
+            setenv("XDG_RUNTIME_DIR", runtime, 1) != 0 ||
+            setenv("GIT_CONFIG_GLOBAL", git_config_path, 1) != 0 ||
+            setenv("GIT_CONFIG_NOSYSTEM", "1", 1) != 0 ||
+            unsetenv("XDG_CONFIG_HOME") != 0 ||
+            unsetenv("GNUPGHOME") != 0) {
+            _exit(result);
+        }
+        ctx = calloc(1U, sizeof(*ctx));
+        destinations = calloc(
+            CONFIG_SWITCH_DESTINATION_MAX, sizeof(*destinations));
+        if (!ctx || !destinations || config_init(ctx) != 0) {
+            result = 211;
+            goto done;
+        }
+        target = config_find_account_exact(ctx, "new");
+        if (!target ||
+            git_config_snapshot(GIT_SCOPE_GLOBAL) != 0 ||
+            git_config_snapshot_export_destinations(
+                destinations, CONFIG_SWITCH_DESTINATION_MAX,
+                &destination_count) != 0) {
+            result = 212;
+            goto done;
+        }
+
+        /* Force a real ctime-only step after load. The guard must accept it
+         * only through the retained exact document witness and must retain
+         * that witness for its later clear proof. */
+        sleep(1);
+        if (chmod(config_path, 0400) != 0 ||
+            chmod(config_path, 0600) != 0 ||
+            config_switch_guard_install_or_adopt(
+                ctx, target, GIT_SCOPE_GLOBAL, destinations,
+                destination_count, &guard) != 0 ||
+            !guard || config_switch_guard_clear(&guard) != 0 || guard) {
+            result = 213;
+            goto done;
+        }
+
+        /* Exact bytes cannot authorize a replacement inode. Preserve the old
+         * inode to prevent reuse, reproduce its mode and mtime on the new
+         * pathname, and require fail-closed ESTALE admission. */
+        if (stat(config_path, &original) != 0 ||
+            slurp(config_path, contents, sizeof(contents))[0] == '\0' ||
+            rename(config_path, original_path) != 0 ||
+            write_text_mode(config_path, contents, 0600) != 0) {
+            result = 214;
+            goto done;
+        }
+#ifdef __APPLE__
+        times[0] = original.st_atimespec;
+        times[1] = original.st_mtimespec;
+#else
+        times[0] = original.st_atim;
+        times[1] = original.st_mtim;
+#endif
+        if (utimensat(AT_FDCWD, config_path, times, 0) != 0) {
+            result = 215;
+            goto done;
+        }
+        clear_error();
+        errno = 0;
+        if (config_switch_guard_install_or_adopt(
+                ctx, target, GIT_SCOPE_GLOBAL, destinations,
+                destination_count, &guard) == 0 ||
+            guard || errno != ESTALE) {
+            result = 216;
+            goto done;
+        }
+        result = 0;
+
+done:
+        if (guard) config_switch_guard_abandon(&guard);
+        git_config_commit();
+        free(destinations);
+        free(ctx);
+        if (home[0] != '\0') ts_rm_rf(home);
+        if (runtime[0] != '\0') ts_rm_rf(runtime);
+        _exit(result);
+    }
+    {
+        int status;
+        pid_t waited;
+
+        do {
+            waited = waitpid(child, &status, 0);
+        } while (waited < 0 && errno == EINTR);
+        return waited == child ? status : -1;
+    }
+}
+
+TEST(switch_source_generation_admits_only_proved_ctime_drift) {
+    int status = run_switch_source_generation_proof_case();
+
+    CHECK(status >= 0);
+    if (status >= 0) {
+        CHECK(WIFEXITED(status));
+        if (WIFEXITED(status)) CHECK_EQ_INT(WEXITSTATUS(status), 0);
+    }
+}
+
 TEST(production_ignores_inherited_test_fault_environment) {
     char home[128], runtime[128], config_dir[4096];
     char output_path[128], output[16384], path[8192], contents[16384];
@@ -1824,5 +1960,6 @@ TEST_MAIN_BEGIN()
     RUN_TEST(destructive_prompt_output_failure_blocks_authorization);
     RUN_TEST(unwritable_config_refuses_switch_before_identity_mutation);
     RUN_TEST(valid_legacy_switch_migrates_before_publication);
+    RUN_TEST(switch_source_generation_admits_only_proved_ctime_drift);
     RUN_TEST(production_ignores_inherited_test_fault_environment);
 TEST_MAIN_END()

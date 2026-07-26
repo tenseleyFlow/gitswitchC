@@ -4658,6 +4658,7 @@ void config_retirement_guard_abandon(
 #define CONFIG_SWITCH_LOCK_NAME ".switch.lock"
 #define CONFIG_SWITCH_GUARD_HEADER "gitswitch-switch-incomplete-v2"
 #define CONFIG_SWITCH_GUARD_MAX_BYTES (64U * 1024U)
+#define CONFIG_SWITCH_SOURCE_CONVERGENCE_MAX 3U
 
 typedef struct {
     char token[ACCOUNT_INCARNATION_LEN];
@@ -5861,22 +5862,93 @@ static int config_switch_guard_config_name(
     return 0;
 }
 
+static bool config_switch_source_identity_matches_after_exact_proof(
+    const publication_identity_t *before,
+    const publication_identity_t *after) {
+    return before && after &&
+           (publication_identity_equal(before, after) ||
+            (before->present && after->present &&
+             before->device == after->device &&
+             before->inode == after->inode &&
+             before->mode == after->mode &&
+             before->uid == after->uid &&
+             before->gid == after->gid &&
+             before->link_count == after->link_count &&
+             before->size == after->size &&
+             before->mtime_seconds == after->mtime_seconds &&
+             before->mtime_nanoseconds == after->mtime_nanoseconds &&
+             (before->ctime_seconds != after->ctime_seconds ||
+              before->ctime_nanoseconds != after->ctime_nanoseconds)));
+}
+
+static int config_switch_guard_source_observe_at(
+    int directory_fd, const char *config_name,
+    publication_identity_t *observed) {
+    struct stat named;
+    int saved_errno = ESTALE;
+
+    if (directory_fd < 0 || !config_name || !observed) {
+        errno = EINVAL;
+        return -1;
+    }
+    if (fstatat(
+            directory_fd, config_name, &named,
+            AT_SYMLINK_NOFOLLOW) != 0) {
+        saved_errno = config_is_namespace_change_errno(errno)
+                          ? ESTALE
+                          : (errno ? errno : EIO);
+        goto observe_fail;
+    }
+    if (!config_metadata_file_is_safe(&named, true)) {
+        saved_errno = ESTALE;
+        goto observe_fail;
+    }
+    publication_identity_from_stat(observed, &named);
+    return 0;
+
+observe_fail:
+    errno = saved_errno;
+    set_system_error(
+        ERR_FILE_IO,
+        "Switch recovery source generation is no longer current");
+    return -1;
+}
+
 static int config_switch_guard_source_matches_at(
     int directory_fd, const char *config_name,
-    const publication_identity_t *expected) {
+    const publication_identity_t *expected,
+    const unsigned char *expected_data, size_t expected_length,
+    publication_identity_t *accepted) {
     struct stat named_before;
     struct stat opened;
     struct stat descriptor_after;
     struct stat named_after;
     struct stat named_final;
     publication_identity_t observed;
+    unsigned char buffer[4096];
+    unsigned char trailing;
+    ssize_t trailing_count;
+    size_t offset = 0U;
     int fd = -1;
     int saved_errno = ESTALE;
 
     if (directory_fd < 0 || !config_name || !expected ||
-        !expected->present) {
+        !expected->present ||
+        (!expected_data && expected_length != 0U)) {
         errno = EINVAL;
         return -1;
+    }
+    if (!expected_data) {
+        if (config_switch_guard_source_observe_at(
+                directory_fd, config_name, &observed) != 0) {
+            return -1;
+        }
+        if (!publication_identity_equal(expected, &observed)) {
+            goto source_fail;
+        }
+        if (accepted) *accepted = observed;
+        secure_zero_memory(buffer, sizeof(buffer));
+        return 0;
     }
     if (fstatat(
             directory_fd, config_name, &named_before,
@@ -5884,6 +5956,16 @@ static int config_switch_guard_source_matches_at(
         saved_errno = config_is_namespace_change_errno(errno)
                           ? ESTALE
                           : (errno ? errno : EIO);
+        goto source_fail;
+    }
+    if (!config_metadata_file_is_safe(&named_before, true)) {
+        saved_errno = ESTALE;
+        goto source_fail;
+    }
+    publication_identity_from_stat(&observed, &named_before);
+    if (!config_switch_source_identity_matches_after_exact_proof(
+            expected, &observed) ||
+        observed.size != expected_length) {
         goto source_fail;
     }
     fd = openat(
@@ -5895,17 +5977,46 @@ static int config_switch_guard_source_matches_at(
                           : (errno ? errno : EIO);
         goto source_fail;
     }
-    if (!config_metadata_file_is_safe(&named_before, true) ||
-        !config_metadata_file_is_safe(&opened, true) ||
-        !config_metadata_snapshot_same(&named_before, &opened) ||
-        fstat(fd, &descriptor_after) != 0 ||
+    if (!config_metadata_file_is_safe(&opened, true) ||
+        !config_metadata_matches_after_exact_content_proof(
+            &named_before, &opened)) {
+        saved_errno = errno ? errno : ESTALE;
+        goto source_fail;
+    }
+    while (offset < expected_length) {
+        size_t length = expected_length - offset;
+
+        if (length > sizeof(buffer)) length = sizeof(buffer);
+        if (!config_pread_full(
+                fd, buffer, length, (off_t)offset) ||
+            memcmp(buffer, expected_data + offset, length) != 0) {
+            saved_errno = errno ? errno : ESTALE;
+            goto source_fail;
+        }
+        offset += length;
+    }
+    do {
+        trailing_count = pread(
+            fd, &trailing, 1, (off_t)expected_length);
+    } while (trailing_count < 0 && errno == EINTR);
+    if (trailing_count != 0) {
+        saved_errno = trailing_count < 0
+                          ? (errno ? errno : EIO)
+                          : ESTALE;
+        goto source_fail;
+    }
+    if (fstat(fd, &descriptor_after) != 0 ||
         fstatat(
             directory_fd, config_name, &named_after,
             AT_SYMLINK_NOFOLLOW) != 0 ||
         !config_metadata_file_is_safe(&descriptor_after, true) ||
         !config_metadata_file_is_safe(&named_after, true) ||
-        !config_metadata_snapshot_same(&opened, &descriptor_after) ||
-        !config_metadata_snapshot_same(&opened, &named_after)) {
+        !config_metadata_matches_after_exact_content_proof(
+            &opened, &descriptor_after) ||
+        !config_metadata_matches_after_exact_content_proof(
+            &opened, &named_after) ||
+        !config_metadata_matches_after_exact_content_proof(
+            &descriptor_after, &named_after)) {
         saved_errno = errno ? errno : ESTALE;
         goto source_fail;
     }
@@ -5919,19 +6030,24 @@ static int config_switch_guard_source_matches_at(
             directory_fd, config_name, &named_final,
             AT_SYMLINK_NOFOLLOW) != 0 ||
         !config_metadata_file_is_safe(&named_final, true) ||
-        !config_metadata_snapshot_same(&named_after, &named_final)) {
+        !config_metadata_matches_after_exact_content_proof(
+            &named_after, &named_final)) {
         saved_errno = errno ? errno : ESTALE;
         goto source_fail;
     }
     publication_identity_from_stat(&observed, &named_final);
-    if (!publication_identity_equal(expected, &observed)) {
+    if (!config_switch_source_identity_matches_after_exact_proof(
+            expected, &observed)) {
         saved_errno = ESTALE;
         goto source_fail;
     }
+    if (accepted) *accepted = observed;
+    secure_zero_memory(buffer, sizeof(buffer));
     return 0;
 
 source_fail:
     if (fd >= 0) close(fd);
+    secure_zero_memory(buffer, sizeof(buffer));
     errno = saved_errno;
     set_system_error(
         ERR_FILE_IO,
@@ -6454,7 +6570,14 @@ static int config_switch_guard_model_from_request(
         !config_switch_destinations_are_probes(
             destinations, destination_count) ||
         !config_metadata_file_is_safe(
-            &ctx->config.source_generation, true)) {
+            &ctx->config.source_generation, true) ||
+        (!ctx->config.source_witness_valid &&
+         !ctx->config.source_read_witness_valid) ||
+        ctx->config.source_generation.st_size < 0 ||
+        ctx->config.source_witness_length >
+            sizeof(ctx->config.source_witness) ||
+        (uintmax_t)ctx->config.source_generation.st_size !=
+            ctx->config.source_witness_length) {
         errno = EINVAL;
         set_error(ERR_INVALID_ARGS,
                   "Invalid switch guard installation request");
@@ -6870,14 +6993,18 @@ int config_switch_guard_install_or_adopt(
     struct stat directory_identity;
     struct stat stage_identity;
     struct stat published_identity;
+    publication_identity_t accepted_source;
+    publication_identity_t settled_source;
     unsigned char *expected_data = NULL;
     size_t expected_length = 0U;
+    size_t convergence_attempt;
     int directory_fd = -1;
     int lock_fd = -1;
     int result = -1;
     int saved_errno = EIO;
     bool stage_created = false;
     bool stage_identity_known = false;
+    bool source_converged = false;
 
     if (!guard || *guard) {
         errno = EINVAL;
@@ -6926,11 +7053,11 @@ int config_switch_guard_install_or_adopt(
             CONFIG_SWITCH_LOCK_NAME) != 0 ||
         config_switch_guard_reconcile_preintent_at(
             directory_fd, lock_fd, directory,
-            &directory_identity) != 0 ||
-        config_switch_guard_source_matches_at(
-            directory_fd, config_name,
-            &expected->source_generation) != 0 ||
-        config_switch_destinations_live(
+            &directory_identity) != 0) {
+        if (errno == 0) errno = ESTALE;
+        goto install_done;
+    }
+    if (config_switch_destinations_live(
             expected->destinations,
             expected->destination_count) != 0 ||
         config_switch_guard_snapshot_read_at(
@@ -7000,7 +7127,8 @@ int config_switch_guard_install_or_adopt(
                 &revalidated->marker_identity) ||
             config_switch_guard_source_matches_at(
                 directory_fd, config_name,
-                &expected->source_generation) != 0 ||
+                &expected->source_generation,
+                NULL, 0U, NULL) != 0 ||
             config_switch_destinations_live(
                 expected->destinations,
                 expected->destination_count) != 0 ||
@@ -7020,7 +7148,8 @@ int config_switch_guard_install_or_adopt(
                 &directory_identity,
                 &revalidated->marker_identity,
                 revalidated->marker_data,
-                revalidated->marker_length, expected,
+                revalidated->marker_length,
+                expected,
                 expected->token, false,
                 guard) != 0) {
             goto install_done;
@@ -7033,24 +7162,82 @@ int config_switch_guard_install_or_adopt(
         goto install_done;
     }
 
+    if (config_switch_guard_source_matches_at(
+            directory_fd, config_name,
+            &expected->source_generation,
+            ctx->config.source_witness,
+            ctx->config.source_witness_length,
+            &accepted_source) != 0) {
+        if (errno == 0) errno = ESTALE;
+        goto install_done;
+    }
+    expected->source_generation = accepted_source;
     if (generate_random_string(
             expected->token, sizeof(expected->token),
             hexadecimal) != 0 ||
-        !account_incarnation_is_valid(expected->token) ||
-        config_switch_guard_serialize(
-            expected, &expected_data,
-            &expected_length) != 0 ||
-        config_switch_guard_stage_write_at(
-            directory_fd, expected_data, expected_length,
-            &stage_identity, &stage_created,
-            &stage_identity_known) != 0 ||
-        SWITCH_GUARD_TEST_CHECKPOINT(
-            SWITCH_GUARD_INSTALL_AFTER_STAGE_SYNC,
-            directory_fd) != 0 ||
-        config_switch_guard_source_matches_at(
-            directory_fd, config_name,
-            &expected->source_generation) != 0 ||
-        config_switch_destinations_live(
+        !account_incarnation_is_valid(expected->token)) {
+        goto install_done;
+    }
+    for (convergence_attempt = 0U;
+         convergence_attempt < CONFIG_SWITCH_SOURCE_CONVERGENCE_MAX;
+         convergence_attempt++) {
+        if (config_switch_guard_serialize(
+                expected, &expected_data,
+                &expected_length) != 0 ||
+            config_switch_guard_stage_write_at(
+                directory_fd, expected_data, expected_length,
+                &stage_identity, &stage_created,
+                &stage_identity_known) != 0 ||
+            SWITCH_GUARD_TEST_CHECKPOINT(
+                SWITCH_GUARD_INSTALL_AFTER_STAGE_SYNC,
+                directory_fd) != 0 ||
+            config_switch_guard_source_matches_at(
+                directory_fd, config_name,
+                &expected->source_generation,
+                ctx->config.source_witness,
+                ctx->config.source_witness_length,
+                &accepted_source) != 0 ||
+            fsync(directory_fd) != 0 ||
+            config_switch_guard_source_observe_at(
+                directory_fd, config_name,
+                &settled_source) != 0) {
+            goto install_done;
+        }
+        if (!config_switch_source_identity_matches_after_exact_proof(
+                &accepted_source, &settled_source)) {
+            errno = ESTALE;
+            set_system_error(
+                ERR_FILE_IO,
+                "Switch recovery source changed while settling its durable generation");
+            goto install_done;
+        }
+        accepted_source = settled_source;
+        if (publication_identity_equal(
+                &expected->source_generation,
+                &accepted_source)) {
+            source_converged = true;
+            break;
+        }
+        if (config_switch_guard_cleanup_owned_stage_at(
+                directory_fd, lock_fd, directory,
+                &directory_identity, &stage_identity,
+                &stage_created) != 0) {
+            goto install_done;
+        }
+        expected->source_generation = accepted_source;
+        secure_zero_memory(expected_data, expected_length);
+        free(expected_data);
+        expected_data = NULL;
+        expected_length = 0U;
+    }
+    if (!source_converged) {
+        errno = ESTALE;
+        set_system_error(
+            ERR_FILE_IO,
+            "Switch recovery source generation did not converge before publication");
+        goto install_done;
+    }
+    if (config_switch_destinations_live(
             expected->destinations,
             expected->destination_count) != 0 ||
         verify_private_lock_file_at(
@@ -7083,9 +7270,13 @@ int config_switch_guard_install_or_adopt(
         memcmp(
             revalidated->marker_data, expected_data,
             expected_length) != 0 ||
+        !publication_identity_equal(
+            &revalidated->marker_model.source_generation,
+            &expected->source_generation) ||
         config_switch_guard_source_matches_at(
             directory_fd, config_name,
-            &expected->source_generation) != 0 ||
+            &expected->source_generation,
+            NULL, 0U, NULL) != 0 ||
         config_switch_destinations_live(
             expected->destinations,
             expected->destination_count) != 0 ||
@@ -7307,7 +7498,8 @@ int config_switch_guard_probe(
     }
     if (config_switch_guard_source_matches_at(
             directory_fd, config_name,
-            &snapshot.marker_model.source_generation) != 0 ||
+            &snapshot.marker_model.source_generation,
+            NULL, 0U, NULL) != 0 ||
         config_switch_destinations_live(
             snapshot.marker_model.destinations,
             snapshot.marker_model.destination_count) != 0 ||
@@ -7375,7 +7567,8 @@ int config_switch_guard_clear(config_switch_guard_t **guard_ptr) {
             guard->directory_fd, snapshot) != 0 ||
         config_switch_guard_source_matches_at(
             guard->directory_fd, guard->config_name,
-            &guard->model.source_generation) != 0 ||
+            &guard->model.source_generation,
+            NULL, 0U, NULL) != 0 ||
         config_switch_destinations_live(
             guard->model.destinations,
             guard->model.destination_count) != 0 ||
@@ -7493,7 +7686,8 @@ int config_switch_guard_retain(
             CONFIG_SWITCH_LOCK_NAME) != 0 ||
         config_switch_guard_source_matches_at(
             guard->directory_fd, guard->config_name,
-            &guard->model.source_generation) != 0 ||
+            &guard->model.source_generation,
+            NULL, 0U, NULL) != 0 ||
         config_switch_destinations_live(
             guard->model.destinations,
             guard->model.destination_count) != 0 ||
@@ -7582,7 +7776,8 @@ retain_recheck:
             guard->directory, &guard->directory_identity) ||
         config_switch_guard_source_matches_at(
             guard->directory_fd, guard->config_name,
-            &guard->model.source_generation) != 0 ||
+            &guard->model.source_generation,
+            NULL, 0U, NULL) != 0 ||
         config_switch_destinations_live(
             guard->model.destinations,
             guard->model.destination_count) != 0) {
