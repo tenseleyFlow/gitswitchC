@@ -152,11 +152,14 @@ int accounts_switch_abort(gitswitch_ctx_t *ctx,
                           bool continue_persistence_rollback);
 
 /**
- * Add new account interactively
- * - Prompts for account details
- * - Validates input
+ * Prepare an interactive account addition in the in-memory context.
+ * - Prompts for and validates account details
  * - Tests SSH/GPG configuration if provided
- * - Saves to configuration
+ * - Requires the caller to persist the configuration separately
+ * - After persistence, the caller must commit; on failure it must abort
+ *
+ * accounts_add_interactive() is a prepare+commit convenience for direct
+ * library callers. It does not save the configuration.
  */
 int accounts_add_interactive(gitswitch_ctx_t *ctx);
 int accounts_add_interactive_prepare(gitswitch_ctx_t *ctx);

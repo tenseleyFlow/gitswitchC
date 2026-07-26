@@ -205,19 +205,19 @@ int gpg_manager_resolve_executable(char *path, size_t path_size);
 int gpg_manager_cleanup(gpg_config_t *gpg_config);
 
 /**
- * Switch to account's GPG configuration with proper isolation
- * - Sets appropriate GNUPGHOME if using isolated mode
- * - Configures git signing key
- * - Enables/disables git commit signing
- * - Validates key exists and is usable
+ * Prepare the account's GPG runtime with proper isolation.
+ * - Resolves and validates the account's canonical signing key
+ * - Sets and retargets GNUPGHOME when using isolated mode
+ * - Records the selected key and signing preference in gpg_config
+ * - Does not modify Git configuration; gpg_configure_git_signing() does
  */
 int gpg_switch_account(gpg_config_t *gpg_config, const account_t *account);
 
 /**
- * Create isolated GNUPGHOME for account
- * - Creates directory with proper permissions (700)
- * - Imports account's GPG key if available
- * - Sets up basic GPG configuration
+ * Create or validate an isolated GNUPGHOME for an account.
+ * - Creates the directory with private permissions when absent
+ * - Sets up the managed GPG agent configuration
+ * - Does not import a key; gpg_switch_account() owns key transfer
  */
 int gpg_create_isolated_home(gpg_config_t *gpg_config, const account_t *account);
 

@@ -73,10 +73,10 @@ typedef struct {
 /* Function prototypes */
 
 /**
- * Initialize git operations
- * - Verify git is available
- * - Check git version compatibility
- * - Validate current repository if in local scope
+ * Initialize Git executable discovery.
+ * - Resolves a launch-eligible `git` from PATH
+ * - Caches only a successful availability check for this process
+ * - Does not execute a version check or inspect the current repository
  */
 int git_ops_init(void);
 
