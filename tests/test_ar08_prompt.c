@@ -25,6 +25,22 @@ typedef struct {
     int saved_fd;
 } redirected_stream_t;
 
+#ifdef HAVE_READLINE
+static int g_readline_fault_fd = -1;
+
+static int readline_pty_error_getc(FILE *stream) {
+    unsigned char byte;
+    ssize_t count;
+
+    (void)stream;
+    do {
+        count = read(g_readline_fault_fd, &byte, 1);
+    } while (count < 0 && errno == EINTR);
+    if (count == 1) return byte;
+    return EOF;
+}
+#endif
+
 static int g_unavailable_gpg_runner_calls;
 
 #define PROMPT_GPG_M5_MISS_STATUS \
@@ -474,6 +490,128 @@ TEST(input_error_is_distinct_from_eof) {
     }
     fclose(stream);
 }
+
+#ifdef HAVE_READLINE
+/* AR-14 L40: both standard streams are a PTY, so prompt_line must enter GNU
+ * readline rather than its redirected-stdio fallback. Readline's input
+ * callback performs a real read(2) from a write-only descriptor for that same
+ * PTY, deterministically producing EBADF without relying on platform-specific
+ * PTY-hangup EOF/EIO behavior. */
+TEST(readline_pty_input_error_is_distinct_from_eof) {
+    typedef struct {
+        int result;
+        int saved_errno;
+        int buffer_empty;
+        int stdin_is_tty;
+        int stdout_is_tty;
+    } readline_error_result_t;
+
+    readline_error_result_t observed = {0};
+    char *slave_name;
+    int master = -1;
+    int slave = -1;
+    int result_pipe[2] = {-1, -1};
+    size_t result_used = 0;
+    int status = 0;
+    pid_t child = -1;
+
+    master = posix_openpt(O_RDWR | O_NOCTTY);
+    CHECK(master >= 0);
+    if (master < 0) goto cleanup;
+    CHECK_EQ_INT(grantpt(master), 0);
+    CHECK_EQ_INT(unlockpt(master), 0);
+    slave_name = ptsname(master);
+    CHECK(slave_name != NULL);
+    if (!slave_name) goto cleanup;
+    slave = open(slave_name, O_RDWR | O_NOCTTY);
+    CHECK(slave >= 0);
+    if (slave < 0) goto cleanup;
+    CHECK_EQ_INT(pipe(result_pipe), 0);
+    if (result_pipe[0] < 0 || result_pipe[1] < 0) goto cleanup;
+
+    fflush(NULL);
+    child = fork();
+    CHECK(child >= 0);
+    if (child < 0) goto cleanup;
+    if (child == 0) {
+        char buffer[16] = "secret";
+        size_t written = 0;
+
+        close(result_pipe[0]);
+        if (dup2(slave, STDIN_FILENO) != STDIN_FILENO ||
+            dup2(slave, STDOUT_FILENO) != STDOUT_FILENO) {
+            _exit(2);
+        }
+        close(master);
+        close(slave);
+        clearerr(stdin);
+        clearerr(stdout);
+        observed.stdin_is_tty = isatty(STDIN_FILENO);
+        observed.stdout_is_tty = isatty(STDOUT_FILENO);
+        g_readline_fault_fd = open(slave_name, O_WRONLY | O_NOCTTY);
+        if (g_readline_fault_fd < 0) _exit(3);
+        rl_getc_function = readline_pty_error_getc;
+        alarm(3);
+        errno = 0;
+        observed.result = prompt_line("", buffer, sizeof(buffer), false);
+        observed.saved_errno = errno;
+        observed.buffer_empty = buffer[0] == '\0';
+        alarm(0);
+        close(g_readline_fault_fd);
+        g_readline_fault_fd = -1;
+
+        while (written < sizeof(observed)) {
+            ssize_t count = write(
+                result_pipe[1], (const char *)&observed + written,
+                sizeof(observed) - written);
+
+            if (count < 0 && errno == EINTR) continue;
+            if (count <= 0) _exit(4);
+            written += (size_t)count;
+        }
+        close(result_pipe[1]);
+        _exit(0);
+    }
+
+    close(result_pipe[1]);
+    result_pipe[1] = -1;
+    while (result_used < sizeof(observed)) {
+        ssize_t count = read(
+            result_pipe[0], (char *)&observed + result_used,
+            sizeof(observed) - result_used);
+
+        if (count < 0 && errno == EINTR) continue;
+        if (count <= 0) break;
+        result_used += (size_t)count;
+    }
+    CHECK_EQ_INT(waitpid(child, &status, 0), child);
+    child = -1;
+    CHECK(WIFEXITED(status));
+    if (WIFEXITED(status)) CHECK_EQ_INT(WEXITSTATUS(status), 0);
+    CHECK(result_used == sizeof(observed));
+    if (result_used == sizeof(observed)) {
+        CHECK(observed.stdin_is_tty);
+        CHECK(observed.stdout_is_tty);
+        CHECK_EQ_INT(observed.result, PROMPT_LINE_ERROR);
+        CHECK_EQ_INT(observed.saved_errno, EBADF);
+        CHECK(observed.buffer_empty);
+    }
+
+cleanup:
+    if (child > 0) {
+        (void)kill(child, SIGKILL);
+        (void)waitpid(child, NULL, 0);
+    }
+    if (result_pipe[0] >= 0) close(result_pipe[0]);
+    if (result_pipe[1] >= 0) close(result_pipe[1]);
+    if (slave >= 0) close(slave);
+    if (master >= 0) close(master);
+}
+#else
+TEST(readline_pty_input_error_is_distinct_from_eof) {
+    TS_SKIP("readline", "test requires a HAVE_READLINE build");
+}
+#endif
 
 #if defined(__GLIBC__)
 typedef struct {
@@ -1383,6 +1521,7 @@ TEST_MAIN_BEGIN()
     RUN_TEST(success_clears_stale_error_state);
     RUN_TEST(empty_line_is_accepted_as_an_empty_answer);
     RUN_TEST(input_error_is_distinct_from_eof);
+    RUN_TEST(readline_pty_input_error_is_distinct_from_eof);
 #if defined(__GLIBC__)
     RUN_TEST(partial_initial_read_error_clears_the_caller_buffer);
     RUN_TEST(drain_error_is_not_reported_as_truncation);
