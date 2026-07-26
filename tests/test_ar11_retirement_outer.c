@@ -291,6 +291,19 @@ static int m18_write_text(const char *path, const char *text, mode_t mode) {
     return text ? m18_write_file(path, text, strlen(text), mode) : -1;
 }
 
+static int m18_generate_ssh_key(const char *path) {
+    const char *argv[] = {
+        "ssh-keygen", "-q", "-t", "ed25519", "-N", "", "-f", path, NULL
+    };
+    run_opts_t opts;
+    run_result_t result;
+
+    memset(&opts, 0, sizeof(opts));
+    memset(&result, 0, sizeof(result));
+    opts.stderr_to_devnull = true;
+    return run_argv_real(argv, &opts, &result);
+}
+
 static int m18_read_bytes(const char *path, m18_bytes_t *bytes) {
     struct stat st;
     unsigned char *data;
@@ -412,8 +425,6 @@ static int m18_fixture_setup(m18_fixture_t *fixture) {
         "  printf '%s\\n' \"$*\" >> \"$GITSWITCH_TEST_GIT_TRACE\"\n"
         "fi\n"
         "exec git \"$@\"\n";
-    static const char key_body[] =
-        "-----BEGIN OPENSSH PRIVATE KEY-----\nfixture\n";
     /* The real runner rejects executables below a world-writable /tmp ancestor.
      * Keep this fixture under the checked-out, same-uid workspace so its
      * private git wrapper exercises the production trusted-PATH resolver. */
@@ -481,8 +492,7 @@ static int m18_fixture_setup(m18_fixture_t *fixture) {
         m18_write_file(fixture->ssh_program, ssh_program_body,
                        sizeof(ssh_program_body) - 1U, 0700) != 0 ||
         m18_write_file(fixture->git_trace_path, "", 0U, 0600) != 0 ||
-        m18_write_file(fixture->ssh_key, key_body,
-                       sizeof(key_body) - 1U, 0600) != 0 ||
+        m18_generate_ssh_key(fixture->ssh_key) != 0 ||
         safe_snprintf(fixture->ssh_command,
                       sizeof(fixture->ssh_command),
                       "'%s' -i '%s' -o IdentitiesOnly=yes",

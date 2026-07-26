@@ -97,8 +97,29 @@ static int prompt_gpg_m5_runner(const char *const argv[],
 static int unavailable_gpg_runner(const char *const argv[],
                                   const run_opts_t *opts,
                                   run_result_t *result) {
-    (void)argv;
-    (void)opts;
+    static const char key_listing[] =
+        "256 SHA256:AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA "
+        "prompt-fixture (ED25519)\n";
+
+    if (argv && argv[0] && argv[1] &&
+        strcmp(argv[0], "ssh-keygen") == 0 &&
+        strcmp(argv[1], "-lf") == 0) {
+        size_t listing_length = sizeof(key_listing) - 1U;
+
+        if (!opts || !opts->out || opts->out_size <= listing_length) {
+            errno = ENOSPC;
+            return -1;
+        }
+        memcpy(opts->out, key_listing, listing_length + 1U);
+        if (result) {
+            memset(result, 0, sizeof(*result));
+            result->spawned = true;
+            result->exit_code = 0;
+            result->out_len = listing_length;
+        }
+        return 0;
+    }
+
     g_unavailable_gpg_runner_calls++;
     if (result) {
         memset(result, 0, sizeof(*result));

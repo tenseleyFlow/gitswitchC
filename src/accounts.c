@@ -986,6 +986,36 @@ static bool abort_switch_failure(pending_switch_t *prepared,
     return true;
 }
 
+/* Keep the manager/preflight diagnostic causal while the checked abort path
+ * performs its own fallible cleanup and may publish rollback diagnostics. */
+static bool abort_switch_failure_preserving_cause(
+    pending_switch_t *prepared, const account_t *prev,
+    const char *prev_gpg_home, bool prev_gpg_present, bool git_written,
+    bool ssh_dirty, bool gpg_dirty, int runtime_lock_fd,
+    bool defer_signal_dispatch) {
+    error_context_t cause = *get_last_error();
+    int cause_errno = errno;
+    bool retained = abort_switch_failure(
+        prepared, prev, prev_gpg_home, prev_gpg_present, git_written,
+        ssh_dirty, gpg_dirty, runtime_lock_fd, defer_signal_dispatch);
+
+    if (!retained) {
+        g_last_error = cause;
+        errno = cause_errno;
+    }
+    return retained;
+}
+
+static int observe_git_config_commit(void *context) {
+    (void)context;
+    git_config_commit();
+    return 0;
+}
+
+static int observe_ssh_manager_cleanup(void *context) {
+    return ssh_manager_cleanup((ssh_config_t *)context);
+}
+
 /* Best-effort probes and informational output run only after the switch's
  * required commits are complete. In the CLI transaction that means after the
  * active-account file and resume hint have both committed. */
@@ -1381,21 +1411,41 @@ static int accounts_switch_impl(gitswitch_ctx_t *ctx, const char *identifier,
          * account's state is postponed past the point of no return (F4). */
         bool ssh_dirty = false, gpg_dirty = false;
         bool ssh_teardown_deferred = false, gpg_teardown_deferred = false;
+        ssh_key_admission_t *ssh_admission = NULL;
 
-        /* L17 (accounts half): the SSH key path is tilde-expanded and
-         * validated exactly ONCE, here. The copy of the account handed to the
-         * SSH layer below carries the expanded absolute path, so that layer's
-         * internal expand_path calls (switch, host alias, connection test)
-         * degrade to plain copies instead of repeating the $HOME resolution.
-         * Collapsing the SSH layer's own re-validation of the same file is
-         * the ssh_manager.c half of L17 (ticket T1). */
+        /* L17/M22 (accounts half): expand the SSH key path once and prove
+         * OpenSSH can parse one bounded descriptor-backed generation before
+         * any prior runtime is stopped. Retain that exact generation through
+         * the remaining preflight and activation; a final namespace proof
+         * immediately before teardown rejects an already-replaced path, while
+         * activation consumes the retained bytes even if the source changes
+         * later. The copy handed down carries the expanded absolute path. */
         /* --- 1. Validate availability up front (no mutation yet) --- */
         if (account->ssh_enabled && strlen(account->ssh_key_path) > 0) {
             char expanded_key[MAX_PATH_LEN];
-            if (expand_path(account->ssh_key_path, expanded_key, sizeof(expanded_key)) != 0 ||
-                ssh_validate_key_file(expanded_key) != 0) {
-                set_error(ERR_SSH_KEY_LOAD_FAILED,
-                          "SSH key not usable: %s", account->ssh_key_path);
+            uint64_t validation_generation = error_report_generation();
+
+            if (expand_path(account->ssh_key_path, expanded_key,
+                            sizeof(expanded_key)) != 0) {
+                if (error_report_generation() == validation_generation) {
+                    set_error(ERR_INVALID_PATH,
+                              "Cannot resolve SSH key path: %s",
+                              account->ssh_key_path);
+                }
+                runtime_state_lock_release(runtime_lock_fd);
+                return -1;
+            }
+            validation_generation = error_report_generation();
+            if (ssh_key_admission_begin(
+                    expanded_key, &ssh_admission) != 0) {
+                /* Preserve OpenSSH parse/launch/staging diagnostics. A
+                 * validation API that ever fails silently still receives a
+                 * bounded fallback rather than leaking stale error state. */
+                if (error_report_generation() == validation_generation) {
+                    set_error(ERR_SSH_KEY_LOAD_FAILED,
+                              "SSH key not usable: %s",
+                              account->ssh_key_path);
+                }
                 runtime_state_lock_release(runtime_lock_fd);
                 return -1;
             }
@@ -1423,12 +1473,14 @@ static int accounts_switch_impl(gitswitch_ctx_t *ctx, const char *identifier,
 
                 if (gpg_manager_isolated_home_present(account->name,
                                                       &isolated_present) != 0) {
+                    ssh_key_admission_end(&ssh_admission);
                     runtime_state_lock_release(runtime_lock_fd);
                     return -1;
                 }
                 if (!isolated_present) {
                     g_last_error = source_error;
                     errno = source_errno;
+                    ssh_key_admission_end(&ssh_admission);
                     runtime_state_lock_release(runtime_lock_fd);
                     return -1;
                 }
@@ -1444,6 +1496,7 @@ static int accounts_switch_impl(gitswitch_ctx_t *ctx, const char *identifier,
             char detail[sizeof(g_last_error.message)];
 
             safe_strncpy(detail, get_last_error()->message, sizeof(detail));
+            ssh_key_admission_end(&ssh_admission);
             runtime_state_lock_release(runtime_lock_fd);
             set_error(ERR_GIT_CONFIG_FAILED,
                       "Cannot snapshot Git configuration before switching: %s",
@@ -1511,11 +1564,36 @@ static int accounts_switch_impl(gitswitch_ctx_t *ctx, const char *identifier,
                 int preflight_errno = errno;
 
                 git_config_commit();
+                ssh_key_admission_end(&ssh_admission);
                 runtime_state_lock_release(runtime_lock_fd);
                 g_last_error = preflight_error;
                 errno = preflight_errno;
                 return -1;
             }
+        }
+
+        /* Final read-only generation checkpoint. The OpenSSH-parsed bytes
+         * remain retained after this proof, so a later pathname rename cannot
+         * substitute a key during activation. Rejecting a mismatch here keeps
+         * the previous SSH/GPG session untouched. */
+        if (ssh_admission &&
+            ssh_key_admission_verify_named(ssh_admission) != 0) {
+            ssh_key_admission_end(&ssh_admission);
+            if (write_git) {
+                (void)error_run_observational(
+                    observe_git_config_commit, NULL);
+            }
+            if (defer_commit) {
+                if (abort_switch_failure_preserving_cause(
+                        &prepared_owner, prev_account, prev_gpg_home,
+                        prev_gpg_present, false, false, false,
+                        runtime_lock_fd, defer_signal_dispatch)) {
+                    return -1;
+                }
+            } else {
+                runtime_state_lock_release(runtime_lock_fd);
+            }
+            return -1;
         }
 
         /* The recovery marker installed immediately above is intentionally
@@ -1534,6 +1612,7 @@ static int accounts_switch_impl(gitswitch_ctx_t *ctx, const char *identifier,
             error_context_t guard_error = *get_last_error();
             int guard_errno = errno;
 
+            ssh_key_admission_end(&ssh_admission);
             if (write_git) {
                 git_config_commit();
             }
@@ -1566,6 +1645,7 @@ static int accounts_switch_impl(gitswitch_ctx_t *ctx, const char *identifier,
             error_context_t rollback_error = *get_last_error();
             int rollback_errno = errno;
 
+            ssh_key_admission_end(&ssh_admission);
             if (write_git) git_config_commit();
             if (defer_commit) {
                 if (abort_switch_failure(
@@ -1597,6 +1677,7 @@ static int accounts_switch_impl(gitswitch_ctx_t *ctx, const char *identifier,
             bool rollback_complete = true;
 
             safe_strncpy(detail, get_last_error()->message, sizeof(detail));
+            ssh_key_admission_end(&ssh_admission);
             /* Cleanup is ordered SSH then GPG. A GPG restoration failure can
              * therefore arrive after the previous agent was already reaped.
              * Route through the central checked abort path so that exact SSH
@@ -1627,6 +1708,7 @@ static int accounts_switch_impl(gitswitch_ctx_t *ctx, const char *identifier,
         /* A signal may have arrived while the previous owned agent was being
          * stopped. Roll it back before attempting any new activation. */
         if (signals_pending()) {
+            ssh_key_admission_end(&ssh_admission);
             (void)abort_switch_failure(
                 defer_commit ? &prepared_owner : NULL,
                 prev_account, prev_gpg_home, prev_gpg_present, false,
@@ -1656,32 +1738,35 @@ static int accounts_switch_impl(gitswitch_ctx_t *ctx, const char *identifier,
              * stopped the prior owned agent. */
             if (ssh_manager_init(&g_session.ssh_config, SSH_AGENT_ISOLATED) != 0) {
                 printf("  [!!] SSH key failed to load\n");
-                if (abort_switch_failure(
+                ssh_key_admission_end(&ssh_admission);
+                if (abort_switch_failure_preserving_cause(
                         defer_commit ? &prepared_owner : NULL,
                         prev_account, prev_gpg_home, prev_gpg_present, false,
                         ssh_dirty, false, runtime_lock_fd,
                         defer_signal_dispatch)) {
                     return -1;
                 }
-                set_error(ERR_SSH_KEY_LOAD_FAILED,
-                          "Failed to set up SSH for account: %s", account->name);
                 return -1;
             }
             ssh_dirty = true;
-            if (ssh_switch_account(&g_session.ssh_config, &runtime_target) != 0) {
+            if (ssh_switch_account_admitted(
+                    &g_session.ssh_config, &runtime_target,
+                    ssh_admission) != 0) {
                 printf("  [!!] SSH key failed to load\n");
-                (void)ssh_manager_cleanup(&g_session.ssh_config);
-                if (abort_switch_failure(
+                ssh_key_admission_end(&ssh_admission);
+                (void)error_run_observational(
+                    observe_ssh_manager_cleanup,
+                    &g_session.ssh_config);
+                if (abort_switch_failure_preserving_cause(
                         defer_commit ? &prepared_owner : NULL,
                         prev_account, prev_gpg_home, prev_gpg_present, false,
                         ssh_dirty, false, runtime_lock_fd,
                         defer_signal_dispatch)) {
                     return -1;
                 }
-                set_error(ERR_SSH_KEY_LOAD_FAILED,
-                          "Failed to set up SSH for account: %s", account->name);
                 return -1;
             }
+            ssh_key_admission_end(&ssh_admission);
             ssh_ok = true;
             g_session.ssh_active = true;
             printf("  [OK] SSH key loaded\n");

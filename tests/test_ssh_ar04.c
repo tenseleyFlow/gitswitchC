@@ -31,6 +31,7 @@
 
 static char g_xdg[64]; /* keep AF_UNIX paths below sun_path's small cap */
 static int g_runner_calls;
+static int g_agent_spawn_calls;
 static pid_t g_post_spawn_agent_pid = -1;
 
 static int test_write_exact(int fd, const void *buf, size_t len) {
@@ -361,6 +362,7 @@ static int fake_agent_runner(const char *const argv[], const run_opts_t *opts,
 
     if (strcmp(argv[0], "ssh-agent") == 0) {
         const char *sock = agent_socket_arg(argv);
+        g_agent_spawn_calls++;
         if (!sock || bind_socket_for_runner(sock, opts) != 0) return -1;
         if (opts && opts->out) {
             snprintf(opts->out, opts->out_size,
@@ -1104,11 +1106,13 @@ TEST(fresh_agent_aborts_when_orphan_cleanup_is_incomplete) {
     make_account(&account);
 
     g_runner_calls = 0;
+    g_agent_spawn_calls = 0;
     previous = run_set_runner(fake_agent_runner);
     CHECK_EQ_INT(ssh_start_isolated_agent(&cfg, &account), -1);
     run_set_runner(previous);
 
-    CHECK_EQ_INT(g_runner_calls, 0); /* no replacement agent was started */
+    CHECK(g_runner_calls >= 1); /* full key admission ran before cleanup */
+    CHECK_EQ_INT(g_agent_spawn_calls, 0); /* no replacement agent was started */
     CHECK(entry_exists(stale_pid));
     CHECK(entry_exists(stale_sock));
     CHECK(!entry_exists(new_sock));

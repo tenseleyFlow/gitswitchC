@@ -242,6 +242,19 @@ static int m17_git_config(const char *path, const char *operation,
     return result.spawned ? result.exit_code : -1;
 }
 
+static int m17_generate_ssh_key(const char *path) {
+    const char *argv[] = {
+        "ssh-keygen", "-q", "-t", "ed25519", "-N", "", "-f", path, NULL
+    };
+    run_opts_t opts;
+    run_result_t result;
+
+    memset(&opts, 0, sizeof(opts));
+    memset(&result, 0, sizeof(result));
+    opts.stderr_to_devnull = true;
+    return run_argv_real(argv, &opts, &result);
+}
+
 static int m17_make_record(m17_fixture_t *fixture, size_t index) {
     publication_record_t *record;
     struct stat st;
@@ -326,8 +339,6 @@ cleanup:
 static int m17_fixture_setup(m17_fixture_t *fixture,
                              bool credentialled, bool with_ledger) {
     static const char ssh_program_body[] = "#!/bin/sh\nexit 0\n";
-    static const char key_body[] =
-        "-----BEGIN OPENSSH PRIVATE KEY-----\nfixture\n";
     static const char git_marker[] = "[fixture]\n\tmarker = keep\n";
     static const char replacement[] =
         "[fixture]\n\tmarker = external-replacement\n";
@@ -385,8 +396,7 @@ static int m17_fixture_setup(m17_fixture_t *fixture,
     }
     if (m17_write_file(fixture->ssh_program, ssh_program_body,
                        sizeof(ssh_program_body) - 1U, 0700) != 0 ||
-        m17_write_file(fixture->ssh_key, key_body,
-                       sizeof(key_body) - 1U, 0600) != 0 ||
+        (credentialled && m17_generate_ssh_key(fixture->ssh_key) != 0) ||
         safe_snprintf(fixture->ssh_command,
                       sizeof(fixture->ssh_command),
                       "'%s' -i '%s' -o IdentitiesOnly=yes",

@@ -435,6 +435,71 @@ done:
     return result;
 }
 
+static int generate_fixture_ssh_key(const char *path) {
+    char ssh_keygen_path[PATH_MAX];
+    const char *argv[] = {
+        ssh_keygen_path, "-q", "-t", "ed25519", "-N", "", "-f", path, NULL
+    };
+    run_opts_t opts;
+    run_result_t result;
+
+    if (!path ||
+        find_fixture_executable("ssh-keygen", ssh_keygen_path,
+                                sizeof(ssh_keygen_path)) != 0) {
+        return -1;
+    }
+    memset(&opts, 0, sizeof(opts));
+    memset(&result, 0, sizeof(result));
+    opts.stderr_to_devnull = true;
+    return run_argv_real(argv, &opts, &result);
+}
+
+static int life_reap_attempts;
+
+static ssh_process_outcome_t count_and_refuse_session_reap(
+    const ssh_agent_record_t *record, const char *socket_arg,
+    int runtime_dir_fd) {
+    (void)record;
+    (void)socket_arg;
+    (void)runtime_dir_fd;
+    life_reap_attempts++;
+    return SSH_PROCESS_OWNED;
+}
+
+static char life_activation_key_path[PATH_MAX];
+static char life_activation_replacement_path[PATH_MAX];
+static int life_activation_replacement_attempts;
+static int life_activation_replacement_result;
+static int life_activation_agent_launches;
+
+static int replace_key_after_admission_parse(
+    const char *const argv[], const run_opts_t *opts,
+    run_result_t *result) {
+    const char *leaf = NULL;
+    int rc;
+
+    if (argv && argv[0]) {
+        leaf = strrchr(argv[0], '/');
+        leaf = leaf ? leaf + 1 : argv[0];
+        if (strcmp(leaf, "ssh-agent") == 0) {
+            life_activation_agent_launches++;
+        }
+    }
+    rc = run_argv_real(argv, opts, result);
+    /* The first ssh-keygen -lf in this instrumented switch is the account
+     * admission parse. Replace the configured name only after OpenSSH has
+     * accepted the original descriptor-backed generation. */
+    if (rc == 0 && leaf && strcmp(leaf, "ssh-keygen") == 0 &&
+        argv[1] && strcmp(argv[1], "-lf") == 0 &&
+        life_activation_replacement_attempts == 0) {
+        life_activation_replacement_attempts++;
+        life_activation_replacement_result =
+            rename(life_activation_replacement_path,
+                   life_activation_key_path);
+    }
+    return rc;
+}
+
 static int prepare_shims(char *shim_dir, size_t size) {
     char path[1024], true_path[PATH_MAX], git_path[PATH_MAX];
 
@@ -489,10 +554,7 @@ TEST(active_live_field_edits_are_rejected_without_mutation) {
     CHECK_EQ_INT(make_temp_dir(runtime, sizeof(runtime)), 0);
     CHECK_EQ_INT(prepare_shims(shims, sizeof(shims)), 0);
     snprintf(key, sizeof(key), "%s/new-key", runtime);
-    CHECK_EQ_INT(write_text(key,
-                            "-----BEGIN OPENSSH PRIVATE KEY-----\n"
-                            "test\n-----END OPENSSH PRIVATE KEY-----\n",
-                            0600), 0);
+    CHECK_EQ_INT(generate_fixture_ssh_key(key), 0);
     snprintf(ssh_input, sizeof(ssh_input), "\n\n\n%s\n\n\n\n", key);
     inputs[0] = "renamed\n\n\n\n\n\n";
     inputs[1] = "\nnew@example.com\n\n\n\n\n";
@@ -673,10 +735,7 @@ TEST(active_description_edit_and_inactive_live_edits_still_work) {
 
     CHECK_EQ_INT(prepare_home(home, inactive_config), 0);
     snprintf(key, sizeof(key), "%s/inactive-key", runtime);
-    CHECK_EQ_INT(write_text(key,
-                            "-----BEGIN OPENSSH PRIVATE KEY-----\n"
-                            "test\n-----END OPENSSH PRIVATE KEY-----\n",
-                            0600), 0);
+    CHECK_EQ_INT(generate_fixture_ssh_key(key), 0);
     snprintf(input, sizeof(input),
              "\n\n\n%s\ngithub.com-work\ngithub.com\nABCDEF0123456789\ny\n\n",
              key);
@@ -865,6 +924,405 @@ static void exercise_remove_runtime_teardown(const char *ssh_agent_path) {
 
     remove_tree(home);
     remove_tree(runtime);
+}
+
+/* AR-14 M22: OpenSSH usability is read-only switch admission. A repeated
+ * switch must parse the new target before it attempts to reap the process-
+ * local agent owned by the preceding successful switch. Otherwise malformed
+ * private-key armor can needlessly stop a working session and replace the
+ * useful parse diagnostic with a cleanup/rollback error. */
+TEST(malformed_private_key_fails_before_prior_session_teardown) {
+    char home[256], runtime[256], valid_key[1024], invalid_key[1024];
+    char config_path[1024], git_config[1024], config_body[4096];
+    char current_socket[1024], target_before[1024], target_after[1024];
+    char saved_home[PATH_MAX] = "";
+    char saved_runtime[PATH_MAX] = "";
+    char saved_git_config[PATH_MAX] = "";
+    char saved_git_nosystem[64] = "";
+    char saved_git_count[64] = "";
+    const char *environment_value;
+    bool had_home;
+    bool had_runtime;
+    bool had_git_config;
+    bool had_git_nosystem;
+    bool had_git_count;
+    gitswitch_ctx_t ctx;
+    error_context_t observed_error;
+    ssh_reap_fn previous_reap;
+    ssize_t before_length;
+    ssize_t after_length;
+    int switch_result;
+    int cleanup_result;
+    int observed_reaps;
+
+    if (!command_exists("ssh-agent") || !command_exists("ssh-add") ||
+        !command_exists("ssh-keygen")) {
+        TS_SKIP("openssh",
+                "ssh-agent, ssh-add, and ssh-keygen are required");
+    }
+
+    environment_value = getenv("HOME");
+    had_home = environment_value != NULL;
+    if (had_home) {
+        CHECK_EQ_INT(safe_strncpy(saved_home, environment_value,
+                                  sizeof(saved_home)),
+                     0);
+    }
+    environment_value = getenv("XDG_RUNTIME_DIR");
+    had_runtime = environment_value != NULL;
+    if (had_runtime) {
+        CHECK_EQ_INT(safe_strncpy(saved_runtime, environment_value,
+                                  sizeof(saved_runtime)),
+                     0);
+    }
+    environment_value = getenv("GIT_CONFIG_GLOBAL");
+    had_git_config = environment_value != NULL;
+    if (had_git_config) {
+        CHECK_EQ_INT(safe_strncpy(saved_git_config, environment_value,
+                                  sizeof(saved_git_config)),
+                     0);
+    }
+    environment_value = getenv("GIT_CONFIG_NOSYSTEM");
+    had_git_nosystem = environment_value != NULL;
+    if (had_git_nosystem) {
+        CHECK_EQ_INT(safe_strncpy(saved_git_nosystem, environment_value,
+                                  sizeof(saved_git_nosystem)),
+                     0);
+    }
+    environment_value = getenv("GIT_CONFIG_COUNT");
+    had_git_count = environment_value != NULL;
+    if (had_git_count) {
+        CHECK_EQ_INT(safe_strncpy(saved_git_count, environment_value,
+                                  sizeof(saved_git_count)),
+                     0);
+    }
+
+    CHECK_EQ_INT(make_temp_dir(home, sizeof(home)), 0);
+    CHECK_EQ_INT(make_temp_dir(runtime, sizeof(runtime)), 0);
+    CHECK_EQ_INT(accounts_session_cleanup(), 0);
+    snprintf(valid_key, sizeof(valid_key), "%s/valid-key", runtime);
+    snprintf(invalid_key, sizeof(invalid_key), "%s/invalid-key", runtime);
+    CHECK_EQ_INT(generate_fixture_ssh_key(valid_key), 0);
+    CHECK_EQ_INT(write_text(
+                     invalid_key,
+                     "-----BEGIN OPENSSH PRIVATE KEY-----\n"
+                     "not-a-valid-openssh-private-key\n"
+                     "-----END OPENSSH PRIVATE KEY-----\n",
+                     0600),
+                 0);
+    snprintf(config_body, sizeof(config_body),
+             "[settings]\n"
+             "default_scope = \"global\"\n"
+             "\n"
+             "[accounts.1]\n"
+             "incarnation = \"" LIFE_WORK_INCARNATION "\"\n"
+             "name = \"work\"\n"
+             "email = \"work@example.com\"\n"
+             "preferred_scope = \"global\"\n"
+             "ssh_key = \"%s\"\n"
+             "\n"
+             "[accounts.2]\n"
+             "incarnation = \"" LIFE_OTHER_INCARNATION "\"\n"
+             "name = \"broken\"\n"
+             "email = \"broken@example.com\"\n"
+             "preferred_scope = \"global\"\n"
+             "ssh_key = \"%s\"\n",
+             valid_key, valid_key);
+    CHECK_EQ_INT(prepare_home(home, config_body), 0);
+    snprintf(config_path, sizeof(config_path),
+             "%s/.config/gitswitch/accounts.toml", home);
+    snprintf(git_config, sizeof(git_config), "%s/.gitconfig", home);
+    CHECK_EQ_INT(setenv("HOME", home, 1), 0);
+    CHECK_EQ_INT(setenv("XDG_RUNTIME_DIR", runtime, 1), 0);
+    CHECK_EQ_INT(setenv("GIT_CONFIG_GLOBAL", git_config, 1), 0);
+    CHECK_EQ_INT(setenv("GIT_CONFIG_NOSYSTEM", "1", 1), 0);
+    CHECK_EQ_INT(unsetenv("GIT_CONFIG_COUNT"), 0);
+
+    memset(&ctx, 0, sizeof(ctx));
+    CHECK_EQ_INT(config_load(&ctx, config_path), 0);
+    ctx.config.force_global = true;
+    ctx.config.assume_yes = true;
+    CHECK_EQ_INT(accounts_switch(&ctx, "work"), 0);
+    CHECK(ctx.current_account == &ctx.accounts[0]);
+
+    snprintf(current_socket, sizeof(current_socket),
+             "%s/gitswitch-ssh/current.sock", runtime);
+    before_length =
+        readlink(current_socket, target_before, sizeof(target_before) - 1U);
+    CHECK(before_length > 0);
+    if (before_length > 0) target_before[before_length] = '\0';
+
+    CHECK_EQ_INT(safe_strncpy(ctx.accounts[1].ssh_key_path, invalid_key,
+                              sizeof(ctx.accounts[1].ssh_key_path)),
+                 0);
+    life_reap_attempts = 0;
+    previous_reap =
+        ssh_manager_set_reap_fn(count_and_refuse_session_reap);
+    clear_error();
+    switch_result = accounts_switch(&ctx, "broken");
+    observed_error = *get_last_error();
+    observed_reaps = life_reap_attempts;
+    ssh_manager_set_reap_fn(previous_reap);
+
+    after_length =
+        readlink(current_socket, target_after, sizeof(target_after) - 1U);
+    if (after_length > 0) target_after[after_length] = '\0';
+    cleanup_result = accounts_session_cleanup();
+
+    CHECK_EQ_INT(switch_result, -1);
+    CHECK_EQ_INT(observed_reaps, 0);
+    CHECK_EQ_INT(observed_error.code, ERR_SSH_KEY_INVALID);
+    CHECK(strstr(observed_error.message, "OpenSSH") != NULL ||
+          strstr(observed_error.message, "private key") != NULL);
+    CHECK(ctx.current_account == &ctx.accounts[0]);
+    CHECK_STR_EQ(ctx.config.active_account, "work");
+    CHECK(after_length > 0);
+    if (before_length > 0 && after_length > 0) {
+        CHECK_STR_EQ(target_after, target_before);
+    }
+    CHECK_EQ_INT(cleanup_result, 0);
+
+    CHECK_EQ_INT(had_git_count
+                     ? setenv("GIT_CONFIG_COUNT", saved_git_count, 1)
+                     : unsetenv("GIT_CONFIG_COUNT"),
+                 0);
+    CHECK_EQ_INT(had_git_nosystem
+                     ? setenv("GIT_CONFIG_NOSYSTEM", saved_git_nosystem, 1)
+                     : unsetenv("GIT_CONFIG_NOSYSTEM"),
+                 0);
+    CHECK_EQ_INT(had_git_config
+                     ? setenv("GIT_CONFIG_GLOBAL", saved_git_config, 1)
+                     : unsetenv("GIT_CONFIG_GLOBAL"),
+                 0);
+    CHECK_EQ_INT(had_runtime
+                     ? setenv("XDG_RUNTIME_DIR", saved_runtime, 1)
+                     : unsetenv("XDG_RUNTIME_DIR"),
+                 0);
+    CHECK_EQ_INT(had_home ? setenv("HOME", saved_home, 1)
+                          : unsetenv("HOME"),
+                 0);
+    remove_tree(home);
+    remove_tree(runtime);
+}
+
+/* AR-14 M22: replace a target immediately after OpenSSH accepts the
+ * descriptor-backed admission generation. The final pathname proof must
+ * reject that generation change before the prior healthy session is reaped
+ * or a replacement agent is launched. Exercise both another valid key and
+ * malformed private-key armor: identity continuity, not reparsing the new
+ * pathname, owns the rejection. */
+static void exercise_activation_generation_replacement(
+    bool valid_replacement) {
+    char home[256], runtime[256], prior_key[1024], target_key[1024];
+    char staged_replacement_key[1024], config_path[1024], git_config[1024];
+    char config_body[4096], current_socket[1024];
+    char target_socket[1024], target_pid[1024];
+    char target_before[1024], target_after[1024];
+    char saved_home[PATH_MAX] = "";
+    char saved_runtime[PATH_MAX] = "";
+    char saved_git_config[PATH_MAX] = "";
+    char saved_git_nosystem[64] = "";
+    char saved_git_count[64] = "";
+    const char *environment_value;
+    bool had_home;
+    bool had_runtime;
+    bool had_git_config;
+    bool had_git_nosystem;
+    bool had_git_count;
+    gitswitch_ctx_t ctx;
+    command_runner_fn previous_runner;
+    error_context_t observed_error;
+    ssh_reap_fn previous_reap;
+    ssize_t before_length;
+    ssize_t after_length;
+    int switch_result;
+    int cleanup_result;
+    int observed_agent_launches;
+    int observed_reaps;
+
+    if (!command_exists("ssh-agent") || !command_exists("ssh-add") ||
+        !command_exists("ssh-keygen")) {
+        TS_SKIP("openssh",
+                "ssh-agent, ssh-add, and ssh-keygen are required");
+    }
+
+    environment_value = getenv("HOME");
+    had_home = environment_value != NULL;
+    if (had_home) {
+        CHECK_EQ_INT(safe_strncpy(saved_home, environment_value,
+                                  sizeof(saved_home)),
+                     0);
+    }
+    environment_value = getenv("XDG_RUNTIME_DIR");
+    had_runtime = environment_value != NULL;
+    if (had_runtime) {
+        CHECK_EQ_INT(safe_strncpy(saved_runtime, environment_value,
+                                  sizeof(saved_runtime)),
+                     0);
+    }
+    environment_value = getenv("GIT_CONFIG_GLOBAL");
+    had_git_config = environment_value != NULL;
+    if (had_git_config) {
+        CHECK_EQ_INT(safe_strncpy(saved_git_config, environment_value,
+                                  sizeof(saved_git_config)),
+                     0);
+    }
+    environment_value = getenv("GIT_CONFIG_NOSYSTEM");
+    had_git_nosystem = environment_value != NULL;
+    if (had_git_nosystem) {
+        CHECK_EQ_INT(safe_strncpy(saved_git_nosystem, environment_value,
+                                  sizeof(saved_git_nosystem)),
+                     0);
+    }
+    environment_value = getenv("GIT_CONFIG_COUNT");
+    had_git_count = environment_value != NULL;
+    if (had_git_count) {
+        CHECK_EQ_INT(safe_strncpy(saved_git_count, environment_value,
+                                  sizeof(saved_git_count)),
+                     0);
+    }
+
+    CHECK_EQ_INT(make_temp_dir(home, sizeof(home)), 0);
+    CHECK_EQ_INT(make_temp_dir(runtime, sizeof(runtime)), 0);
+    CHECK_EQ_INT(accounts_session_cleanup(), 0);
+    snprintf(prior_key, sizeof(prior_key), "%s/prior-key", runtime);
+    snprintf(target_key, sizeof(target_key), "%s/target-key", runtime);
+    snprintf(staged_replacement_key, sizeof(staged_replacement_key),
+             "%s/target-key.replacement", runtime);
+    CHECK_EQ_INT(generate_fixture_ssh_key(prior_key), 0);
+    CHECK_EQ_INT(generate_fixture_ssh_key(target_key), 0);
+    if (valid_replacement) {
+        CHECK_EQ_INT(generate_fixture_ssh_key(staged_replacement_key), 0);
+    } else {
+        CHECK_EQ_INT(write_text(
+                         staged_replacement_key,
+                         "-----BEGIN OPENSSH PRIVATE KEY-----\n"
+                         "shape-valid-but-not-an-openssh-private-key\n"
+                         "-----END OPENSSH PRIVATE KEY-----\n",
+                         0600),
+                     0);
+    }
+    snprintf(config_body, sizeof(config_body),
+             "[settings]\n"
+             "default_scope = \"global\"\n"
+             "\n"
+             "[accounts.1]\n"
+             "incarnation = \"" LIFE_WORK_INCARNATION "\"\n"
+             "name = \"work\"\n"
+             "email = \"work@example.com\"\n"
+             "preferred_scope = \"global\"\n"
+             "ssh_key = \"%s\"\n"
+             "\n"
+             "[accounts.2]\n"
+             "incarnation = \"" LIFE_OTHER_INCARNATION "\"\n"
+             "name = \"replacement\"\n"
+             "email = \"replacement@example.com\"\n"
+             "preferred_scope = \"global\"\n"
+             "ssh_key = \"%s\"\n",
+             prior_key, target_key);
+    CHECK_EQ_INT(prepare_home(home, config_body), 0);
+    snprintf(config_path, sizeof(config_path),
+             "%s/.config/gitswitch/accounts.toml", home);
+    snprintf(git_config, sizeof(git_config), "%s/.gitconfig", home);
+    CHECK_EQ_INT(setenv("HOME", home, 1), 0);
+    CHECK_EQ_INT(setenv("XDG_RUNTIME_DIR", runtime, 1), 0);
+    CHECK_EQ_INT(setenv("GIT_CONFIG_GLOBAL", git_config, 1), 0);
+    CHECK_EQ_INT(setenv("GIT_CONFIG_NOSYSTEM", "1", 1), 0);
+    CHECK_EQ_INT(unsetenv("GIT_CONFIG_COUNT"), 0);
+
+    memset(&ctx, 0, sizeof(ctx));
+    CHECK_EQ_INT(config_load(&ctx, config_path), 0);
+    ctx.config.force_global = true;
+    ctx.config.assume_yes = true;
+    CHECK_EQ_INT(accounts_switch(&ctx, "work"), 0);
+    CHECK(ctx.current_account == &ctx.accounts[0]);
+
+    snprintf(current_socket, sizeof(current_socket),
+             "%s/gitswitch-ssh/current.sock", runtime);
+    snprintf(target_socket, sizeof(target_socket),
+             "%s/gitswitch-ssh/ssh-agent.replacement.sock", runtime);
+    snprintf(target_pid, sizeof(target_pid),
+             "%s/gitswitch-ssh/ssh-agent.replacement.pid", runtime);
+    before_length =
+        readlink(current_socket, target_before, sizeof(target_before) - 1U);
+    CHECK(before_length > 0);
+    if (before_length > 0) target_before[before_length] = '\0';
+
+    CHECK_EQ_INT(safe_strncpy(life_activation_key_path, target_key,
+                              sizeof(life_activation_key_path)),
+                 0);
+    CHECK_EQ_INT(safe_strncpy(life_activation_replacement_path,
+                              staged_replacement_key,
+                              sizeof(life_activation_replacement_path)),
+                 0);
+    life_activation_replacement_attempts = 0;
+    life_activation_replacement_result = -1;
+    life_activation_agent_launches = 0;
+    life_reap_attempts = 0;
+    previous_reap =
+        ssh_manager_set_reap_fn(count_and_refuse_session_reap);
+    previous_runner =
+        run_set_runner(replace_key_after_admission_parse);
+    clear_error();
+    switch_result = accounts_switch(&ctx, "replacement");
+    observed_error = *get_last_error();
+    observed_reaps = life_reap_attempts;
+    observed_agent_launches = life_activation_agent_launches;
+    run_set_runner(previous_runner);
+    ssh_manager_set_reap_fn(previous_reap);
+
+    after_length =
+        readlink(current_socket, target_after, sizeof(target_after) - 1U);
+    if (after_length > 0) target_after[after_length] = '\0';
+    cleanup_result = accounts_session_cleanup();
+
+    CHECK_EQ_INT(life_activation_replacement_result, 0);
+    CHECK_EQ_INT(life_activation_replacement_attempts, 1);
+    CHECK_EQ_INT(switch_result, -1);
+    CHECK_EQ_INT(observed_reaps, 0);
+    CHECK_EQ_INT(observed_agent_launches, 0);
+    CHECK_EQ_INT(observed_error.code, ERR_SSH_KEY_INVALID);
+    CHECK(strstr(observed_error.message,
+                 "changed after OpenSSH validation") != NULL);
+    CHECK(ctx.current_account == &ctx.accounts[0]);
+    CHECK_STR_EQ(ctx.config.active_account, "work");
+    CHECK(after_length > 0);
+    if (before_length > 0 && after_length > 0) {
+        CHECK_STR_EQ(target_after, target_before);
+    }
+    CHECK(access(target_socket, F_OK) != 0);
+    CHECK(access(target_pid, F_OK) != 0);
+    CHECK_EQ_INT(cleanup_result, 0);
+
+    CHECK_EQ_INT(had_git_count
+                     ? setenv("GIT_CONFIG_COUNT", saved_git_count, 1)
+                     : unsetenv("GIT_CONFIG_COUNT"),
+                 0);
+    CHECK_EQ_INT(had_git_nosystem
+                     ? setenv("GIT_CONFIG_NOSYSTEM", saved_git_nosystem, 1)
+                     : unsetenv("GIT_CONFIG_NOSYSTEM"),
+                 0);
+    CHECK_EQ_INT(had_git_config
+                     ? setenv("GIT_CONFIG_GLOBAL", saved_git_config, 1)
+                     : unsetenv("GIT_CONFIG_GLOBAL"),
+                 0);
+    CHECK_EQ_INT(had_runtime
+                     ? setenv("XDG_RUNTIME_DIR", saved_runtime, 1)
+                     : unsetenv("XDG_RUNTIME_DIR"),
+                 0);
+    CHECK_EQ_INT(had_home ? setenv("HOME", saved_home, 1)
+                          : unsetenv("HOME"),
+                 0);
+    remove_tree(home);
+    remove_tree(runtime);
+}
+
+TEST(valid_activation_generation_replacement_preserves_prior_session) {
+    exercise_activation_generation_replacement(true);
+}
+
+TEST(malformed_activation_generation_replacement_preserves_prior_session) {
+    exercise_activation_generation_replacement(false);
 }
 
 TEST(remove_tears_down_runtime_before_deleting_account) {
@@ -1380,6 +1838,9 @@ int main(int argc, char **argv) {
     RUN_TEST(remove_rebinds_current_pointer_after_array_compaction);
     RUN_TEST(remove_without_publication_provenance_succeeds_vacuously);
     RUN_TEST(sock_substrings_round_trip_and_malformed_links_fall_back);
+    RUN_TEST(malformed_private_key_fails_before_prior_session_teardown);
+    RUN_TEST(valid_activation_generation_replacement_preserves_prior_session);
+    RUN_TEST(malformed_activation_generation_replacement_preserves_prior_session);
     error_cleanup();
     return ts_test_finish();
 }

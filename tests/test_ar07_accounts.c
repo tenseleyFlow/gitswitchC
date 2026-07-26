@@ -215,6 +215,9 @@ static int health_local_probe_runner(const char *const argv[],
                                      run_result_t *result) {
     bool list_secret = false;
 
+    if (argv && argv[0] && ts_command_is(argv[0], "ssh-keygen")) {
+        return run_argv_real(argv, opts, result);
+    }
     if (argv && argv[0] && strncmp(argv[0], "ssh", 3) == 0) {
         g_health_ssh_calls++;
         return null_runner(argv, opts, result);
@@ -651,6 +654,20 @@ static int make_sandbox(char *root, size_t root_size, char *key_one,
     return 0;
 }
 
+static int replace_with_valid_private_key(const char *path) {
+    const char *keygen[] = {
+        "ssh-keygen", "-q", "-t", "ed25519", "-N", "", "-f", path, NULL
+    };
+    run_opts_t opts;
+    run_result_t result;
+
+    if (!path || unlink(path) != 0) return -1;
+    memset(&opts, 0, sizeof(opts));
+    memset(&result, 0, sizeof(result));
+    opts.stderr_to_devnull = true;
+    return run_argv_real(keygen, &opts, &result);
+}
+
 static void fill_account(account_t *account, uint32_t id, const char *name,
                          const char *email, const char *key,
                          const char *alias) {
@@ -784,6 +801,8 @@ TEST(alias_collisions_are_rejected_on_add_update_and_load) {
 
     CHECK_EQ_INT(make_sandbox(root, sizeof(root), key_one, sizeof(key_one),
                               key_two, sizeof(key_two)), 0);
+    CHECK_EQ_INT(replace_with_valid_private_key(key_one), 0);
+    CHECK_EQ_INT(replace_with_valid_private_key(key_two), 0);
     memset(&ctx, 0, sizeof(ctx));
     fill_account(&one, 1, "one", "one@example.com", key_one, "GitHub-Work");
     fill_account(&two, 2, "two", "two@example.com", key_two, "other");
@@ -878,6 +897,8 @@ static void exercise_key_only_save_fault(config_io_boundary_t boundary,
 
     CHECK_EQ_INT(make_sandbox(root, sizeof(root), key_one, sizeof(key_one),
                               key_two, sizeof(key_two)), 0);
+    CHECK_EQ_INT(replace_with_valid_private_key(key_one), 0);
+    CHECK_EQ_INT(replace_with_valid_private_key(key_two), 0);
     memset(&ctx, 0, sizeof(ctx));
     fill_account(&original, 1, "one", "one@example.com", key_one,
                  "github-work");
@@ -933,6 +954,7 @@ TEST(private_key_admission_rejects_public_content) {
 
     CHECK_EQ_INT(make_sandbox(root, sizeof(root), key_one, sizeof(key_one),
                               key_two, sizeof(key_two)), 0);
+    CHECK_EQ_INT(replace_with_valid_private_key(key_one), 0);
     snprintf(public_path, sizeof(public_path), "%s/id.pub", root);
     snprintf(link_path, sizeof(link_path), "%s/key-link", root);
     CHECK_EQ_INT(write_mode(public_path, public_key_text, 0600), 0);
@@ -1409,6 +1431,7 @@ TEST(health_reports_only_the_local_capabilities_it_proves) {
 
     CHECK_EQ_INT(make_sandbox(root, sizeof(root), key_one, sizeof(key_one),
                               key_two, sizeof(key_two)), 0);
+    CHECK_EQ_INT(replace_with_valid_private_key(key_one), 0);
     CHECK((size_t)snprintf(source_home, sizeof(source_home), "%s/.gnupg",
                            root) < sizeof(source_home));
     CHECK_EQ_INT(mkdir(source_home, 0700), 0);

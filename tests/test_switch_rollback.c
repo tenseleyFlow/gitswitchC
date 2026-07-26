@@ -1596,9 +1596,10 @@ TEST(ssh_init_failure_keeps_previous_runtime_isolation) {
     gitswitch_ctx_t ctx = make_ctx();
     account_t *a = &ctx.accounts[0];
     a->ssh_enabled = true;
-    /* A real 0600 private-key-shaped file so the step-1 key validation
-     * (stat/mode/header — no PATH involved) passes and the switch reaches
-     * ssh_manager_init. */
+    /* A real 0600 private-key-shaped file. The injected SSH runner below
+     * supplies a valid OpenSSH fingerprint for this exact preflight, so the
+     * switch reaches ssh_manager_init even after PATH is intentionally
+     * reduced to an empty trusted directory. */
     snprintf(key_path, sizeof(key_path), "%s/key_ed25519", g_xdg);
     kf = fopen(key_path, "w");
     CHECK(kf != NULL);
@@ -1629,7 +1630,7 @@ TEST(ssh_init_failure_keeps_previous_runtime_isolation) {
     g_fail_user_name_set = false;
     g_raise_on_user_name = false;
     g_log = NULL;
-    command_runner_fn prev = run_set_runner(fake_runner);
+    command_runner_fn prev = run_set_runner(ssh_git_runner);
     int rc = prepare_switch_expect(
         &ctx, "testacct", ACCOUNTS_SWITCH_PREPARE_CLEAN_FAILURE);
     failure = *get_last_error();
@@ -1645,7 +1646,8 @@ TEST(ssh_init_failure_keeps_previous_runtime_isolation) {
     free(saved_path);
 
     CHECK_EQ_INT(rc, -1);
-    CHECK(strstr(failure.message, "Failed to set up SSH for account") != NULL);
+    CHECK_EQ_INT(failure.code, ERR_SSH_AGENT_NOT_FOUND);
+    CHECK(strstr(failure.message, "ssh-agent command not found") != NULL);
     /* The previous account's entry points were never disturbed and must
      * survive; pre-fix the abort path reaped them. */
     CHECK(symlink_present(g_ssh_sock));
@@ -1691,7 +1693,8 @@ TEST(prepared_ssh_switch_failure_releases_transaction_ownership) {
     g_fail_ssh_add = false;
 
     CHECK_EQ_INT(rc, -1);
-    CHECK(strstr(failure.message, "Failed to set up SSH for account") != NULL);
+    CHECK_EQ_INT(failure.code, ERR_SSH_KEY_LOAD_FAILED);
+    CHECK(strstr(failure.message, "Failed to add SSH key") != NULL);
     CHECK_STR_EQ(g_store_name, "Previous Name");
     CHECK_STR_EQ(g_store_email, "prev@example.com");
     CHECK(ctx.current_account == NULL);

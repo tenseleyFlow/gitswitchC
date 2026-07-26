@@ -19,6 +19,7 @@
 #include "test.h"
 #include "config.h"
 #include "gitswitch.h"
+#include "utils.h"
 #include <errno.h>
 #include <fcntl.h>
 #include <stdbool.h>
@@ -1023,6 +1024,21 @@ static int write_key_file(const char *path) {
     return chmod(path, 0600);
 }
 
+/* M22: tests that expect the add flow to admit an SSH key need a genuinely
+ * usable private key, not merely bytes with the OpenSSH armor shape. */
+static int generate_ed25519_private_key(const char *path) {
+    const char *argv[] = {
+        "ssh-keygen", "-q", "-t", "ed25519", "-N", "", "-f", path, NULL
+    };
+    run_opts_t opts;
+    run_result_t result;
+
+    memset(&opts, 0, sizeof(opts));
+    memset(&result, 0, sizeof(result));
+    opts.stderr_to_devnull = true;
+    return run_argv_real(argv, &opts, &result);
+}
+
 /* AR-03 L3: with a hand-planted [accounts.4294967295], `add` used to assign
  * max_id+1 == 0 — an id the loader rejects, so the new account "saved" into a
  * config no later command could load. The add must fall back to the lowest
@@ -1079,6 +1095,9 @@ TEST(add_reprompts_invalid_host_alias_until_valid) {
     char long_alias[321];
     int rc;
 
+    if (!command_exists("ssh-keygen")) {
+        TS_SKIP("openssh", "ssh-keygen unavailable");
+    }
     if (!make_temp_dir(home, sizeof(home)) || !make_temp_dir(rt, sizeof(rt))) {
         CHECK(!"mkdtemp failed");
         return;
@@ -1086,7 +1105,7 @@ TEST(add_reprompts_invalid_host_alias_until_valid) {
     CHECK_EQ_INT(write_config(home,
         "[settings]\ndefault_scope = \"global\"\n"), 0);
     snprintf(key_path, sizeof(key_path), "%s/id_test", home);
-    CHECK_EQ_INT(write_key_file(key_path), 0);
+    CHECK_EQ_INT(generate_ed25519_private_key(key_path), 0);
 
     memset(long_alias, 'a', sizeof(long_alias) - 1);
     long_alias[sizeof(long_alias) - 1] = '\0';
@@ -1124,6 +1143,9 @@ TEST(add_hostname_prompt_warns_on_empty_and_reprompts_on_invalid) {
     char key_path[512], toml_path[4352], toml[8192], out[8192], script[1024];
     int rc;
 
+    if (!command_exists("ssh-keygen")) {
+        TS_SKIP("openssh", "ssh-keygen unavailable");
+    }
     if (!make_temp_dir(home, sizeof(home)) || !make_temp_dir(rt, sizeof(rt))) {
         CHECK(!"mkdtemp failed");
         return;
@@ -1131,7 +1153,7 @@ TEST(add_hostname_prompt_warns_on_empty_and_reprompts_on_invalid) {
     CHECK_EQ_INT(write_config(home,
         "[settings]\ndefault_scope = \"global\"\n"), 0);
     snprintf(key_path, sizeof(key_path), "%s/id_test", home);
-    CHECK_EQ_INT(write_key_file(key_path), 0);
+    CHECK_EQ_INT(generate_ed25519_private_key(key_path), 0);
 
     /* Add #1: alias set, canonical hostname left empty -> default-to-alias
      * warning; name, email, description, ssh key, alias, hostname(empty),

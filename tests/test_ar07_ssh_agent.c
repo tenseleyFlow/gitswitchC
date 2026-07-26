@@ -1186,6 +1186,7 @@ TEST(key_inspection_opens_once_and_refuses_symlink_following) {
     char link[128];
     ssh_key_inspection_t inspection;
     ssh_key_open_fn previous;
+    command_runner_fn previous_runner;
     int dir_fd;
     int fd;
 
@@ -1216,7 +1217,10 @@ TEST(key_inspection_opens_once_and_refuses_symlink_following) {
 
     g_key_open_calls = 0;
     previous = ssh_manager_set_key_open_fn(counting_key_open);
+    g_keygen_listing_mode = KEYGEN_LISTING_COMPLETE;
+    previous_runner = run_set_runner(fake_identity_runner);
     CHECK_EQ_INT(ssh_validate_key_file(key), 0);
+    run_set_runner(previous_runner);
     ssh_manager_set_key_open_fn(previous);
     CHECK_EQ_INT(g_key_open_calls, 1);
 

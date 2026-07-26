@@ -225,6 +225,15 @@ static int fake_csh_agent_runner(const char *const argv[], const run_opts_t *opt
     }
     if (opts && opts->out && opts->out_size > 0) opts->out[0] = '\0';
 
+    if (strcmp(argv[0], "ssh-keygen") == 0 && argv[1] &&
+        strcmp(argv[1], "-lf") == 0) {
+        if (opts && opts->out && opts->out_size > 0) {
+            snprintf(opts->out, opts->out_size,
+                     "256 %s fixture (ED25519)\n", FP_A);
+            if (result) result->out_len = strlen(opts->out);
+        }
+        return 0;
+    }
     if (strcmp(argv[0], "ssh-agent") == 0) {
         const char *sock = argv_sock_path(argv);
         g_agent_start_attempts++;
@@ -284,6 +293,15 @@ static int fake_badperm_agent_runner(const char *const argv[], const run_opts_t 
     }
     if (opts && opts->out && opts->out_size > 0) opts->out[0] = '\0';
 
+    if (strcmp(argv[0], "ssh-keygen") == 0 && argv[1] &&
+        strcmp(argv[1], "-lf") == 0) {
+        if (opts && opts->out && opts->out_size > 0) {
+            snprintf(opts->out, opts->out_size,
+                     "256 %s fixture (ED25519)\n", FP_A);
+            if (result) result->out_len = strlen(opts->out);
+        }
+        return 0;
+    }
     if (strcmp(argv[0], "ssh-agent") == 0) {
         const char *sock = argv_sock_path(argv);
         g_agent_start_attempts++;
@@ -494,6 +512,55 @@ static int fake_recording_adopt_runner(const char *const argv[], const run_opts_
     return 0;
 }
 
+static int g_live_validation_probe_attempts;
+static int g_live_validation_fingerprint_attempts;
+
+/* The reusable socket is live and reports one exact identity, but computing
+ * the admitted key's fingerprint cannot even launch. The causal runner error
+ * must survive, and a validation failure must not retire or replace the live
+ * agent that was only being considered for adoption. */
+static int fake_live_validation_launch_failure_runner(
+    const char *const argv[], const run_opts_t *opts, run_result_t *result) {
+    if (result) memset(result, 0, sizeof(*result));
+    if (opts && opts->out && opts->out_size > 0) opts->out[0] = '\0';
+
+    if (strcmp(argv[0], "ssh-add") == 0 && argv[1] &&
+        strcmp(argv[1], "-l") == 0) {
+        g_live_validation_probe_attempts++;
+        if (opts && opts->out) {
+            snprintf(opts->out, opts->out_size,
+                     "256 %s agent-key (ED25519)\n", FP_A);
+            if (result) result->out_len = strlen(opts->out);
+        }
+        if (result) {
+            result->spawned = true;
+            result->exit_code = 0;
+        }
+        return 0;
+    }
+    if (strcmp(argv[0], "ssh-keygen") == 0 && argv[1] &&
+        strcmp(argv[1], "-lf") == 0) {
+        g_live_validation_fingerprint_attempts++;
+        if (result) result->exit_code = -1;
+        set_error(ERR_SYSTEM_COMMAND_FAILED,
+                  "causal live-agent fingerprint launch failure");
+        return -1;
+    }
+    if (strcmp(argv[0], "ssh-agent") == 0) {
+        g_agent_start_attempts++;
+        if (result) {
+            result->spawned = true;
+            result->exit_code = 1;
+        }
+        return -1;
+    }
+    if (result) {
+        result->spawned = true;
+        result->exit_code = 0;
+    }
+    return 0;
+}
+
 TEST(agent_probe_precedes_fingerprint_computation) {
     char dir[128], sock[256];
     ssh_config_t cfg;
@@ -521,6 +588,43 @@ TEST(agent_probe_precedes_fingerprint_computation) {
     /* L18: the cheap liveness probe must come first — a stale socket (dead
      * agent, the common miss) must not cost an ssh-keygen fork+exec. */
     CHECK_STR_EQ(g_first_probe, "ssh-add");
+}
+
+TEST(live_agent_fingerprint_launch_failure_preserves_socket_and_diagnostic) {
+    char dir[128], sock[256];
+    struct stat before;
+    struct stat after;
+    ssh_config_t cfg;
+    account_t acct;
+    command_runner_fn prev;
+    int rc;
+
+    CHECK_EQ_INT(make_xdg_agent_dir(dir, sizeof(dir)), 0);
+    snprintf(sock, sizeof(sock), "%s/ssh-agent.work.sock", dir);
+    CHECK_EQ_INT(bind_sock(sock, 0600), 0);
+    CHECK_EQ_INT(lstat(sock, &before), 0);
+    CHECK_EQ_INT(make_account(&acct, "keyA"), 0);
+    memset(&cfg, 0, sizeof(cfg));
+    cfg.mode = SSH_AGENT_ISOLATED;
+    cfg.agent_pid = -1;
+
+    g_agent_start_attempts = 0;
+    g_live_validation_probe_attempts = 0;
+    g_live_validation_fingerprint_attempts = 0;
+    clear_error();
+    prev = run_set_runner(fake_live_validation_launch_failure_runner);
+    rc = ssh_start_isolated_agent(&cfg, &acct);
+    run_set_runner(prev);
+
+    CHECK_EQ_INT(rc, -1);
+    CHECK_EQ_INT(g_live_validation_probe_attempts, 1);
+    CHECK_EQ_INT(g_live_validation_fingerprint_attempts, 1);
+    CHECK_EQ_INT(g_agent_start_attempts, 0);
+    CHECK_EQ_INT(get_last_error()->code, ERR_SYSTEM_COMMAND_FAILED);
+    CHECK(strstr(get_last_error()->message,
+                 "causal live-agent fingerprint launch failure") != NULL);
+    CHECK_EQ_INT(lstat(sock, &after), 0);
+    CHECK(before.st_dev == after.st_dev && before.st_ino == after.st_ino);
 }
 
 /* ---- T3: reap_ssh_agent positive kill path (real agent, Linux-gated) ------ */
@@ -769,6 +873,8 @@ TEST_MAIN_BEGIN()
     RUN_TEST(reuse_refuses_contaminated_agent);
     RUN_TEST(reuse_requires_exact_fingerprint_token);
     RUN_TEST(agent_probe_precedes_fingerprint_computation);
+    RUN_TEST(
+        live_agent_fingerprint_launch_failure_preserves_socket_and_diagnostic);
 #if defined(__linux__)
     RUN_TEST(reset_reaps_real_recorded_agent);
 #endif

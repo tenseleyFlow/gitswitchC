@@ -752,11 +752,14 @@ TEST(agent_output_quoted_auth_sock_is_unwrapped) {
     CHECK(!cfg.reused_existing_agent);
 }
 
-/* A stale agent forces a fingerprint-before-fresh-load sequence. Replacing
- * the configured name immediately after that fingerprint must not redirect
- * the later ssh-add: both operations consume generation A captured at switch
- * admission, while the public pathname now names generation B. */
-TEST(isolated_switch_retains_generation_between_fingerprint_and_load) {
+/* A stale agent forces a fingerprint-before-fresh-load sequence inside the
+ * low-level activation entry point. Replacing the configured name immediately
+ * after that fingerprint must not redirect the later ssh-add: both operations
+ * consume generation A captured by that activation, while the public pathname
+ * now names generation B. The complete public/account switch performs an
+ * additional pre-mutation namespace proof, covered by the M22 admission
+ * regressions, and therefore rejects an earlier replacement instead. */
+TEST(isolated_activation_retains_generation_between_fingerprint_and_load) {
     static const char generation_a[] =
         "-----BEGIN OPENSSH PRIVATE KEY-----\n"
         "generation-a\n"
@@ -792,7 +795,7 @@ TEST(isolated_switch_retains_generation_between_fingerprint_and_load) {
     g_swap_key_after_fingerprint = true;
     previous_reap_ops = install_synthetic_gone_generation();
     previous = run_set_runner(fake_quoting_agent_runner);
-    CHECK_EQ_INT(ssh_switch_account(&cfg, &acct), 0);
+    CHECK_EQ_INT(ssh_start_isolated_agent(&cfg, &acct), 0);
     run_set_runner(previous);
 
     CHECK(!g_swap_key_after_fingerprint);
@@ -1607,7 +1610,8 @@ TEST_MAIN_BEGIN()
     RUN_TEST(ssh_fingerprint_reuse_rejects_different_key);
     RUN_TEST(ssh_fingerprint_reuse_rejects_same_fingerprint_certificate);
     RUN_TEST(agent_output_quoted_auth_sock_is_unwrapped);
-    RUN_TEST(isolated_switch_retains_generation_between_fingerprint_and_load);
+    RUN_TEST(
+        isolated_activation_retains_generation_between_fingerprint_and_load);
     RUN_TEST(fresh_commit_revalidates_public_agent_directory);
     RUN_TEST(ssh_reuse_refuses_symlinked_agent_socket);
     RUN_TEST(ssh_reuse_refuses_symlinked_pid_sidecar);

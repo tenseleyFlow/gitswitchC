@@ -23,6 +23,7 @@
 
 #include "test.h"
 #include "prompt.h"
+#include "utils.h"
 #include <errno.h>
 #include <fcntl.h>
 #include <poll.h>
@@ -98,8 +99,9 @@ static void remove_tree(const char *path) {
 }
 
 /* Throwaway HOME + XDG_RUNTIME_DIR with a hardened config (0600 file inside
- * 0700 dirs — the T5 checks reject anything looser) and a dummy 0600 SSH key
- * the config references (account load validates existence + permissions). */
+ * 0700 dirs — the T5 checks reject anything looser) and a genuine unencrypted
+ * Ed25519 private key. Account load now proves OpenSSH usability, so a
+ * shape-only armor fixture would fail before the PTY behavior under test. */
 typedef struct {
     char home[128];
     char rt[128];
@@ -114,6 +116,30 @@ static int write_file_mode(const char *path, const char *body, mode_t mode) {
     return chmod(path, mode);
 }
 
+enum {
+    SANDBOX_SETUP_ERROR = -1,
+    SANDBOX_SETUP_OK = 0,
+    SANDBOX_SETUP_OPENSSH_UNAVAILABLE = 1
+};
+
+static int generate_ed25519_private_key(const char *path) {
+    const char *argv[] = {
+        "ssh-keygen", "-q", "-t", "ed25519", "-N", "", "-f", path, NULL
+    };
+    run_opts_t opts;
+    run_result_t result;
+
+    if (!command_exists("ssh-keygen")) {
+        return SANDBOX_SETUP_OPENSSH_UNAVAILABLE;
+    }
+    memset(&opts, 0, sizeof(opts));
+    memset(&result, 0, sizeof(result));
+    opts.stderr_to_devnull = true;
+    return run_argv_real(argv, &opts, &result) == 0
+               ? SANDBOX_SETUP_OK
+               : SANDBOX_SETUP_ERROR;
+}
+
 static int sandbox_setup(sandbox_t *sb) {
     char path[512];
     char cfg[1024];
@@ -124,9 +150,10 @@ static int sandbox_setup(sandbox_t *sb) {
     }
 
     snprintf(path, sizeof(path), "%s/key_ed25519", sb->home);
-    if (write_file_mode(path,
-                        "-----BEGIN OPENSSH PRIVATE KEY-----\nfixture\n",
-                        0600) != 0) return -1;
+    {
+        int key_rc = generate_ed25519_private_key(path);
+        if (key_rc != SANDBOX_SETUP_OK) return key_rc;
+    }
 
     snprintf(path, sizeof(path), "%s/.config", sb->home);
     if (mkdir(path, 0700) != 0) return -1;
@@ -157,6 +184,19 @@ static void sandbox_teardown(sandbox_t *sb) {
     remove_tree(sb->home);
     remove_tree(sb->rt);
 }
+
+#define SETUP_SANDBOX_OR_RETURN(sb) do {                                    \
+    int _setup_rc = sandbox_setup(&(sb));                                   \
+    if (_setup_rc == SANDBOX_SETUP_OPENSSH_UNAVAILABLE) {                   \
+        sandbox_teardown(&(sb));                                            \
+        TS_SKIP("openssh", "ssh-keygen unavailable in trusted PATH");       \
+    }                                                                       \
+    if (_setup_rc != SANDBOX_SETUP_OK) {                                    \
+        CHECK(!"sandbox setup failed");                                     \
+        sandbox_teardown(&(sb));                                            \
+        return;                                                             \
+    }                                                                       \
+} while (0)
 
 /* Read a whole (small) file; returns length, 0 on any failure. */
 static size_t slurp(const char *path, char *buf, size_t size) {
@@ -859,7 +899,7 @@ TEST(edit_empty_input_keeps_all_fields) {
     const char *argv[] = { "gitswitch", "edit", "work", NULL };
 
     SKIP_IF_NO_PTY();
-    if (sandbox_setup(&sb) != 0) { CHECK(!"sandbox setup failed"); return; }
+    SETUP_SANDBOX_OR_RETURN(sb);
     if (pty_spawn(&g_p, argv, &sb) != 0) { CHECK(!"pty_spawn failed"); sandbox_teardown(&sb); return; }
 
     CHECK_EQ_INT(expect_send(&g_p, "Account Name [work]:", "\n"), 0);
@@ -892,7 +932,7 @@ TEST(none_disables_ssh_and_gpg) {
     const char *argv[] = { "gitswitch", "edit", "work", NULL };
 
     SKIP_IF_NO_PTY();
-    if (sandbox_setup(&sb) != 0) { CHECK(!"sandbox setup failed"); return; }
+    SETUP_SANDBOX_OR_RETURN(sb);
     if (pty_spawn(&g_p, argv, &sb) != 0) { CHECK(!"pty_spawn failed"); sandbox_teardown(&sb); return; }
 
     CHECK_EQ_INT(expect_send(&g_p, "Account Name [work]:", "\n"), 0);
@@ -928,7 +968,7 @@ TEST(yes_flag_skips_confirmation) {
     const char *rm_argv[] = { "gitswitch", "-y", "remove", "other", NULL };
 
     SKIP_IF_NO_PTY();
-    if (sandbox_setup(&sb) != 0) { CHECK(!"sandbox setup failed"); return; }
+    SETUP_SANDBOX_OR_RETURN(sb);
 
     /* add: field prompts still run, the (y/N) confirm must not. */
     if (pty_spawn(&g_p, add_argv, &sb) != 0) { CHECK(!"pty_spawn failed"); sandbox_teardown(&sb); return; }
@@ -984,7 +1024,7 @@ TEST(duplicate_name_rejected_and_config_unchanged) {
     const char *argv[] = { "gitswitch", "edit", "other", NULL };
 
     SKIP_IF_NO_PTY();
-    if (sandbox_setup(&sb) != 0) { CHECK(!"sandbox setup failed"); return; }
+    SETUP_SANDBOX_OR_RETURN(sb);
     before_len = slurp(sb.cfg, before, sizeof(before));
     CHECK(before_len > 0);
 
@@ -1018,7 +1058,7 @@ TEST(eof_ctrl_d_cancels_cleanly) {
     const char *rm_argv[] = { "gitswitch", "remove", "work", NULL };
 
     SKIP_IF_NO_PTY();
-    if (sandbox_setup(&sb) != 0) { CHECK(!"sandbox setup failed"); return; }
+    SETUP_SANDBOX_OR_RETURN(sb);
     before_len = slurp(sb.cfg, before, sizeof(before));
     CHECK(before_len > 0);
 
@@ -1114,7 +1154,7 @@ TEST(ssh_key_path_tab_completion_and_inhibition) {
     const char *argv[] = { "gitswitch", "add", NULL };
 
     SKIP_IF_NO_PTY();
-    if (sandbox_setup(&sb) != 0) { CHECK(!"sandbox setup failed"); return; }
+    SETUP_SANDBOX_OR_RETURN(sb);
 
     /* Unique completion target in the child's CWD ($HOME). */
     snprintf(path, sizeof(path), "%s/zzuniq_target_rsa", sb.home);
@@ -1158,7 +1198,7 @@ TEST(reset_typed_yes_confirmation_semantics) {
     const char *argv[] = { "gitswitch", "reset", NULL };
 
     SKIP_IF_NO_PTY();
-    if (sandbox_setup(&sb) != 0) { CHECK(!"sandbox setup failed"); return; }
+    SETUP_SANDBOX_OR_RETURN(sb);
 
     /* 'y' is not consent. */
     if (pty_spawn(&g_p, argv, &sb) != 0) { CHECK(!"pty_spawn failed"); sandbox_teardown(&sb); return; }
@@ -1191,7 +1231,7 @@ TEST(remove_typed_yes_confirmation_semantics) {
     const char *argv[] = { "gitswitch", "remove", "other", NULL };
 
     SKIP_IF_NO_PTY();
-    if (sandbox_setup(&sb) != 0) { CHECK(!"sandbox setup failed"); return; }
+    SETUP_SANDBOX_OR_RETURN(sb);
 
     before_len = slurp(sb.cfg, before, sizeof(before));
     CHECK(before_len > 0);
@@ -1225,7 +1265,7 @@ TEST(cancelled_ops_leave_config_byte_identical) {
     const char *edit_argv[] = { "gitswitch", "edit", "work", NULL };
 
     SKIP_IF_NO_PTY();
-    if (sandbox_setup(&sb) != 0) { CHECK(!"sandbox setup failed"); return; }
+    SETUP_SANDBOX_OR_RETURN(sb);
     before_len = slurp(sb.cfg, before, sizeof(before));
     CHECK(before_len > 0);
 
@@ -1270,7 +1310,7 @@ TEST(invalid_input_reprompt_loops) {
     const char *argv[] = { "gitswitch", "add", NULL };
 
     SKIP_IF_NO_PTY();
-    if (sandbox_setup(&sb) != 0) { CHECK(!"sandbox setup failed"); return; }
+    SETUP_SANDBOX_OR_RETURN(sb);
     if (pty_spawn(&g_p, argv, &sb) != 0) { CHECK(!"pty_spawn failed"); sandbox_teardown(&sb); return; }
 
     CHECK_EQ_INT(expect_send(&g_p, "Account Name:", "bad/name\n"), 0);
@@ -1424,11 +1464,7 @@ TEST(bash_tab_completion_preserves_active_quote_argv) {
         CHECK(!"cannot resolve Bash completion asset");
         return;
     }
-    if (sandbox_setup(&sb) != 0) {
-        CHECK(!"sandbox setup failed");
-        sandbox_teardown(&sb);
-        return;
-    }
+    SETUP_SANDBOX_OR_RETURN(sb);
     sandbox_ready = true;
 
     written = snprintf(completion_link, sizeof(completion_link),

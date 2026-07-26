@@ -2071,11 +2071,37 @@ done:
     return rc;
 }
 
+static bool is_key_fingerprint_command(const char *const argv[]) {
+    return argv && argv[0] && argv[1] &&
+           strcmp(argv[0], "ssh-keygen") == 0 &&
+           strcmp(argv[1], "-lf") == 0;
+}
+
+static int emit_fixture_key_fingerprint(const run_opts_t *opts,
+                                        run_result_t *result) {
+    int written;
+
+    if (!opts || !opts->out || opts->out_size == 0U) return -1;
+    written = snprintf(opts->out, opts->out_size,
+                       "256 %s account-key (ED25519)\n", TEST_FP);
+    if (written < 0 || (size_t)written >= opts->out_size) return -1;
+    if (result) {
+        memset(result, 0, sizeof(*result));
+        result->spawned = true;
+        result->exit_code = 0;
+        result->out_len = (size_t)written;
+    }
+    return 0;
+}
+
 static int bad_permission_agent_runner(const char *const argv[],
                                        const run_opts_t *opts,
                                        run_result_t *result) {
     const char *socket_arg;
 
+    if (is_key_fingerprint_command(argv)) {
+        return emit_fixture_key_fingerprint(opts, result);
+    }
     if (result) {
         memset(result, 0, sizeof(*result));
         result->spawned = true;
@@ -2105,6 +2131,9 @@ static int missing_pid_agent_runner(const char *const argv[],
                                     run_result_t *result) {
     const char *socket_arg;
 
+    if (is_key_fingerprint_command(argv)) {
+        return emit_fixture_key_fingerprint(opts, result);
+    }
     if (result) {
         memset(result, 0, sizeof(*result));
         result->spawned = true;
@@ -2133,6 +2162,9 @@ static int failed_after_agent_spawn_runner(const char *const argv[],
                                            run_result_t *result) {
     const char *socket_arg;
 
+    if (is_key_fingerprint_command(argv)) {
+        return emit_fixture_key_fingerprint(opts, result);
+    }
     if (result) {
         memset(result, 0, sizeof(*result));
         result->spawned = true;
@@ -2161,6 +2193,9 @@ static int failed_with_truncated_pid_and_socket_runner(
     const char *const argv[], const run_opts_t *opts, run_result_t *result) {
     const char *socket_arg;
 
+    if (is_key_fingerprint_command(argv)) {
+        return emit_fixture_key_fingerprint(opts, result);
+    }
     if (result) {
         memset(result, 0, sizeof(*result));
         result->exit_code = -1;

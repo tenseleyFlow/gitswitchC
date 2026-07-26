@@ -34,6 +34,7 @@
 #include <inttypes.h>
 #ifdef __linux__
 #include <sys/syscall.h>
+#include <linux/memfd.h>
 #endif
 #if defined(__APPLE__) || defined(__FreeBSD__)
 #include <sys/sysctl.h>
@@ -71,8 +72,23 @@ typedef struct {
     size_t length;
     int fd;
     bool fd_open;
+    bool source_detached;
+    bool fingerprint_valid;
+    char fingerprint[256];
     struct stat identity;
 } ssh_key_snapshot_t;
+
+struct ssh_key_admission {
+    char expanded_key_path[MAX_PATH_LEN];
+    ssh_key_snapshot_t snapshot;
+    bool named_generation_verified;
+};
+
+typedef enum {
+    SSH_KEY_GENERATION_ERROR = -1,
+    SSH_KEY_GENERATION_MISMATCH = 0,
+    SSH_KEY_GENERATION_MATCH = 1
+} ssh_key_generation_match_t;
 
 /* Internal helper functions */
 /* merge_stderr is int, not bool: the parameter anchors va_start, and C11
@@ -86,7 +102,7 @@ static int ssh_add_key_pinned(int dir_fd, const char *socket_arg,
                               const ssh_key_snapshot_t *snapshot);
 static int ssh_start_isolated_agent_with_key(
     ssh_config_t *ssh_config, const account_t *account,
-    const ssh_key_snapshot_t *snapshot);
+    ssh_key_snapshot_t *snapshot);
 static int ssh_key_snapshot_capture(const char *key_path,
                                     ssh_key_snapshot_t *snapshot);
 static void ssh_key_snapshot_clear(ssh_key_snapshot_t *snapshot);
@@ -1730,8 +1746,19 @@ static bool ssh_key_snapshot_fd_matches(
     struct stat current;
     size_t offset = 0;
 
-    if (!snapshot || !snapshot->fd_open || snapshot->fd < 0 ||
-        !snapshot->data || snapshot->length == 0 ||
+    if (!snapshot || !snapshot->data || snapshot->length == 0) {
+        return false;
+    }
+    /* An account admission performs one final pathname/descriptor identity
+     * proof immediately before any prior-session teardown, then closes the
+     * mutable source descriptor. From that point the private in-memory copy is
+     * the exact admitted generation. A later rename or in-place source rewrite
+     * cannot substitute bytes or turn safe activation into a post-teardown
+     * validation failure. */
+    if (snapshot->source_detached) {
+        return !snapshot->fd_open && snapshot->fd < 0;
+    }
+    if (!snapshot->fd_open || snapshot->fd < 0 ||
         fstat(snapshot->fd, &current) != 0 ||
         !same_runtime_identity(&snapshot->identity, &current) ||
         snapshot->identity.st_gid != current.st_gid ||
@@ -1763,31 +1790,18 @@ static bool ssh_key_snapshot_fd_matches(
     return true;
 }
 
-#if !defined(__linux__)
-typedef struct {
-    int fd;
-    size_t length;
-    bool created;
-    bool have_identity;
-    bool registered;
-    char name[MAX_PATH_LEN];
-    char path[MAX_PATH_LEN];
-    struct stat identity;
-} ssh_fingerprint_scratch_t;
-
 /* OpenSSH probes `<private-path>.pub` before extracting the public portion of
  * the private key itself. Give the portable scratch an exact NAME_MAX-byte
  * component: the scratch remains openable, while the kernel must reject the
  * appended `.pub` component as ENAMETOOLONG before any sibling lookup. This
  * avoids both accidental sidecar selection and an otherwise unavoidable
- * same-UID sentinel replacement race. */
+ * same-UID sentinel replacement race. The component is deterministic because
+ * the enclosing private directory lock permits one cooperating writer and a
+ * fixed slot bounds crash leftovers to one recoverable entry. */
 static int ssh_fingerprint_scratch_name(int dir_fd, char *name, size_t size) {
     static const char prefix[] = ".key-fingerprint.";
-    static const char random_chars[] =
-        "abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789";
     const size_t prefix_length = sizeof(prefix) - 1U;
     long name_max;
-    size_t random_size;
 
     if (dir_fd < 0 || !name || size == 0U) return -1;
     errno = 0;
@@ -1797,15 +1811,104 @@ static int ssh_fingerprint_scratch_name(int dir_fd, char *name, size_t size) {
         return -1;
     }
     memcpy(name, prefix, prefix_length);
-    random_size = (size_t)name_max - prefix_length + 1U;
-    if (generate_random_string(name + prefix_length, random_size,
-                               random_chars) != 0 ||
-        strnlen(name, size) != (size_t)name_max) {
-        secure_zero_memory(name, size);
-        return -1;
-    }
+    memset(name + prefix_length, 'k', (size_t)name_max - prefix_length);
+    name[name_max] = '\0';
     return 0;
 }
+
+/* Recover the one portable staging slot left by an uncatchable termination.
+ * The caller holds the validation-directory lock. Refuse anything except the
+ * exact self-owned 0600 single-link regular-file shape that this process
+ * creates; hostile or ambiguous entries remain untouched and block further
+ * validation. Scrub through the retained descriptor before retiring the
+ * verified name. FreeBSD can bind unlink to the descriptor; Darwin uses the
+ * same locked-writer plus immediately-before-unlink identity contract as the
+ * ordinary cleanup path. */
+static int ssh_fingerprint_scratch_recover_at(int dir_fd, const char *name) {
+    static const char zeros[4096];
+    struct stat opened;
+    struct stat scrubbed;
+    struct stat named;
+    size_t length;
+    size_t offset = 0U;
+    int fd;
+    int rc = -1;
+
+    if (dir_fd < 0 || !name || !*name) return -1;
+    fd = openat(dir_fd, name,
+                O_RDWR | O_CLOEXEC | O_NOFOLLOW | O_NONBLOCK);
+    if (fd < 0) return errno == ENOENT ? 0 : -1;
+    if (fstat(fd, &opened) != 0 ||
+        !S_ISREG(opened.st_mode) ||
+        opened.st_uid != getuid() ||
+        opened.st_nlink != 1 ||
+        (opened.st_mode & 0777) != 0600 ||
+        opened.st_size < 0 ||
+        (uintmax_t)opened.st_size >
+            (uintmax_t)SSH_PRIVATE_KEY_SNAPSHOT_MAX_BYTES) {
+        goto done;
+    }
+    length = (size_t)opened.st_size;
+    while (offset < length) {
+        size_t wanted = length - offset;
+        ssize_t written;
+
+        if (wanted > sizeof(zeros)) wanted = sizeof(zeros);
+        written = pwrite(fd, zeros, wanted, (off_t)offset);
+        if (written > 0) {
+            offset += (size_t)written;
+        } else if (written < 0 && errno == EINTR) {
+            continue;
+        } else {
+            goto done;
+        }
+    }
+    if (ftruncate(fd, 0) != 0 ||
+        fstat(fd, &scrubbed) != 0 ||
+        !same_runtime_identity(&opened, &scrubbed) ||
+        !S_ISREG(scrubbed.st_mode) ||
+        scrubbed.st_uid != getuid() ||
+        scrubbed.st_nlink != 1 ||
+        (scrubbed.st_mode & 0777) != 0600 ||
+        scrubbed.st_size != 0 ||
+        fstatat(dir_fd, name, &named, AT_SYMLINK_NOFOLLOW) != 0 ||
+        !same_runtime_revision(&scrubbed, &named)) {
+        goto done;
+    }
+#if defined(__FreeBSD__)
+    if (funlinkat(dir_fd, name, fd, 0) != 0) goto done;
+#else
+    if (unlinkat(dir_fd, name, 0) != 0) goto done;
+#endif
+    rc = 0;
+done:
+    if (close(fd) != 0) rc = -1;
+    return rc;
+}
+
+int ssh_manager_test_fingerprint_slot_name(int dir_fd, char *name,
+                                           size_t name_size) {
+    return ssh_fingerprint_scratch_name(dir_fd, name, name_size);
+}
+
+int ssh_manager_test_recover_fingerprint_slot(int dir_fd) {
+    char name[MAX_PATH_LEN];
+
+    if (ssh_fingerprint_scratch_name(dir_fd, name, sizeof(name)) != 0) {
+        return -1;
+    }
+    return ssh_fingerprint_scratch_recover_at(dir_fd, name);
+}
+
+#if !defined(__linux__)
+typedef struct {
+    int fd;
+    size_t length;
+    bool created;
+    bool have_identity;
+    char name[MAX_PATH_LEN];
+    struct stat identity;
+} ssh_fingerprint_scratch_t;
 
 static bool ssh_fingerprint_scratch_matches(
     int dir_fd, const ssh_fingerprint_scratch_t *scratch,
@@ -1858,7 +1961,6 @@ static int ssh_fingerprint_scratch_cleanup(
     struct stat named;
     size_t offset = 0;
     int rc = 0;
-    bool scrubbed = false;
 
     if (!scratch) return 0;
     if (scratch->fd >= 0 && scratch->created) {
@@ -1877,20 +1979,7 @@ static int ssh_fingerprint_scratch_cleanup(
         }
         if (ftruncate(scratch->fd, 0) != 0) {
             rc = -1;
-        } else {
-            scrubbed = true;
         }
-    }
-
-    /* Once the retained inode contains no key bytes, a path-only signal slot
-     * is more dangerous than useful: an uncooperative same-UID process could
-     * replace the random name and turn later emergency cleanup into deletion
-     * of that replacement. Normal gitswitch writers are serialized by the
-     * manager lock; unregister before the best-effort namespace retirement so
-     * any uncertain name is left untouched rather than armed for later. */
-    if (scratch->registered && scrubbed) {
-        signals_scratch_unregister(scratch->path);
-        scratch->registered = false;
     }
 
     if (dir_fd >= 0 && scratch->name[0] != '\0' &&
@@ -1926,19 +2015,14 @@ static int ssh_fingerprint_scratch_cleanup(
                scratch->created) {
         /* Creation succeeded but identity capture did not, so pathname
          * deletion has no ownership proof. The file is still empty at this
-         * stage; preserve the uncertain name and drop any path-only slot. */
+         * stage; preserve the uncertain name for locked recovery. */
         rc = -1;
     }
 
-    /* Never discard the captured identity while a path-only slot remains.
-     * Even if both truncation and namespace retirement fail, a later signal
-     * must not unlink an unrelated replacement installed at this name. The
-     * operation reports failure and preserves any uncertain entry for
-     * explicit recovery. */
-    if (scratch->registered) {
-        signals_scratch_unregister(scratch->path);
-        scratch->registered = false;
-    }
+    /* The fixed slot is deliberately absent from the process-global,
+     * pathname-only emergency registry. Normal/deferred-signal cleanup uses
+     * the retained descriptor here; an uncatchable termination leaves at
+     * most this one slot for the next locked, identity-checked recovery. */
     if (scratch->fd >= 0 && close(scratch->fd) != 0) rc = -1;
     secure_zero_memory(scratch, sizeof(*scratch));
     scratch->fd = -1;
@@ -1946,29 +2030,33 @@ static int ssh_fingerprint_scratch_cleanup(
 }
 
 static int ssh_fingerprint_scratch_create(
-    int dir_fd, const char *dir_path, const ssh_key_snapshot_t *snapshot,
+    int dir_fd, const ssh_key_snapshot_t *snapshot,
     ssh_fingerprint_scratch_t *scratch) {
     struct stat created;
     struct stat named;
 
-    if (dir_fd < 0 || !dir_path || !*dir_path || !snapshot || !scratch ||
+    if (dir_fd < 0 || !snapshot || !scratch ||
         !ssh_key_snapshot_fd_matches(snapshot)) {
         return -1;
     }
     memset(scratch, 0, sizeof(*scratch));
     scratch->fd = -1;
 
-    for (unsigned int attempt = 0; attempt < 16; attempt++) {
-        if (ssh_fingerprint_scratch_name(
-                dir_fd, scratch->name, sizeof(scratch->name)) != 0 ||
-            (size_t)snprintf(scratch->path, sizeof(scratch->path), "%s/%s",
-                             dir_path, scratch->name) >= sizeof(scratch->path)) {
+    if (ssh_fingerprint_scratch_name(
+            dir_fd, scratch->name, sizeof(scratch->name)) != 0) {
+        return -1;
+    }
+    scratch->fd = openat(
+        dir_fd, scratch->name,
+        O_RDWR | O_CREAT | O_EXCL | O_CLOEXEC | O_NOFOLLOW, 0600);
+    if (scratch->fd < 0 && errno == EEXIST) {
+        if (ssh_fingerprint_scratch_recover_at(
+                dir_fd, scratch->name) != 0) {
             return -1;
         }
         scratch->fd = openat(
             dir_fd, scratch->name,
             O_RDWR | O_CREAT | O_EXCL | O_CLOEXEC | O_NOFOLLOW, 0600);
-        if (scratch->fd >= 0 || errno != EEXIST) break;
     }
     if (scratch->fd < 0) return -1;
     scratch->created = true;
@@ -1983,11 +2071,6 @@ static int ssh_fingerprint_scratch_create(
         return -1;
     }
     scratch->have_identity = true;
-    if (signals_scratch_register(scratch->path) != 0) {
-        (void)ssh_fingerprint_scratch_cleanup(dir_fd, scratch);
-        return -1;
-    }
-    scratch->registered = true;
     if (write_all_fd(scratch->fd, snapshot->data, snapshot->length) != 0 ||
         fstat(scratch->fd, &created) != 0 ||
         fstatat(dir_fd, scratch->name, &named,
@@ -2128,26 +2211,30 @@ static bool ssh_keygen_fingerprint_prefix(
 }
 
 /* Copy the SHA256:... fingerprint token of the admitted key generation into
- * `buf`. Linux can name the retained regular descriptor through procfs: each
- * ssh-keygen reopen gets an independent file offset. Darwin and FreeBSD
- * /dev/fd entries use dup-style shared offsets; OpenSSH reads the private-key header,
- * reopens the path, and otherwise starts the second read at EOF. On those
- * platforms, expose the already-captured bytes briefly through a 0600 file in
- * the pinned, locked manager directory. Its NAME_MAX component prevents
- * OpenSSH from selecting an adjacent `.pub`; its exact inode and contents are
- * checked before and after ssh-keygen, then scrubbed and unlinked. */
+ * `buf`. Linux copies the captured bytes into a sealed anonymous memfd and
+ * exposes that immutable generation through procfs: each ssh-keygen reopen
+ * gets an independent file offset without observing the mutable source fd.
+ * Darwin and FreeBSD /dev/fd entries use dup-style shared offsets; OpenSSH
+ * reads the private-key header, reopens the path, and otherwise starts the
+ * second read at EOF. On those platforms, expose the already-captured bytes
+ * briefly through a 0600 file in the pinned, locked manager directory. Its
+ * NAME_MAX component prevents OpenSSH from selecting an adjacent `.pub`; its
+ * exact inode and contents are checked before and after ssh-keygen, then
+ * scrubbed and unlinked. */
 static int ssh_key_fingerprint_generation(
-    int dir_fd, bool use_cwd_fd, const char *dir_path,
-    const char *key_path, const ssh_key_snapshot_t *snapshot,
+    int dir_fd, bool use_cwd_fd, const char *key_path,
+    const ssh_key_snapshot_t *snapshot,
     char *buf, size_t size) {
     char *out;
     size_t out_size;
 #if defined(__linux__)
     const char *stdin_path = "/proc/self/fd/0";
+    int sealed_fd = -1;
 #endif
     const char *argv[] = {"ssh-keygen", "-lf", key_path, NULL};
     run_opts_t opts;
     run_result_t res;
+    uint64_t run_error_generation;
 #if !defined(__linux__)
     ssh_fingerprint_scratch_t scratch;
     memset(&scratch, 0, sizeof(scratch));
@@ -2180,18 +2267,44 @@ static int ssh_key_fingerprint_generation(
             return -1;
         }
 #if defined(__linux__)
-        if (lseek(snapshot->fd, 0, SEEK_SET) != 0) {
-            set_error(ERR_SSH_KEY_INVALID,
-                      "Validated SSH key could not be rewound for fingerprinting");
+#if defined(SYS_memfd_create) && defined(MFD_ALLOW_SEALING) && \
+    defined(MFD_CLOEXEC) && defined(F_ADD_SEALS) && defined(F_GET_SEALS) && \
+    defined(F_SEAL_WRITE) && defined(F_SEAL_GROW) && \
+    defined(F_SEAL_SHRINK) && defined(F_SEAL_SEAL)
+        const int required_seals =
+            F_SEAL_WRITE | F_SEAL_GROW | F_SEAL_SHRINK | F_SEAL_SEAL;
+        int applied_seals;
+        sealed_fd = (int)syscall(
+            SYS_memfd_create, "gitswitch-ssh-key",
+            (unsigned int)(MFD_CLOEXEC | MFD_ALLOW_SEALING));
+        if (sealed_fd < 0 ||
+            write_all_fd(sealed_fd, snapshot->data, snapshot->length) != 0 ||
+            fcntl(sealed_fd, F_ADD_SEALS, required_seals) != 0 ||
+            (applied_seals = fcntl(sealed_fd, F_GET_SEALS)) < 0 ||
+            (applied_seals & required_seals) != required_seals ||
+            lseek(sealed_fd, 0, SEEK_SET) != 0) {
+            int saved_errno = errno;
+            if (sealed_fd >= 0) (void)close(sealed_fd);
+            errno = saved_errno;
+            set_system_error(
+                ERR_SYSTEM_CALL,
+                "Cannot seal an immutable SSH key fingerprint snapshot");
             free(out);
             return -1;
         }
         argv[2] = stdin_path;
-        opts.stdin_fd = snapshot->fd;
+        opts.stdin_fd = sealed_fd;
         opts.use_stdin_fd = true;
 #else
+        set_error(
+            ERR_SYSTEM_CALL,
+            "This Linux build cannot create a sealed SSH key fingerprint snapshot");
+        free(out);
+        return -1;
+#endif
+#else
         if (!use_cwd_fd || ssh_fingerprint_scratch_create(
-                dir_fd, dir_path, snapshot, &scratch) != 0) {
+                dir_fd, snapshot, &scratch) != 0) {
             set_error(ERR_SSH_KEY_INVALID,
                       "Cannot stage the validated SSH key for portable fingerprinting");
             free(out);
@@ -2202,7 +2315,15 @@ static int ssh_key_fingerprint_generation(
         opts.use_cwd_fd = true;
 #endif
     }
+    run_error_generation = error_report_generation();
     int run_rc = run_argv(argv, &opts, &res);
+#if defined(__linux__)
+    if (sealed_fd >= 0 && close(sealed_fd) != 0 && run_rc == 0) {
+        set_system_error(ERR_SYSTEM_CALL,
+                         "Cannot close sealed SSH key fingerprint snapshot");
+        run_rc = -1;
+    }
+#endif
     bool generation_matches = !snapshot || ssh_key_snapshot_fd_matches(snapshot);
 #if !defined(__linux__)
     if (snapshot &&
@@ -2221,7 +2342,6 @@ static int ssh_key_fingerprint_generation(
 #else
     (void)dir_fd;
     (void)use_cwd_fd;
-    (void)dir_path;
 #endif
     if (!generation_matches) {
         set_error(ERR_SSH_KEY_INVALID,
@@ -2229,13 +2349,144 @@ static int ssh_key_fingerprint_generation(
         free(out);
         return -1;
     }
-    if (run_rc != 0 || res.out_truncated || res.out_len >= out_size ||
+    if (run_rc != 0) {
+        if (error_report_generation() == run_error_generation) {
+            if (res.spawned && res.term_signal == 0 && res.exit_code != 0) {
+                set_error(
+                    ERR_SSH_KEY_INVALID,
+                    "OpenSSH could not parse the admitted SSH private key: %s",
+                    key_path);
+            } else if (res.spawned && res.term_signal != 0) {
+                set_error(
+                    ERR_SYSTEM_COMMAND_FAILED,
+                    "OpenSSH SSH key validation was terminated by signal %d",
+                    res.term_signal);
+            } else {
+                set_error(ERR_SYSTEM_COMMAND_FAILED,
+                          "OpenSSH SSH key validation did not complete");
+            }
+        }
+        free(out);
+        return -1;
+    }
+    if (res.out_truncated || res.out_len >= out_size ||
         !ssh_keygen_fingerprint_prefix(out, res.out_len, buf, size)) {
+        set_error(ERR_SSH_KEY_INVALID,
+                  "OpenSSH returned an invalid fingerprint for the admitted "
+                  "SSH private key: %s",
+                  key_path);
         free(out);
         return -1;
     }
     free(out);
     return 0;
+}
+
+/* Prove that OpenSSH can parse the exact admitted key generation without
+ * decrypting it. `ssh-keygen -lf` accepts encrypted private keys without an
+ * askpass interaction, unlike `ssh-keygen -y` or `ssh-add`.
+ *
+ * Linux exposes a sealed anonymous copy through procfs, so no pathname is
+ * created and the parser cannot observe a concurrent rewrite of the admitted
+ * inode. Darwin and FreeBSD use the portable scrubbed-scratch machinery above
+ * inside one bounded, reusable private staging directory per runtime
+ * parent/user. Its private lock serializes cooperating writers and makes
+ * Darwin's pathname cleanup boundary explicit. A fixed NAME_MAX slot bounds
+ * an uncatchable-crash remnant to one entry, which the next locked validation
+ * scrubs and retires before reuse. This is validation staging, not SSH agent
+ * runtime state. */
+static int ssh_key_snapshot_require_openssh_parse(
+    const char *key_path, ssh_key_snapshot_t *snapshot) {
+#if !defined(__linux__)
+    char runtime_parent[MAX_PATH_LEN];
+    char child[64];
+    int parent_fd = -1;
+    int dir_fd = -1;
+    int lock_fd = -1;
+    int rc = -1;
+    bool owns_signal_guard = false;
+    bool signal_guard_was_active;
+    int written;
+
+    signal_guard_was_active = signals_guard_active();
+    if (signals_guard_begin() != 0) {
+        return -1;
+    }
+    owns_signal_guard = !signal_guard_was_active;
+    parent_fd = open_runtime_parent(
+        runtime_parent, sizeof(runtime_parent));
+    if (parent_fd < 0) {
+        goto finish;
+    }
+    if (strcmp(runtime_parent, "/tmp") == 0) {
+        written = snprintf(child, sizeof(child),
+                           "gitswitch-key-validation-%d", getuid());
+    } else {
+        written = snprintf(child, sizeof(child),
+                           "gitswitch-key-validation");
+    }
+    if (written < 0 || (size_t)written >= sizeof(child)) {
+        set_error(ERR_INVALID_PATH,
+                  "SSH key validation staging path is too long");
+        goto finish;
+    }
+    dir_fd = open_private_subdir_at(parent_fd, child, true, NULL);
+    close(parent_fd);
+    parent_fd = -1;
+    if (dir_fd < 0) goto finish;
+    lock_fd = lock_private_file_at(dir_fd, ".lock");
+    if (lock_fd < 0) {
+        set_system_error(ERR_SSH_KEY_INVALID,
+                         "Cannot lock private SSH key validation staging");
+        goto finish;
+    }
+    rc = ssh_key_fingerprint_generation(
+        dir_fd, true, key_path, snapshot,
+        snapshot->fingerprint, sizeof(snapshot->fingerprint));
+    snapshot->fingerprint_valid = rc == 0;
+    if (verify_private_lock_file_at(lock_fd, dir_fd, ".lock") != 0) {
+        rc = -1;
+        set_system_error(ERR_SSH_KEY_INVALID,
+                         "SSH key validation staging lock changed unexpectedly");
+    }
+finish:
+    if (lock_fd >= 0) unlock_private_file(lock_fd);
+    if (dir_fd >= 0 && close(dir_fd) != 0 && rc == 0) {
+        rc = -1;
+        set_system_error(ERR_SSH_KEY_INVALID,
+                         "Cannot close SSH key validation staging");
+    }
+    if (parent_fd >= 0) close(parent_fd);
+    if (owns_signal_guard) {
+        int guard_rc;
+
+        if (signals_pending()) {
+            guard_rc = signals_dispatch_pending();
+        } else {
+            guard_rc = signals_guard_end();
+            if (guard_rc == 0 && signals_pending()) {
+                guard_rc = signals_dispatch_pending();
+            }
+        }
+        if (guard_rc != 0) rc = -1;
+    }
+    snapshot->fingerprint_valid = rc == 0;
+    if (!snapshot->fingerprint_valid) {
+        secure_zero_memory(
+            snapshot->fingerprint, sizeof(snapshot->fingerprint));
+    }
+    return rc;
+#else
+    int rc = ssh_key_fingerprint_generation(
+        -1, false, key_path, snapshot,
+        snapshot->fingerprint, sizeof(snapshot->fingerprint));
+    snapshot->fingerprint_valid = rc == 0;
+    if (!snapshot->fingerprint_valid) {
+        secure_zero_memory(
+            snapshot->fingerprint, sizeof(snapshot->fingerprint));
+    }
+    return rc;
+#endif
 }
 
 static bool ssh_agent_type_is_certificate(const char *type, size_t length) {
@@ -2343,10 +2594,10 @@ static bool ssh_agent_raw_identity_fingerprint(
     return true;
 }
 
-/* True if an ssh-agent is answering on `sock` AND holds EXACTLY the raw key
- * at `key_path` — one complete identity, fingerprint compared as a whole
- * token, explicit non-certificate type — so adopting it is safe and skips a
- * passphrase re-prompt. Presence alone is not enough (AR-03 M2): a foreign
+/* Classify whether an ssh-agent is answering on `sock` AND holds EXACTLY the
+ * raw key at `key_path` — one complete identity, fingerprint compared as a
+ * whole token, explicit non-certificate type — so adopting it is safe and
+ * skips a passphrase re-prompt. Presence alone is not enough (AR-03 M2): a foreign
  * key injected into the per-account agent
  * (`SSH_AUTH_SOCK=current.sock ssh-add ~/.ssh/other_key`) would ride along
  * into the "isolated" session and let a push authenticate as the wrong
@@ -2357,12 +2608,13 @@ static bool ssh_agent_raw_identity_fingerprint(
  * fingerprint computed only once the probe answers (AR-03 L18): a stale
  * socket (dead agent) is the common miss, and running ssh-keygen before
  * knowing the agent is alive wasted a fork+exec on every such miss. Anything
- * indeterminate falls back to false (restart + load) rather than risk
- * adopting the wrong agent. */
-static bool ssh_agent_has_exact_key_generation(
-    int dir_fd, bool use_cwd_fd, const char *dir_path,
-    const char *socket_arg,
-    const char *key_path, const ssh_key_snapshot_t *snapshot) {
+ * indeterminate refuses adoption. A definite identity/fingerprint mismatch
+ * authorizes replacement; helper, staging, signal, or admitted-generation
+ * failures return ERROR so activation cannot destructively reinterpret an
+ * operational failure as a mismatch. */
+static ssh_key_generation_match_t ssh_agent_has_exact_key_generation(
+    int dir_fd, bool use_cwd_fd, const char *socket_arg,
+    const char *key_path, ssh_key_snapshot_t *snapshot) {
     char want_fp[256];
     char agent_fp[256];
     char envbuf[MAX_PATH_LEN + 20];
@@ -2371,23 +2623,45 @@ static bool ssh_agent_has_exact_key_generation(
     const char *argv[] = { "ssh-add", "-l", NULL };
     run_opts_t opts;
     run_result_t res;
+    uint64_t run_error_generation;
 
     if (!socket_arg || !*socket_arg || !key_path || !*key_path ||
         (snapshot && (!snapshot->data || snapshot->length == 0)) ||
         (size_t)snprintf(envbuf, sizeof(envbuf), "SSH_AUTH_SOCK=%s",
                          socket_arg) >= sizeof(envbuf)) {
-        return false;
+        set_error(ERR_INVALID_ARGS,
+                  "Invalid SSH key-generation match arguments");
+        return SSH_KEY_GENERATION_ERROR;
     }
     env[0] = envbuf;
     memset(&opts, 0, sizeof(opts));
+    memset(&res, 0, sizeof(res));
+    res.exit_code = -1;
     opts.out = out;
     opts.out_size = sizeof(out);
     opts.stderr_to_devnull = true;
     opts.extra_env = env;
     opts.cwd_fd = dir_fd;
     opts.use_cwd_fd = use_cwd_fd;
+    run_error_generation = error_report_generation();
     if (run_argv(argv, &opts, &res) != 0) {
-        return false; /* exit 1 (no identities) / 2 (no agent) */
+        if (error_report_generation() != run_error_generation) {
+            return SSH_KEY_GENERATION_ERROR;
+        }
+        if (res.spawned && res.term_signal == 0 &&
+            (res.exit_code == 1 || res.exit_code == 2)) {
+            /* OpenSSH: no identities or no reachable agent. */
+            return SSH_KEY_GENERATION_MISMATCH;
+        }
+        if (res.spawned && res.term_signal != 0) {
+            set_error(ERR_SYSTEM_COMMAND_FAILED,
+                      "SSH agent identity probe was terminated by signal %d",
+                      res.term_signal);
+        } else {
+            set_error(ERR_SYSTEM_COMMAND_FAILED,
+                      "SSH agent identity probe did not complete");
+        }
+        return SSH_KEY_GENERATION_ERROR;
     }
     /* An incomplete capture cannot prove single-key exclusivity. In
      * particular, a long first identity can fill this buffer while a second
@@ -2395,29 +2669,46 @@ static bool ssh_agent_has_exact_key_generation(
     if (res.out_truncated || res.out_len >= sizeof(out) ||
         !ssh_agent_raw_identity_fingerprint(
             out, res.out_len, agent_fp, sizeof(agent_fp))) {
-        return false;
+        return SSH_KEY_GENERATION_MISMATCH;
+    }
+    if (snapshot) {
+        if ((!snapshot->fingerprint_valid &&
+             ssh_key_snapshot_require_openssh_parse(
+                 key_path, snapshot) != 0)) {
+            return SSH_KEY_GENERATION_ERROR;
+        }
+        if (!ssh_key_snapshot_fd_matches(snapshot)) {
+            set_error(ERR_SSH_KEY_INVALID,
+                      "Admitted SSH key changed during agent verification");
+            return SSH_KEY_GENERATION_ERROR;
+        }
+        return strcmp(agent_fp, snapshot->fingerprint) == 0
+                   ? SSH_KEY_GENERATION_MATCH
+                   : SSH_KEY_GENERATION_MISMATCH;
     }
     if (ssh_key_fingerprint_generation(
-            dir_fd, use_cwd_fd, dir_path, key_path, snapshot, want_fp,
+            dir_fd, use_cwd_fd, key_path, NULL, want_fp,
             sizeof(want_fp)) != 0) {
-        return false;
+        return SSH_KEY_GENERATION_ERROR;
     }
 
-    return strcmp(agent_fp, want_fp) == 0;
+    return strcmp(agent_fp, want_fp) == 0
+               ? SSH_KEY_GENERATION_MATCH
+               : SSH_KEY_GENERATION_MISMATCH;
 }
 
-static bool ssh_socket_has_key_generation(
-    int dir_fd, const char *dir_path, const char *socket_arg,
-    const char *key_path,
-    const ssh_key_snapshot_t *snapshot) {
+static ssh_key_generation_match_t ssh_socket_has_key_generation(
+    int dir_fd, const char *socket_arg, const char *key_path,
+    ssh_key_snapshot_t *snapshot) {
     return ssh_agent_has_exact_key_generation(
-        dir_fd, true, dir_path, socket_arg, key_path, snapshot);
+        dir_fd, true, socket_arg, key_path, snapshot);
 }
 
 static bool ssh_socket_has_key(int dir_fd, const char *socket_arg,
                                const char *key_path) {
     return ssh_socket_has_key_generation(
-        dir_fd, NULL, socket_arg, key_path, NULL);
+               dir_fd, socket_arg, key_path, NULL) ==
+           SSH_KEY_GENERATION_MATCH;
 }
 
 bool ssh_manager_test_socket_has_key(int dir_fd, const char *socket_arg,
@@ -2535,43 +2826,164 @@ int ssh_manager_cleanup(ssh_config_t *ssh_config) {
     return 0;
 }
 
-/* Switch to account's SSH configuration */
-int ssh_switch_account(ssh_config_t *ssh_config, const account_t *account) {
+int ssh_key_admission_begin(const char *expanded_key_path,
+                            ssh_key_admission_t **admission) {
+    ssh_key_admission_t *prepared;
+    size_t path_length;
+
+    if (!expanded_key_path || !*expanded_key_path || !admission ||
+        *admission) {
+        set_error(ERR_INVALID_ARGS,
+                  "Invalid SSH key admission arguments");
+        return -1;
+    }
+    path_length = strnlen(expanded_key_path, MAX_PATH_LEN);
+    if (path_length == MAX_PATH_LEN) {
+        set_error(ERR_INVALID_PATH,
+                  "Expanded SSH key path exceeds the supported limit");
+        return -1;
+    }
+    prepared = calloc(1, sizeof(*prepared));
+    if (!prepared) {
+        errno = ENOMEM;
+        set_error(ERR_MEMORY_ALLOCATION,
+                  "Cannot allocate SSH key admission state");
+        return -1;
+    }
+    memcpy(prepared->expanded_key_path, expanded_key_path, path_length + 1U);
+    if (ssh_key_snapshot_capture(
+            prepared->expanded_key_path, &prepared->snapshot) != 0 ||
+        ssh_key_snapshot_require_openssh_parse(
+            prepared->expanded_key_path, &prepared->snapshot) != 0) {
+        ssh_key_admission_end(&prepared);
+        return -1;
+    }
+    *admission = prepared;
+    return 0;
+}
+
+/* Prove the configured name still selects the generation that OpenSSH parsed.
+ * Once this point-in-time namespace proof succeeds, close the mutable source
+ * descriptor. Activation is then bound only to the retained private bytes and
+ * cached fingerprint, so a later source replacement cannot substitute a key
+ * or create a post-teardown parse failure. */
+int ssh_key_admission_verify_named(ssh_key_admission_t *admission) {
+    struct stat named;
+    int named_fd;
+    int close_rc;
+
+    if (!admission || admission->named_generation_verified ||
+        admission->snapshot.source_detached ||
+        !admission->snapshot.fingerprint_valid) {
+        set_error(ERR_INVALID_ARGS,
+                  "Invalid or already-consumed SSH key admission");
+        return -1;
+    }
+    named_fd = g_ssh_key_open(
+        admission->expanded_key_path,
+        O_RDONLY | O_CLOEXEC | O_NOFOLLOW | O_NONBLOCK);
+    if (named_fd < 0) {
+        errno = ESTALE;
+        set_error(
+            ERR_SSH_KEY_INVALID,
+            "SSH key path changed after OpenSSH validation: %s",
+            admission->expanded_key_path);
+        return -1;
+    }
+    if (fstat(named_fd, &named) != 0 ||
+        !same_runtime_identity(&admission->snapshot.identity, &named) ||
+        admission->snapshot.identity.st_gid != named.st_gid ||
+        named.st_size < 0 ||
+        (uintmax_t)named.st_size != admission->snapshot.length ||
+        !ssh_key_snapshot_fd_matches(&admission->snapshot)) {
+        int saved_errno = errno;
+
+        (void)close(named_fd);
+        errno = saved_errno ? saved_errno : ESTALE;
+        set_error(
+            ERR_SSH_KEY_INVALID,
+            "SSH key path changed after OpenSSH validation: %s",
+            admission->expanded_key_path);
+        return -1;
+    }
+    close_rc = close(named_fd);
+    if (close_rc != 0) {
+        set_system_error(
+            ERR_SYSTEM_CALL,
+            "Cannot close the verified SSH key namespace descriptor");
+        return -1;
+    }
+
+    close_rc = close(admission->snapshot.fd);
+    admission->snapshot.fd = -1;
+    admission->snapshot.fd_open = false;
+    if (close_rc != 0) {
+        set_system_error(
+            ERR_SYSTEM_CALL,
+            "Cannot detach the admitted SSH key generation");
+        return -1;
+    }
+    admission->snapshot.source_detached = true;
+    admission->named_generation_verified = true;
+    return 0;
+}
+
+void ssh_key_admission_end(ssh_key_admission_t **admission) {
+    error_context_t saved_error;
+    int saved_errno;
+
+    if (!admission || !*admission) return;
+    saved_error = *get_last_error();
+    saved_errno = errno;
+    ssh_key_snapshot_clear(&(*admission)->snapshot);
+    secure_zero_memory(*admission, sizeof(**admission));
+    free(*admission);
+    *admission = NULL;
+    g_last_error = saved_error;
+    errno = saved_errno;
+}
+
+/* Switch using the exact generation retained by account-layer admission. */
+int ssh_switch_account_admitted(ssh_config_t *ssh_config,
+                                const account_t *account,
+                                ssh_key_admission_t *admission) {
     char expanded_key_path[MAX_PATH_LEN];
-    ssh_key_snapshot_t key_snapshot;
+    ssh_key_snapshot_t *key_snapshot;
     int rc = -1;
 
-    memset(&key_snapshot, 0, sizeof(key_snapshot));
-    
-    if (!ssh_config || !account) {
-        set_error(ERR_INVALID_ARGS, "Invalid arguments to ssh_switch_account");
+    if (!ssh_config || !account || !admission) {
+        set_error(ERR_INVALID_ARGS,
+                  "Invalid arguments to ssh_switch_account_admitted");
         return -1;
     }
     if (ssh_config->mode == SSH_AGENT_SYSTEM) {
         return reject_system_agent_mode();
     }
-    
-    /* Skip if SSH not enabled for this account */
     if (!account->ssh_enabled || strlen(account->ssh_key_path) == 0) {
-        log_debug("SSH not enabled for account: %s", account->name);
-        return 0;
-    }
-    
-    log_info("Switching SSH configuration for account: %s", account->name);
-    
-    /* Validate and expand key path */
-    if (expand_path(account->ssh_key_path, expanded_key_path, sizeof(expanded_key_path)) != 0) {
-        set_error(ERR_INVALID_PATH, "Failed to expand SSH key path: %s", account->ssh_key_path);
+        set_error(ERR_INVALID_ARGS,
+                  "SSH key admission supplied for an account without SSH");
         return -1;
     }
-    
-    /* Capture and validate one pathname generation. Every fingerprint and
-     * load below consumes these descriptor-derived bytes, so a rename over
-     * the configured pathname cannot substitute a key after admission. */
-    if (ssh_key_snapshot_capture(expanded_key_path, &key_snapshot) != 0) {
-        return -1; /* Error already set */
+    if (expand_path(account->ssh_key_path, expanded_key_path,
+                    sizeof(expanded_key_path)) != 0) {
+        set_error(ERR_INVALID_PATH,
+                  "Failed to expand SSH key path: %s",
+                  account->ssh_key_path);
+        return -1;
     }
-    
+    if (strcmp(expanded_key_path, admission->expanded_key_path) != 0 ||
+        !admission->named_generation_verified ||
+        !admission->snapshot.source_detached ||
+        !admission->snapshot.fingerprint_valid ||
+        !ssh_key_snapshot_fd_matches(&admission->snapshot)) {
+        set_error(
+            ERR_SSH_KEY_INVALID,
+            "SSH activation does not match the admitted key generation");
+        return -1;
+    }
+    key_snapshot = &admission->snapshot;
+    log_info("Switching SSH configuration for account: %s", account->name);
+
     /* Handle based on mode */
     switch (ssh_config->mode) {
         case SSH_AGENT_SYSTEM:
@@ -2582,13 +2994,13 @@ int ssh_switch_account(ssh_config_t *ssh_config, const account_t *account) {
             /* Start the isolated agent and load its key while the socket
              * directory remains descriptor-pinned and manager-locked. */
             if (ssh_start_isolated_agent_with_key(
-                    ssh_config, account, &key_snapshot) != 0) {
+                    ssh_config, account, key_snapshot) != 0) {
                 goto done; /* Error already set */
             }
             break;
             
         case SSH_AGENT_NONE:
-            /* No agent management - just validate key */
+            /* Admission already proved that OpenSSH parses this generation. */
             log_info("SSH agent management disabled - key validated but not loaded");
             break;
             
@@ -2619,7 +3031,42 @@ int ssh_switch_account(ssh_config_t *ssh_config, const account_t *account) {
     log_info("SSH configuration switched successfully for account: %s", account->name);
     rc = 0;
 done:
-    ssh_key_snapshot_clear(&key_snapshot);
+    return rc;
+}
+
+/* Source-compatible one-call entry point. It creates the same exact-generation
+ * admission used by the account transaction, verifies the configured name
+ * before manager mutation, and destroys the sensitive handle on every path. */
+int ssh_switch_account(ssh_config_t *ssh_config, const account_t *account) {
+    char expanded_key_path[MAX_PATH_LEN];
+    ssh_key_admission_t *admission = NULL;
+    int rc;
+
+    if (!ssh_config || !account) {
+        set_error(ERR_INVALID_ARGS, "Invalid arguments to ssh_switch_account");
+        return -1;
+    }
+    if (ssh_config->mode == SSH_AGENT_SYSTEM) {
+        return reject_system_agent_mode();
+    }
+    if (!account->ssh_enabled || strlen(account->ssh_key_path) == 0) {
+        log_debug("SSH not enabled for account: %s", account->name);
+        return 0;
+    }
+    if (expand_path(account->ssh_key_path, expanded_key_path,
+                    sizeof(expanded_key_path)) != 0) {
+        set_error(ERR_INVALID_PATH,
+                  "Failed to expand SSH key path: %s",
+                  account->ssh_key_path);
+        return -1;
+    }
+    if (ssh_key_admission_begin(expanded_key_path, &admission) != 0 ||
+        ssh_key_admission_verify_named(admission) != 0) {
+        ssh_key_admission_end(&admission);
+        return -1;
+    }
+    rc = ssh_switch_account_admitted(ssh_config, account, admission);
+    ssh_key_admission_end(&admission);
     return rc;
 }
 
@@ -2649,7 +3096,7 @@ int ssh_start_isolated_agent(ssh_config_t *ssh_config, const account_t *account)
 
 static int ssh_start_isolated_agent_with_key(
     ssh_config_t *ssh_config, const account_t *account,
-    const ssh_key_snapshot_t *snapshot) {
+    ssh_key_snapshot_t *snapshot) {
     char output[1024];
     char socket_dir[MAX_PATH_LEN];
     char socket_path[MAX_PATH_LEN];
@@ -2667,12 +3114,16 @@ static int ssh_start_isolated_agent_with_key(
     ssh_current_link_identity_t committed_current;
     ssh_runtime_pin_t reuse_pin;
     bool reuse_pin_active = false;
+    error_context_t causal_match_error;
+    bool preserve_causal_match_error = false;
+    int causal_match_errno = 0;
     int dir_fd = -1;
     bool prior_key_names_reuse_target = false;
 
     ssh_runtime_pin_init(&reuse_pin);
+    memset(&causal_match_error, 0, sizeof(causal_match_error));
 
-    if (!ssh_config || !account) {
+    if (!ssh_config || !account || !snapshot) {
         set_error(ERR_INVALID_ARGS, "Invalid arguments to ssh_start_isolated_agent");
         return -1;
     }
@@ -2775,9 +3226,16 @@ static int ssh_start_isolated_agent_with_key(
             if (S_ISSOCK(reuse_pin.identity.st_mode) &&
                 reuse_pin.identity.st_uid == getuid() &&
                 (reuse_pin.identity.st_mode & 0777) == 0600) {
-                can_reuse = ssh_socket_has_key_generation(
-                    dir_fd, socket_dir, socket_name, reuse_key_path,
-                    snapshot);
+                ssh_key_generation_match_t match =
+                    ssh_socket_has_key_generation(
+                    dir_fd, socket_name, reuse_key_path, snapshot);
+                if (match == SSH_KEY_GENERATION_ERROR) {
+                    causal_match_error = *get_last_error();
+                    causal_match_errno = errno;
+                    preserve_causal_match_error = true;
+                    goto done;
+                }
+                can_reuse = match == SSH_KEY_GENERATION_MATCH;
                 if (verify_ssh_runtime_pin_at(
                         dir_fd, socket_name, socket_path, &reuse_pin) != 0) {
                     goto done;
@@ -2788,6 +3246,17 @@ static int ssh_start_isolated_agent_with_key(
     if (!can_reuse && reuse_pin_active) {
         if (release_ssh_runtime_pin(dir_fd, &reuse_pin) != 0) goto done;
         reuse_pin_active = false;
+    }
+
+    /* Complete switch admission already parsed and cached its retained
+     * generation. The low-level legacy entry point can still arrive with only
+     * a captured shape: a canonical live-agent listing parses before it can
+     * authorize reuse, and every other path performs the same full OpenSSH
+     * parse here before orphan cleanup or prior-agent retirement. */
+    if (!snapshot->fingerprint_valid &&
+        ssh_key_snapshot_require_openssh_parse(
+            reuse_key_path, snapshot) != 0) {
+        goto done;
     }
 
     /* ssh-add/ssh-keygen are external scheduling points. Before any orphan
@@ -3232,12 +3701,22 @@ static int ssh_start_isolated_agent_with_key(
                            snapshot) != 0) {
         goto fresh_commit_failed;
     }
-    if (!ssh_socket_has_key_generation(
-            dir_fd, socket_dir, socket_name, reuse_key_path, snapshot)) {
-        set_error(ERR_SSH_KEY_LOAD_FAILED,
-                  "Fresh isolated SSH agent does not contain exactly the "
-                  "requested key");
-        goto fresh_commit_failed;
+    {
+        ssh_key_generation_match_t match =
+            ssh_socket_has_key_generation(
+                dir_fd, socket_name, reuse_key_path, snapshot);
+        if (match == SSH_KEY_GENERATION_ERROR) {
+            causal_match_error = *get_last_error();
+            causal_match_errno = errno;
+            preserve_causal_match_error = true;
+            goto fresh_commit_failed;
+        }
+        if (match != SSH_KEY_GENERATION_MATCH) {
+            set_error(ERR_SSH_KEY_LOAD_FAILED,
+                      "Fresh isolated SSH agent does not contain exactly the "
+                      "requested key");
+            goto fresh_commit_failed;
+        }
     }
     ssh_config->key_already_loaded = true;
     if (verify_socket_dir_namespace(dir_fd, socket_dir) != 0) {
@@ -3347,6 +3826,10 @@ done:
     }
     unlock_agent_dir(lock_fd);
     close(dir_fd);
+    if (preserve_causal_match_error) {
+        g_last_error = causal_match_error;
+        errno = causal_match_errno;
+    }
     return rc;
 }
 
@@ -4051,16 +4534,21 @@ failed:
     return -1;
 }
 
-/* Validate SSH key file */
 int ssh_validate_key_file(const char *key_path) {
-    ssh_key_inspection_t inspection;
+    ssh_key_snapshot_t snapshot;
+    int rc;
 
     if (!key_path) {
         set_error(ERR_INVALID_ARGS, "NULL key_path to ssh_validate_key_file");
         return -1;
     }
-    if (ssh_inspect_key_file(key_path, &inspection) != 0) return -1;
-    return ssh_require_valid_key_inspection(key_path, &inspection);
+    memset(&snapshot, 0, sizeof(snapshot));
+    rc = ssh_key_snapshot_capture(key_path, &snapshot);
+    if (rc == 0) {
+        rc = ssh_key_snapshot_require_openssh_parse(key_path, &snapshot);
+    }
+    ssh_key_snapshot_clear(&snapshot);
+    return rc;
 }
 
 typedef struct {
@@ -7868,8 +8356,10 @@ static int ssh_manager_inspect_current_account(char *name, size_t name_size,
                 goto done;
             }
             if (ssh_key_snapshot_capture(key_path, &key_snapshot) == 0) {
-                reachable = ssh_socket_has_key_generation(
-                    dir_fd, socket_dir, component, key_path, &key_snapshot);
+                reachable =
+                    ssh_socket_has_key_generation(
+                        dir_fd, component, key_path, &key_snapshot) ==
+                    SSH_KEY_GENERATION_MATCH;
             }
             if (!reachable) {
                 /* Empty/wrong/extra identities are ordinary stale runtime,
