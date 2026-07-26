@@ -337,6 +337,7 @@ check_install_staging_contract()
     install_real_chmod=$(command -v chmod) ||
         fail "install-race chmod is unavailable"
     install_real_mv=$(command -v mv) || fail "install-race mv is unavailable"
+    install_real_rm=$(command -v rm) || fail "install-race rm is unavailable"
     install_tmp=$(mktemp -d "${TMPDIR:-/tmp}/gitswitch-install-contract.XXXXXX") ||
         fail "cannot create install-race temporary directory"
     install_builddir=$install_tmp/build
@@ -419,6 +420,47 @@ fi
 exit "$status"
 EOF
     chmod 0755 "$install_shims/sh" || fail "cannot activate install-race shim"
+cat >"$install_shims/mv" <<'EOF'
+#!/bin/sh
+case ${AR14_COMPLETION_FAIL_MODE-} in
+    publish) candidate=${3-} ;;
+    retire) candidate=${2-} ;;
+    *) candidate= ;;
+esac
+if [ -n "${AR14_COMPLETION_FAIL_PATH-}" ] &&
+   [ "$candidate" = "$AR14_COMPLETION_FAIL_PATH" ] &&
+   [ ! -e "$AR14_COMPLETION_FAIL_MARKER" ]; then
+    : >"$AR14_COMPLETION_FAIL_MARKER" || exit 98
+    exit 97
+fi
+if [ -n "${AR14_RESTORE_FAIL_PATH-}" ] &&
+   [ "${3-}" = "$AR14_RESTORE_FAIL_PATH" ] &&
+   [ -e "${AR14_COMPLETION_FAIL_MARKER-}" ] &&
+   [ ! -e "$AR14_RESTORE_FAIL_MARKER" ]; then
+    : >"$AR14_RESTORE_FAIL_MARKER" || exit 98
+    exit 96
+fi
+exec "$AR11_INSTALL_REAL_MV" "$@"
+EOF
+    chmod 0755 "$install_shims/mv" ||
+        fail "cannot activate completion-publication race shim"
+cat >"$install_shims/rm" <<'EOF'
+#!/bin/sh
+if [ -n "${AR14_RM_FAIL_PREFIX-}" ] &&
+   [ ! -e "$AR14_RM_FAIL_MARKER" ]; then
+    for candidate do
+        case $candidate in
+            "$AR14_RM_FAIL_PREFIX"*)
+                : >"$AR14_RM_FAIL_MARKER" || exit 98
+                exit 95
+                ;;
+        esac
+    done
+fi
+exec "$AR11_INSTALL_REAL_RM" "$@"
+EOF
+    chmod 0755 "$install_shims/rm" ||
+        fail "cannot activate uninstall-cleanup failure shim"
 
     # Corrupt only the validator's distinct staged argument. The fixed recipe
     # must reject it before atomic publication, preserve a pre-existing final
@@ -440,6 +482,7 @@ EOF
         AR11_INSTALL_REAL_CP="$install_real_cp" \
         AR11_INSTALL_REAL_CHMOD="$install_real_chmod" \
         AR11_INSTALL_REAL_MV="$install_real_mv" \
+        AR11_INSTALL_REAL_RM="$install_real_rm" \
         AR11_INSTALL_SWAP_BINARY="$install_replacement" \
         AR11_INSTALL_SWAP_REPORT="$install_report" \
         AR11_INSTALL_STAGE_STATE="$install_stage_state" \
@@ -479,8 +522,13 @@ EOF
     set -- "$install_reject_bin/.${install_target}.install."*
     { [ "$#" -eq 1 ] && [ ! -e "$1" ] && [ ! -L "$1" ]; } ||
         fail "failed install left a private binary temporary"
-    [ ! -e "$install_reject_stage$install_prefix/share" ] ||
-        fail "failed binary validation installed completion assets"
+    for rejected_completion in \
+        "$install_reject_stage$install_prefix/share/bash-completion/completions/$install_target" \
+        "$install_reject_stage$install_prefix/share/zsh/site-functions/_$install_target" \
+        "$install_reject_stage$install_prefix/share/fish/vendor_completions.d/$install_target.fish"; do
+        { [ ! -e "$rejected_completion" ] && [ ! -L "$rejected_completion" ]; } ||
+            fail "failed binary validation installed a completion asset"
+    done
 
     # Then let the real validator succeed and replace the private source plus
     # any still-named staged path afterward. Publication must already have
@@ -491,6 +539,7 @@ EOF
         AR11_INSTALL_REAL_CP="$install_real_cp" \
         AR11_INSTALL_REAL_CHMOD="$install_real_chmod" \
         AR11_INSTALL_REAL_MV="$install_real_mv" \
+        AR11_INSTALL_REAL_RM="$install_real_rm" \
         AR11_INSTALL_SWAP_BINARY="$install_replacement" \
         AR11_INSTALL_SWAP_REPORT="$install_report" \
         AR11_INSTALL_STAGE_STATE="$install_stage_state" \
@@ -531,9 +580,204 @@ EOF
     { [ "$#" -eq 1 ] && [ ! -e "$1" ] && [ ! -L "$1" ]; } ||
         fail "successful install left a private binary temporary"
 
+    # AR-14 L38: the binary and three completion assets are one transaction.
+    # Exercise a destination containing shell-significant whitespace/glob
+    # characters, fail the second publication after Bash has committed, and
+    # prove rollback restores the exact prior generation. Then apply the same
+    # causal failure to uninstall after Bash has been retired.
+    completion_stage="$install_tmp/completion stage [literal]"
+    completion_root=$completion_stage$install_prefix
+    completion_binary=$completion_root/bin/$install_target
+    completion_bash=$completion_root/share/bash-completion/completions/$install_target
+    completion_zsh=$completion_root/share/zsh/site-functions/_$install_target
+    completion_fish=$completion_root/share/fish/vendor_completions.d/$install_target.fish
+    completion_marker=$install_tmp/completion-failure.marker
+    mkdir -p "${completion_binary%/*}" "${completion_bash%/*}" "${completion_zsh%/*}" \
+        "${completion_fish%/*}" ||
+        fail "cannot create completion transaction fixture"
+    "$install_real_cp" "$install_sentinel" "$completion_binary" ||
+        fail "cannot seed prior installed binary"
+    printf '%s\n' old-bash >"$completion_bash"
+    printf '%s\n' old-zsh >"$completion_zsh"
+    printf '%s\n' old-fish >"$completion_fish"
+    chmod 0600 "$completion_bash" "$completion_zsh" "$completion_fish"
+    chmod 0700 "$completion_binary"
+    cp "$completion_binary" "$install_tmp/old-binary"
+    cp "$completion_bash" "$install_tmp/old-bash"
+    cp "$completion_zsh" "$install_tmp/old-zsh"
+    cp "$completion_fish" "$install_tmp/old-fish"
+    "$install_real_cp" "$install_expected" "$install_built" ||
+        fail "cannot restore completion fixture release binary"
+    rm -f "$install_report" "$install_stage_state" "$completion_marker"
+    if PATH="$install_shims:$PATH" \
+        AR11_INSTALL_REAL_SH="$install_real_sh" \
+        AR11_INSTALL_REAL_CP="$install_real_cp" \
+        AR11_INSTALL_REAL_CHMOD="$install_real_chmod" \
+        AR11_INSTALL_REAL_MV="$install_real_mv" \
+        AR11_INSTALL_REAL_RM="$install_real_rm" \
+        AR11_INSTALL_SWAP_BINARY="$install_replacement" \
+        AR11_INSTALL_SWAP_REPORT="$install_report" \
+        AR11_INSTALL_STAGE_STATE="$install_stage_state" \
+        AR11_INSTALL_SWAP_MODE=none \
+        AR14_COMPLETION_FAIL_MODE=publish \
+        AR14_COMPLETION_FAIL_PATH="$completion_zsh" \
+        AR14_COMPLETION_FAIL_MARKER="$completion_marker" \
+        "$install_make" -C "$install_root" BUILD_TYPE=release \
+            BUILDDIR="$install_builddir" TARGET="$install_target" \
+            install DESTDIR="$completion_stage" PREFIX="$install_prefix" \
+            >"$install_out" 2>&1; then
+        fail "completion install accepted an injected partial publication"
+    fi
+    [ -e "$completion_marker" ] || {
+        sed -n '1,200p' "$install_out" >&2
+        fail "completion publication failure shim was not exercised"
+    }
+    cmp -s "$install_tmp/old-binary" "$completion_binary" &&
+        cmp -s "$install_tmp/old-bash" "$completion_bash" &&
+        cmp -s "$install_tmp/old-zsh" "$completion_zsh" &&
+        cmp -s "$install_tmp/old-fish" "$completion_fish" ||
+        fail "failed install publication left a mixed generation"
+    [ "$(find "$completion_binary" -prune -type f -perm 0700 -print)" = \
+        "$completion_binary" ] ||
+        fail "binary rollback changed the prior mode"
+    for completion in "$completion_bash" "$completion_zsh" "$completion_fish"; do
+        [ "$(find "$completion" -prune -type f -perm 0600 -print)" = "$completion" ] ||
+            fail "completion rollback changed the prior mode: $completion"
+    done
+    if find "$completion_root/share" -name '.*completion.*' -print |
+        grep . >/dev/null; then
+        fail "failed completion publication left transaction residue"
+    fi
+    set -- "${completion_binary%/*}/.${install_target}.install."*
+    { [ "$#" -eq 1 ] && [ ! -e "$1" ] && [ ! -L "$1" ]; } ||
+        fail "failed install left a private binary stage"
+    set -- "${completion_binary%/*}/.${install_target}.install.rollback."*
+    { [ "$#" -eq 1 ] && [ ! -e "$1" ] && [ ! -L "$1" ]; } ||
+        fail "successful rollback left a binary backup"
+
+    # If restoration itself fails, the transaction must fail and retain the
+    # exact old binary under its rollback-owned name instead of deleting it.
+    restore_marker=$install_tmp/restore-failure.marker
+    rm -f "$completion_marker" "$restore_marker"
+    if PATH="$install_shims:$PATH" \
+        AR11_INSTALL_REAL_SH="$install_real_sh" \
+        AR11_INSTALL_REAL_CP="$install_real_cp" \
+        AR11_INSTALL_REAL_CHMOD="$install_real_chmod" \
+        AR11_INSTALL_REAL_MV="$install_real_mv" \
+        AR11_INSTALL_REAL_RM="$install_real_rm" \
+        AR11_INSTALL_SWAP_BINARY="$install_replacement" \
+        AR11_INSTALL_SWAP_REPORT="$install_report" \
+        AR11_INSTALL_STAGE_STATE="$install_stage_state" \
+        AR11_INSTALL_SWAP_MODE=none \
+        AR14_COMPLETION_FAIL_MODE=publish \
+        AR14_COMPLETION_FAIL_PATH="$completion_zsh" \
+        AR14_COMPLETION_FAIL_MARKER="$completion_marker" \
+        AR14_RESTORE_FAIL_PATH="$completion_binary" \
+        AR14_RESTORE_FAIL_MARKER="$restore_marker" \
+        "$install_make" -C "$install_root" BUILD_TYPE=release \
+            BUILDDIR="$install_builddir" TARGET="$install_target" \
+            install DESTDIR="$completion_stage" PREFIX="$install_prefix" \
+            >"$install_out" 2>&1; then
+        fail "install reported success after binary restoration failed"
+    fi
+    [ -e "$restore_marker" ] ||
+        fail "binary restoration failure shim was not exercised"
+    { [ ! -e "$completion_binary" ] && [ ! -L "$completion_binary" ]; } ||
+        fail "failed binary restoration left transaction-owned bytes canonical"
+    set -- "${completion_binary%/*}/.${install_target}.install.rollback."*
+    [ "$#" -eq 1 ] && [ -f "$1" ] ||
+        fail "failed binary restoration did not retain one recovery backup"
+    cmp -s "$install_tmp/old-binary" "$1" ||
+        fail "retained binary recovery backup has wrong bytes"
+    "$install_real_mv" -f "$1" "$completion_binary" ||
+        fail "cannot recover binary after deterministic restore failure"
+    chmod 0700 "$completion_binary"
+
+    "$install_make" -C "$install_root" BUILD_TYPE=release \
+        BUILDDIR="$install_builddir" TARGET="$install_target" \
+        install DESTDIR="$completion_stage" PREFIX="$install_prefix" \
+        >"$install_out" 2>&1 ||
+        fail "completion install failed for a quoted destination"
+    cmp -s "$install_root/completions/gitswitch.bash" "$completion_bash" &&
+        cmp -s "$install_root/completions/gitswitch.zsh" "$completion_zsh" &&
+        cmp -s "$install_root/completions/gitswitch.fish" "$completion_fish" ||
+        fail "successful completion install published wrong bytes"
+    for completion in "$completion_bash" "$completion_zsh" "$completion_fish"; do
+        [ "$(find "$completion" -prune -type f -perm 0644 -print)" = "$completion" ] ||
+            fail "successful completion install used the wrong mode: $completion"
+    done
+
+    rm -f "$completion_marker"
+    if PATH="$install_shims:$PATH" \
+        AR11_INSTALL_REAL_MV="$install_real_mv" \
+        AR11_INSTALL_REAL_RM="$install_real_rm" \
+        AR14_COMPLETION_FAIL_MODE=retire \
+        AR14_COMPLETION_FAIL_PATH="$completion_zsh" \
+        AR14_COMPLETION_FAIL_MARKER="$completion_marker" \
+        "$install_make" -C "$install_root" TARGET="$install_target" \
+            uninstall DESTDIR="$completion_stage" PREFIX="$install_prefix" \
+            >"$install_out" 2>&1; then
+        fail "completion uninstall accepted an injected partial retirement"
+    fi
+    [ -e "$completion_marker" ] ||
+        fail "completion uninstall failure shim was not exercised"
+    [ -x "$completion_root/bin/$install_target" ] &&
+        cmp -s "$install_root/completions/gitswitch.bash" "$completion_bash" &&
+        cmp -s "$install_root/completions/gitswitch.zsh" "$completion_zsh" &&
+        cmp -s "$install_root/completions/gitswitch.fish" "$completion_fish" ||
+        fail "failed completion uninstall did not restore the live generation"
+
+    # Once every canonical name is retired, cleanup failure is post-commit:
+    # report failure, keep canonical names absent, and retain recoverable
+    # transaction-owned residue rather than falsely claiming completion.
+    cleanup_marker=$install_tmp/uninstall-cleanup-failure.marker
+    rm -f "$cleanup_marker"
+    if PATH="$install_shims:$PATH" \
+        AR11_INSTALL_REAL_MV="$install_real_mv" \
+        AR11_INSTALL_REAL_RM="$install_real_rm" \
+        AR14_RM_FAIL_PREFIX="${completion_binary}.uninstall." \
+        AR14_RM_FAIL_MARKER="$cleanup_marker" \
+        "$install_make" -C "$install_root" TARGET="$install_target" \
+            uninstall DESTDIR="$completion_stage" PREFIX="$install_prefix" \
+            >"$install_out" 2>&1; then
+        fail "uninstall reported success after committed cleanup failed"
+    fi
+    [ -e "$cleanup_marker" ] ||
+        fail "uninstall cleanup failure shim was not exercised"
+    for removed in "$completion_binary" "$completion_bash" \
+        "$completion_zsh" "$completion_fish"; do
+        { [ ! -e "$removed" ] && [ ! -L "$removed" ]; } ||
+            fail "post-commit cleanup failure resurrected canonical path: $removed"
+    done
+    set -- "${completion_binary}.uninstall."*
+    [ "$#" -eq 1 ] && [ -f "$1" ] ||
+        fail "post-commit binary cleanup failure retained no recovery residue"
+    cmp -s "$install_expected" "$1" ||
+        fail "post-commit binary retirement residue has wrong bytes"
+    "$install_real_rm" -f \
+        "${completion_binary}.uninstall."* \
+        "${completion_bash}.uninstall."* \
+        "${completion_zsh}.uninstall."* \
+        "${completion_fish}.uninstall."*
+
+    "$install_make" -C "$install_root" BUILD_TYPE=release \
+        BUILDDIR="$install_builddir" TARGET="$install_target" \
+        install DESTDIR="$completion_stage" PREFIX="$install_prefix" \
+        >"$install_out" 2>&1 ||
+        fail "reinstall after committed cleanup failure failed"
+    "$install_make" -C "$install_root" TARGET="$install_target" \
+        uninstall DESTDIR="$completion_stage" PREFIX="$install_prefix" \
+        >"$install_out" 2>&1 ||
+        fail "successful quoted uninstall failed"
+    for removed in "$completion_root/bin/$install_target" \
+        "$completion_bash" "$completion_zsh" "$completion_fish"; do
+        { [ ! -e "$removed" ] && [ ! -L "$removed" ]; } ||
+            fail "successful uninstall retained an installed artifact: $removed"
+    done
+
     trap - 0 1 2 3 15
     rm -rf "$install_tmp"
-    printf 'ar07-release: PASS (staged install rejects corruption and seals publication)\n'
+    printf 'ar07-release: PASS (staged binary and completion transactions)\n'
 }
 
 expect_artifact_rejection()

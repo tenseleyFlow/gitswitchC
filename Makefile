@@ -1374,41 +1374,105 @@ $(BINDIR)/$(TARGET): $(OBJECTS) | $(BINDIR)
 # caller must build explicitly first (`make release` / `make`). BUILD_TYPE is
 # irrelevant here — no rebuild happens.
 .PHONY: install
+export DESTDIR PREFIX TARGET
 ifeq ($(BUILD_TYPE),release)
 install: release-policy-check
 endif
 install:
 	@set -e; \
-	source_binary="$(BINDIR)/$(TARGET)"; \
-	destination_dir="$(DESTDIR)$(PREFIX)/bin"; \
-	destination_binary="$$destination_dir/$(TARGET)"; \
+	root="$${DESTDIR}$${PREFIX}"; \
+	case "$$root" in -*) root="./$$root" ;; esac; \
+	source_binary="$(BINDIR)/$${TARGET}"; \
+	binary_dir="$$root/bin"; \
+	bash_dir="$$root/share/bash-completion/completions"; \
+	zsh_dir="$$root/share/zsh/site-functions"; \
+	fish_dir="$$root/share/fish/vendor_completions.d"; \
+	binary_final="$$binary_dir/$${TARGET}"; \
+	bash_final="$$bash_dir/$${TARGET}"; \
+	zsh_final="$$zsh_dir/_$${TARGET}"; \
+	fish_final="$$fish_dir/$${TARGET}.fish"; \
 	if [ ! -x "$$source_binary" ]; then \
 		echo "Error: $$source_binary not built. Run 'make release' (or 'make') first." >&2; \
 		exit 1; \
 	fi; \
-	echo "Installing $(TARGET)..."; \
-	install -d "$$destination_dir"; \
-	staged_binary=`mktemp "$$destination_dir/.$(TARGET).install.XXXXXX"`; \
-	cleanup_staged_install() { \
-		cleanup_status=$$1; \
-		trap - 0 1 2 3 15; \
-		rm -f "$$staged_binary"; \
-		exit "$$cleanup_status"; \
+	echo "Installing $${TARGET} and shell completions..."; \
+	install -d "$$binary_dir" "$$bash_dir" "$$zsh_dir" "$$fish_dir"; \
+	binary_stage=; bash_stage=; zsh_stage=; fish_stage=; \
+	binary_backup=; bash_backup=; zsh_backup=; fish_backup=; \
+	binary_state=untouched; bash_state=untouched; \
+	zsh_state=untouched; fish_state=untouched; \
+	binary_published=0; bash_published=0; zsh_published=0; fish_published=0; \
+	committed=0; \
+	rollback_install_asset() { \
+		rollback_state=$$1; rollback_final=$$2; \
+		rollback_backup=$$3; rollback_stage=$$4; rollback_published=$$5; \
+		if [ "$$rollback_state" = inflight ]; then \
+			if { [ ! -e "$$rollback_final" ] && [ ! -L "$$rollback_final" ]; } && \
+			   { [ -e "$$rollback_backup" ] || [ -L "$$rollback_backup" ]; }; then \
+				rollback_state=backed; \
+			elif [ -e "$$rollback_final" ] || [ -L "$$rollback_final" ]; then \
+				rollback_state=untouched; \
+			else \
+				transaction_status=1; return; \
+			fi; \
+		fi; \
+		case "$$rollback_state" in \
+		backed) \
+			if [ "$$rollback_published" -eq 1 ] || \
+			   { [ ! -e "$$rollback_stage" ] && [ ! -L "$$rollback_stage" ]; }; then \
+				rm -f "$$rollback_final" || { transaction_status=1; return; }; \
+			fi; \
+			if [ -e "$$rollback_final" ] || [ -L "$$rollback_final" ]; then \
+				transaction_status=1; return; \
+			fi; \
+			mv -f "$$rollback_backup" "$$rollback_final" || transaction_status=1; \
+			;; \
+		absent) \
+			if [ "$$rollback_published" -eq 1 ] || \
+			   { [ ! -e "$$rollback_stage" ] && [ ! -L "$$rollback_stage" ]; }; then \
+				rm -f "$$rollback_final" || transaction_status=1; \
+			fi; \
+			if [ -n "$$rollback_backup" ]; then \
+				rm -f "$$rollback_backup" || transaction_status=1; \
+			fi; \
+			;; \
+		untouched) \
+			if [ -n "$$rollback_backup" ]; then \
+				rm -f "$$rollback_backup" || transaction_status=1; \
+			fi; \
+			;; \
+		esac; \
 	}; \
-	trap 'cleanup_staged_install $$?' 0; \
-	trap 'cleanup_staged_install 129' 1; \
-	trap 'cleanup_staged_install 130' 2; \
-	trap 'cleanup_staged_install 131' 3; \
-	trap 'cleanup_staged_install 143' 15; \
-	install -m 755 "$$source_binary" "$$staged_binary"; \
+	install_transaction_cleanup() { \
+		transaction_status=$$?; \
+		trap - 0 1 2 3 15; \
+		if [ "$$committed" -eq 0 ]; then \
+			rollback_install_asset "$$fish_state" "$$fish_final" "$$fish_backup" "$$fish_stage" "$$fish_published"; \
+			rollback_install_asset "$$zsh_state" "$$zsh_final" "$$zsh_backup" "$$zsh_stage" "$$zsh_published"; \
+			rollback_install_asset "$$bash_state" "$$bash_final" "$$bash_backup" "$$bash_stage" "$$bash_published"; \
+			rollback_install_asset "$$binary_state" "$$binary_final" "$$binary_backup" "$$binary_stage" "$$binary_published"; \
+		fi; \
+		for install_temp in "$$binary_stage" "$$bash_stage" "$$zsh_stage" "$$fish_stage"; do \
+			if [ -n "$$install_temp" ]; then rm -f "$$install_temp" || transaction_status=1; fi; \
+		done; \
+		exit "$$transaction_status"; \
+	}; \
+	trap install_transaction_cleanup 0; \
+	trap 'exit 129' 1; trap 'exit 130' 2; trap 'exit 131' 3; trap 'exit 143' 15; \
+	binary_stage=`mktemp "$$binary_dir/.$${TARGET}.install.XXXXXX"`; \
+	bash_stage=`mktemp "$$bash_dir/.$${TARGET}.completion.install.XXXXXX"`; \
+	zsh_stage=`mktemp "$$zsh_dir/._$${TARGET}.completion.install.XXXXXX"`; \
+	fish_stage=`mktemp "$$fish_dir/.$${TARGET}.fish.completion.install.XXXXXX"`; \
+	binary_backup=`mktemp "$$binary_dir/.$${TARGET}.install.rollback.XXXXXX"`; \
+	bash_backup=`mktemp "$$bash_dir/.$${TARGET}.completion.rollback.XXXXXX"`; \
+	zsh_backup=`mktemp "$$zsh_dir/._$${TARGET}.completion.rollback.XXXXXX"`; \
+	fish_backup=`mktemp "$$fish_dir/.$${TARGET}.fish.completion.rollback.XXXXXX"`; \
+	install -m 755 "$$source_binary" "$$binary_stage"; \
+	install -m 644 completions/gitswitch.bash "$$bash_stage"; \
+	install -m 644 completions/gitswitch.zsh "$$zsh_stage"; \
+	install -m 644 completions/gitswitch.fish "$$fish_stage"; \
 	bt=`sed -n '1s/|.*//p' "$(BUILDTYPE_STAMP)" 2>/dev/null`; \
-	if [ "$$bt" != "release" ]; then \
-		sh tests/test_ar07_release.sh copy-publish \
-			"$$source_binary" "$$staged_binary" "$$destination_binary" || { \
-			echo 'ERROR: refusing to install an unverified staged binary' >&2; exit 1; \
-		}; \
-		echo "Warning: installing a '$$bt' build (not 'release'); run 'make release' for a hardened, non-ASan binary." >&2; \
-	else \
+	if [ "$$bt" = "release" ]; then \
 		built_os=`sed -n 's/^platform_os=//p' "$(BUILDTYPE_STAMP)"`; \
 		case "$$built_os" in Linux|Darwin|FreeBSD) ;; \
 			*) built_ack=`sed -n 's/^unsupported_release_ack=//p' "$(BUILDTYPE_STAMP)"`; \
@@ -1435,32 +1499,129 @@ install:
 		*) echo "ERROR: release install: unrecognized artifact format '$$built_format'; refusing to skip the hardening pre-check" >&2; \
 			exit 1; ;; \
 		esac; \
+	fi; \
+	if [ -e "$$binary_final" ] || [ -L "$$binary_final" ]; then \
+		binary_state=inflight; \
+		mv -f "$$binary_final" "$$binary_backup"; binary_state=backed; \
+	else binary_state=absent; rm -f "$$binary_backup"; fi; \
+	if [ -e "$$bash_final" ] || [ -L "$$bash_final" ]; then \
+		bash_state=inflight; \
+		mv -f "$$bash_final" "$$bash_backup"; bash_state=backed; \
+	else bash_state=absent; rm -f "$$bash_backup"; fi; \
+	if [ -e "$$zsh_final" ] || [ -L "$$zsh_final" ]; then \
+		zsh_state=inflight; \
+		mv -f "$$zsh_final" "$$zsh_backup"; zsh_state=backed; \
+	else zsh_state=absent; rm -f "$$zsh_backup"; fi; \
+	if [ -e "$$fish_final" ] || [ -L "$$fish_final" ]; then \
+		fish_state=inflight; \
+		mv -f "$$fish_final" "$$fish_backup"; fish_state=backed; \
+	else fish_state=absent; rm -f "$$fish_backup"; fi; \
+	if [ "$$bt" != "release" ]; then \
+		sh tests/test_ar07_release.sh copy-publish \
+			"$$source_binary" "$$binary_stage" "$$binary_final" || { \
+			echo 'ERROR: refusing to install an unverified staged binary' >&2; exit 1; \
+		}; \
+		binary_published=1; \
+		echo "Warning: installing a '$$bt' build (not 'release'); run 'make release' for a hardened, non-ASan binary." >&2; \
+	else \
 		GITSWITCH_RELEASE_FORMAT="$$built_format" \
 			sh tests/test_ar07_release.sh artifact-publish \
-			"$$source_binary" "$$staged_binary" \
-			"$$destination_binary" "$$built_triple" || { \
+			"$$source_binary" "$$binary_stage" \
+			"$$binary_final" "$$built_triple" || { \
 			echo 'ERROR: refusing to install an unverified release artifact' >&2; exit 1; \
 		}; \
+		binary_published=1; \
 	fi; \
-	rm -f "$$staged_binary"; \
+	mv -f "$$bash_stage" "$$bash_final"; \
+	bash_published=1; \
+	mv -f "$$zsh_stage" "$$zsh_final"; \
+	zsh_published=1; \
+	mv -f "$$fish_stage" "$$fish_final"; \
+	fish_published=1; \
+	rm -f "$$binary_stage" "$$bash_stage" "$$zsh_stage" "$$fish_stage"; \
+	committed=1; \
+	rm -f "$$binary_backup" "$$bash_backup" "$$zsh_backup" "$$fish_backup"; \
 	trap - 0 1 2 3 15
-	@echo "Installing shell completions..."
-	install -d $(DESTDIR)$(PREFIX)/share/bash-completion/completions
-	install -m 644 completions/gitswitch.bash $(DESTDIR)$(PREFIX)/share/bash-completion/completions/$(TARGET)
-	install -d $(DESTDIR)$(PREFIX)/share/zsh/site-functions
-	install -m 644 completions/gitswitch.zsh $(DESTDIR)$(PREFIX)/share/zsh/site-functions/_$(TARGET)
-	install -d $(DESTDIR)$(PREFIX)/share/fish/vendor_completions.d
-	install -m 644 completions/gitswitch.fish $(DESTDIR)$(PREFIX)/share/fish/vendor_completions.d/$(TARGET).fish
 	@echo "Installation complete"
 
 # Uninstall target
 .PHONY: uninstall
 uninstall:
-	@echo "Uninstalling $(TARGET)..."
-	rm -f $(DESTDIR)$(PREFIX)/bin/$(TARGET)
-	rm -f $(DESTDIR)$(PREFIX)/share/bash-completion/completions/$(TARGET)
-	rm -f $(DESTDIR)$(PREFIX)/share/zsh/site-functions/_$(TARGET)
-	rm -f $(DESTDIR)$(PREFIX)/share/fish/vendor_completions.d/$(TARGET).fish
+	@set -e; \
+	root="$${DESTDIR}$${PREFIX}"; \
+	case "$$root" in -*) root="./$$root" ;; esac; \
+	binary="$$root/bin/$${TARGET}"; \
+	bash_final="$$root/share/bash-completion/completions/$${TARGET}"; \
+	zsh_final="$$root/share/zsh/site-functions/_$${TARGET}"; \
+	fish_final="$$root/share/fish/vendor_completions.d/$${TARGET}.fish"; \
+	echo "Uninstalling $${TARGET}..."; \
+	binary_retired=; bash_retired=; zsh_retired=; fish_retired=; \
+	binary_state=untouched; bash_state=untouched; \
+	zsh_state=untouched; fish_state=untouched; committed=0; \
+	rollback_uninstall_asset() { \
+		rollback_state=$$1; rollback_final=$$2; rollback_retired=$$3; \
+		if [ "$$rollback_state" = inflight ]; then \
+			if { [ ! -e "$$rollback_final" ] && [ ! -L "$$rollback_final" ]; } && \
+			   { [ -e "$$rollback_retired" ] || [ -L "$$rollback_retired" ]; }; then \
+				rollback_state=retired; \
+			elif [ -e "$$rollback_final" ] || [ -L "$$rollback_final" ]; then \
+				rollback_state=untouched; \
+			else \
+				transaction_status=1; return; \
+			fi; \
+		fi; \
+		case "$$rollback_state" in \
+		retired) \
+			if [ -e "$$rollback_final" ] || [ -L "$$rollback_final" ]; then \
+				transaction_status=1; return; \
+			fi; \
+			mv -f "$$rollback_retired" "$$rollback_final" || transaction_status=1; \
+			;; \
+		untouched) \
+			if [ -n "$$rollback_retired" ]; then \
+				rm -f "$$rollback_retired" || transaction_status=1; \
+			fi; \
+			;; \
+		esac; \
+	}; \
+	uninstall_transaction_cleanup() { \
+		transaction_status=$$?; \
+		trap - 0 1 2 3 15; \
+		if [ "$$committed" -eq 0 ]; then \
+			rollback_uninstall_asset "$$fish_state" "$$fish_final" "$$fish_retired"; \
+			rollback_uninstall_asset "$$zsh_state" "$$zsh_final" "$$zsh_retired"; \
+			rollback_uninstall_asset "$$bash_state" "$$bash_final" "$$bash_retired"; \
+			rollback_uninstall_asset "$$binary_state" "$$binary" "$$binary_retired"; \
+		fi; \
+		exit "$$transaction_status"; \
+	}; \
+	trap uninstall_transaction_cleanup 0; \
+	trap 'exit 129' 1; trap 'exit 130' 2; trap 'exit 131' 3; trap 'exit 143' 15; \
+	if [ -e "$$binary" ] || [ -L "$$binary" ]; then \
+		binary_retired=`mktemp "$${binary}.uninstall.XXXXXX"`; \
+		binary_state=inflight; \
+		mv -f "$$binary" "$$binary_retired"; binary_state=retired; \
+	fi; \
+	if [ -e "$$bash_final" ] || [ -L "$$bash_final" ]; then \
+		bash_retired=`mktemp "$${bash_final}.uninstall.XXXXXX"`; \
+		bash_state=inflight; \
+		mv -f "$$bash_final" "$$bash_retired"; bash_state=retired; \
+	fi; \
+	if [ -e "$$zsh_final" ] || [ -L "$$zsh_final" ]; then \
+		zsh_retired=`mktemp "$${zsh_final}.uninstall.XXXXXX"`; \
+		zsh_state=inflight; \
+		mv -f "$$zsh_final" "$$zsh_retired"; zsh_state=retired; \
+	fi; \
+	if [ -e "$$fish_final" ] || [ -L "$$fish_final" ]; then \
+		fish_retired=`mktemp "$${fish_final}.uninstall.XXXXXX"`; \
+		fish_state=inflight; \
+		mv -f "$$fish_final" "$$fish_retired"; fish_state=retired; \
+	fi; \
+	committed=1; \
+	for uninstall_temp in "$$binary_retired" "$$bash_retired" "$$zsh_retired" "$$fish_retired"; do \
+		if [ -n "$$uninstall_temp" ]; then rm -f "$$uninstall_temp"; fi; \
+	done; \
+	trap - 0 1 2 3 15
 	@echo "Uninstall complete"
 
 # Test compilation

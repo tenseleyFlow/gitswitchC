@@ -235,6 +235,15 @@ stage=$tmp/stage
 # Darwin, so platform CI exercises the flags selected by that platform branch.
 sh "$source_root/tests/test_ar07_release.sh" artifact "$release_bin" \
     "$stage$prefix/bin/gitswitch"
+"$make_cmd" -C "$source_root" uninstall DESTDIR="$stage" PREFIX="$prefix"
+for removed in \
+    "$stage$prefix/bin/gitswitch" \
+    "$stage$prefix/share/bash-completion/completions/gitswitch" \
+    "$stage$prefix/share/zsh/site-functions/_gitswitch" \
+    "$stage$prefix/share/fish/vendor_completions.d/gitswitch.fish"; do
+    { [ ! -e "$removed" ] && [ ! -L "$removed" ]; } ||
+        fail "uninstall retained packaged artifact: $removed"
+done
 
 # AR-05 L17: the H4 manifest fix exists because the source archive once could
 # not satisfy its own RPM spec (%install ran make install against missing
