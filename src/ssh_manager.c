@@ -1838,73 +1838,10 @@ static ssh_process_outcome_t pid_is_our_ssh_agent(
                : SSH_PROCESS_REPLACED;
 }
 
-/* Wait up to `total_ms` for `pid` to disappear. ssh-agent daemonizes (it is
- * reparented to init, not our child), so kill(pid, 0) flips to ESRCH as soon
- * as init reaps it — no waitpid involved. Poll with exponential backoff
- * (1ms doubling to a 50ms cap) inside the same total budget: the very first
- * liveness check runs before the just-signaled agent has even been scheduled,
- * so a fixed 50ms interval used to stack ~50ms of dead time per reaped agent
- * — all of it under the held agent-dir lock (AR-03 L19). A healthy agent
- * exits within the first millisecond or two. */
 static int64_t monotonic_milliseconds(void) {
     struct timespec now;
     if (clock_gettime(CLOCK_MONOTONIC, &now) != 0) return -1;
     return (int64_t)now.tv_sec * 1000 + now.tv_nsec / 1000000;
-}
-
-static int sleep_until_milliseconds(int64_t target_ms) {
-    for (;;) {
-        int64_t now = monotonic_milliseconds();
-        int64_t remaining;
-        struct timespec delay;
-        if (now < 0) return -1;
-        remaining = target_ms - now;
-        if (remaining <= 0) return 0;
-        delay.tv_sec = (time_t)(remaining / 1000);
-        delay.tv_nsec = (long)(remaining % 1000) * 1000000L;
-        if (nanosleep(&delay, NULL) == 0) return 0;
-        if (errno != EINTR) return -1;
-        /* Recompute from CLOCK_MONOTONIC. An interrupted sleep consumes only
-         * the time that actually elapsed, never its requested slice. */
-    }
-}
-
-static ssh_process_outcome_t wait_pid_gone(
-    const ssh_agent_record_t *record, int total_ms) {
-    int64_t started;
-    int64_t deadline;
-    int delay = 1;
-
-    if (total_ms < 0) return SSH_PROCESS_INDETERMINATE;
-    started = monotonic_milliseconds();
-    if (started < 0 || started > INT64_MAX - total_ms) {
-        return SSH_PROCESS_INDETERMINATE;
-    }
-    deadline = started + total_ms;
-    for (;;) {
-        ssh_process_generation_t observed;
-        ssh_process_outcome_t presence = probe_process_presence(record->pid);
-        int64_t now;
-        int64_t next;
-        if (presence != SSH_PROCESS_OWNED) return presence;
-        if (g_reap_ops.generation(record->pid, &observed) != 0) {
-            return inspection_failure_outcome(record->pid);
-        }
-        if (!ssh_process_generation_equal(&record->generation, &observed)) {
-            return SSH_PROCESS_REPLACED;
-        }
-        now = monotonic_milliseconds();
-        if (now < 0) return SSH_PROCESS_INDETERMINATE;
-        if (now >= deadline) return SSH_PROCESS_OWNED;
-        next = now + delay;
-        if (next > deadline) next = deadline;
-        if (sleep_until_milliseconds(next) != 0) {
-            return SSH_PROCESS_INDETERMINATE;
-        }
-        if (delay < 50) {
-            delay = delay * 2 < 50 ? delay * 2 : 50;
-        }
-    }
 }
 
 static ssh_process_outcome_t wait_pidfd_gone(int pidfd, int total_ms) {
@@ -1949,9 +1886,9 @@ static ssh_process_outcome_t wait_pidfd_gone(int pidfd, int total_ms) {
  * On Linux, pin the process with a pidfd BEFORE verifying+signaling so a PID
  * recycled in the check-then-signal window (CONC-4 TOCTOU) cannot receive
  * either signal — the pidfd refers to a specific process instance, not a
- * reusable number. Where pidfd is unavailable (older kernels, non-Linux) fall
- * back to plain kill guarded by the identity check, re-verified before the
- * SIGKILL escalation. */
+ * reusable number. Where pidfd is unavailable, fail closed and retain the
+ * durable recovery tuple; numeric PID ownership evidence never authorizes a
+ * nonzero signal. */
 static int ssh_process_signal_real(pid_t pid, int signal_number) {
     return kill(pid, signal_number);
 }
@@ -2112,43 +2049,7 @@ static ssh_process_outcome_t reap_ssh_agent(
         return outcome;
     }
     if (open_errno == ESRCH) return SSH_PROCESS_GONE;
-    if (open_errno != ENOSYS && open_errno != EINVAL &&
-        open_errno != EOPNOTSUPP) {
-        return SSH_PROCESS_INDETERMINATE;
-    }
-
-    identity = verify_expected_process_generation(record);
-    if (identity != SSH_PROCESS_OWNED) return identity;
-    identity = g_reap_ops.identity(record, sock, runtime_dir_fd);
-    if (identity != SSH_PROCESS_OWNED) return identity;
-    identity = verify_expected_process_generation(record);
-    if (identity != SSH_PROCESS_OWNED) return identity;
-    for (int attempts = 0;; attempts++) {
-        if (g_reap_ops.signal(record->pid, SIGTERM) == 0) {
-            outcome = SSH_PROCESS_OWNED;
-            break;
-        }
-        if (errno == EINTR && attempts < 16) continue;
-        return errno == ESRCH ? SSH_PROCESS_GONE
-                              : SSH_PROCESS_INDETERMINATE;
-    }
-    outcome = wait_pid_gone(record, 500);
-    if (outcome != SSH_PROCESS_OWNED) return outcome;
-
-    /* Without a pidfd, re-prove the PID identity before the harder signal. */
-    identity = g_reap_ops.identity(record, sock, runtime_dir_fd);
-    if (identity != SSH_PROCESS_OWNED) return identity;
-    identity = verify_expected_process_generation(record);
-    if (identity != SSH_PROCESS_OWNED) return identity;
-    log_warning("ssh-agent PID %ld ignored SIGTERM; escalating to SIGKILL",
-                (long)record->pid);
-    for (int attempts = 0;; attempts++) {
-        if (g_reap_ops.signal(record->pid, SIGKILL) == 0) break;
-        if (errno == EINTR && attempts < 16) continue;
-        return errno == ESRCH ? SSH_PROCESS_GONE
-                              : SSH_PROCESS_INDETERMINATE;
-    }
-    return wait_pid_gone(record, 500);
+    return SSH_PROCESS_INDETERMINATE;
 }
 
 static bool ssh_reap_allows_cleanup(ssh_process_outcome_t outcome) {
