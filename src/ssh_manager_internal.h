@@ -26,6 +26,13 @@ int ssh_revalidate_host_alias_obligation(
  * lock, reread, parse, and revalidate its own current snapshot. */
 int ssh_preflight_host_alias_config(const account_t *account);
 
+/* Run the same isolated SSH authentication probe as the public compatibility
+ * API, but require the child invocation and output capture to finish before
+ * one caller-supplied absolute CLOCK_MONOTONIC deadline in milliseconds. */
+int ssh_test_connection_with_deadline(const account_t *account,
+                                      const char *host,
+                                      int64_t deadline_millis);
+
 /* Capture and OpenSSH-parse one exact private-key generation, retain its
  * descriptor-backed bytes across account-layer preflight, and bind activation
  * to those bytes. `verify_named` is the final no-mutation checkpoint: it

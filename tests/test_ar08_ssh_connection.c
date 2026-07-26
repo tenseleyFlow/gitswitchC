@@ -6,6 +6,9 @@
 #include "git_ops.h"
 #include "gitswitch.h"
 #include "ssh_manager.h"
+#define GITSWITCH_INTERNAL_API
+#include "ssh_manager_internal.h"
+#undef GITSWITCH_INTERNAL_API
 #include "utils.h"
 
 #include <signal.h>
@@ -26,6 +29,9 @@ static int g_exit_code;
 static int g_term_signal;
 static bool g_spawned;
 static bool g_truncated;
+static bool g_timed_out;
+static bool g_use_deadline;
+static int64_t g_deadline_millis;
 static char g_argv[16][MAX_PATH_LEN];
 static int g_argc;
 
@@ -44,7 +50,7 @@ static bool argv_has_option_value(const char *option, const char *value) {
 static void publish_result(const run_opts_t *opts, run_result_t *result,
                            const char *output, int exit_code,
                            int term_signal, bool spawned,
-                           bool truncated) {
+                           bool truncated, bool timed_out) {
     size_t output_len = output ? strlen(output) : 0U;
     size_t copied = 0U;
 
@@ -61,6 +67,7 @@ static void publish_result(const run_opts_t *opts, run_result_t *result,
         result->term_signal = term_signal;
         result->out_len = copied;
         result->out_truncated = truncated || copied != output_len;
+        result->timed_out = timed_out;
     }
 }
 
@@ -72,6 +79,7 @@ static int connection_runner(const char *const argv[],
     int term_signal = g_term_signal;
     bool spawned = g_spawned;
     bool truncated = g_truncated;
+    bool timed_out = g_timed_out;
     bool strict_identity;
     bool config_isolated;
     bool exact_identity;
@@ -79,6 +87,9 @@ static int connection_runner(const char *const argv[],
     int i;
 
     g_argc = 0;
+    g_use_deadline = opts && opts->use_deadline;
+    g_deadline_millis =
+        g_use_deadline ? opts->deadline_millis : 0;
     for (i = 0; argv && argv[i] && i < 16; i++) {
         CHECK_EQ_INT(safe_strncpy(g_argv[i], argv[i],
                                   sizeof(g_argv[i])), 0);
@@ -105,6 +116,7 @@ static int connection_runner(const char *const argv[],
         term_signal = 0;
         spawned = true;
         truncated = false;
+        timed_out = false;
     } else if (g_mode == CONNECTION_CAUSAL_ACCEPT_ACCOUNT_KEY) {
         output = exact_identity
                      ? "Hi intended-user! You've successfully authenticated, "
@@ -114,6 +126,7 @@ static int connection_runner(const char *const argv[],
         term_signal = 0;
         spawned = true;
         truncated = false;
+        timed_out = false;
     } else if (g_mode == CONNECTION_CAUSAL_ACCEPT_MANAGED_ALIAS) {
         bool exact_alias = exact_identity && destination_pinned &&
                            g_argc > 0 &&
@@ -127,10 +140,11 @@ static int connection_runner(const char *const argv[],
         term_signal = 0;
         spawned = true;
         truncated = false;
+        timed_out = false;
     }
 
     publish_result(opts, result, output, exit_code, term_signal, spawned,
-                   truncated);
+                   truncated, timed_out);
     return spawned && term_signal == 0 && exit_code == 0 ? 0 : -1;
 }
 
@@ -159,7 +173,99 @@ static int scripted_probe(const account_t *account, const char *output,
     g_term_signal = term_signal;
     g_spawned = spawned;
     g_truncated = truncated;
+    g_timed_out = false;
     return ssh_test_connection(account, "git@github.com");
+}
+
+static int scripted_deadline_probe(const account_t *account,
+                                   const char *host,
+                                   int64_t deadline_millis,
+                                   const char *output,
+                                   int exit_code,
+                                   bool timed_out) {
+    g_mode = CONNECTION_SCRIPTED;
+    g_output = output;
+    g_exit_code = exit_code;
+    g_term_signal = 0;
+    g_spawned = true;
+    g_truncated = false;
+    g_timed_out = timed_out;
+    return ssh_test_connection_with_deadline(account, host,
+                                             deadline_millis);
+}
+
+TEST(deadline_probe_propagates_exact_absolute_deadline) {
+    static const int64_t direct_deadline = INT64_C(123456789);
+    static const int64_t alias_deadline = INT64_C(987654321);
+    static const char greeting[] =
+        "Hi intended-user! You've successfully authenticated, but GitHub "
+        "does not provide shell access.";
+    account_t account;
+    command_runner_fn previous;
+
+    previous = run_set_runner(connection_runner);
+    make_account(&account, false);
+    CHECK_EQ_INT(scripted_deadline_probe(&account, "git@github.com",
+                                         direct_deadline, greeting, 1,
+                                         false), 0);
+    CHECK(g_use_deadline);
+    CHECK(g_deadline_millis == direct_deadline);
+    CHECK_STR_EQ(g_argv[g_argc - 1], "git@github.com");
+
+    make_account(&account, true);
+    CHECK_EQ_INT(scripted_deadline_probe(&account, "work-github",
+                                         alias_deadline, greeting, 1,
+                                         false), 0);
+    CHECK(g_use_deadline);
+    CHECK(g_deadline_millis == alias_deadline);
+    CHECK_STR_EQ(g_argv[g_argc - 1], "git@work-github");
+    run_set_runner(previous);
+}
+
+TEST(public_probe_remains_unbounded) {
+    static const char greeting[] =
+        "Hi intended-user! You've successfully authenticated, but GitHub "
+        "does not provide shell access.";
+    account_t account;
+    command_runner_fn previous;
+
+    make_account(&account, false);
+    previous = run_set_runner(connection_runner);
+    CHECK_EQ_INT(scripted_probe(&account, greeting, 1, 0, true, false), 0);
+    CHECK(!g_use_deadline);
+    CHECK(g_deadline_millis == 0);
+    run_set_runner(previous);
+}
+
+TEST(deadline_timeout_rejects_otherwise_valid_authentication) {
+    static const char greeting[] =
+        "Hi intended-user! You've successfully authenticated, but GitHub "
+        "does not provide shell access.";
+    account_t account;
+    command_runner_fn previous;
+
+    make_account(&account, false);
+    previous = run_set_runner(connection_runner);
+    CHECK_EQ_INT(scripted_deadline_probe(&account, "git@github.com",
+                                         INT64_C(42), greeting, 1, true),
+                 -1);
+    CHECK(g_use_deadline);
+    CHECK(g_deadline_millis == INT64_C(42));
+    run_set_runner(previous);
+}
+
+TEST(deadline_probe_rejects_negative_deadline_without_running_ssh) {
+    account_t account;
+    command_runner_fn previous;
+
+    make_account(&account, false);
+    previous = run_set_runner(connection_runner);
+    g_argc = 99;
+    CHECK_EQ_INT(ssh_test_connection_with_deadline(
+                     &account, "git@github.com", INT64_C(-1)), -1);
+    CHECK_EQ_INT(g_argc, 99);
+    CHECK_EQ_INT(get_last_error()->code, ERR_INVALID_ARGS);
+    run_set_runner(previous);
 }
 
 TEST(diagnostic_fragments_never_authenticate) {
@@ -587,6 +693,10 @@ TEST_MAIN_BEGIN()
     error_init(LOG_LEVEL_WARNING, NULL);
     RUN_TEST(diagnostic_fragments_never_authenticate);
     RUN_TEST(provider_greetings_require_exact_lines_and_exit_classes);
+    RUN_TEST(deadline_probe_propagates_exact_absolute_deadline);
+    RUN_TEST(public_probe_remains_unbounded);
+    RUN_TEST(deadline_timeout_rejects_otherwise_valid_authentication);
+    RUN_TEST(deadline_probe_rejects_negative_deadline_without_running_ssh);
     RUN_TEST(direct_probe_offers_only_the_intended_account_key);
     RUN_TEST(managed_alias_probe_pins_git_user_destination_and_config);
     RUN_TEST(managed_alias_probe_rejects_a_missing_canonical_destination);

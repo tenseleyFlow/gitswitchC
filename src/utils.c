@@ -3553,18 +3553,52 @@ static int child_report_fd_close_observation(
     return child_write_status(status_fd, &status);
 }
 
+typedef struct {
+    bool enabled;
+    bool observed;
+    int64_t deadline;
+    int64_t last_now;
+} run_deadline_state_t;
+
+static int run_deadline_observe(run_deadline_state_t *state,
+                                int *remaining_millis);
+static int runner_poll(struct pollfd *fds, nfds_t count, int timeout_millis);
+
 /* Returns 0 for the CLOEXEC EOF that proves exec succeeded, 1 for a complete
- * child failure report, and -1 for a malformed/failed status read.  Optional
- * observation messages can precede either EOF or a later setup failure. */
+ * child failure report, -1 for a malformed/failed status read, -2 for
+ * deadline expiry, and -3 for a monotonic-clock failure. Optional observation
+ * messages can precede either EOF or a later setup failure. */
 static int read_child_status(
     int fd, child_status_t *failure,
-    run_test_fd_close_observation_t *observation, bool *observation_valid) {
+    run_test_fd_close_observation_t *observation, bool *observation_valid,
+    run_deadline_state_t *deadline) {
     *observation_valid = false;
     for (;;) {
         child_status_t status = {0};
         char *bytes = (char *)&status;
         size_t offset = 0;
         while (offset < sizeof(status)) {
+            if (deadline && deadline->enabled) {
+                int remaining = 0;
+                int deadline_rc = run_deadline_observe(
+                    deadline, &remaining);
+                if (deadline_rc > 0) return -2;
+                if (deadline_rc < 0) return -3;
+
+                struct pollfd pfd = {
+                    .fd = fd,
+                    .events = POLLIN
+                };
+                int poll_rc = runner_poll(&pfd, 1, remaining);
+                if (poll_rc == 0) {
+                    errno = ETIMEDOUT;
+                    return -2;
+                }
+                if (poll_rc < 0) {
+                    if (errno == EINTR) continue;
+                    return -1;
+                }
+            }
             ssize_t got = read(fd, bytes + offset, sizeof(status) - offset);
             if (got > 0) {
                 offset += (size_t)got;
@@ -3595,10 +3629,207 @@ static int read_child_status(
     }
 }
 
-static int64_t monotonic_millis(void) {
+#ifdef GITSWITCH_TESTING
+static unsigned int g_monotonic_call_count;
+static unsigned int g_test_monotonic_failure_ordinal;
+static int g_test_monotonic_failure_errno;
+static unsigned int g_test_monotonic_rollback_ordinal;
+static int64_t g_test_monotonic_rollback_millis;
+static unsigned int g_test_monotonic_timespec_ordinal;
+static int64_t g_test_monotonic_timespec_seconds;
+static long g_test_monotonic_timespec_nanoseconds;
+static unsigned int g_test_poll_call_count;
+static unsigned int g_test_poll_failure_ordinal;
+static int g_test_poll_failure_errno;
+static int64_t g_test_child_setup_delay_millis;
+
+void run_test_set_monotonic_failure(unsigned int call_ordinal,
+                                    int system_errno) {
+    g_monotonic_call_count = 0;
+    g_test_monotonic_failure_ordinal = call_ordinal;
+    g_test_monotonic_failure_errno = system_errno;
+    g_test_monotonic_rollback_ordinal = 0;
+    g_test_monotonic_rollback_millis = 0;
+    g_test_monotonic_timespec_ordinal = 0;
+}
+
+void run_test_set_monotonic_rollback(unsigned int call_ordinal,
+                                     int64_t rollback_millis) {
+    g_monotonic_call_count = 0;
+    g_test_monotonic_failure_ordinal = 0;
+    g_test_monotonic_failure_errno = 0;
+    g_test_monotonic_rollback_ordinal = call_ordinal;
+    g_test_monotonic_rollback_millis = rollback_millis;
+    g_test_monotonic_timespec_ordinal = 0;
+}
+
+void run_test_set_monotonic_timespec(unsigned int call_ordinal,
+                                     int64_t seconds, long nanoseconds) {
+    g_monotonic_call_count = 0;
+    g_test_monotonic_failure_ordinal = 0;
+    g_test_monotonic_failure_errno = 0;
+    g_test_monotonic_rollback_ordinal = 0;
+    g_test_monotonic_rollback_millis = 0;
+    g_test_monotonic_timespec_ordinal = call_ordinal;
+    g_test_monotonic_timespec_seconds = seconds;
+    g_test_monotonic_timespec_nanoseconds = nanoseconds;
+}
+
+void run_test_set_poll_failure(unsigned int call_ordinal,
+                               int system_errno) {
+    g_test_poll_call_count = 0;
+    g_test_poll_failure_ordinal = call_ordinal;
+    g_test_poll_failure_errno = system_errno;
+}
+
+void run_test_set_child_setup_delay(int64_t delay_millis) {
+    g_test_child_setup_delay_millis = delay_millis;
+}
+#endif
+
+static int runner_poll(struct pollfd *fds, nfds_t count, int timeout_millis) {
+#ifdef GITSWITCH_TESTING
+    g_test_poll_call_count++;
+    if (g_test_poll_failure_errno != 0 &&
+        g_test_poll_call_count == g_test_poll_failure_ordinal) {
+        int injected_errno = g_test_poll_failure_errno;
+        g_test_poll_failure_errno = 0;
+        g_test_poll_failure_ordinal = 0;
+        errno = injected_errno;
+        return -1;
+    }
+#endif
+    return poll(fds, count, timeout_millis);
+}
+
+static int monotonic_millis(int64_t *millis) {
     struct timespec now;
+    if (!millis) {
+        errno = EINVAL;
+        return -1;
+    }
+#ifdef GITSWITCH_TESTING
+    g_monotonic_call_count++;
+    if (g_test_monotonic_failure_errno != 0 &&
+        g_monotonic_call_count == g_test_monotonic_failure_ordinal) {
+        int injected_errno = g_test_monotonic_failure_errno;
+        g_test_monotonic_failure_errno = 0;
+        g_test_monotonic_failure_ordinal = 0;
+        errno = injected_errno;
+        return -1;
+    }
+#endif
     if (clock_gettime(CLOCK_MONOTONIC, &now) != 0) return -1;
-    return (int64_t)now.tv_sec * 1000 + now.tv_nsec / 1000000;
+#ifdef GITSWITCH_TESTING
+    if (g_test_monotonic_timespec_ordinal != 0 &&
+        g_monotonic_call_count == g_test_monotonic_timespec_ordinal) {
+        now.tv_sec = (time_t)g_test_monotonic_timespec_seconds;
+        now.tv_nsec = g_test_monotonic_timespec_nanoseconds;
+        g_test_monotonic_timespec_ordinal = 0;
+    }
+#endif
+    if (now.tv_nsec < 0 || now.tv_nsec >= 1000000000L) {
+        errno = ERANGE;
+        return -1;
+    }
+    int64_t fractional_millis = now.tv_nsec / 1000000;
+    if (now.tv_sec < 0 ||
+        (uint64_t)now.tv_sec > (uint64_t)INT64_MAX / 1000U ||
+        ((uint64_t)now.tv_sec == (uint64_t)INT64_MAX / 1000U &&
+         fractional_millis > INT64_MAX % 1000)) {
+        errno = EOVERFLOW;
+        return -1;
+    }
+    *millis = (int64_t)now.tv_sec * 1000 + fractional_millis;
+#ifdef GITSWITCH_TESTING
+    if (g_test_monotonic_rollback_millis > 0 &&
+        g_monotonic_call_count == g_test_monotonic_rollback_ordinal) {
+        int64_t rollback = g_test_monotonic_rollback_millis;
+        g_test_monotonic_rollback_millis = 0;
+        g_test_monotonic_rollback_ordinal = 0;
+        if (*millis < INT64_MIN + rollback) {
+            errno = EOVERFLOW;
+            return -1;
+        }
+        *millis -= rollback;
+    }
+#endif
+    return 0;
+}
+
+static int64_t monotonic_millis_add_saturating(int64_t base,
+                                                int64_t delta) {
+    if (delta > 0 && base > INT64_MAX - delta) return INT64_MAX;
+    if (delta < 0 && base < INT64_MIN - delta) return INT64_MIN;
+    return base + delta;
+}
+
+int run_deadline_after_millis(int64_t timeout_ms, int64_t *deadline_millis) {
+    int64_t now;
+    if (!deadline_millis || timeout_ms < 0) {
+        errno = EINVAL;
+        return -1;
+    }
+    if (monotonic_millis(&now) != 0) return -1;
+    if (timeout_ms > INT64_MAX - now) {
+        errno = EOVERFLOW;
+        return -1;
+    }
+    *deadline_millis = now + timeout_ms;
+    return 0;
+}
+
+/* 0 => live, 1 => expired, -1 => the monotonic clock contract failed. */
+static int run_deadline_observe(run_deadline_state_t *state,
+                                int *remaining_millis) {
+    int64_t now;
+    if (!state || !state->enabled) {
+        if (remaining_millis) *remaining_millis = INT_MAX;
+        return 0;
+    }
+    if (monotonic_millis(&now) != 0) return -1;
+    if (state->observed && now < state->last_now) {
+        errno = ERANGE;
+        return -1;
+    }
+    state->observed = true;
+    state->last_now = now;
+    if (now >= state->deadline) {
+        if (remaining_millis) *remaining_millis = 0;
+        errno = ETIMEDOUT;
+        return 1;
+    }
+    if (remaining_millis) {
+        int64_t remaining = state->deadline - now;
+        *remaining_millis =
+            remaining > INT_MAX ? INT_MAX : (int)remaining;
+    }
+    return 0;
+}
+
+static void run_deadline_set_error(int deadline_rc, const char *phase,
+                                   run_result_t *result) {
+    int primary_errno = errno;
+    if (deadline_rc > 0) {
+        primary_errno = ETIMEDOUT;
+        if (result) result->timed_out = true;
+        errno = primary_errno;
+        set_system_error(ERR_SYSTEM_CALL,
+                         "run_argv: deadline expired %s", phase);
+    } else {
+        if (primary_errno == 0) primary_errno = EIO;
+        errno = primary_errno;
+        if (primary_errno == ERANGE) {
+            set_system_error(
+                ERR_SYSTEM_CALL,
+                "run_argv: monotonic clock moved backwards %s", phase);
+        } else {
+            set_system_error(
+                ERR_SYSTEM_CALL,
+                "run_argv: cannot observe monotonic deadline %s", phase);
+        }
+    }
+    errno = primary_errno;
 }
 
 #define RUNNER_POLL_SLICE_MS 50
@@ -3616,6 +3847,7 @@ static int run_argv_real_impl(
     result->exit_code = -1;
     result->term_signal = 0;
     result->spawned = false;
+    result->timed_out = false;
     result->out_len = 0;
     result->out_truncated = false;
     memset(&result->launch_witness, 0, sizeof(result->launch_witness));
@@ -3683,6 +3915,26 @@ static int run_argv_real_impl(
             !S_ISDIR(cwd_st.st_mode)) {
             set_error(ERR_INVALID_ARGS,
                       "run_argv: cwd_fd is not an open directory");
+            return -1;
+        }
+    }
+
+    run_deadline_state_t deadline = {
+        .enabled = opts->use_deadline,
+        .deadline = opts->deadline_millis
+    };
+    if (deadline.enabled && deadline.deadline < 0) {
+        errno = EINVAL;
+        set_system_error(
+            ERR_INVALID_ARGS,
+            "run_argv: monotonic deadline must be nonnegative");
+        errno = EINVAL;
+        return -1;
+    }
+    if (deadline.enabled) {
+        int deadline_rc = run_deadline_observe(&deadline, NULL);
+        if (deadline_rc != 0) {
+            run_deadline_set_error(deadline_rc, "before launch", result);
             return -1;
         }
     }
@@ -3947,7 +4199,10 @@ static int run_argv_real_impl(
     }
 
     pid_t pid;
-    if (g_test_fork_failure_errno != 0) {
+    int pre_fork_deadline_rc = run_deadline_observe(&deadline, NULL);
+    if (pre_fork_deadline_rc != 0) {
+        pid = -1;
+    } else if (g_test_fork_failure_errno != 0) {
         int injected_errno = g_test_fork_failure_errno;
         g_test_fork_failure_errno = 0;
         errno = injected_errno;
@@ -3974,7 +4229,16 @@ static int run_argv_real_impl(
         close(exec_fd);
         trusted_script_launch_cleanup(&script_launch);
         errno = fork_errno;
-        if (mask_restore_errno != 0 || wait_mask_restore_errno != 0) {
+        if (pre_fork_deadline_rc != 0) {
+            run_deadline_set_error(
+                pre_fork_deadline_rc, "before child creation", result);
+            report_secondary_runner_cleanup_failure(
+                "while restoring the guarded spawn mask",
+                mask_restore_errno);
+            report_secondary_runner_cleanup_failure(
+                "while restoring SIGCHLD wait ownership",
+                wait_mask_restore_errno);
+        } else if (mask_restore_errno != 0 || wait_mask_restore_errno != 0) {
             set_system_error(
                 ERR_SYSTEM_CALL,
                 "fork() failed; also failed to restore parent signal mask (spawn restore errno=%d, wait restore errno=%d)",
@@ -3997,6 +4261,16 @@ static int run_argv_real_impl(
         int child_status_fd = status_pipe[1];
         close(status_pipe[0]);
         int child_cwd_fd = -1;
+#ifdef GITSWITCH_TESTING
+        if (g_test_child_setup_delay_millis > 0) {
+            struct timespec delay = {
+                .tv_sec = (time_t)(g_test_child_setup_delay_millis / 1000),
+                .tv_nsec = (long)(g_test_child_setup_delay_millis % 1000) *
+                           1000000L
+            };
+            while (nanosleep(&delay, &delay) != 0 && errno == EINTR) {}
+        }
+#endif
 
         /* Preserve a pinned working-directory descriptor before touching
          * stdio.  If the parent began with fd 0/1/2 closed, cwd_fd can occupy
@@ -4337,11 +4611,26 @@ static int run_argv_real_impl(
     child_status_t child_status = {0};
     run_test_fd_close_observation_t child_fd_close_observation = {0};
     bool child_fd_close_observation_valid = false;
+    bool deadline_expired = false;
+    bool deadline_clock_failed = false;
+    int deadline_errno = 0;
     int child_status_rc = read_child_status(
         status_pipe[0], &child_status, &child_fd_close_observation,
-        &child_fd_close_observation_valid);
+        &child_fd_close_observation_valid, &deadline);
     int child_status_errno = errno;
     close(status_pipe[0]);
+    if (child_status_rc == -2) {
+        deadline_expired = true;
+        deadline_errno = ETIMEDOUT;
+        result->timed_out = true;
+        (void)kill(pid, SIGKILL);
+    } else if (child_status_rc == -3) {
+        deadline_clock_failed = true;
+        deadline_errno = child_status_errno != 0 ? child_status_errno : EIO;
+        (void)kill(pid, SIGKILL);
+    } else if (child_status_rc < 0) {
+        (void)kill(pid, SIGKILL);
+    }
     if (g_test_fd_close_observation_enabled &&
         child_fd_close_observation_valid) {
         g_test_fd_close_observation = child_fd_close_observation;
@@ -4350,7 +4639,8 @@ static int run_argv_real_impl(
 
     run_sigpipe_state_t sigpipe_state;
     memset(&sigpipe_state, 0, sizeof(sigpipe_state));
-    if (pipe_input && run_sigpipe_begin(&sigpipe_state) != 0) {
+    if (pipe_input && !deadline_expired && !deadline_clock_failed &&
+        run_sigpipe_begin(&sigpipe_state) != 0) {
         int block_errno = errno;
         int cleanup_wait_errno = 0;
         int cleanup_wait_mask_errno = 0;
@@ -4445,11 +4735,41 @@ static int run_argv_real_impl(
     int wait_errno = 0;
     int64_t capture_deadline = -1;
 
-    while (infd >= 0 || outfd >= 0) {
+    while (infd >= 0 || outfd >= 0 ||
+           (deadline.enabled && !child_reaped)) {
         int timeout_ms = RUNNER_POLL_SLICE_MS;
+        if (!deadline_expired && !deadline_clock_failed &&
+            deadline.enabled) {
+            int remaining = 0;
+            int deadline_rc = run_deadline_observe(
+                &deadline, &remaining);
+            if (deadline_rc != 0) {
+                deadline_expired = deadline_rc > 0;
+                deadline_clock_failed = deadline_rc < 0;
+                deadline_errno = deadline_expired
+                                     ? ETIMEDOUT
+                                     : (errno != 0 ? errno : EIO);
+                result->timed_out = deadline_expired;
+                if (infd >= 0) {
+                    close(infd);
+                    infd = -1;
+                }
+                if (outfd >= 0) {
+                    close(outfd);
+                    outfd = -1;
+                }
+                if (!child_reaped) (void)kill(pid, SIGKILL);
+                break;
+            }
+            if (remaining < timeout_ms) timeout_ms = remaining;
+        } else if (deadline_expired || deadline_clock_failed) {
+            break;
+        }
         if (child_reaped && outfd >= 0) {
-            int64_t now = monotonic_millis();
-            if (now < 0) {
+            int64_t now;
+            if (deadline.enabled) {
+                now = deadline.last_now;
+            } else if (monotonic_millis(&now) != 0) {
                 io_failed = true;
                 io_errno = errno;
                 close(outfd);
@@ -4457,7 +4777,8 @@ static int run_argv_real_impl(
                 continue;
             }
             if (capture_deadline < 0) {
-                capture_deadline = now + RUNNER_CAPTURE_GRACE_MS;
+                capture_deadline = monotonic_millis_add_saturating(
+                    now, RUNNER_CAPTURE_GRACE_MS);
             }
             int64_t remaining = capture_deadline - now;
             if (remaining <= 0) {
@@ -4474,7 +4795,7 @@ static int run_argv_real_impl(
         if (infd >= 0) { pfds[n].fd = infd; pfds[n].events = POLLOUT; in_idx = n++; }
         if (outfd >= 0) { pfds[n].fd = outfd; pfds[n].events = POLLIN; out_idx = n++; }
 
-        int poll_rc = poll(pfds, (nfds_t)n, timeout_ms);
+        int poll_rc = runner_poll(pfds, (nfds_t)n, timeout_ms);
         if (poll_rc < 0) {
             if (errno == EINTR) {
                 /* Still execute the child-state/deadline maintenance below. */
@@ -4487,6 +4808,7 @@ static int run_argv_real_impl(
                 if (outfd >= 0) { close(outfd); outfd = -1; }
                 io_failed = true;
                 io_errno = errno;
+                if (!child_reaped) (void)kill(pid, SIGKILL);
                 break;
             }
         }
@@ -4581,14 +4903,34 @@ static int run_argv_real_impl(
                     infd = -1;
                 }
                 if (outfd >= 0) {
-                    int64_t now = monotonic_millis();
-                    if (now < 0) {
+                    int64_t now;
+                    int deadline_rc = deadline.enabled
+                                          ? run_deadline_observe(
+                                                &deadline, NULL)
+                                          : 0;
+                    if (deadline_rc != 0) {
+                        deadline_expired = deadline_rc > 0;
+                        deadline_clock_failed = deadline_rc < 0;
+                        deadline_errno = deadline_expired
+                                             ? ETIMEDOUT
+                                             : (errno != 0 ? errno : EIO);
+                        result->timed_out = deadline_expired;
+                        close(outfd);
+                        outfd = -1;
+                    } else if (deadline.enabled) {
+                        now = deadline.last_now;
+                        capture_deadline =
+                            monotonic_millis_add_saturating(
+                                now, RUNNER_CAPTURE_GRACE_MS);
+                    } else if (monotonic_millis(&now) != 0) {
                         io_failed = true;
                         io_errno = errno;
                         close(outfd);
                         outfd = -1;
                     } else {
-                        capture_deadline = now + RUNNER_CAPTURE_GRACE_MS;
+                        capture_deadline =
+                            monotonic_millis_add_saturating(
+                                now, RUNNER_CAPTURE_GRACE_MS);
                     }
                 }
                 if (wait_result.mask_errno != 0) {
@@ -4611,6 +4953,19 @@ static int run_argv_real_impl(
                 if (outfd >= 0) { close(outfd); outfd = -1; }
                 break;
             }
+        }
+    }
+    if (deadline.enabled && !deadline_expired && !deadline_clock_failed &&
+        child_status_rc >= 0 && !io_failed && !wait_failed) {
+        int deadline_rc = run_deadline_observe(&deadline, NULL);
+        if (deadline_rc != 0) {
+            deadline_expired = deadline_rc > 0;
+            deadline_clock_failed = deadline_rc < 0;
+            deadline_errno = deadline_expired
+                                 ? ETIMEDOUT
+                                 : (errno != 0 ? errno : EIO);
+            result->timed_out = deadline_expired;
+            if (!child_reaped) (void)kill(pid, SIGKILL);
         }
     }
     if (want_out) {
@@ -4662,6 +5017,16 @@ static int run_argv_real_impl(
         result->exit_code = -1;
     }
 
+    if (deadline_expired || deadline_clock_failed) {
+        errno = deadline_errno;
+        run_deadline_set_error(
+            deadline_expired ? 1 : -1,
+            result->spawned ? "while running child" : "before launch",
+            result);
+        report_secondary_signal_cleanup_failures(
+            sigpipe_cleanup_errno, wait_ownership_cleanup_errno);
+        return -1;
+    }
     if (child_status_rc > 0) {
         int primary_errno = child_status.system_errno;
         errno = primary_errno;

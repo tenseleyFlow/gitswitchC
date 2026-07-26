@@ -4,8 +4,30 @@
 #define RUNNER_INTERNAL_H
 
 #include <stdbool.h>
+#include <stdint.h>
 
 #include "utils.h"
+
+/* Convert a nonnegative relative duration to one absolute CLOCK_MONOTONIC
+ * deadline. The caller passes that same value through every downstream
+ * operation so elapsed setup time is never reset. */
+int run_deadline_after_millis(int64_t timeout_ms, int64_t *deadline_millis);
+
+#ifdef GITSWITCH_TESTING
+/* One-shot deterministic clock failures for deadline-path regressions.
+ * `call_ordinal` is one-based and applies to the next runner/deadline-helper
+ * clock sequence. A positive rollback_millis makes that selected observation
+ * precede the prior one without changing wall time. */
+void run_test_set_monotonic_failure(unsigned int call_ordinal,
+                                    int system_errno);
+void run_test_set_monotonic_rollback(unsigned int call_ordinal,
+                                     int64_t rollback_millis);
+void run_test_set_monotonic_timespec(unsigned int call_ordinal,
+                                     int64_t seconds, long nanoseconds);
+void run_test_set_poll_failure(unsigned int call_ordinal,
+                               int system_errno);
+void run_test_set_child_setup_delay(int64_t delay_millis);
+#endif
 
 /* Open `program_path` through the production executable-trust and direct
  * shebang policy without executing it. `program_path` must be the exact

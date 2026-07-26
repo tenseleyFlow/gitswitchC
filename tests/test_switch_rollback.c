@@ -376,7 +376,11 @@ static int g_ssh_activation_commands;
 static int g_ssh_connection_probes;
 static int g_ssh_alias_probes;
 static int g_ssh_default_probes;
+static int g_deadlined_ssh_probes;
+static int g_deadlined_nonprobe_commands;
+static int64_t g_ssh_probe_deadline;
 static bool g_fail_ssh_probe;
+static bool g_timeout_ssh_probe;
 static char g_ssh_probe_target[MAX_NAME_LEN + sizeof("git@")];
 static char g_ssh_probe_hostname[sizeof("HostName=") + MAX_NAME_LEN];
 static gitswitch_ctx_t *g_probe_expected_ctx;
@@ -951,6 +955,14 @@ static int ssh_git_runner(const char *const argv[], const run_opts_t *opts,
         g_probe_failure_pending_observation = false;
     }
     g_ssh_git_runner_calls++;
+    if (opts && opts->use_deadline) {
+        if (strcmp(argv[0], "ssh") == 0) {
+            g_deadlined_ssh_probes++;
+            g_ssh_probe_deadline = opts->deadline_millis;
+        } else {
+            g_deadlined_nonprobe_commands++;
+        }
+    }
     if (strcmp(argv[0], "ssh") == 0) {
         bool alias_probe = false;
 
@@ -981,10 +993,12 @@ static int ssh_git_runner(const char *const argv[], const run_opts_t *opts,
         if (result) {
             memset(result, 0, sizeof(*result));
             result->spawned = true;
-            result->exit_code = g_fail_ssh_probe ? 255 : 1;
+            result->exit_code =
+                (g_fail_ssh_probe || g_timeout_ssh_probe) ? 255 : 1;
+            result->timed_out = g_timeout_ssh_probe;
         }
         if (opts && opts->out && opts->out_size > 0) {
-            if (g_fail_ssh_probe) {
+            if (g_fail_ssh_probe || g_timeout_ssh_probe) {
                 opts->out[0] = '\0';
             } else {
                 snprintf(opts->out, opts->out_size,
@@ -993,11 +1007,13 @@ static int ssh_git_runner(const char *const argv[], const run_opts_t *opts,
             }
             if (result) result->out_len = strlen(opts->out);
         }
-        if (g_fail_ssh_probe) {
+        if (g_fail_ssh_probe || g_timeout_ssh_probe) {
             g_probe_failure_pending_observation = true;
-            errno = EIO;
+            errno = g_timeout_ssh_probe ? ETIMEDOUT : EIO;
             set_system_error(ERR_SYSTEM_COMMAND_FAILED,
-                             "Injected SSH connection probe failure");
+                             g_timeout_ssh_probe
+                                 ? "Injected SSH connection probe timeout"
+                                 : "Injected SSH connection probe failure");
             return -1;
         }
         return 0;
@@ -1298,7 +1314,11 @@ static void seed_previous_git_identity(void) {
     g_ssh_connection_probes = 0;
     g_ssh_alias_probes = 0;
     g_ssh_default_probes = 0;
+    g_deadlined_ssh_probes = 0;
+    g_deadlined_nonprobe_commands = 0;
+    g_ssh_probe_deadline = -1;
     g_fail_ssh_probe = false;
+    g_timeout_ssh_probe = false;
     g_ssh_probe_target[0] = '\0';
     g_ssh_probe_hostname[0] = '\0';
     g_probe_expected_ctx = NULL;
@@ -2346,6 +2366,8 @@ TEST(fresh_alias_switch_runs_one_postcommit_probe) {
     char home[600], saved_home[4096], config_path[700], after[4096];
     gitswitch_ctx_t ctx;
     command_runner_fn previous_runner;
+    int64_t deadline_lower;
+    int64_t deadline_upper;
     int rc;
 
     if (!ssh_probe_fixture_available()) {
@@ -2361,13 +2383,19 @@ TEST(fresh_alias_switch_runs_one_postcommit_probe) {
     g_probe_expected_ctx = &ctx;
     g_probe_expected_config_path = config_path;
     g_probe_expected_alias = "github.com-tgt";
+    CHECK_EQ_INT(run_deadline_after_millis(0, &deadline_lower), 0);
     previous_runner = run_set_runner(ssh_git_runner);
     rc = accounts_switch(&ctx, "testacct");
+    CHECK_EQ_INT(run_deadline_after_millis(7000, &deadline_upper), 0);
 
     CHECK_EQ_INT(rc, 0);
     CHECK_EQ_INT(g_ssh_connection_probes, 1);
     CHECK_EQ_INT(g_ssh_alias_probes, 1);
     CHECK_EQ_INT(g_ssh_default_probes, 0);
+    CHECK_EQ_INT(g_deadlined_ssh_probes, 1);
+    CHECK_EQ_INT(g_deadlined_nonprobe_commands, 0);
+    CHECK(g_ssh_probe_deadline >= deadline_lower + 7000);
+    CHECK(g_ssh_probe_deadline <= deadline_upper);
     CHECK_STR_EQ(g_ssh_probe_target, "git@github.com-tgt");
     CHECK_STR_EQ(g_ssh_probe_hostname, "HostName=github.com");
     CHECK(g_ssh_activation_commands > 0);
@@ -2427,8 +2455,8 @@ TEST(prepared_verbose_fresh_switch_runs_one_default_probe) {
     run_set_runner(previous_runner);
 }
 
-/* Authentication and transport failures are observational only. The probe
- * runner injects a structured operational error after verifying the exact
+/* Authentication, transport, and deadline failures are observational only.
+ * The probe runner injects a structured timeout after verifying the exact
  * committed state visible at invocation; the successful switch must retain
  * that state and restore the caller-visible diagnostic it had beforehand. */
 TEST(failed_postcommit_probe_preserves_switch_and_diagnostic) {
@@ -2450,7 +2478,7 @@ TEST(failed_postcommit_probe_preserves_switch_and_diagnostic) {
     ctx = make_ctx();
     CHECK_EQ_INT(enable_switch_target_ssh(&ctx, "github.com-tgt"), 0);
     seed_previous_git_identity();
-    g_fail_ssh_probe = true;
+    g_timeout_ssh_probe = true;
     g_probe_expected_ctx = &ctx;
     g_probe_expected_config_path = config_path;
     g_probe_expected_alias = "github.com-tgt";
@@ -2465,6 +2493,9 @@ TEST(failed_postcommit_probe_preserves_switch_and_diagnostic) {
     CHECK_EQ_INT(g_ssh_connection_probes, 1);
     CHECK_EQ_INT(g_ssh_alias_probes, 1);
     CHECK_EQ_INT(g_ssh_default_probes, 0);
+    CHECK_EQ_INT(g_deadlined_ssh_probes, 1);
+    CHECK_EQ_INT(g_deadlined_nonprobe_commands, 0);
+    CHECK(g_ssh_probe_deadline > 0);
     CHECK(g_probe_observed_committed_state);
     CHECK_EQ_INT(observed_error->code, g_probe_error_before.code);
     CHECK_STR_EQ(observed_error->message, g_probe_error_before.message);
@@ -2479,7 +2510,7 @@ TEST(failed_postcommit_probe_preserves_switch_and_diagnostic) {
                  g_probe_error_before.system_errno);
     CHECK_EQ_INT(g_post_probe_errno, g_probe_errno_before);
     CHECK(g_post_probe_generation == g_probe_generation_before);
-    CHECK(observed_errno != EIO);
+    CHECK(observed_errno != ETIMEDOUT);
     CHECK(ctx.current_account == &ctx.accounts[0]);
     CHECK_STR_EQ(ctx.config.active_account, "testacct");
     CHECK_STR_EQ(g_store_name, "testacct");
@@ -2493,7 +2524,7 @@ TEST(failed_postcommit_probe_preserves_switch_and_diagnostic) {
     CHECK(strstr(get_last_error()->message, "No prepared account switch") !=
           NULL);
 
-    g_fail_ssh_probe = false;
+    g_timeout_ssh_probe = false;
     g_probe_expected_ctx = NULL;
     g_probe_expected_config_path = NULL;
     g_probe_expected_alias = NULL;

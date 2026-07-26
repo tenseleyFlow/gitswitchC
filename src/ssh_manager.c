@@ -7525,7 +7525,7 @@ static bool ssh_authentication_was_proven(const char *output,
     size_t offset = 0U;
 
     if (!output || !result || !result->spawned || result->term_signal != 0 ||
-        result->out_truncated) {
+        result->out_truncated || result->timed_out) {
         return false;
     }
     while (offset < output_len) {
@@ -7566,8 +7566,10 @@ static bool ssh_authentication_was_proven(const char *output,
     return false;
 }
 
-/* Test SSH connection */
-int ssh_test_connection(const account_t *account, const char *host) {
+static int ssh_test_connection_impl(const account_t *account,
+                                    const char *host,
+                                    bool use_deadline,
+                                    int64_t deadline_millis) {
     char output[1024] = {0};
     char expanded_key_path[MAX_PATH_LEN];
     char hostname_option[sizeof("HostName=") + MAX_NAME_LEN];
@@ -7575,7 +7577,7 @@ int ssh_test_connection(const account_t *account, const char *host) {
     run_opts_t opts;
     run_result_t result;
 
-    if (!account || !host) {
+    if (!account || !host || (use_deadline && deadline_millis < 0)) {
         set_error(ERR_INVALID_ARGS, "Invalid arguments to ssh_test_connection");
         return -1;
     }
@@ -7592,6 +7594,8 @@ int ssh_test_connection(const account_t *account, const char *host) {
     opts.out = output;
     opts.out_size = sizeof(output);
     opts.merge_stderr = true;
+    opts.use_deadline = use_deadline;
+    opts.deadline_millis = use_deadline ? deadline_millis : 0;
 
     /* Git hosts print their discovery greeting on stderr. Every probe ignores
      * user and system configuration: IdentitiesOnly still permits inherited
@@ -7640,6 +7644,18 @@ int ssh_test_connection(const account_t *account, const char *host) {
 
     log_debug("SSH connection test failed to %s: %s", host, output);
     return -1;
+}
+
+/* Public compatibility entry point: existing callers retain the historical
+ * unbounded process-runner contract. */
+int ssh_test_connection(const account_t *account, const char *host) {
+    return ssh_test_connection_impl(account, host, false, 0);
+}
+
+int ssh_test_connection_with_deadline(const account_t *account,
+                                      const char *host,
+                                      int64_t deadline_millis) {
+    return ssh_test_connection_impl(account, host, true, deadline_millis);
 }
 
 /* Internal helper functions */

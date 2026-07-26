@@ -2,6 +2,7 @@
 #include "test.h"
 #include "gitswitch.h"
 #include "utils.h"
+#include "runner_internal.h"
 #include "error.h"
 
 #include <errno.h>
@@ -342,6 +343,13 @@ static int quiet_capture_holder_main(void) {
         while (nanosleep(&lifetime, &lifetime) != 0 && errno == EINTR) {}
         _exit(0);
     }
+    return 0;
+}
+
+static int deadline_pause_main(bool close_stdout) {
+    struct timespec lifetime = {.tv_sec = 5, .tv_nsec = 0};
+    if (close_stdout && close(STDOUT_FILENO) != 0) return 1;
+    while (nanosleep(&lifetime, &lifetime) != 0 && errno == EINTR) {}
     return 0;
 }
 
@@ -721,6 +729,295 @@ TEST(ordinary_buffered_capture_is_fully_drained) {
     CHECK_EQ_INT(run_argv(argv, &opts, &result), 0);
     CHECK_STR_EQ(output, "buffered-output");
     CHECK_EQ_INT((long)result.out_len, 15);
+}
+
+TEST(deadline_helper_rejects_invalid_and_overflowing_durations) {
+    int64_t deadline = 0;
+
+    errno = 0;
+    CHECK_EQ_INT(run_deadline_after_millis(-1, &deadline), -1);
+    CHECK_EQ_INT(errno, EINVAL);
+    errno = 0;
+    CHECK_EQ_INT(run_deadline_after_millis(1, NULL), -1);
+    CHECK_EQ_INT(errno, EINVAL);
+    errno = 0;
+    CHECK_EQ_INT(run_deadline_after_millis(INT64_MAX, &deadline), -1);
+    CHECK_EQ_INT(errno, EOVERFLOW);
+}
+
+TEST(monotonic_millisecond_conversion_checks_quotient_remainder) {
+    const int64_t seconds = INT64_MAX / 1000;
+    const int64_t remainder = INT64_MAX % 1000;
+    int64_t deadline = 0;
+
+    run_test_set_monotonic_timespec(
+        1, seconds, (long)(remainder + 1) * 1000000L);
+    errno = 0;
+    CHECK_EQ_INT(run_deadline_after_millis(0, &deadline), -1);
+    CHECK_EQ_INT(errno, EOVERFLOW);
+
+    run_test_set_monotonic_timespec(
+        1, seconds, (long)remainder * 1000000L);
+    CHECK_EQ_INT(run_deadline_after_millis(0, &deadline), 0);
+    CHECK_EQ_INT(deadline, INT64_MAX);
+}
+
+TEST(expired_and_negative_deadlines_fail_before_spawn) {
+    const char *argv[] = {"true", NULL};
+    run_opts_t opts;
+    run_result_t result;
+
+    memset(&opts, 0, sizeof(opts));
+    opts.use_deadline = true;
+    opts.deadline_millis = -1;
+    errno = 0;
+    CHECK_EQ_INT(run_argv(argv, &opts, &result), -1);
+    CHECK_EQ_INT(errno, EINVAL);
+    CHECK(!result.spawned);
+    CHECK(!result.timed_out);
+
+    opts.deadline_millis = 0;
+    errno = 0;
+    CHECK_EQ_INT(run_argv(argv, &opts, &result), -1);
+    CHECK_EQ_INT(errno, ETIMEDOUT);
+    CHECK(!result.spawned);
+    CHECK(result.timed_out);
+}
+
+TEST(invalid_invocation_precedes_expired_deadline) {
+    const char *argv[] = {"true", NULL};
+    const char input = 'x';
+    run_opts_t opts;
+    run_result_t result;
+
+    memset(&opts, 0, sizeof(opts));
+    opts.use_deadline = true;
+    opts.deadline_millis = 0;
+    clear_error();
+    errno = 0;
+    CHECK_EQ_INT(run_argv(NULL, &opts, &result), -1);
+    CHECK(!result.spawned);
+    CHECK(!result.timed_out);
+    CHECK(strstr(get_last_error()->message, "empty argv") != NULL);
+
+    opts.input = &input;
+    opts.input_len = 1;
+    opts.use_stdin_fd = true;
+    opts.stdin_fd = STDIN_FILENO;
+    clear_error();
+    CHECK_EQ_INT(run_argv(argv, &opts, &result), -1);
+    CHECK(!result.spawned);
+    CHECK(!result.timed_out);
+    CHECK(strstr(get_last_error()->message,
+                 "mutually exclusive") != NULL);
+}
+
+TEST(deadline_covers_child_setup_status_and_reaps_timeout) {
+    const char *argv[] = {"true", NULL};
+    run_opts_t opts;
+    run_result_t result;
+    int64_t started = test_monotonic_ms();
+
+    memset(&opts, 0, sizeof(opts));
+    CHECK_EQ_INT(run_deadline_after_millis(80, &opts.deadline_millis), 0);
+    opts.use_deadline = true;
+    run_test_set_child_setup_delay(2000);
+    clear_error();
+    errno = 0;
+    CHECK_EQ_INT(run_argv(argv, &opts, &result), -1);
+    int returned_errno = errno;
+    int64_t elapsed = test_monotonic_ms() - started;
+    run_test_set_child_setup_delay(0);
+
+    CHECK_EQ_INT(returned_errno, ETIMEDOUT);
+    CHECK(result.spawned);
+    CHECK(result.timed_out);
+    CHECK_EQ_INT(result.term_signal, SIGKILL);
+    CHECK(elapsed >= 0 && elapsed < 1000);
+    CHECK(strstr(get_last_error()->message, "deadline expired") != NULL);
+}
+
+static void check_pause_deadline(bool close_stdout) {
+    const char *argv[] = {
+        g_self_path,
+        close_stdout ? "--ar14-deadline-close-stdout"
+                     : "--ar14-deadline-pause",
+        NULL
+    };
+    char output[32];
+    run_opts_t opts;
+    run_result_t result;
+    int64_t started = test_monotonic_ms();
+
+    memset(&opts, 0, sizeof(opts));
+    opts.out = output;
+    opts.out_size = sizeof(output);
+    CHECK_EQ_INT(run_deadline_after_millis(100, &opts.deadline_millis), 0);
+    opts.use_deadline = true;
+    errno = 0;
+    clear_error();
+    CHECK_EQ_INT(run_argv(argv, &opts, &result), -1);
+    int returned_errno = errno;
+    int64_t elapsed = test_monotonic_ms() - started;
+
+    CHECK_EQ_INT(returned_errno, ETIMEDOUT);
+    CHECK(result.spawned);
+    CHECK(result.timed_out);
+    CHECK_EQ_INT(result.term_signal, SIGKILL);
+    CHECK(elapsed >= 0 && elapsed < 1000);
+}
+
+TEST(deadline_kills_and_reaps_hung_child_with_open_capture) {
+    check_pause_deadline(false);
+}
+
+TEST(deadline_kills_and_reaps_hung_child_after_capture_eof) {
+    check_pause_deadline(true);
+}
+
+TEST(poll_failure_kills_and_reaps_before_reporting_primary_errno) {
+    const char *argv[] = {g_self_path, "--ar14-deadline-pause", NULL};
+    run_opts_t opts;
+    run_result_t result;
+    int64_t started = test_monotonic_ms();
+
+    memset(&opts, 0, sizeof(opts));
+    CHECK_EQ_INT(run_deadline_after_millis(1000, &opts.deadline_millis), 0);
+    opts.use_deadline = true;
+    run_test_set_poll_failure(2, EIO);
+    clear_error();
+    errno = 0;
+    CHECK_EQ_INT(run_argv(argv, &opts, &result), -1);
+    int returned_errno = errno;
+    int64_t elapsed = test_monotonic_ms() - started;
+
+    CHECK_EQ_INT(returned_errno, EIO);
+    CHECK(result.spawned);
+    CHECK(!result.timed_out);
+    CHECK_EQ_INT(result.term_signal, SIGKILL);
+    CHECK(elapsed >= 0 && elapsed < 750);
+    CHECK(strstr(get_last_error()->message,
+                 "subprocess pipe I/O failed") != NULL);
+}
+
+TEST(global_deadline_preempts_descendant_capture_grace) {
+    const char *argv[] = {"sh", "-c", "sleep 2 &", NULL};
+    char output[32];
+    run_opts_t opts;
+    run_result_t result;
+    int64_t started = test_monotonic_ms();
+
+    memset(&opts, 0, sizeof(opts));
+    opts.out = output;
+    opts.out_size = sizeof(output);
+    opts.stderr_to_devnull = true;
+    CHECK_EQ_INT(run_deadline_after_millis(80, &opts.deadline_millis), 0);
+    opts.use_deadline = true;
+    errno = 0;
+    CHECK_EQ_INT(run_argv(argv, &opts, &result), -1);
+    int returned_errno = errno;
+    int64_t elapsed = test_monotonic_ms() - started;
+
+    CHECK_EQ_INT(returned_errno, ETIMEDOUT);
+    CHECK(result.spawned);
+    CHECK(result.timed_out);
+    CHECK_EQ_INT(result.exit_code, 0);
+    CHECK(elapsed >= 0 && elapsed < 750);
+}
+
+TEST(global_deadline_survives_continuous_descendant_output) {
+    const char *argv[] = {"sh", "-c", "yes x &", NULL};
+    char output[32];
+    run_opts_t opts;
+    run_result_t result;
+    int64_t started = test_monotonic_ms();
+
+    memset(&opts, 0, sizeof(opts));
+    opts.out = output;
+    opts.out_size = sizeof(output);
+    opts.stderr_to_devnull = true;
+    CHECK_EQ_INT(run_deadline_after_millis(80, &opts.deadline_millis), 0);
+    opts.use_deadline = true;
+    errno = 0;
+    CHECK_EQ_INT(run_argv(argv, &opts, &result), -1);
+    int returned_errno = errno;
+    int64_t elapsed = test_monotonic_ms() - started;
+
+    CHECK_EQ_INT(returned_errno, ETIMEDOUT);
+    CHECK(result.spawned);
+    CHECK(result.timed_out);
+    CHECK(result.out_truncated);
+    CHECK_EQ_INT(result.exit_code, 0);
+    CHECK(elapsed >= 0 && elapsed < 750);
+}
+
+TEST(global_deadline_survives_repeated_poll_interruptions) {
+    const char *argv[] = {g_self_path, "--ar14-deadline-pause", NULL};
+    struct sigaction original_action;
+    struct sigaction action;
+    struct itimerval timer;
+    struct itimerval stopped = {{0, 0}, {0, 0}};
+    run_opts_t opts;
+    run_result_t result;
+
+    CHECK_EQ_INT(sigaction(SIGALRM, NULL, &original_action), 0);
+    memset(&action, 0, sizeof(action));
+    action.sa_handler = periodic_alarm_handler;
+    CHECK_EQ_INT(sigemptyset(&action.sa_mask), 0);
+    CHECK_EQ_INT(sigaction(SIGALRM, &action, NULL), 0);
+    memset(&timer, 0, sizeof(timer));
+    timer.it_value.tv_usec = 5000;
+    timer.it_interval.tv_usec = 5000;
+    g_periodic_alarm_calls = 0;
+    CHECK_EQ_INT(setitimer(ITIMER_REAL, &timer, NULL), 0);
+
+    memset(&opts, 0, sizeof(opts));
+    CHECK_EQ_INT(run_deadline_after_millis(100, &opts.deadline_millis), 0);
+    opts.use_deadline = true;
+    errno = 0;
+    CHECK_EQ_INT(run_argv(argv, &opts, &result), -1);
+    int returned_errno = errno;
+    CHECK_EQ_INT(setitimer(ITIMER_REAL, &stopped, NULL), 0);
+    CHECK_EQ_INT(sigaction(SIGALRM, &original_action, NULL), 0);
+
+    CHECK_EQ_INT(returned_errno, ETIMEDOUT);
+    CHECK(result.timed_out);
+    CHECK_EQ_INT(result.term_signal, SIGKILL);
+    CHECK(g_periodic_alarm_calls >= 5);
+}
+
+TEST(clock_failure_and_rollback_fail_closed_without_timeout_claim) {
+    const char *argv[] = {"true", NULL};
+    run_opts_t opts;
+    run_result_t result;
+
+    memset(&opts, 0, sizeof(opts));
+    opts.use_deadline = true;
+    opts.deadline_millis = INT64_MAX;
+    run_test_set_monotonic_failure(1, EIO);
+    errno = 0;
+    CHECK_EQ_INT(run_argv(argv, &opts, &result), -1);
+    CHECK_EQ_INT(errno, EIO);
+    CHECK(!result.spawned);
+    CHECK(!result.timed_out);
+    CHECK(strstr(get_last_error()->message,
+                 "cannot observe monotonic deadline") != NULL);
+
+    run_test_set_monotonic_rollback(2, 10000);
+    errno = 0;
+    CHECK_EQ_INT(run_argv(argv, &opts, &result), -1);
+    CHECK_EQ_INT(errno, ERANGE);
+    CHECK(!result.spawned);
+    CHECK(!result.timed_out);
+    CHECK(strstr(get_last_error()->message,
+                 "monotonic clock moved backwards") != NULL);
+
+    /* Both one-shot hooks self-clear; an ordinary deadline remains usable. */
+    CHECK_EQ_INT(run_deadline_after_millis(1000, &opts.deadline_millis), 0);
+    CHECK_EQ_INT(run_argv(argv, &opts, &result), 0);
+    CHECK(result.spawned);
+    CHECK(!result.timed_out);
+    CHECK_EQ_INT(result.exit_code, 0);
 }
 
 /* L21 safety matrix: sparse inherited descriptors must be absent under every
@@ -1120,6 +1417,13 @@ int main(int argc, char **argv) {
     if (argc == 2 && strcmp(argv[1], "--ar11-quiet-holder") == 0) {
         return quiet_capture_holder_main();
     }
+    if (argc == 2 && strcmp(argv[1], "--ar14-deadline-pause") == 0) {
+        return deadline_pause_main(false);
+    }
+    if (argc == 2 &&
+        strcmp(argv[1], "--ar14-deadline-close-stdout") == 0) {
+        return deadline_pause_main(true);
+    }
 
     error_init(LOG_LEVEL_WARNING, NULL);
     if (argc != 1 || !realpath(argv[0], g_self_path)) {
@@ -1143,6 +1447,18 @@ int main(int argc, char **argv) {
     RUN_TEST(interrupted_poll_still_advances_child_capture_deadline);
     RUN_TEST(continuous_descendant_output_cannot_starve_capture_deadline);
     RUN_TEST(ordinary_buffered_capture_is_fully_drained);
+    RUN_TEST(deadline_helper_rejects_invalid_and_overflowing_durations);
+    RUN_TEST(monotonic_millisecond_conversion_checks_quotient_remainder);
+    RUN_TEST(expired_and_negative_deadlines_fail_before_spawn);
+    RUN_TEST(invalid_invocation_precedes_expired_deadline);
+    RUN_TEST(deadline_covers_child_setup_status_and_reaps_timeout);
+    RUN_TEST(deadline_kills_and_reaps_hung_child_with_open_capture);
+    RUN_TEST(deadline_kills_and_reaps_hung_child_after_capture_eof);
+    RUN_TEST(poll_failure_kills_and_reaps_before_reporting_primary_errno);
+    RUN_TEST(global_deadline_preempts_descendant_capture_grace);
+    RUN_TEST(global_deadline_survives_continuous_descendant_output);
+    RUN_TEST(global_deadline_survives_repeated_poll_interruptions);
+    RUN_TEST(clock_failure_and_rollback_fail_closed_without_timeout_claim);
     RUN_TEST(sparse_parent_descriptors_close_in_auto_branch);
     RUN_TEST(sparse_parent_descriptors_close_in_snapshot_branch);
     RUN_TEST(sparse_parent_descriptors_close_in_numeric_branch);

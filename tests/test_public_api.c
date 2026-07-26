@@ -319,6 +319,7 @@ TEST(all_retained_public_apis_compile_and_link) {
     REQUIRE_PUBLIC_API(run_argv);
     REQUIRE_PUBLIC_API(run_argv_real);
     REQUIRE_PUBLIC_API(run_argv_with_expected_launch);
+    REQUIRE_PUBLIC_API(run_deadline_after_millis);
     REQUIRE_PUBLIC_API(run_launch_witness_capture);
     REQUIRE_PUBLIC_API(run_launch_witness_matches);
     REQUIRE_PUBLIC_API(run_launch_witness_revalidate);
@@ -333,6 +334,11 @@ TEST(all_retained_public_apis_compile_and_link) {
     REQUIRE_PUBLIC_API(run_test_set_fork_failure);
     REQUIRE_PUBLIC_API(run_test_set_post_fork_pre_publish_hook);
 #ifdef GITSWITCH_TESTING
+    REQUIRE_PUBLIC_API(run_test_set_child_setup_delay);
+    REQUIRE_PUBLIC_API(run_test_set_monotonic_failure);
+    REQUIRE_PUBLIC_API(run_test_set_monotonic_rollback);
+    REQUIRE_PUBLIC_API(run_test_set_monotonic_timespec);
+    REQUIRE_PUBLIC_API(run_test_set_poll_failure);
     REQUIRE_PUBLIC_API(run_test_set_exec_parse_failure);
     REQUIRE_PUBLIC_API(run_test_set_path_candidate_failure);
     REQUIRE_PUBLIC_API(run_test_set_directory_open_failure);

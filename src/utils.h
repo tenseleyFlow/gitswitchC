@@ -199,6 +199,8 @@ typedef struct {
     const char *const *extra_env;   /* NULL-terminated "KEY=VALUE" entries set in the child (e.g. GNUPGHOME) */
     int         cwd_fd;             /* pinned directory inherited across fork; ignored unless use_cwd_fd */
     bool        use_cwd_fd;         /* fchdir(cwd_fd) in the child before closing inherited descriptors */
+    bool        use_deadline;       /* enforce absolute CLOCK_MONOTONIC deadline_millis */
+    int64_t     deadline_millis;    /* absolute monotonic milliseconds; zero is already expired */
 } run_opts_t;
 
 /* Exact launch generation retained by the production runner after a clean
@@ -224,6 +226,7 @@ typedef struct {
     int    exit_code;     /* WEXITSTATUS on normal exit; -1 if killed by signal or spawn failed */
     int    term_signal;   /* signal number if killed by signal, else 0 */
     bool   spawned;       /* true if the child actually started */
+    bool   timed_out;     /* deadline expired after/before spawn; cleanup/reap still completed */
     size_t out_len;       /* bytes captured into out (excluding the NUL) */
     bool   out_truncated; /* true if the child wrote more than out could hold —
                            * the capture is INCOMPLETE, not just short. Callers

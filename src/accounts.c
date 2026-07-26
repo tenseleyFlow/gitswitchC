@@ -31,6 +31,7 @@
 #define GITSWITCH_INTERNAL_API
 #include "git_ops_internal.h"
 #include "git_status_internal.h"
+#include "runner_internal.h"
 #include "ssh_manager_internal.h"
 #undef GITSWITCH_INTERNAL_API
 #include "gpg_manager.h"
@@ -1032,9 +1033,12 @@ typedef struct {
 
 static int invoke_ssh_probe_observation(void *context) {
     const ssh_probe_observation_t *probe = context;
+    int64_t deadline_millis;
 
     if (!probe) return -1;
-    return ssh_test_connection(probe->account, probe->host);
+    if (run_deadline_after_millis(7000, &deadline_millis) != 0) return -1;
+    return ssh_test_connection_with_deadline(
+        probe->account, probe->host, deadline_millis);
 }
 
 static int run_informational_ssh_probe(const account_t *account,
