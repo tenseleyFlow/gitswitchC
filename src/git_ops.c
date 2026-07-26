@@ -9630,9 +9630,10 @@ int git_retirement_recovery_begin(
                 sizeof(accounts[i].incarnation)) != 0) {
             goto done;
         }
-        written = snprintf(accounts[i].name, sizeof(accounts[i].name),
-                           "retiring account %" PRIu32,
-                           publications[i]->account_id);
+        written = snprintf( /* Flawfinder: ignore — bounded destination and
+                             * compile-time PRI format. */
+            accounts[i].name, sizeof(accounts[i].name),
+            "retiring account %" PRIu32, publications[i]->account_id);
         if (written < 0 ||
             (size_t)written >= sizeof(accounts[i].name)) {
             errno = EOVERFLOW;

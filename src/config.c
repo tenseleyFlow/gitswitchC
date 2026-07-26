@@ -5347,7 +5347,8 @@ static int config_switch_parse_uintmax(
         parsed > maximum) {
         return config_switch_guard_malformed("invalid unsigned integer");
     }
-    written = snprintf(
+    written = snprintf( /* Flawfinder: ignore — bounded destination and
+                         * compile-time PRI format. */
         canonical, sizeof(canonical), "%" PRIuMAX, parsed);
     if (written < 0 || (size_t)written != length ||
         memcmp(canonical, value, length) != 0) {
@@ -5378,7 +5379,8 @@ static int config_switch_parse_int64(
         parsed < INT64_MIN || parsed > INT64_MAX) {
         return config_switch_guard_malformed("invalid signed integer");
     }
-    written = snprintf(
+    written = snprintf( /* Flawfinder: ignore — bounded destination and
+                         * compile-time PRI format. */
         canonical, sizeof(canonical), "%" PRId64, (int64_t)parsed);
     if (written < 0 || (size_t)written != length ||
         memcmp(canonical, value, length) != 0) {

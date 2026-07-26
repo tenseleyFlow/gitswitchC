@@ -8699,8 +8699,9 @@ static int gpg_append_clean_record(unsigned char *output, size_t output_size,
 
     if (!output || !used || *used >= output_size || !format) return -1;
     va_start(args, format);
-    written = vsnprintf((char *)output + *used, output_size - *used,
-                        format, args);
+    written = vsnprintf( /* Flawfinder: ignore — bounded destination; private
+                          * callers pass fixed formats. */
+        (char *)output + *used, output_size - *used, format, args);
     va_end(args);
     if (written < 0 || (size_t)written >= output_size - *used) return -1;
     *used += (size_t)written;
