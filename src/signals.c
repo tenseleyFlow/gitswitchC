@@ -68,13 +68,11 @@ static void publish_rollback_state(void) {
         (g_legacy_rollback_in_progress || g_owned_rollback_depth > 0) ? 1 : 0;
 }
 
-/* AR-03 L8: the pid of the subprocess run_argv is currently blocked on, or 0.
- * Published right after fork() and retired with its matching guarded reap;
- * WNOWAIT keeps the PID unreusable until that transition. The handler can
- * kill() a child the rollback is wedged behind (for example ssh-add awaiting
- * input). sig_atomic_t is the only type the handler may read while mainline
- * writes it; the static assert prevents pid_t truncation. */
+/* The waitable supervisor PID and independently proven equal PGID. WNOWAIT
+ * keeps both identifiers unreusable until the guarded reap retires every
+ * handler-visible field. */
 static volatile sig_atomic_t g_child_pid = 0;
+static volatile sig_atomic_t g_child_pgid = 0;
 _Static_assert(sizeof(sig_atomic_t) >= sizeof(pid_t),
                "pid_t must fit in sig_atomic_t for the L8 child-pid publication");
 
@@ -83,6 +81,7 @@ _Static_assert(sizeof(sig_atomic_t) >= sizeof(pid_t),
  * forward is enough for anything with default dispositions (all our
  * interactive children), the escalation covers a wrapper that ignores it. */
 static volatile sig_atomic_t g_child_signaled = 0;
+static volatile sig_atomic_t g_child_outbound_signal = 0;
 
 /* Saved dispositions so signals_guard_end() restores exactly what was there
  * (default action, or an outer SIG_IGN we chose not to override). */
@@ -94,6 +93,41 @@ typedef enum {
     GUARD_RESTORE_PENDING
 } guard_state_t;
 static guard_state_t g_guard_state = GUARD_INACTIVE;
+
+void signals_record_relayed_group_signal(int signal_number);
+
+void signals_record_relayed_group_signal(int signal_number) {
+    if (g_guard_state != GUARD_ACTIVE) return;
+    if ((pid_t)g_child_pgid == (pid_t)g_child_pid &&
+        g_child_pid > 0 &&
+        g_child_outbound_signal == (sig_atomic_t)signal_number) {
+        g_child_outbound_signal = 0;
+        return;
+    }
+    for (size_t i = 0U; i < GUARDED_SIGNAL_COUNT; i++) {
+        if (g_action_installed[i] &&
+            g_guarded_signals[i] == signal_number) {
+            if (g_pending_signal == 0) {
+                g_pending_signal = (sig_atomic_t)signal_number;
+                if ((pid_t)g_child_pgid == (pid_t)g_child_pid &&
+                    g_child_pid > 0) {
+                    /* The relay proves this signal already reached the whole
+                     * group; mark the polite-delivery credit without echoing
+                     * it back into the supervisor. */
+                    g_child_signaled = g_child_pid;
+                }
+            } else if ((pid_t)g_child_pgid == (pid_t)g_child_pid &&
+                       g_child_pid > 0 &&
+                       (pid_t)g_child_signaled == (pid_t)g_child_pid) {
+                (void)kill(-(pid_t)g_child_pgid, SIGKILL);
+            } else if ((pid_t)g_child_pgid == (pid_t)g_child_pid &&
+                       g_child_pid > 0) {
+                g_child_signaled = g_child_pid;
+            }
+            return;
+        }
+    }
+}
 
 /* AR-10 L15: like the dispatch injection below, the sigaction fault and
  * guard-end sabotage seams exist ONLY in GITSWITCH_TESTING objects. They
@@ -298,6 +332,12 @@ static void guard_handler(int sig) {
          * context — running git/teardown from here would not be
          * async-signal-safe. */
         g_pending_signal = sig;
+        if ((pid_t)g_child_pgid == (pid_t)g_child_pid &&
+            g_child_pid > 0) {
+            g_child_signaled = g_child_pid;
+            g_child_outbound_signal = (sig_atomic_t)sig;
+            (void)kill(-(pid_t)g_child_pgid, sig);
+        }
         errno = saved_errno;
         return;
     }
@@ -319,19 +359,19 @@ static void guard_handler(int sig) {
      * in-flight child (kill() is async-signal-safe) so the blocker dies and
      * the rollback PROCEEDS — every restore step is per-key/best-effort, so
      * the sequence still runs to completion and the mainline dispatches the
-     * pending signal at the end. Signal the child's PID, not its pgid: our
-     * children share this process group (no setpgid at spawn), so a group
-     * kill would loop the signal back at us and any sibling; the recorded
-     * pid is exactly the process that is blocked. If the same child survives
-     * a repeat signal (something ignoring SIGTERM), escalate to SIGKILL. */
+     * pending signal at the end. A runner-created process group is published
+     * only after the parent independently proves pgid == child pid, so group
+     * delivery cannot reach this process or an unrelated sibling. */
     if (g_rollback_in_progress) {
         pid_t child = (pid_t)g_child_pid;
+        pid_t group = (pid_t)g_child_pgid;
         if (child > 0) {
             if ((pid_t)g_child_signaled == child) {
-                (void)kill(child, SIGKILL);
+                (void)kill(group == child ? -group : child, SIGKILL);
             } else {
                 g_child_signaled = (sig_atomic_t)child;
-                (void)kill(child, sig);
+                g_child_outbound_signal = (sig_atomic_t)sig;
+                (void)kill(group == child ? -group : child, sig);
             }
         }
         errno = saved_errno;
@@ -342,6 +382,10 @@ static void guard_handler(int sig) {
      * swallowed by a stuck child prompt). Do the only teardown that is safe
      * here — drop registered scratch files — then die with the correct
      * signal status. signal() and raise() are on the async-signal-safe list. */
+    if ((pid_t)g_child_pgid == (pid_t)g_child_pid &&
+        g_child_pid > 0) {
+        (void)kill(-(pid_t)g_child_pgid, SIGKILL);
+    }
     scratch_unlink_all();
     (void)signal(sig, SIG_DFL);
     (void)raise(sig);
@@ -464,8 +508,16 @@ bool signals_rollback_active(void) {
     return g_rollback_in_progress != 0;
 }
 
+void signals_child_group_spawned(pid_t pid, pid_t proven_pgid);
+
 void signals_child_spawned(pid_t pid) {
+    signals_child_group_spawned(pid, 0);
+}
+
+void signals_child_group_spawned(pid_t pid, pid_t proven_pgid) {
     if (pid > 0) {
+        g_child_pgid =
+            proven_pgid == pid ? (sig_atomic_t)proven_pgid : 0;
         g_child_pid = (sig_atomic_t)pid;
     }
 }
@@ -473,7 +525,9 @@ void signals_child_spawned(pid_t pid) {
 static void signals_child_retire(pid_t pid) {
     if ((pid_t)g_child_pid == pid) {
         g_child_pid = 0;
+        g_child_pgid = 0;
         g_child_signaled = 0;
+        g_child_outbound_signal = 0;
     }
 }
 

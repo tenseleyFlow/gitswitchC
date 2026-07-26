@@ -41,7 +41,13 @@
 #include "utils.h"
 #include "error.h"
 #include "runner_internal.h"
+#define GITSWITCH_SIGNALS_RUNNER_INTERNAL
 #include "signals.h"
+#undef GITSWITCH_SIGNALS_RUNNER_INTERNAL
+
+#ifdef GITSWITCH_TESTING
+void run_test_set_child_process_group_failure(int system_errno);
+#endif
 
 /* POSIX exposes the process environment through this external object, but
  * Darwin and FreeBSD do not declare it from <unistd.h> under every feature
@@ -3250,6 +3256,7 @@ static run_test_post_fork_pre_publish_hook_fn
     g_test_post_fork_pre_publish_hook;
 static int g_test_fork_failure_errno;
 #ifdef GITSWITCH_TESTING
+static int g_test_child_process_group_failure_errno;
 static unsigned int g_test_path_candidate_failure_ordinal;
 static int g_test_path_candidate_failure_errno;
 static unsigned int g_test_directory_open_failure_ordinal;
@@ -3458,6 +3465,11 @@ void run_test_set_fork_failure(int system_errno) {
 }
 
 #ifdef GITSWITCH_TESTING
+void run_test_set_child_process_group_failure(int system_errno) {
+    g_test_child_process_group_failure_errno =
+        system_errno > 0 ? system_errno : 0;
+}
+
 void run_test_set_exec_parse_failure(unsigned int parse_ordinal,
                                      int system_errno) {
     g_test_exec_parse_failure_ordinal =
@@ -3562,12 +3574,205 @@ static int child_close_fds_from(
 }
 
 typedef enum {
-    CHILD_STAGE_STDIO = 1,
+    CHILD_STAGE_PROCESS_GROUP = 1,
+    CHILD_STAGE_STDIO,
     CHILD_STAGE_CWD,
     CHILD_STAGE_FD_CLOSE,
     CHILD_STAGE_ENV,
     CHILD_STAGE_EXEC
 } child_stage_t;
+
+typedef struct {
+    int fd;
+    pid_t foreground_pgid;
+    bool transferred;
+} runner_tty_state_t;
+
+static int runner_write_byte(int fd, unsigned char byte) {
+    ssize_t written;
+    do {
+        written = write(fd, &byte, 1U);
+    } while (written < 0 && errno == EINTR);
+    return written == 1 ? 0 : -1;
+}
+
+static int runner_read_byte(int fd, unsigned char expected) {
+    unsigned char byte = 0U;
+    ssize_t got;
+    do {
+        got = read(fd, &byte, 1U);
+    } while (got < 0 && errno == EINTR);
+    if (got == 1 && byte == expected) return 0;
+    if (got == 0) errno = EPIPE;
+    else if (got == 1) errno = EPROTO;
+    return -1;
+}
+
+static int runner_tcsetpgrp_masked(int fd, pid_t pgid) {
+    sigset_t block;
+    sigset_t saved;
+    int operation_errno = 0;
+    int restore_errno = 0;
+
+    if (sigemptyset(&block) != 0 || sigaddset(&block, SIGTTOU) != 0 ||
+        sigprocmask(SIG_BLOCK, &block, &saved) != 0) {
+        return -1;
+    }
+    if (tcsetpgrp(fd, pgid) != 0) operation_errno = errno;
+    if (sigprocmask(SIG_SETMASK, &saved, NULL) != 0) restore_errno = errno;
+    if (operation_errno != 0 || restore_errno != 0) {
+        errno = operation_errno != 0 ? operation_errno : restore_errno;
+        return -1;
+    }
+    return 0;
+}
+
+static int runner_tty_prepare(runner_tty_state_t *state) {
+    pid_t foreground;
+
+    memset(state, 0, sizeof(*state));
+    state->fd = -1;
+    state->fd = open("/dev/tty", O_RDWR | O_NOCTTY);
+    if (state->fd < 0) {
+        if (errno == ENXIO || errno == ENODEV || errno == ENOTTY ||
+            errno == EACCES) {
+            state->fd = -1;
+            return 0;
+        }
+        return -1;
+    }
+    foreground = tcgetpgrp(state->fd);
+    if (foreground < 0) {
+        int saved = errno;
+        close(state->fd);
+        state->fd = -1;
+        if (saved == ENOTTY) return 0;
+        errno = saved;
+        return -1;
+    }
+    if (foreground != getpgrp()) {
+        close(state->fd);
+        state->fd = -1;
+        return 0;
+    }
+    state->foreground_pgid = foreground;
+    return 0;
+}
+
+static int runner_tty_transfer(runner_tty_state_t *state, pid_t pgid) {
+    if (!state || state->fd < 0) return 0;
+    if (runner_tcsetpgrp_masked(state->fd, pgid) != 0) return -1;
+    state->transferred = true;
+    return 0;
+}
+
+static int runner_tty_restore(runner_tty_state_t *state) {
+    int restore_errno = 0;
+
+    if (!state) return 0;
+    if (state->transferred &&
+        runner_tcsetpgrp_masked(state->fd, state->foreground_pgid) != 0) {
+        restore_errno = errno;
+    }
+    if (state->fd >= 0) close(state->fd);
+    state->fd = -1;
+    state->transferred = false;
+    if (restore_errno != 0) {
+        errno = restore_errno;
+        return -1;
+    }
+    return 0;
+}
+
+static void runner_signal_child(pid_t pid, bool group_proven,
+                                int signal_number) {
+    if (pid <= 0) return;
+    (void)kill(group_proven ? -pid : pid, signal_number);
+}
+
+static void runner_accept_group_relay(pid_t pid, bool group_proven,
+                                      int signal_number) {
+    if (signal_number == SIGTSTP) {
+        /* A separate foreground pgrp cannot leave both supervisor and worker
+         * stopped or the background parent would wait forever. Full shell
+         * stop/continue proxying is outside the guarded-signal contract;
+         * fail this run closed and restore terminal ownership instead. */
+        runner_signal_child(pid, group_proven, SIGCONT);
+        runner_signal_child(pid, group_proven, SIGKILL);
+        return;
+    }
+    signals_record_relayed_group_signal(signal_number);
+}
+
+static volatile sig_atomic_t g_runner_relay_fd = -1;
+
+static void runner_group_signal_relay(int signal_number) {
+    int saved_errno = errno;
+    unsigned char byte = (unsigned char)signal_number;
+    int fd = (int)g_runner_relay_fd;
+    if (fd >= 0) (void)write(fd, &byte, 1U);
+    errno = saved_errno;
+}
+
+static int runner_install_group_relay(int relay_fd) {
+    static const int relayed[] = {
+        SIGINT, SIGTERM, SIGHUP, SIGQUIT, SIGTSTP
+    };
+    struct sigaction current;
+    struct sigaction relay;
+
+    memset(&relay, 0, sizeof(relay));
+    relay.sa_handler = runner_group_signal_relay;
+    if (sigemptyset(&relay.sa_mask) != 0) return -1;
+    int flags = fcntl(relay_fd, F_GETFL, 0);
+    if (flags < 0 || fcntl(relay_fd, F_SETFL, flags | O_NONBLOCK) != 0) {
+        return -1;
+    }
+    g_runner_relay_fd = (sig_atomic_t)relay_fd;
+    for (size_t i = 0U; i < sizeof(relayed) / sizeof(relayed[0]); i++) {
+        if (sigaction(relayed[i], NULL, &current) != 0) return -1;
+        if (current.sa_handler != SIG_IGN &&
+            sigaction(relayed[i], &relay, NULL) != 0) {
+            return -1;
+        }
+    }
+    return 0;
+}
+
+static void runner_reset_group_relay_for_exec(void) {
+    static const int relayed[] = {
+        SIGINT, SIGTERM, SIGHUP, SIGQUIT, SIGTSTP
+    };
+    struct sigaction current;
+    struct sigaction action;
+
+    memset(&action, 0, sizeof(action));
+    action.sa_handler = SIG_DFL;
+    (void)sigemptyset(&action.sa_mask);
+    for (size_t i = 0U; i < sizeof(relayed) / sizeof(relayed[0]); i++) {
+        if (sigaction(relayed[i], NULL, &current) == 0 &&
+            current.sa_handler == runner_group_signal_relay) {
+            (void)sigaction(relayed[i], &action, NULL);
+        }
+    }
+    g_runner_relay_fd = -1;
+}
+
+static void runner_supervisor_exit_for_status(pid_t child, int status) {
+    if (WIFEXITED(status)) _exit(WEXITSTATUS(status));
+    if (WIFSIGNALED(status)) {
+        int signal_number = WTERMSIG(status);
+        sigset_t unblock;
+        (void)signal(signal_number, SIG_DFL);
+        if (sigemptyset(&unblock) == 0 &&
+            sigaddset(&unblock, signal_number) == 0) {
+            (void)sigprocmask(SIG_UNBLOCK, &unblock, NULL);
+        }
+        (void)raise(signal_number);
+    }
+    (void)kill(child, SIGKILL);
+    _exit(127);
+}
 
 typedef enum {
     CHILD_STATUS_FAILURE = 1,
@@ -4179,6 +4384,9 @@ static int run_argv_real_impl(
     int in_pipe[2] = {-1, -1};
     int out_pipe[2] = {-1, -1};
     int status_pipe[2] = {-1, -1};
+    int group_ready_pipe[2] = {-1, -1};
+    int group_release_pipe[2] = {-1, -1};
+    int signal_relay_pipe[2] = {-1, -1};
     if (need_devnull && (devnull = open_internal_devnull()) < 0) {
         set_system_error(ERR_SYSTEM_CALL,
                          "run_argv: cannot acquire /dev/null for child stdio");
@@ -4217,6 +4425,29 @@ static int run_argv_real_impl(
         trusted_script_launch_cleanup(&script_launch);
         return -1;
     }
+    if (make_internal_pipe(group_ready_pipe) != 0 ||
+        make_internal_pipe(group_release_pipe) != 0 ||
+        make_internal_pipe(signal_relay_pipe) != 0) {
+        int pipe_errno = errno;
+        set_system_error(ERR_SYSTEM_CALL,
+                         "run_argv: cannot create process-group gate");
+        if (devnull >= 0) close(devnull);
+        if (pipe_input) { close(in_pipe[0]); close(in_pipe[1]); }
+        if (want_out) { close(out_pipe[0]); close(out_pipe[1]); }
+        close(status_pipe[0]);
+        close(status_pipe[1]);
+        if (group_ready_pipe[0] >= 0) close(group_ready_pipe[0]);
+        if (group_ready_pipe[1] >= 0) close(group_ready_pipe[1]);
+        if (group_release_pipe[0] >= 0) close(group_release_pipe[0]);
+        if (group_release_pipe[1] >= 0) close(group_release_pipe[1]);
+        if (signal_relay_pipe[0] >= 0) close(signal_relay_pipe[0]);
+        if (signal_relay_pipe[1] >= 0) close(signal_relay_pipe[1]);
+        free(fd_snapshot.fds);
+        close(exec_fd);
+        trusted_script_launch_cleanup(&script_launch);
+        errno = pipe_errno;
+        return -1;
+    }
 
     /* Own SIGCHLD before fork so an inherited auto-reap policy or foreign
      * signal handler can never consume a helper after it has side effects.
@@ -4229,6 +4460,12 @@ static int run_argv_real_impl(
         if (want_out) { close(out_pipe[0]); close(out_pipe[1]); }
         close(status_pipe[0]);
         close(status_pipe[1]);
+        close(group_ready_pipe[0]);
+        close(group_ready_pipe[1]);
+        close(group_release_pipe[0]);
+        close(group_release_pipe[1]);
+        close(signal_relay_pipe[0]);
+        close(signal_relay_pipe[1]);
         free(fd_snapshot.fds);
         close(exec_fd);
         trusted_script_launch_cleanup(&script_launch);
@@ -4248,6 +4485,12 @@ static int run_argv_real_impl(
         if (want_out) { close(out_pipe[0]); close(out_pipe[1]); }
         close(status_pipe[0]);
         close(status_pipe[1]);
+        close(group_ready_pipe[0]);
+        close(group_ready_pipe[1]);
+        close(group_release_pipe[0]);
+        close(group_release_pipe[1]);
+        close(signal_relay_pipe[0]);
+        close(signal_relay_pipe[1]);
         free(fd_snapshot.fds);
         close(exec_fd);
         trusted_script_launch_cleanup(&script_launch);
@@ -4292,6 +4535,12 @@ static int run_argv_real_impl(
         if (want_out) { close(out_pipe[0]); close(out_pipe[1]); }
         close(status_pipe[0]);
         close(status_pipe[1]);
+        close(group_ready_pipe[0]);
+        close(group_ready_pipe[1]);
+        close(group_release_pipe[0]);
+        close(group_release_pipe[1]);
+        close(signal_relay_pipe[0]);
+        close(signal_relay_pipe[1]);
         free(fd_snapshot.fds);
         close(exec_fd);
         trusted_script_launch_cleanup(&script_launch);
@@ -4319,13 +4568,102 @@ static int run_argv_real_impl(
 
     if (pid == 0) {
         /* ---- child ---- */
+        int child_status_fd = status_pipe[1];
+
+        close(group_ready_pipe[0]);
+        close(group_release_pipe[1]);
+        close(signal_relay_pipe[0]);
+#ifdef GITSWITCH_TESTING
+        if (g_test_child_process_group_failure_errno != 0) {
+            int injected_errno =
+                g_test_child_process_group_failure_errno;
+            g_test_child_process_group_failure_errno = 0;
+            child_report_failure(child_status_fd,
+                                 CHILD_STAGE_PROCESS_GROUP,
+                                 injected_errno, 126);
+        }
+#endif
+        if (setpgid(0, 0) != 0) {
+            child_report_failure(child_status_fd,
+                                 CHILD_STAGE_PROCESS_GROUP, errno, 126);
+        }
+        if (runner_install_group_relay(signal_relay_pipe[1]) != 0) {
+            child_report_failure(child_status_fd,
+                                 CHILD_STAGE_PROCESS_GROUP, errno, 126);
+        }
+        if (runner_write_byte(group_ready_pipe[1], 0x47U) != 0 ||
+            runner_read_byte(group_release_pipe[0], 0x52U) != 0) {
+            child_report_failure(child_status_fd,
+                                 CHILD_STAGE_PROCESS_GROUP, errno, 126);
+        }
+        close(group_ready_pipe[1]);
+        close(group_release_pipe[0]);
+        if (sigprocmask(SIG_SETMASK, &pre_wait_mask, NULL) != 0) {
+            child_report_failure(child_status_fd,
+                                 CHILD_STAGE_PROCESS_GROUP, errno, 126);
+        }
+
+        pid_t exec_child = fork();
+        if (exec_child < 0) {
+            child_report_failure(child_status_fd,
+                                 CHILD_STAGE_PROCESS_GROUP, errno, 126);
+        }
+        if (exec_child > 0) {
+            int exec_status = 0;
+            pid_t waited;
+            run_test_fd_close_observation_t supervisor_close_observation;
+            int supervisor_relay_fd = STDERR_FILENO + 1;
+
+            close(status_pipe[0]);
+            close(status_pipe[1]);
+            if (in_pipe[0] >= 0) close(in_pipe[0]);
+            if (in_pipe[1] >= 0) close(in_pipe[1]);
+            if (out_pipe[0] >= 0) close(out_pipe[0]);
+            if (out_pipe[1] >= 0) close(out_pipe[1]);
+            if (devnull >= 0) close(devnull);
+            close(exec_fd);
+            if (script_launch.interpreter_fd >= 0) {
+                close(script_launch.interpreter_fd);
+            }
+            if (signal_relay_pipe[1] != supervisor_relay_fd) {
+                if (dup2(signal_relay_pipe[1], supervisor_relay_fd) < 0) {
+                    (void)kill(exec_child, SIGKILL);
+                    _exit(127);
+                }
+                close(signal_relay_pipe[1]);
+            }
+            g_runner_relay_fd = (sig_atomic_t)supervisor_relay_fd;
+            close(STDIN_FILENO);
+            close(STDOUT_FILENO);
+            close(STDERR_FILENO);
+            /* The worker inherited its own copy of every test fault before
+             * this supervisor-only reset. Do not let a worker close-strategy
+             * injection strand the waitable group leader with inherited
+             * locks; use the fastest real primitive, then the parent snapshot
+             * or numeric fallback. */
+            g_test_bulk_close_failure_errno = 0;
+            if (child_close_fds_from(
+                    supervisor_relay_fd + 1, use_bulk_close, false,
+                    &fd_snapshot,
+                    &supervisor_close_observation) != 0) {
+                (void)kill(exec_child, SIGKILL);
+                _exit(127);
+            }
+            do {
+                waited = waitpid(exec_child, &exec_status, 0);
+            } while (waited < 0 && errno == EINTR);
+            if (waited != exec_child) _exit(127);
+            runner_supervisor_exit_for_status(exec_child, exec_status);
+        }
+        close(signal_relay_pipe[1]);
+        runner_reset_group_relay_for_exec();
+
         /* Drop the parent's guard handler first (AR-06 F76): until exec resets
          * it, a signal delivered to this child would run guard_handler (which
          * only records and returns), swallowing it and leaving the helper
          * "pre-interrupted" instead of terminating normally. */
         signals_reset_for_child(&pre_wait_mask);
 
-        int child_status_fd = status_pipe[1];
         close(status_pipe[0]);
         int child_cwd_fd = -1;
 #ifdef GITSWITCH_TESTING
@@ -4621,20 +4959,160 @@ static int run_argv_real_impl(
 
     /* ---- parent ---- */
     result->spawned = true;
+#ifdef GITSWITCH_TESTING
+    g_test_child_process_group_failure_errno = 0;
+#endif
+    bool group_proven = false;
+    runner_tty_state_t tty_state;
+    memset(&tty_state, 0, sizeof(tty_state));
+    tty_state.fd = -1;
+    close(group_ready_pipe[1]);
+    close(group_release_pipe[0]);
+    close(signal_relay_pipe[1]);
     if (g_test_post_fork_pre_publish_hook) {
         g_test_post_fork_pre_publish_hook();
     }
-    /* AR-03 L8: publish the in-flight child while guarded signals are still
-     * blocked, so a pending rollback signal can observe it when the exact
-     * parent mask is restored below. */
-    signals_child_spawned(pid);
+    int group_ready_rc = 0;
+    if (deadline.enabled) {
+        for (;;) {
+            int remaining = 0;
+            int deadline_rc = run_deadline_observe(&deadline, &remaining);
+            struct pollfd ready_poll = {
+                .fd = group_ready_pipe[0],
+                .events = POLLIN
+            };
+            int poll_rc;
+
+            if (deadline_rc != 0) {
+                group_ready_rc = -1;
+                errno = deadline_rc > 0 ? ETIMEDOUT : errno;
+                break;
+            }
+            poll_rc = poll(&ready_poll, 1, remaining);
+            if (poll_rc > 0) break;
+            if (poll_rc < 0 && errno == EINTR) continue;
+            group_ready_rc = -1;
+            if (poll_rc == 0) errno = ETIMEDOUT;
+            break;
+        }
+    }
+    if (group_ready_rc == 0) {
+        group_ready_rc =
+            runner_read_byte(group_ready_pipe[0], 0x47U);
+    }
+    int group_ready_errno = group_ready_rc == 0 ? 0 : errno;
+    child_status_t early_group_failure = {0};
+    int early_group_failure_rc = 0;
+    if (group_ready_rc != 0 && group_ready_errno == EPIPE) {
+        run_test_fd_close_observation_t ignored_observation = {0};
+        bool ignored_observation_valid = false;
+        early_group_failure_rc = read_child_status(
+            status_pipe[0], &early_group_failure, &ignored_observation,
+            &ignored_observation_valid, &deadline);
+    }
+    if (group_ready_rc == 0 &&
+        (setpgid(pid, pid) == 0 || errno == EACCES) &&
+        getpgid(pid) == pid) {
+        group_proven = true;
+    }
+    close(group_ready_pipe[0]);
+    if (!group_proven || runner_tty_prepare(&tty_state) != 0 ||
+        runner_tty_transfer(&tty_state, pid) != 0) {
+        int group_errno =
+            early_group_failure_rc > 0 &&
+                    early_group_failure.stage ==
+                        CHILD_STAGE_PROCESS_GROUP
+                ? early_group_failure.system_errno
+                : (group_ready_errno != 0
+                       ? group_ready_errno
+                       : (errno != 0 ? errno : EIO));
+        int cleanup_wait_errno = 0;
+        int group_status = 0;
+        signals_child_wait_result_t wait_result;
+
+        close(group_release_pipe[1]);
+        close(signal_relay_pipe[0]);
+        runner_signal_child(pid, group_proven, SIGKILL);
+        (void)runner_tty_restore(&tty_state);
+        do {
+            wait_result = signals_wait_child(pid, &group_status, 0);
+        } while (wait_result.waited < 0 &&
+                 wait_result.wait_errno == EINTR &&
+                 wait_result.mask_errno == 0);
+        if (wait_result.waited != pid) {
+            cleanup_wait_errno = wait_result.wait_errno != 0
+                                     ? wait_result.wait_errno : ECHILD;
+        }
+        if (wait_result.waited == pid && WIFEXITED(group_status)) {
+            result->exit_code = WEXITSTATUS(group_status);
+        } else if (wait_result.waited == pid &&
+                   WIFSIGNALED(group_status)) {
+            result->term_signal = WTERMSIG(group_status);
+        }
+        (void)signals_restore_after_child_spawn(&pre_spawn_mask);
+        (void)signals_child_wait_end(&pre_wait_mask);
+        if (devnull >= 0) close(devnull);
+        if (pipe_input) { close(in_pipe[0]); close(in_pipe[1]); }
+        if (want_out) { close(out_pipe[0]); close(out_pipe[1]); }
+        close(status_pipe[0]);
+        close(status_pipe[1]);
+        free(fd_snapshot.fds);
+        close(exec_fd);
+        trusted_script_launch_cleanup(&script_launch);
+        errno = group_errno;
+        if (early_group_failure_rc > 0 &&
+            early_group_failure.stage == CHILD_STAGE_PROCESS_GROUP) {
+            set_system_error(
+                ERR_SYSTEM_CALL,
+                "run_argv: child process-group supervisor setup failed");
+        } else if (group_errno == ETIMEDOUT) {
+            run_deadline_set_error(
+                1, "while establishing child process group", result);
+        } else {
+            set_system_error(
+                ERR_SYSTEM_CALL,
+                "run_argv: cannot establish and verify isolated child process group");
+        }
+        report_secondary_runner_cleanup_failure(
+            "while reaping failed process-group setup", cleanup_wait_errno);
+        errno = group_errno;
+        return -1;
+    }
+    /* Publish only the independently proven group, then release the
+     * supervisor to fork/exec descendants. */
+    signals_child_group_spawned(pid, pid);
+    if (runner_write_byte(group_release_pipe[1], 0x52U) != 0) {
+        int release_errno = errno;
+        close(group_release_pipe[1]);
+        runner_signal_child(pid, true, SIGKILL);
+        (void)runner_tty_restore(&tty_state);
+        (void)signals_restore_after_child_spawn(&pre_spawn_mask);
+        (void)signals_wait_child(pid, NULL, 0);
+        (void)signals_child_wait_end(&pre_wait_mask);
+        close(signal_relay_pipe[0]);
+        if (devnull >= 0) close(devnull);
+        if (pipe_input) { close(in_pipe[0]); close(in_pipe[1]); }
+        if (want_out) { close(out_pipe[0]); close(out_pipe[1]); }
+        close(status_pipe[0]);
+        close(status_pipe[1]);
+        free(fd_snapshot.fds);
+        close(exec_fd);
+        trusted_script_launch_cleanup(&script_launch);
+        errno = release_errno;
+        set_system_error(ERR_SYSTEM_CALL,
+                         "run_argv: cannot release child process-group gate");
+        errno = release_errno;
+        return -1;
+    }
+    close(group_release_pipe[1]);
     if (signals_restore_after_child_spawn(&pre_spawn_mask) != 0) {
         int restore_errno = errno;
         int cleanup_wait_errno = 0;
         int wait_mask_restore_errno = 0;
         signals_child_wait_result_t wait_result;
 
-        (void)kill(pid, SIGKILL);
+        runner_signal_child(pid, true, SIGKILL);
+        (void)runner_tty_restore(&tty_state);
         do {
             wait_result = signals_wait_child(pid, NULL, 0);
         } while (wait_result.waited < 0 &&
@@ -4653,6 +5131,7 @@ static int run_argv_real_impl(
         if (want_out) { close(out_pipe[0]); close(out_pipe[1]); }
         close(status_pipe[0]);
         close(status_pipe[1]);
+        close(signal_relay_pipe[0]);
         free(fd_snapshot.fds);
         close(exec_fd);
         trusted_script_launch_cleanup(&script_launch);
@@ -4694,13 +5173,13 @@ static int run_argv_real_impl(
         deadline_expired = true;
         deadline_errno = ETIMEDOUT;
         result->timed_out = true;
-        (void)kill(pid, SIGKILL);
+        runner_signal_child(pid, group_proven, SIGKILL);
     } else if (child_status_rc == -3) {
         deadline_clock_failed = true;
         deadline_errno = child_status_errno != 0 ? child_status_errno : EIO;
-        (void)kill(pid, SIGKILL);
+        runner_signal_child(pid, group_proven, SIGKILL);
     } else if (child_status_rc < 0) {
-        (void)kill(pid, SIGKILL);
+        runner_signal_child(pid, group_proven, SIGKILL);
     }
     if (g_test_fd_close_observation_enabled &&
         child_fd_close_observation_valid) {
@@ -4720,7 +5199,9 @@ static int run_argv_real_impl(
 
         close(in_pipe[1]);
         if (want_out) close(out_pipe[0]);
-        (void)kill(pid, SIGKILL);
+        runner_signal_child(pid, group_proven, SIGKILL);
+        close(signal_relay_pipe[0]);
+        (void)runner_tty_restore(&tty_state);
         do {
             wait_result = signals_wait_child(pid, NULL, 0);
         } while (wait_result.waited < 0 &&
@@ -4781,7 +5262,7 @@ static int run_argv_real_impl(
          * use the normal wait/reap path before reporting the setup failure. */
         if (infd >= 0) { close(infd); infd = -1; }
         if (outfd >= 0) { close(outfd); outfd = -1; }
-        (void)kill(pid, SIGKILL);
+        runner_signal_child(pid, group_proven, SIGKILL);
     }
 
     /* A child-side report means no helper was successfully exec'd.  Close the
@@ -4802,12 +5283,20 @@ static int run_argv_real_impl(
 
     int status = 0;
     bool child_reaped = false;
+    bool child_exited_unreaped = false;
     bool wait_failed = false;
     int wait_errno = 0;
     int64_t capture_deadline = -1;
 
-    while (infd >= 0 || outfd >= 0 ||
-           (deadline.enabled && !child_reaped)) {
+    int relayfd = signal_relay_pipe[0];
+    if (set_nonblock(relayfd) != 0) {
+        io_failed = true;
+        nonblock_setup_failed = true;
+        io_errno = errno;
+        runner_signal_child(pid, group_proven, SIGKILL);
+    }
+
+    while (infd >= 0 || outfd >= 0 || !child_exited_unreaped) {
         int timeout_ms = RUNNER_POLL_SLICE_MS;
         if (!deadline_expired && !deadline_clock_failed &&
             deadline.enabled) {
@@ -4829,14 +5318,14 @@ static int run_argv_real_impl(
                     close(outfd);
                     outfd = -1;
                 }
-                if (!child_reaped) (void)kill(pid, SIGKILL);
+                runner_signal_child(pid, group_proven, SIGKILL);
                 break;
             }
             if (remaining < timeout_ms) timeout_ms = remaining;
         } else if (deadline_expired || deadline_clock_failed) {
             break;
         }
-        if (child_reaped && outfd >= 0) {
+        if (child_exited_unreaped && outfd >= 0) {
             int64_t now;
             if (deadline.enabled) {
                 now = deadline.last_now;
@@ -4854,6 +5343,7 @@ static int run_argv_real_impl(
             int64_t remaining = capture_deadline - now;
             if (remaining <= 0) {
                 output_stalled = true;
+                runner_signal_child(pid, group_proven, SIGKILL);
                 close(outfd);
                 outfd = -1;
                 continue;
@@ -4861,10 +5351,15 @@ static int run_argv_real_impl(
             if (remaining < timeout_ms) timeout_ms = (int)remaining;
         }
 
-        struct pollfd pfds[2];
-        int n = 0, in_idx = -1, out_idx = -1;
+        struct pollfd pfds[3];
+        int n = 0, in_idx = -1, out_idx = -1, relay_idx = -1;
         if (infd >= 0) { pfds[n].fd = infd; pfds[n].events = POLLOUT; in_idx = n++; }
         if (outfd >= 0) { pfds[n].fd = outfd; pfds[n].events = POLLIN; out_idx = n++; }
+        if (relayfd >= 0) {
+            pfds[n].fd = relayfd;
+            pfds[n].events = POLLIN;
+            relay_idx = n++;
+        }
 
         int poll_rc = runner_poll(pfds, (nfds_t)n, timeout_ms);
         if (poll_rc < 0) {
@@ -4879,7 +5374,27 @@ static int run_argv_real_impl(
                 if (outfd >= 0) { close(outfd); outfd = -1; }
                 io_failed = true;
                 io_errno = errno;
-                if (!child_reaped) (void)kill(pid, SIGKILL);
+                runner_signal_child(pid, group_proven, SIGKILL);
+                break;
+            }
+        }
+
+        if (poll_rc > 0 && relay_idx >= 0 &&
+            (pfds[relay_idx].revents &
+             (POLLIN | POLLERR | POLLHUP | POLLNVAL))) {
+            for (;;) {
+                unsigned char relayed = 0U;
+                ssize_t got = read(relayfd, &relayed, 1U);
+                if (got == 1) {
+                    runner_accept_group_relay(
+                        pid, group_proven, (int)relayed);
+                    continue;
+                }
+                if (got == 0 ||
+                    (got < 0 && errno != EAGAIN && errno != EINTR)) {
+                    close(relayfd);
+                    relayfd = -1;
+                }
                 break;
             }
         }
@@ -4950,28 +5465,32 @@ static int run_argv_real_impl(
              * so waitpid(WNOHANG) and the post-exit deadline run every cycle. */
         }
 
-        /* Finite polling lets us observe the direct child independently of
-         * capture EOF.  A background descendant may retain stdout forever;
-         * once the direct child is reaped, only a short drain grace remains. */
-        if (!child_reaped) {
-            signals_child_wait_result_t wait_result;
-            do {
-                wait_result = signals_wait_child(pid, &status, WNOHANG);
-            } while (wait_result.waited < 0 &&
-                     wait_result.wait_errno == EINTR &&
-                     wait_result.mask_errno == 0);
-
-            /* AR-12 U4: process a successful reap FIRST even when a
-             * mask-restore failure is reported alongside it — the PID is
-             * consumed and the exit status is valid; discarding the reap
-             * left child_reaped false and re-waited a released PID. The
-             * mask failure still fails the call afterwards. */
-            if (wait_result.waited == pid) {
-                child_reaped = true;
+        /* Observe without releasing the group leader PID. This pins the PGID
+         * until descendant-held capture either reaches EOF or the bounded
+         * grace expires and the proven group is killed. */
+        if (!child_exited_unreaped) {
+            siginfo_t observed;
+            memset(&observed, 0, sizeof(observed));
+            if (waitid(P_PID, (id_t)pid, &observed,
+                       WEXITED | WNOWAIT | WNOHANG) != 0) {
+                if (errno != EINTR) {
+                    wait_failed = true;
+                    wait_errno = errno;
+                    if (infd >= 0) { close(infd); infd = -1; }
+                    if (outfd >= 0) { close(outfd); outfd = -1; }
+                    runner_signal_child(pid, group_proven, SIGKILL);
+                    break;
+                }
+            } else if (observed.si_pid == pid) {
+                child_exited_unreaped = true;
                 if (infd >= 0) {
                     if (in_off < opts->input_len) input_failed = true;
                     close(infd);
                     infd = -1;
+                }
+                if (observed.si_code != CLD_EXITED ||
+                    observed.si_status != 0) {
+                    runner_signal_child(pid, group_proven, SIGKILL);
                 }
                 if (outfd >= 0) {
                     int64_t now;
@@ -5004,27 +5523,21 @@ static int run_argv_real_impl(
                                 now, RUNNER_CAPTURE_GRACE_MS);
                     }
                 }
-                if (wait_result.mask_errno != 0) {
-                    wait_failed = true;
-                    wait_errno = wait_result.mask_errno;
-                    if (infd >= 0) { close(infd); infd = -1; }
-                    if (outfd >= 0) { close(outfd); outfd = -1; }
-                    break;
-                }
-            } else if (wait_result.mask_errno != 0) {
-                wait_failed = true;
-                wait_errno = wait_result.mask_errno;
-                if (infd >= 0) { close(infd); infd = -1; }
-                if (outfd >= 0) { close(outfd); outfd = -1; }
-                break;
-            } else if (wait_result.waited < 0) {
-                wait_failed = true;
-                wait_errno = wait_result.wait_errno;
-                if (infd >= 0) { close(infd); infd = -1; }
-                if (outfd >= 0) { close(outfd); outfd = -1; }
-                break;
             }
         }
+    }
+    if (relayfd >= 0) {
+        for (;;) {
+            unsigned char relayed = 0U;
+            ssize_t got = read(relayfd, &relayed, 1U);
+            if (got == 1) {
+                runner_accept_group_relay(
+                    pid, group_proven, (int)relayed);
+                continue;
+            }
+            break;
+        }
+        close(relayfd);
     }
     if (deadline.enabled && !deadline_expired && !deadline_clock_failed &&
         child_status_rc >= 0 && !io_failed && !wait_failed) {
@@ -5036,7 +5549,7 @@ static int run_argv_real_impl(
                                  ? ETIMEDOUT
                                  : (errno != 0 ? errno : EIO);
             result->timed_out = deadline_expired;
-            if (!child_reaped) (void)kill(pid, SIGKILL);
+            runner_signal_child(pid, group_proven, SIGKILL);
         }
     }
     if (want_out) {
@@ -5045,6 +5558,16 @@ static int run_argv_real_impl(
         secure_zero_memory(rdbuf, sizeof(rdbuf));
     }
     result->out_len = out_off;
+
+    if (deadline_expired || deadline_clock_failed || child_status_rc != 0 ||
+        io_failed || input_failed || output_stalled || wait_failed) {
+        runner_signal_child(pid, group_proven, SIGKILL);
+    }
+
+    int tty_cleanup_errno = 0;
+    if (runner_tty_restore(&tty_state) != 0) {
+        tty_cleanup_errno = errno;
+    }
 
     if (!child_reaped && !wait_failed) {
         signals_child_wait_result_t wait_result;
@@ -5096,12 +5619,20 @@ static int run_argv_real_impl(
             result);
         report_secondary_signal_cleanup_failures(
             sigpipe_cleanup_errno, wait_ownership_cleanup_errno);
+        report_secondary_runner_cleanup_failure(
+            "while restoring terminal foreground ownership",
+            tty_cleanup_errno);
         return -1;
     }
     if (child_status_rc > 0) {
         int primary_errno = child_status.system_errno;
         errno = primary_errno;
         switch ((child_stage_t)child_status.stage) {
+            case CHILD_STAGE_PROCESS_GROUP:
+                set_system_error(
+                    ERR_SYSTEM_CALL,
+                    "run_argv: child process-group supervisor setup failed");
+                break;
             case CHILD_STAGE_STDIO:
                 set_system_error(ERR_SYSTEM_CALL,
                                  "run_argv: child stdio setup failed");
@@ -5131,6 +5662,9 @@ static int run_argv_real_impl(
         errno = primary_errno;
         report_secondary_signal_cleanup_failures(
             sigpipe_cleanup_errno, wait_ownership_cleanup_errno);
+        report_secondary_runner_cleanup_failure(
+            "while restoring terminal foreground ownership",
+            tty_cleanup_errno);
         return -1;
     }
     if (child_status_rc < 0) {
@@ -5204,6 +5738,14 @@ static int run_argv_real_impl(
                 "while restoring SIGCHLD wait ownership",
                 wait_ownership_cleanup_errno);
         }
+        return -1;
+    }
+    if (tty_cleanup_errno != 0) {
+        errno = tty_cleanup_errno;
+        set_system_error(
+            ERR_SYSTEM_CALL,
+            "run_argv: cannot restore terminal foreground ownership");
+        errno = tty_cleanup_errno;
         return -1;
     }
     result->launch_witness = opened_witness;

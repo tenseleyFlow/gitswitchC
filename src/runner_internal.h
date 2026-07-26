@@ -27,6 +27,10 @@ void run_test_set_monotonic_timespec(unsigned int call_ordinal,
 void run_test_set_poll_failure(unsigned int call_ordinal,
                                int system_errno);
 void run_test_set_child_setup_delay(int64_t delay_millis);
+#ifdef GITSWITCH_RUNNER_GROUP_TEST_API
+/* One-shot child-supervisor setpgid(2) failure before GROUP_READY. */
+void run_test_set_child_process_group_failure(int system_errno);
+#endif
 #endif
 
 /* Open `program_path` through the production executable-trust and direct

@@ -28,19 +28,11 @@
  *     mid-way and persist a mixed identity (AR-08 M4 / AR-02 #2), so further
  *     signals stay recorded until commit or completed abort. Interactive
  *     children keep default dispositions, so Ctrl-C still interrupts them.
- *   - That rollback deferral is BOUNDED, not absolute (AR-03 L8): a
- *     PROCESS-TARGETED kill never reaches the child's terminal group, so a
- *     rollback blocked at a re-prompting ssh-add passphrase read used to
- *     defer `kill -TERM <pid>` forever — unkillable short of SIGKILL, with
- *     the identity left half-rolled-back. Now run_argv publishes the
- *     in-flight child pid (signals_child_spawned/reaped, a single
- *     sig_atomic_t store), and a further guarded signal inside the rollback
- *     window forwards that signal to the CHILD's pid via kill() (which is
- *     async-signal-safe), escalating to SIGKILL if the same child survives a
- *     repeat. Killing the blocker makes the rollback PROCEED — every restore
- *     step is already per-key/best-effort, so the sequence still runs to
- *     completion and the mainline dispatches normally; this is not a return
- *     of the emergency exit mid-restore.
+ *   - That rollback deferral is BOUNDED, not absolute (AR-03 L8/L20).
+ *     run_argv publishes an independently proven, isolated child process
+ *     group while guarded signals are blocked. A further guarded signal
+ *     during rollback reaches the whole group, escalating to SIGKILL on a
+ *     repeat, so wrappers and their descendants cannot keep rollback wedged.
  *   - Signals whose disposition is SIG_IGN at guard time stay ignored (so a
  *     nohup'd run keeps ignoring SIGHUP), matching sigaction(2) convention.
  */
@@ -202,13 +194,19 @@ signals_child_wait_result_t signals_wait_child(pid_t pid, int *status,
                                                 int options);
 
 /**
- * Publish the in-flight subprocess (AR-03 L8). run_argv calls this while
- * guarded signals are blocked immediately after fork. Retirement is owned
- * exclusively by signals_wait_child(), which closes the reap-to-clear PID
- * reuse window. Publishing outside the rollback window is harmless: the
- * handler consults the PID only for a repeated signal during rollback.
+ * Publish the in-flight subprocess and, only when independently proven equal
+ * to pid, its isolated process group. run_argv calls this while guarded
+ * signals are blocked and before releasing the supervisor's pre-exec gate.
+ * Retirement is owned exclusively by signals_wait_child(), which clears PID,
+ * PGID, escalation, and relay-credit state in the guarded reap transition.
  */
 void signals_child_spawned(pid_t pid);
+
+#ifdef GITSWITCH_SIGNALS_RUNNER_INTERNAL
+void signals_child_group_spawned(pid_t pid, pid_t proven_pgid);
+/* Record a guarded signal proven by the runner supervisor relay. */
+void signals_record_relayed_group_signal(int signal_number);
+#endif
 
 #ifdef GITSWITCH_TESTING
 /* One-shot checkpoint after waitpid returns but before child publication is

@@ -1,9 +1,13 @@
 /* AR-07 T2: subprocess setup, input integrity, capture liveness, and fd close. */
+#define _GNU_SOURCE
 #include "test.h"
 #include "gitswitch.h"
 #include "utils.h"
+#define GITSWITCH_RUNNER_GROUP_TEST_API
 #include "runner_internal.h"
+#undef GITSWITCH_RUNNER_GROUP_TEST_API
 #include "error.h"
+#include "signals.h"
 
 #include <errno.h>
 #include <fcntl.h>
@@ -12,6 +16,7 @@
 #include <stdlib.h>
 #include <string.h>
 #include <sys/resource.h>
+#include <sys/ioctl.h>
 #include <sys/time.h>
 #include <sys/wait.h>
 #include <time.h>
@@ -430,6 +435,34 @@ TEST(child_setup_status_is_reported_explicitly) {
     CHECK(strstr(get_last_error()->message, "environment setup failed") != NULL);
 }
 
+TEST(process_group_supervisor_setup_failure_is_truthful_and_reaped) {
+    const char *argv[] = {"true", NULL};
+    run_result_t failed;
+    run_result_t retry;
+    int64_t started = test_monotonic_ms();
+
+    run_test_set_child_process_group_failure(EPERM);
+    clear_error();
+    errno = 0;
+    CHECK_EQ_INT(run_argv(argv, NULL, &failed), -1);
+    int returned_errno = errno;
+    int64_t elapsed = test_monotonic_ms() - started;
+
+    CHECK_EQ_INT(returned_errno, EPERM);
+    CHECK(failed.spawned);
+    CHECK_EQ_INT(failed.exit_code, 126);
+    CHECK(elapsed >= 0 && elapsed < 1000);
+    CHECK(strstr(get_last_error()->message,
+                 "process-group supervisor setup failed") != NULL);
+
+    errno = 0;
+    CHECK_EQ_INT(waitpid(-1, NULL, WNOHANG), -1);
+    CHECK_EQ_INT(errno, ECHILD);
+    CHECK_EQ_INT(run_argv(argv, NULL, &retry), 0);
+    CHECK(retry.spawned);
+    CHECK_EQ_INT(retry.exit_code, 0);
+}
+
 /* M30: accepting only a prefix into the kernel pipe is not successful input
  * delivery when the helper closes stdin and exits zero. */
 TEST(early_stdin_close_is_a_runner_failure) {
@@ -627,6 +660,227 @@ TEST(descendant_held_capture_pipe_returns_within_grace) {
     }
     CHECK(reap_within(worker, 2000, &status));
     CHECK(WIFEXITED(status) && WEXITSTATUS(status) == 0);
+}
+
+static bool process_gone_within(pid_t pid, int timeout_ms) {
+    int waited = 0;
+    while (waited < timeout_ms) {
+        if (kill(pid, 0) != 0 && errno == ESRCH) return true;
+        struct timespec delay = {.tv_nsec = 10000000L};
+        nanosleep(&delay, NULL);
+        waited += 10;
+    }
+    return kill(pid, 0) != 0 && errno == ESRCH;
+}
+
+TEST(timeout_kills_the_proven_group_grandchild) {
+    const char *argv[] = {
+        "sh", "-c", "sleep 30 & child=$!; echo \"$child\"; wait", NULL
+    };
+    char output[64];
+    run_opts_t opts;
+    run_result_t result;
+
+    memset(&opts, 0, sizeof(opts));
+    opts.out = output;
+    opts.out_size = sizeof(output);
+    opts.stderr_to_devnull = true;
+    CHECK_EQ_INT(run_deadline_after_millis(100, &opts.deadline_millis), 0);
+    opts.use_deadline = true;
+    CHECK_EQ_INT(run_argv(argv, &opts, &result), -1);
+    pid_t descendant = (pid_t)strtol(output, NULL, 10);
+    CHECK(descendant > 1);
+    if (descendant > 1) CHECK(process_gone_within(descendant, 1000));
+}
+
+TEST(successful_leader_with_stdout_holder_kills_group_before_pid_release) {
+    const char *argv[] = {
+        "sh", "-c", "sleep 30 & echo \"$!\"", NULL
+    };
+    char output[64];
+    run_opts_t opts;
+    run_result_t result;
+    int64_t started = test_monotonic_ms();
+
+    memset(&opts, 0, sizeof(opts));
+    opts.out = output;
+    opts.out_size = sizeof(output);
+    opts.stderr_to_devnull = true;
+    CHECK_EQ_INT(run_argv(argv, &opts, &result), -1);
+    int64_t elapsed = test_monotonic_ms() - started;
+    pid_t descendant = (pid_t)strtol(output, NULL, 10);
+    CHECK(result.spawned);
+    CHECK_EQ_INT(result.exit_code, 0);
+    CHECK(elapsed >= 0 && elapsed < 1000);
+    CHECK(descendant > 1);
+    if (descendant > 1) CHECK(process_gone_within(descendant, 1000));
+}
+
+TEST(closed_stdio_daemon_like_descendant_remains_supported) {
+    const char *argv[] = {
+        "sh", "-c", "sleep 1 </dev/null >/dev/null 2>&1 &", NULL
+    };
+    char output[16];
+    run_opts_t opts;
+    run_result_t result;
+
+    memset(&opts, 0, sizeof(opts));
+    opts.out = output;
+    opts.out_size = sizeof(output);
+    opts.stderr_to_devnull = true;
+    CHECK_EQ_INT(run_argv(argv, &opts, &result), 0);
+    CHECK(result.spawned);
+    CHECK_EQ_INT(result.exit_code, 0);
+}
+
+static int rollback_group_signal_worker(void) {
+    const char *argv[] = {
+        "sh", "-c", "trap '' TERM; sleep 30 & echo \"$!\"; wait", NULL
+    };
+    char output[64];
+    run_opts_t opts;
+    run_result_t result;
+    pid_t signaler;
+
+    if (signals_guard_begin() != 0 || raise(SIGTERM) != 0 ||
+        !signals_pending()) {
+        return 70;
+    }
+    signals_rollback_begin();
+    signaler = fork();
+    if (signaler < 0) return 71;
+    if (signaler == 0) {
+        struct timespec delay = {.tv_nsec = 100000000L};
+        nanosleep(&delay, NULL);
+        (void)kill(getppid(), SIGTERM);
+        nanosleep(&delay, NULL);
+        (void)kill(getppid(), SIGTERM);
+        _exit(0);
+    }
+    memset(&opts, 0, sizeof(opts));
+    opts.out = output;
+    opts.out_size = sizeof(output);
+    opts.stderr_to_devnull = true;
+    int rc = run_argv(argv, &opts, &result);
+    int signaler_status = 0;
+    (void)waitpid(signaler, &signaler_status, 0);
+    pid_t descendant = (pid_t)strtol(output, NULL, 10);
+    bool gone = descendant > 1 && process_gone_within(descendant, 1000);
+    signals_rollback_end();
+    (void)signals_guard_end();
+    return rc != 0 && gone ? 0 : 72;
+}
+
+TEST(repeated_rollback_signal_terminates_group_descendant) {
+    CHECK(isolated_runner_check_passes(rollback_group_signal_worker));
+}
+
+static int pty_foreground_signal_worker(int slave_fd, int ready_fd,
+                                        int expected_signal,
+                                        bool expect_pending) {
+    const char *argv[] = {"sleep", "30", NULL};
+    run_result_t result;
+    pid_t caller_group;
+
+    if (setsid() < 0 || ioctl(slave_fd, TIOCSCTTY, 0) != 0) return 80;
+    if (dup2(slave_fd, STDIN_FILENO) != STDIN_FILENO ||
+        dup2(slave_fd, STDOUT_FILENO) != STDOUT_FILENO ||
+        dup2(slave_fd, STDERR_FILENO) != STDERR_FILENO) {
+        return 81;
+    }
+    if (slave_fd > STDERR_FILENO) close(slave_fd);
+    caller_group = getpgrp();
+    if (tcsetpgrp(STDIN_FILENO, caller_group) != 0 ||
+        write(ready_fd, &caller_group, sizeof(caller_group)) !=
+            (ssize_t)sizeof(caller_group)) {
+        return 82;
+    }
+    close(ready_fd);
+    if (signals_guard_begin() != 0) return 83;
+    int rc = run_argv(argv, NULL, &result);
+    bool restored = tcgetpgrp(STDIN_FILENO) == caller_group;
+    bool relayed = expect_pending
+                       ? signals_pending_signal() == expected_signal
+                       : signals_pending_signal() == 0;
+    (void)signals_guard_end();
+    return rc != 0 && result.spawned &&
+                   result.term_signal == expected_signal &&
+                   restored && relayed
+               ? 0 : 84;
+}
+
+static bool pty_control_round_trip(unsigned char control,
+                                   int expected_signal,
+                                   bool expect_pending) {
+    int master = posix_openpt(O_RDWR | O_NOCTTY);
+    if (master < 0 || grantpt(master) != 0 || unlockpt(master) != 0) {
+        if (master >= 0) close(master);
+        return false;
+    }
+    char *slave_name = ptsname(master);
+    if (!slave_name) {
+        close(master);
+        return false;
+    }
+    int slave = open(slave_name, O_RDWR | O_NOCTTY);
+    int ready[2];
+    int pipe_rc = pipe(ready);
+    if (slave < 0 || pipe_rc != 0) {
+        if (slave >= 0) close(slave);
+        close(master);
+        return false;
+    }
+    pid_t worker = fork();
+    if (worker == 0) {
+        close(master);
+        close(ready[0]);
+        _exit(pty_foreground_signal_worker(
+            slave, ready[1], expected_signal, expect_pending));
+    }
+    if (worker < 0) {
+        close(slave);
+        close(master);
+        close(ready[0]);
+        close(ready[1]);
+        return false;
+    }
+    close(slave);
+    close(ready[1]);
+    pid_t caller_group = 0;
+    ssize_t got = read(ready[0], &caller_group, sizeof(caller_group));
+    close(ready[0]);
+    if (got != (ssize_t)sizeof(caller_group)) {
+        close(master);
+        return false;
+    }
+    bool transferred = false;
+    for (int elapsed = 0; elapsed < 1000; elapsed += 10) {
+        pid_t foreground = tcgetpgrp(master);
+        if (foreground > 0 && foreground != caller_group) {
+            transferred = true;
+            break;
+        }
+        struct timespec delay = {.tv_nsec = 10000000L};
+        nanosleep(&delay, NULL);
+    }
+    if (!transferred || write(master, &control, 1U) != 1) {
+        (void)kill(worker, SIGKILL);
+        close(master);
+        return false;
+    }
+    int status = 0;
+    bool passed = reap_within(worker, 2000, &status) &&
+                  WIFEXITED(status) && WEXITSTATUS(status) == 0;
+    close(master);
+    return passed;
+}
+
+TEST(pty_interrupt_targets_child_group_and_restores_foreground_owner) {
+    CHECK(pty_control_round_trip(0x03U, SIGINT, true));
+}
+
+TEST(pty_stop_fails_closed_without_hanging_and_restores_foreground_owner) {
+    CHECK(pty_control_round_trip(0x1aU, SIGKILL, false));
 }
 
 static volatile sig_atomic_t g_periodic_alarm_calls;
@@ -1438,12 +1692,19 @@ int main(int argc, char **argv) {
     RUN_TEST(sigpipe_runner_generated_epipe_leaves_no_pending_instance);
     RUN_TEST(runner_fails_before_spawn_under_fd_exhaustion);
     RUN_TEST(child_setup_status_is_reported_explicitly);
+    RUN_TEST(process_group_supervisor_setup_failure_is_truthful_and_reaped);
     RUN_TEST(early_stdin_close_is_a_runner_failure);
     RUN_TEST(full_binary_stdin_delivery_remains_successful);
     RUN_TEST(intentional_zero_byte_input_delivers_eof_successfully);
     RUN_TEST(default_stdin_is_devnull_and_parent_input_is_preserved);
     RUN_TEST(default_stdout_is_devnull_not_parent_stdout);
     RUN_TEST(descendant_held_capture_pipe_returns_within_grace);
+    RUN_TEST(timeout_kills_the_proven_group_grandchild);
+    RUN_TEST(successful_leader_with_stdout_holder_kills_group_before_pid_release);
+    RUN_TEST(closed_stdio_daemon_like_descendant_remains_supported);
+    RUN_TEST(repeated_rollback_signal_terminates_group_descendant);
+    RUN_TEST(pty_interrupt_targets_child_group_and_restores_foreground_owner);
+    RUN_TEST(pty_stop_fails_closed_without_hanging_and_restores_foreground_owner);
     RUN_TEST(interrupted_poll_still_advances_child_capture_deadline);
     RUN_TEST(continuous_descendant_output_cannot_starve_capture_deadline);
     RUN_TEST(ordinary_buffered_capture_is_fully_drained);
