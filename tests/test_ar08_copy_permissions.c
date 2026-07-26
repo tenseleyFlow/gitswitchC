@@ -7,9 +7,12 @@
 
 #include <errno.h>
 #include <fcntl.h>
+#include <signal.h>
 #include <stdbool.h>
 #include <sys/stat.h>
 #include <sys/types.h>
+#include <sys/wait.h>
+#include <time.h>
 #include <unistd.h>
 
 typedef void (*copy_file_test_hook_fn)(int stage, const char *dst_path);
@@ -59,6 +62,22 @@ static int g_replacement_hook_error;
 static int g_read_fault_stage;
 static int g_read_hook_calls;
 static int g_read_hook_error;
+
+static int wait_for_child_bounded(pid_t child, int *status) {
+    const struct timespec delay = {0, 10 * 1000 * 1000};
+
+    for (int attempt = 0; attempt < 100; attempt++) {
+        pid_t waited = waitpid(child, status, WNOHANG);
+
+        if (waited == child) return 0;
+        if (waited < 0 && errno != EINTR) return -1;
+        while (nanosleep(&delay, NULL) != 0 && errno == EINTR) {}
+    }
+    (void)kill(child, SIGKILL);
+    while (waitpid(child, status, 0) < 0 && errno == EINTR) {}
+    errno = ETIMEDOUT;
+    return -1;
+}
 
 static int write_text_mode(const char *path, const char *content, mode_t mode) {
     size_t length = strlen(content);
@@ -601,6 +620,87 @@ TEST(destination_leaf_shape_is_rejected_before_open) {
     CHECK_EQ_INT(get_last_error()->code, ERR_FILE_IO);
 }
 
+TEST(preexisting_fifo_source_is_rejected_promptly_and_preserved) {
+    char root[] = "/tmp/gs_copy_fifo_source_XXXXXX";
+    char src[512];
+    char dst[512];
+    struct stat st;
+    int status = 0;
+    pid_t child;
+
+    CHECK(ts_mkdtemp(root) != NULL);
+    CHECK((size_t)snprintf(src, sizeof(src), "%s/source-fifo", root) <
+          sizeof(src));
+    CHECK((size_t)snprintf(dst, sizeof(dst), "%s/destination", root) <
+          sizeof(dst));
+    CHECK_EQ_INT(mkfifo(src, 0600), 0);
+
+    fflush(NULL);
+    child = fork();
+    CHECK(child >= 0);
+    if (child == 0) {
+        struct stat child_stat;
+
+        clear_error();
+        if (copy_file(src, dst) != -1) _exit(10);
+        if (get_last_error()->code != ERR_FILE_IO) _exit(11);
+        if (lstat(src, &child_stat) != 0 ||
+            !S_ISFIFO(child_stat.st_mode)) {
+            _exit(12);
+        }
+        if (lstat(dst, &child_stat) == 0 || errno != ENOENT) _exit(13);
+        _exit(0);
+    }
+    if (child > 0) {
+        CHECK_EQ_INT(wait_for_child_bounded(child, &status), 0);
+        CHECK(WIFEXITED(status));
+        if (WIFEXITED(status)) CHECK_EQ_INT(WEXITSTATUS(status), 0);
+    }
+    CHECK_EQ_INT(lstat(src, &st), 0);
+    CHECK(S_ISFIFO(st.st_mode));
+    CHECK_EQ_INT(unlink(src), 0);
+    CHECK_EQ_INT(rmdir(root), 0);
+}
+
+TEST(symlink_directory_and_device_sources_are_rejected) {
+    char root[] = "/tmp/gs_copy_special_source_XXXXXX";
+    char regular[512];
+    char symlink_path[512];
+    char dst[512];
+    struct stat st;
+
+    CHECK(ts_mkdtemp(root) != NULL);
+    CHECK((size_t)snprintf(regular, sizeof(regular), "%s/regular", root) <
+          sizeof(regular));
+    CHECK((size_t)snprintf(symlink_path, sizeof(symlink_path), "%s/link",
+                           root) < sizeof(symlink_path));
+    CHECK((size_t)snprintf(dst, sizeof(dst), "%s/destination", root) <
+          sizeof(dst));
+    CHECK_EQ_INT(write_text_mode(regular, "source", 0600), 0);
+    CHECK_EQ_INT(symlink("regular", symlink_path), 0);
+
+    clear_error();
+    CHECK_EQ_INT(copy_file(symlink_path, dst), -1);
+    CHECK_EQ_INT(get_last_error()->code, ERR_INVALID_ARGS);
+    CHECK_EQ_INT(lstat(symlink_path, &st), 0);
+    CHECK(S_ISLNK(st.st_mode));
+    CHECK(access(dst, F_OK) != 0 && errno == ENOENT);
+
+    clear_error();
+    CHECK_EQ_INT(copy_file(root, dst), -1);
+    CHECK_EQ_INT(get_last_error()->code, ERR_FILE_IO);
+    CHECK(access(dst, F_OK) != 0 && errno == ENOENT);
+
+    clear_error();
+    CHECK_EQ_INT(copy_file("/dev/null", dst), -1);
+    CHECK_EQ_INT(get_last_error()->code, ERR_FILE_IO);
+    CHECK(access(dst, F_OK) != 0 && errno == ENOENT);
+
+    CHECK_EQ_INT(unlink(symlink_path), 0);
+    CHECK_EQ_INT(unlink(regular), 0);
+    CHECK_EQ_INT(rmdir(root), 0);
+}
+
 TEST(read_file_accepts_seven_bytes_in_eight_byte_buffer) {
     char root[] = "/tmp/gs_read_fit_XXXXXX";
     char path[512];
@@ -680,6 +780,8 @@ int main(void) {
     RUN_TEST(destination_leaf_replacement_after_open_is_detected_without_corruption);
     RUN_TEST(destination_parent_replacement_after_open_is_detected_without_corruption);
     RUN_TEST(destination_leaf_shape_is_rejected_before_open);
+    RUN_TEST(preexisting_fifo_source_is_rejected_promptly_and_preserved);
+    RUN_TEST(symlink_directory_and_device_sources_are_rejected);
     RUN_TEST(read_file_accepts_seven_bytes_in_eight_byte_buffer);
     RUN_TEST(read_file_rejects_eight_bytes_in_eight_byte_buffer);
     RUN_TEST(read_file_reports_injected_initial_read_error);

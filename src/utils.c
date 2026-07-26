@@ -29,8 +29,11 @@
 #include <sys/acl.h>
 #endif
 
-#if defined(__linux__)
+#if defined(__linux__) || defined(__APPLE__) || defined(__FreeBSD__)
 #include <sys/mman.h>
+#endif
+
+#if defined(__linux__)
 #include <linux/random.h>
 #include <sys/syscall.h>
 #endif
@@ -2216,10 +2219,12 @@ int copy_file(const char *src_path, const char *dst_path) {
     size_t bytes;
     int result = 0;
     int operation_errno = 0;
+    int src_fd = -1;
     int parent_fd = -1;
     int dst_fd = -1;
     int verify_fd = -1;
     int named_parent_fd = -1;
+    int src_flags = O_RDONLY;
     int dst_flags = O_WRONLY | O_CREAT;
     int parent_flags = O_RDONLY;
     struct stat src_stat;
@@ -2246,23 +2251,84 @@ int copy_file(const char *src_path, const char *dst_path) {
         return -1;
     }
     
-    src = fopen(src_path, "rbe");
-    if (!src) {
-        set_system_error(ERR_FILE_IO, "Failed to open source file: %s", src_path);
-        result = -1;
-        goto cleanup;
-    }
-    
-    /* Capture metadata from the same source object whose bytes are copied. */
-    if (fstat(fileno(src), &src_stat) != 0) {
+#ifdef O_CLOEXEC
+    src_flags |= O_CLOEXEC;
+#endif
+#ifdef O_NOFOLLOW
+    src_flags |= O_NOFOLLOW;
+#endif
+#ifdef O_NONBLOCK
+    /* A pre-existing FIFO or device must not make a copy attempt wait for a
+     * peer. Normalize the descriptor only after fstat proves a regular file. */
+    src_flags |= O_NONBLOCK;
+#endif
+    src_fd = open(src_path, src_flags);
+    if (src_fd < 0) {
         int saved_errno = errno;
-        (void)fclose(src);
-        src = NULL;
+
         errno = saved_errno;
-        set_system_error(ERR_FILE_IO, "Failed to inspect source file: %s", src_path);
+        if (saved_errno == ELOOP
+#if defined(__FreeBSD__)
+            || saved_errno == EMLINK
+#endif
+        ) {
+            set_error(ERR_INVALID_ARGS,
+                      "Refusing symlink source: %s", src_path);
+        } else {
+            set_system_error(ERR_FILE_IO,
+                             "Failed to open source file: %s", src_path);
+        }
         result = -1;
         goto cleanup;
     }
+#ifndef O_CLOEXEC
+    {
+        int fd_flags = fcntl(src_fd, F_GETFD);
+        if (fd_flags < 0 ||
+            fcntl(src_fd, F_SETFD, fd_flags | FD_CLOEXEC) != 0) {
+            set_system_error(ERR_FILE_IO,
+                             "Failed to secure source descriptor: %s",
+                             src_path);
+            result = -1;
+            goto cleanup;
+        }
+    }
+#endif
+    /* Capture metadata from the same source object whose bytes are copied. */
+    if (fstat(src_fd, &src_stat) != 0) {
+        set_system_error(ERR_FILE_IO,
+                         "Failed to inspect source file: %s", src_path);
+        result = -1;
+        goto cleanup;
+    }
+    if (!S_ISREG(src_stat.st_mode)) {
+        errno = EINVAL;
+        set_system_error(ERR_FILE_IO,
+                         "Source is not a regular file: %s", src_path);
+        result = -1;
+        goto cleanup;
+    }
+#ifdef O_NONBLOCK
+    {
+        int status_flags = fcntl(src_fd, F_GETFL);
+        if (status_flags < 0 ||
+            fcntl(src_fd, F_SETFL, status_flags & ~O_NONBLOCK) != 0) {
+            set_system_error(ERR_FILE_IO,
+                             "Failed to normalize source descriptor: %s",
+                             src_path);
+            result = -1;
+            goto cleanup;
+        }
+    }
+#endif
+    src = fdopen(src_fd, "rb");
+    if (!src) {
+        set_system_error(ERR_FILE_IO,
+                         "Failed to open source stream: %s", src_path);
+        result = -1;
+        goto cleanup;
+    }
+    src_fd = -1; /* fdopen owns it from here. */
 
 #ifdef O_DIRECTORY
     parent_flags |= O_DIRECTORY;
@@ -2543,6 +2609,7 @@ cleanup: {
         if (dst) (void)fclose(dst);
         else if (dst_fd >= 0) close(dst_fd);
         if (src) (void)fclose(src);
+        else if (src_fd >= 0) close(src_fd);
         if (verify_fd >= 0) close(verify_fd);
         if (named_parent_fd >= 0) close(named_parent_fd);
         if (parent_fd >= 0) close(parent_fd);
@@ -4442,19 +4509,23 @@ static int run_argv_real_impl(
             for (size_t i = 0; opts->extra_env[i]; i++) {
                 const char *e = opts->extra_env[i];
                 const char *eq = strchr(e, '=');
-                if (eq) {
-                    char key[256];
-                    size_t klen = (size_t)(eq - e);
-                    if (klen == 0 || klen >= sizeof(key)) {
-                        child_report_failure(child_status_fd,
-                                             CHILD_STAGE_ENV, EINVAL, 126);
-                    }
-                    memcpy(key, e, klen);
-                    key[klen] = '\0';
-                    if (setenv(key, eq + 1, 1) != 0) {
-                        child_report_failure(child_status_fd,
-                                             CHILD_STAGE_ENV, errno, 126);
-                    }
+                char key[256];
+                size_t klen;
+
+                if (!eq) {
+                    child_report_failure(child_status_fd,
+                                         CHILD_STAGE_ENV, EINVAL, 126);
+                }
+                klen = (size_t)(eq - e);
+                if (klen == 0 || klen >= sizeof(key)) {
+                    child_report_failure(child_status_fd,
+                                         CHILD_STAGE_ENV, EINVAL, 126);
+                }
+                memcpy(key, e, klen);
+                key[klen] = '\0';
+                if (setenv(key, eq + 1, 1) != 0) {
+                    child_report_failure(child_status_fd,
+                                         CHILD_STAGE_ENV, errno, 126);
                 }
             }
         }
@@ -6836,12 +6907,12 @@ void *safe_memcpy(void *dest, const void *src, size_t size) {
 }
 
 int safe_mlock(void *ptr, size_t size) {
-#if defined(__linux__)
     if (!ptr || size == 0) {
         set_error(ERR_INVALID_ARGS, "Invalid arguments to safe_mlock");
         return -1;
     }
-    
+
+#if defined(__linux__) || defined(__APPLE__) || defined(__FreeBSD__)
     if (mlock(ptr, size) != 0) {
         set_system_error(ERR_SYSTEM_CALL, "Failed to lock memory");
         return -1;
@@ -6849,20 +6920,20 @@ int safe_mlock(void *ptr, size_t size) {
     
     return 0;
 #else
-    /* Not supported on this platform */
-    (void)ptr;
-    (void)size;
-    return 0;
+    errno = ENOTSUP;
+    set_system_error(ERR_SYSTEM_CALL,
+                     "Memory locking is not supported on this platform");
+    return -1;
 #endif
 }
 
 int safe_munlock(void *ptr, size_t size) {
-#if defined(__linux__)
     if (!ptr || size == 0) {
         set_error(ERR_INVALID_ARGS, "Invalid arguments to safe_munlock");
         return -1;
     }
-    
+
+#if defined(__linux__) || defined(__APPLE__) || defined(__FreeBSD__)
     if (munlock(ptr, size) != 0) {
         set_system_error(ERR_SYSTEM_CALL, "Failed to unlock memory");
         return -1;
@@ -6870,10 +6941,10 @@ int safe_munlock(void *ptr, size_t size) {
     
     return 0;
 #else
-    /* Not supported on this platform */
-    (void)ptr;
-    (void)size;
-    return 0;
+    errno = ENOTSUP;
+    set_system_error(ERR_SYSTEM_CALL,
+                     "Memory unlocking is not supported on this platform");
+    return -1;
 #endif
 }
 

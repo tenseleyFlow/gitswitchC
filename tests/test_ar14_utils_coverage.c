@@ -312,6 +312,30 @@ TEST(memory_lock_helpers_reject_invalid_requests_portably) {
     CHECK_EQ_INT(safe_munlock(&byte, 0), -1);
 }
 
+TEST(memory_lock_helpers_never_report_false_platform_success) {
+    long page_size = sysconf(_SC_PAGESIZE);
+    void *page = NULL;
+    int lock_result;
+
+    CHECK(page_size > 0);
+    if (page_size <= 0) return;
+    CHECK_EQ_INT(posix_memalign(&page, (size_t)page_size,
+                               (size_t)page_size), 0);
+    if (!page) return;
+    memset(page, 0xa5, (size_t)page_size);
+
+    clear_error();
+    errno = 0;
+    lock_result = safe_mlock(page, 1);
+    if (lock_result == 0) {
+        CHECK_EQ_INT(safe_munlock(page, 1), 0);
+    } else {
+        CHECK_EQ_INT(get_last_error()->code, ERR_SYSTEM_CALL);
+        CHECK(get_last_error()->system_errno != 0);
+    }
+    free(page);
+}
+
 TEST(debug_dumps_accept_null_and_populated_models) {
     char root[] = "/tmp/gitswitch-ar14-utils-log-XXXXXX";
     char log_path[MAX_PATH_LEN];
@@ -396,5 +420,6 @@ TEST_MAIN_BEGIN()
     RUN_TEST(account_lookup_supports_id_name_description_and_email);
     RUN_TEST(safe_memory_helpers_validate_arguments_and_copy_bytes);
     RUN_TEST(memory_lock_helpers_reject_invalid_requests_portably);
+    RUN_TEST(memory_lock_helpers_never_report_false_platform_success);
     RUN_TEST(debug_dumps_accept_null_and_populated_models);
 TEST_MAIN_END()
