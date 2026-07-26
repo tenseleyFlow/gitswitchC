@@ -81,6 +81,14 @@ static int make_file(const char *path, const char *content) {
     return write_string_to_file(path, content ? content : "x\n", 0600);
 }
 
+/* `link()` historically follows a symlink source on FreeBSD, which would
+ * attempt to hard-link the managed home directory instead of the recovery
+ * symlink inode. Match production's portable no-follow contract explicitly. */
+static int hardlink_entry_without_follow(const char *source,
+                                         const char *destination) {
+    return linkat(AT_FDCWD, source, AT_FDCWD, destination, 0);
+}
+
 #if !defined(__FreeBSD__)
 static int identity_unlink_for_test(int dir_fd, const char *name,
                                     const struct stat *expected) {
@@ -784,7 +792,7 @@ TEST(full_reset_retires_dead_legacy_reset_with_exact_witness) {
              base, (long)child);
     snprintf(witness, sizeof(witness), "%s.witness", quarantine);
     CHECK_EQ_INT(symlink(home, quarantine), 0);
-    CHECK_EQ_INT(link(quarantine, witness), 0);
+    CHECK_EQ_INT(hardlink_entry_without_follow(quarantine, witness), 0);
     previous = run_set_runner(recording_null_runner);
     CHECK_EQ_INT(gpg_manager_reset(NULL), 0);
     run_set_runner(previous);
@@ -815,7 +823,7 @@ TEST(full_reset_retires_witnessed_malformed_reset_orphan) {
              base, (long)child);
     snprintf(witness, sizeof(witness), "%s.witness", quarantine);
     CHECK_EQ_INT(symlink(home, quarantine), 0);
-    CHECK_EQ_INT(link(quarantine, witness), 0);
+    CHECK_EQ_INT(hardlink_entry_without_follow(quarantine, witness), 0);
     previous = run_set_runner(recording_null_runner);
     CHECK_EQ_INT(gpg_manager_reset(NULL), 0);
     run_set_runner(previous);
@@ -998,10 +1006,10 @@ TEST(full_reset_preflight_preserves_every_planned_entry_on_home_blocker) {
     CHECK_EQ_INT(symlink(home, rollback), 0);
     CHECK_EQ_INT(symlink(home, publish), 0);
     CHECK_EQ_INT(symlink(home, reset), 0);
-    CHECK_EQ_INT(link(reset, reset_witness), 0);
+    CHECK_EQ_INT(hardlink_entry_without_follow(reset, reset_witness), 0);
     CHECK_EQ_INT(symlink(home, forward_p), 0);
     CHECK_EQ_INT(symlink(home, forward_w), 0);
-    CHECK_EQ_INT(link(forward_w, forward_q), 0);
+    CHECK_EQ_INT(hardlink_entry_without_follow(forward_w, forward_q), 0);
 
     paths[0] = current;
     paths[1] = rollback;
@@ -1140,10 +1148,10 @@ TEST(full_reset_applies_valid_full_and_recovery_only_plans) {
     CHECK_EQ_INT(symlink(home, rollback), 0);
     CHECK_EQ_INT(symlink(home, publish), 0);
     CHECK_EQ_INT(symlink(home, reset), 0);
-    CHECK_EQ_INT(link(reset, reset_witness), 0);
+    CHECK_EQ_INT(hardlink_entry_without_follow(reset, reset_witness), 0);
     CHECK_EQ_INT(symlink(home, forward_p), 0);
     CHECK_EQ_INT(symlink(home, forward_w), 0);
-    CHECK_EQ_INT(link(forward_w, forward_q), 0);
+    CHECK_EQ_INT(hardlink_entry_without_follow(forward_w, forward_q), 0);
 
     g_runner_calls = 0;
     previous = run_set_runner(recording_null_runner);
