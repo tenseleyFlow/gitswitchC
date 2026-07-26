@@ -27,7 +27,8 @@ typedef enum {
     RETIREMENT_GUARD_PAIR_AFTER_MARKER_READ,
     RETIREMENT_GUARD_INSTALL_BEFORE_DIR_SYNC,
     RETIREMENT_GUARD_READ_AFTER_CLOSE,
-    RETIREMENT_GUARD_PAIR_AFTER_COMPLETION_READ
+    RETIREMENT_GUARD_PAIR_AFTER_COMPLETION_READ,
+    RETIREMENT_GUARD_STAGE_AFTER_CLOSE
 } retirement_guard_clear_test_stage_t;
 typedef int (*retirement_guard_clear_test_hook_fn)(
     retirement_guard_clear_test_stage_t stage, int descriptor,
@@ -1033,6 +1034,35 @@ TEST(unproven_install_is_not_adopted_until_directory_sync_succeeds) {
     guard_fixture_cleanup(&fixture);
 }
 
+TEST(fresh_install_accepts_ctime_only_drift_after_stage_close) {
+    guard_fixture_t fixture;
+    config_retirement_guard_t *installed = NULL;
+
+    CHECK_EQ_INT(guard_fixture_init(&fixture), 0);
+    CHECK_EQ_INT(config_retirement_guard_clear(&fixture.guard), 0);
+    CHECK(fixture.guard == NULL);
+
+    guard_arm_hook(
+        RETIREMENT_GUARD_STAGE_AFTER_CLOSE,
+        HOOK_CTIME_AT_INSTALL_SYNC);
+    CHECK_EQ_INT(config_retirement_guard_install_or_adopt(
+                     fixture.config_path, CONFIG_RETIREMENT_RESET,
+                     &fixture.owner, 1U, &installed), 0);
+    (void)gitswitch_test_set_retirement_guard_clear_hook(NULL);
+    CHECK(installed != NULL);
+    CHECK(config_retirement_guard_was_created(installed));
+    CHECK(!hook_armed);
+    CHECK(hook_action_observed);
+    CHECK_EQ_INT(hook_action_error, 0);
+    CHECK(guard_same_except_ctime(
+        &hook_identity_before, &hook_identity_after));
+    CHECK(!guard_same_ctime(
+        &hook_identity_before, &hook_identity_after));
+
+    fixture.guard = installed;
+    guard_fixture_cleanup(&fixture);
+}
+
 TEST(fresh_install_accepts_ctime_only_drift_after_reader_close) {
     guard_fixture_t fixture;
     config_retirement_guard_t *installed = NULL;
@@ -1885,6 +1915,7 @@ TEST_MAIN_BEGIN()
     RUN_TEST(lone_and_mismatched_certificates_block);
     RUN_TEST(lifecycle_lock_serializes_guard_owners);
     RUN_TEST(unproven_install_is_not_adopted_until_directory_sync_succeeds);
+    RUN_TEST(fresh_install_accepts_ctime_only_drift_after_stage_close);
     RUN_TEST(fresh_install_accepts_ctime_only_drift_after_reader_close);
     RUN_TEST(
         fresh_install_accepts_ctime_only_drift_before_pair_final_reproof);

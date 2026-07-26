@@ -59,7 +59,8 @@ typedef enum {
     RETIREMENT_GUARD_PAIR_AFTER_MARKER_READ,
     RETIREMENT_GUARD_INSTALL_BEFORE_DIR_SYNC,
     RETIREMENT_GUARD_READ_AFTER_CLOSE,
-    RETIREMENT_GUARD_PAIR_AFTER_COMPLETION_READ
+    RETIREMENT_GUARD_PAIR_AFTER_COMPLETION_READ,
+    RETIREMENT_GUARD_STAGE_AFTER_CLOSE
 } retirement_guard_clear_test_stage_t;
 typedef int (*retirement_guard_clear_test_hook_fn)(
     retirement_guard_clear_test_stage_t stage, int descriptor,

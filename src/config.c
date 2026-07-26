@@ -84,7 +84,8 @@ typedef enum {
     RETIREMENT_GUARD_PAIR_AFTER_MARKER_READ,
     RETIREMENT_GUARD_INSTALL_BEFORE_DIR_SYNC,
     RETIREMENT_GUARD_READ_AFTER_CLOSE,
-    RETIREMENT_GUARD_PAIR_AFTER_COMPLETION_READ
+    RETIREMENT_GUARD_PAIR_AFTER_COMPLETION_READ,
+    RETIREMENT_GUARD_STAGE_AFTER_CLOSE
 } retirement_guard_clear_test_stage_t;
 typedef int (*retirement_guard_clear_test_hook_fn)(
     retirement_guard_clear_test_stage_t stage, int directory_fd,
@@ -130,7 +131,8 @@ enum {
     RETIREMENT_GUARD_PAIR_AFTER_MARKER_READ,
     RETIREMENT_GUARD_INSTALL_BEFORE_DIR_SYNC,
     RETIREMENT_GUARD_READ_AFTER_CLOSE,
-    RETIREMENT_GUARD_PAIR_AFTER_COMPLETION_READ
+    RETIREMENT_GUARD_PAIR_AFTER_COMPLETION_READ,
+    RETIREMENT_GUARD_STAGE_AFTER_CLOSE
 };
 #define RETIREMENT_GUARD_CLEAR_TEST_CHECKPOINT(stage, fd, name)             \
     ((void)(stage), (void)(fd), (void)(name), 0)
@@ -3807,13 +3809,21 @@ static int config_retirement_guard_stage_write_at(
                          "Cannot close retirement transition stage");
         return -1;
     }
-    if (fstatat(directory_fd, CONFIG_RETIREMENT_STAGE_NAME, &named,
-                AT_SYMLINK_NOFOLLOW) != 0 ||
-        !config_metadata_file_is_safe(&named, true) ||
-        !config_metadata_snapshot_same(&opened, &named)) {
-        errno = errno ? errno : ESTALE;
+    /* FreeBSD/UFS may materialize a reader-induced ctime successor only
+     * after this writer closes. Bind publication to that post-close
+     * generation, but admit it only after independently proving every byte
+     * through the pinned parent. */
+    if (RETIREMENT_GUARD_CLEAR_TEST_CHECKPOINT(
+            RETIREMENT_GUARD_STAGE_AFTER_CLOSE,
+            directory_fd, CONFIG_RETIREMENT_STAGE_NAME) != 0 ||
+        config_reprove_published_file_at(
+            directory_fd, CONFIG_RETIREMENT_STAGE_NAME,
+            &opened, data, length, &named) != 0) {
+        saved_errno = errno ? errno : ESTALE;
+        errno = saved_errno;
         set_system_error(ERR_FILE_IO,
                          "Retirement transition stage changed before publication");
+        errno = saved_errno;
         return -1;
     }
     *stage_identity = named;
