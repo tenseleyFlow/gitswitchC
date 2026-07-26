@@ -1559,8 +1559,8 @@ static int inspect_process_image_real(pid_t pid, ssh_process_image_t *image) {
         int argmax_mib[2] = {CTL_KERN, KERN_ARGMAX};
         struct kinfo_proc info;
         size_t info_size = sizeof(info);
-        size_t argmax_size = sizeof(argmax);
         int argmax = 0;
+        size_t argmax_size = sizeof(argmax);
         char *args = NULL;
         char *canonical = NULL;
         size_t args_size;
