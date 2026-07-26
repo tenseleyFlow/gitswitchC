@@ -607,6 +607,30 @@ static int write_cfg_work_other(sandbox_t *sb, const char *active) {
     return sandbox_write_cfg(sb, cfg);
 }
 
+/* Unknown/ambiguous selector rejection is a legacy-document migration test,
+ * not an SSH-key validation test. Keep its fixture credentialless so the
+ * portable BSD key parser does not correctly create its bounded
+ * gitswitch-key-validation staging directory while loading the document.
+ * That staging is unrelated to switch publication and would make the test's
+ * stronger "no command runtime artifacts" assertion platform-dependent. */
+static int write_legacy_cfg_work_other_credentialless(sandbox_t *sb) {
+    static const char cfg[] =
+        "[settings]\n"
+        "default_scope = \"global\"\n"
+        "\n"
+        "[accounts.1]\n"
+        "name = \"work\"\n"
+        "email = \"w@example.com\"\n"
+        "description = \"credentialless legacy work fixture\"\n"
+        "\n"
+        "[accounts.2]\n"
+        "name = \"other\"\n"
+        "email = \"o@example.com\"\n"
+        "description = \"credentialless legacy other fixture\"\n";
+
+    return sandbox_write_cfg(sb, cfg);
+}
+
 /* M17 successful-reset fixtures are deliberately credentialless: their only
  * durable Git authority is the exact destination/generation a completed
  * credentialless switch sealed. Keep the legacy writer above unchanged for
@@ -1224,7 +1248,7 @@ static void assert_rejected_legacy_switch_is_nonmutating(
     const char *argv[] = { "gitswitch", selector, NULL };
 
     if (sandbox_setup(&sb) != 0) { CHECK(!"sandbox setup failed"); return; }
-    CHECK_EQ_INT(write_cfg_work_other(&sb, NULL), 0);
+    CHECK_EQ_INT(write_legacy_cfg_work_other_credentialless(&sb), 0);
     before_len = slurp(sb.cfg, before, sizeof(before));
     CHECK(before_len > 0);
     CHECK_EQ_INT(lstat(sb.cfg, &before_stat), 0);

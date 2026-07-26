@@ -1370,6 +1370,7 @@ TEST(remove_save_failure_keeps_retry_handle_after_runtime_teardown) {
     char socket_path[1024], pid_path[1024], link_target[1024];
     struct stat st;
     ssize_t link_len;
+    int remove_rc;
     pid_t retry_pid = -1;
 
     CHECK_EQ_INT(make_temp_dir(home, sizeof(home)), 0);
@@ -1480,7 +1481,13 @@ TEST(remove_save_failure_keeps_retry_handle_after_runtime_teardown) {
     }
     CHECK(retry_pid > 1);
 
-    CHECK_EQ_INT(run_remove(home, runtime, shims, "work", output), 0);
+    remove_rc = run_remove(home, runtime, shims, "work", output);
+    if (remove_rc != 0) {
+        slurp(output, contents, sizeof(contents));
+        fprintf(stderr, "  final retry-handle remove output:\n%s\n",
+                contents);
+    }
+    CHECK_EQ_INT(remove_rc, 0);
 #if defined(__linux__)
     if (retry_pid > 1) {
         errno = 0;
