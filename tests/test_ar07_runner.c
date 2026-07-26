@@ -1004,13 +1004,23 @@ TEST(post_replay_group_termination_reaches_worker_once) {
 
 static int supervisor_stop_worker(bool post_replay) {
     const char *argv[] = {"sleep", "30", NULL};
+    struct sigaction original_action;
+    struct sigaction default_action;
+    struct sigaction configured_action;
+    struct sigaction after_action;
     sigset_t before_mask;
     sigset_t after_mask;
     run_opts_t opts;
     run_result_t result;
     int64_t started;
 
-    if (sigprocmask(SIG_SETMASK, NULL, &before_mask) != 0 ||
+    if (sigaction(SIGTSTP, NULL, &original_action) != 0) return 79;
+    memset(&default_action, 0, sizeof(default_action));
+    default_action.sa_handler = SIG_DFL;
+    if (sigemptyset(&default_action.sa_mask) != 0 ||
+        sigaction(SIGTSTP, &default_action, NULL) != 0 ||
+        sigaction(SIGTSTP, NULL, &configured_action) != 0 ||
+        sigprocmask(SIG_SETMASK, NULL, &before_mask) != 0 ||
         sigdelset(&before_mask, SIGTSTP) != 0 ||
         sigprocmask(SIG_SETMASK, &before_mask, NULL) != 0) {
         return 79;
@@ -1030,12 +1040,19 @@ static int supervisor_stop_worker(bool post_replay) {
     run_test_set_supervisor_pending_signal(0);
     run_test_set_post_replay_signal(0);
     int64_t elapsed = test_monotonic_ms() - started;
-    if (sigprocmask(SIG_SETMASK, NULL, &after_mask) != 0) return 81;
+    int mask_query_rc = sigprocmask(SIG_SETMASK, NULL, &after_mask);
+    int action_query_rc = sigaction(SIGTSTP, NULL, &after_action);
+    int action_restore_rc =
+        sigaction(SIGTSTP, &original_action, NULL);
     return rc == -1 && result.spawned && !result.timed_out &&
                    result.exit_code == -1 &&
                    result.term_signal == SIGKILL &&
                    elapsed >= 0 && elapsed < 1000 &&
-                   sigsets_semantically_equal(&before_mask, &after_mask)
+                   mask_query_rc == 0 && action_query_rc == 0 &&
+                   action_restore_rc == 0 &&
+                   sigsets_semantically_equal(&before_mask, &after_mask) &&
+                   sigactions_semantically_equal(
+                       &configured_action, &after_action)
                ? 0 : 82;
 }
 
@@ -1056,7 +1073,7 @@ TEST(post_replay_supervisor_stop_handler_fails_group_closed) {
         supervisor_post_replay_stop_worker));
 }
 
-static int supervisor_ignored_hup_worker(void) {
+static int supervisor_ignored_signal_worker(int signal_number) {
     const char *argv[] = {"true", NULL};
     struct sigaction original_action;
     struct sigaction ignored_action;
@@ -1064,19 +1081,19 @@ static int supervisor_ignored_hup_worker(void) {
     struct sigaction after_action;
     run_result_t result;
 
-    if (sigaction(SIGHUP, NULL, &original_action) != 0) return 83;
+    if (sigaction(signal_number, NULL, &original_action) != 0) return 83;
     memset(&ignored_action, 0, sizeof(ignored_action));
     ignored_action.sa_handler = SIG_IGN;
     if (sigemptyset(&ignored_action.sa_mask) != 0 ||
-        sigaction(SIGHUP, &ignored_action, NULL) != 0 ||
-        sigaction(SIGHUP, NULL, &installed_action) != 0) {
+        sigaction(signal_number, &ignored_action, NULL) != 0 ||
+        sigaction(signal_number, NULL, &installed_action) != 0) {
         return 84;
     }
-    run_test_set_supervisor_pending_signal(SIGHUP);
+    run_test_set_supervisor_pending_signal(signal_number);
     int rc = run_argv(argv, NULL, &result);
     run_test_set_supervisor_pending_signal(0);
-    int query_rc = sigaction(SIGHUP, NULL, &after_action);
-    int restore_rc = sigaction(SIGHUP, &original_action, NULL);
+    int query_rc = sigaction(signal_number, NULL, &after_action);
+    int restore_rc = sigaction(signal_number, &original_action, NULL);
     return rc == 0 && result.spawned && result.exit_code == 0 &&
                    query_rc == 0 && restore_rc == 0 &&
                    sigactions_semantically_equal(
@@ -1084,8 +1101,17 @@ static int supervisor_ignored_hup_worker(void) {
                ? 0 : 85;
 }
 
+static int supervisor_ignored_hup_worker(void) {
+    return supervisor_ignored_signal_worker(SIGHUP);
+}
+
+static int supervisor_ignored_stop_worker(void) {
+    return supervisor_ignored_signal_worker(SIGTSTP);
+}
+
 TEST(supervisor_injection_preserves_inherited_ignored_signal) {
     CHECK(isolated_runner_check_passes(supervisor_ignored_hup_worker));
+    CHECK(isolated_runner_check_passes(supervisor_ignored_stop_worker));
 }
 
 static int pending_signal_mask_probe_main(void) {
@@ -1149,9 +1175,21 @@ static int pty_foreground_signal_worker(int slave_fd, int ready_fd,
                                         int expected_signal,
                                         bool expect_pending) {
     const char *argv[] = {"sleep", "30", NULL};
+    struct sigaction original_action;
+    struct sigaction default_action;
+    struct sigaction configured_action;
+    struct sigaction after_action;
     run_result_t result;
     pid_t caller_group;
 
+    if (sigaction(SIGTSTP, NULL, &original_action) != 0) return 79;
+    memset(&default_action, 0, sizeof(default_action));
+    default_action.sa_handler = SIG_DFL;
+    if (sigemptyset(&default_action.sa_mask) != 0 ||
+        sigaction(SIGTSTP, &default_action, NULL) != 0 ||
+        sigaction(SIGTSTP, NULL, &configured_action) != 0) {
+        return 79;
+    }
     if (setsid() < 0 || ioctl(slave_fd, TIOCSCTTY, 0) != 0) return 80;
     if (dup2(slave_fd, STDIN_FILENO) != STDIN_FILENO ||
         dup2(slave_fd, STDOUT_FILENO) != STDOUT_FILENO ||
@@ -1172,10 +1210,16 @@ static int pty_foreground_signal_worker(int slave_fd, int ready_fd,
     bool relayed = expect_pending
                        ? signals_pending_signal() == expected_signal
                        : signals_pending_signal() == 0;
-    (void)signals_guard_end();
+    int guard_rc = signals_guard_end();
+    int action_query_rc = sigaction(SIGTSTP, NULL, &after_action);
+    int action_restore_rc =
+        sigaction(SIGTSTP, &original_action, NULL);
     return rc != 0 && result.spawned &&
                    result.term_signal == expected_signal &&
-                   restored && relayed
+                   restored && relayed && guard_rc == 0 &&
+                   action_query_rc == 0 && action_restore_rc == 0 &&
+                   sigactions_semantically_equal(
+                       &configured_action, &after_action)
                ? 0 : 84;
 }
 

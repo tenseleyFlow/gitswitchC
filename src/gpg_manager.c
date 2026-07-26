@@ -2222,9 +2222,12 @@ static int gpg_capture_process_generation(
         int boot_mib[2] = {CTL_KERN, KERN_BOOTTIME};
         struct timeval boot;
         size_t boot_size = sizeof(boot);
-        if (sysctl(boot_mib, 2, &boot, &boot_size, NULL, 0) != 0 ||
-            boot_size != sizeof(boot) || boot.tv_sec <= 0 ||
+        if (sysctl(boot_mib, 2, &boot, &boot_size, NULL, 0) != 0) {
+            return -1;
+        }
+        if (boot_size != sizeof(boot) || boot.tv_sec <= 0 ||
             boot.tv_usec < 0 || boot.tv_usec > 999999) {
+            errno = EIO;
             return -1;
         }
         generation->boot_hi = (uint64_t)boot.tv_sec;
@@ -2234,12 +2237,21 @@ static int gpg_capture_process_generation(
             int mib[4] = {CTL_KERN, KERN_PROC, KERN_PROC_PID, (int)pid};
             struct kinfo_proc info;
             size_t length = sizeof(info);
-            if (sysctl(mib, 4, &info, &length, NULL, 0) != 0 ||
-                length != sizeof(info) || info.kp_proc.p_pid != pid ||
+            if (sysctl(mib, 4, &info, &length, NULL, 0) != 0) {
+                memset(generation, 0, sizeof(*generation));
+                return -1;
+            }
+            if (length == 0U) {
+                memset(generation, 0, sizeof(*generation));
+                errno = ESRCH;
+                return -1;
+            }
+            if (length != sizeof(info) || info.kp_proc.p_pid != pid ||
                 info.kp_proc.p_starttime.tv_sec <= 0 ||
                 info.kp_proc.p_starttime.tv_usec < 0 ||
                 info.kp_proc.p_starttime.tv_usec > 999999) {
                 memset(generation, 0, sizeof(*generation));
+                errno = EIO;
                 return -1;
             }
             generation->kind = 2U;
@@ -2253,11 +2265,20 @@ static int gpg_capture_process_generation(
             int mib[4] = {CTL_KERN, KERN_PROC, KERN_PROC_PID, (int)pid};
             struct kinfo_proc info;
             size_t length = sizeof(info);
-            if (sysctl(mib, 4, &info, &length, NULL, 0) != 0 ||
-                length != sizeof(info) || info.ki_pid != pid ||
+            if (sysctl(mib, 4, &info, &length, NULL, 0) != 0) {
+                memset(generation, 0, sizeof(*generation));
+                return -1;
+            }
+            if (length == 0U) {
+                memset(generation, 0, sizeof(*generation));
+                errno = ESRCH;
+                return -1;
+            }
+            if (length != sizeof(info) || info.ki_pid != pid ||
                 info.ki_start.tv_sec <= 0 || info.ki_start.tv_usec < 0 ||
                 info.ki_start.tv_usec > 999999) {
                 memset(generation, 0, sizeof(*generation));
+                errno = EIO;
                 return -1;
             }
             generation->kind = 3U;
