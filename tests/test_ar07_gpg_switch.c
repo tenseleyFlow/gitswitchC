@@ -15,13 +15,16 @@
 #include "trusted_command_fixture.h"
 
 #include <errno.h>
+#include <dirent.h>
 #include <fcntl.h>
+#include <limits.h>
 #include <signal.h>
 #include <stdbool.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
 #include <sys/file.h>
+#include <sys/resource.h>
 #include <sys/stat.h>
 #include <sys/types.h>
 #include <sys/wait.h>
@@ -533,6 +536,7 @@ enum listing_result_mode {
     LISTING_RESULT_SETUP_FAILURE,
     LISTING_RESULT_SIGNAL_FAILURE,
     LISTING_RESULT_PIPE_FAILURE,
+    LISTING_RESULT_RAW_MINUS_TWO,
     LISTING_RESULT_GPG_FAILURE,
     LISTING_RESULT_TRUNCATED,
     LISTING_RESULT_IMPORT_SPAWN_FAILURE,
@@ -697,6 +701,8 @@ static int listing_result_runner(const char *const argv[],
                     return -1;
                 case LISTING_RESULT_PIPE_FAILURE:
                     return -1;
+                case LISTING_RESULT_RAW_MINUS_TWO:
+                    return -2;
                 case LISTING_RESULT_GPG_FAILURE:
                     if (result) result->exit_code = 1;
                     return -1;
@@ -887,6 +893,7 @@ TEST(secret_listing_result_matrix_is_causal_and_exact) {
         { LISTING_RESULT_SETUP_FAILURE, "child setup or exec" },
         { LISTING_RESULT_SIGNAL_FAILURE, "terminated by signal" },
         { LISTING_RESULT_PIPE_FAILURE, "transport failed" },
+        { LISTING_RESULT_RAW_MINUS_TWO, "transport failed" },
         { LISTING_RESULT_GPG_FAILURE, "exit status 1" }
     };
     char diagnostic[512];
@@ -1771,6 +1778,171 @@ static int source_identity_runner(const char *const argv[],
         if (result) result->out_len = strlen(opts->out);
     }
     return 0;
+}
+
+static int count_open_fds(void) {
+    enum { TEST_FD_SCAN_MAX = 65536 };
+    const char *const paths[] = {"/proc/self/fd", "/dev/fd", NULL};
+    DIR *directory = NULL;
+    struct dirent *entry;
+    struct rlimit limit;
+    int count = 0;
+    int scan_fd;
+    size_t index;
+
+    for (index = 0; paths[index]; index++) {
+        directory = opendir(paths[index]);
+        if (directory) break;
+    }
+    if (directory) {
+        int scan_errno = 0;
+        int close_errno = 0;
+
+        scan_fd = dirfd(directory);
+        for (;;) {
+            char *end = NULL;
+            long value;
+
+            errno = 0;
+            entry = readdir(directory);
+            if (!entry) {
+                scan_errno = errno;
+                break;
+            }
+            errno = 0;
+            value = strtol(entry->d_name, &end, 10);
+            if (errno == 0 && end && *end == '\0' && value >= 0 &&
+                value <= INT_MAX && value != scan_fd) {
+                count++;
+            }
+        }
+        if (closedir(directory) != 0) close_errno = errno;
+        return scan_errno == 0 && close_errno == 0 ? count : -1;
+    }
+    if (getrlimit(RLIMIT_NOFILE, &limit) != 0) return -1;
+    {
+        size_t scan_limit = TEST_FD_SCAN_MAX;
+        size_t fd;
+
+        if (limit.rlim_cur != RLIM_INFINITY &&
+            limit.rlim_cur < (rlim_t)scan_limit) {
+            scan_limit = (size_t)limit.rlim_cur;
+        }
+        for (fd = 0; fd < scan_limit; fd++) {
+            int rc;
+
+            do {
+                rc = fcntl((int)fd, F_GETFD);
+            } while (rc < 0 && errno == EINTR);
+            if (rc >= 0) {
+                count++;
+            } else if (errno != EBADF) {
+                return -1;
+            }
+        }
+    }
+    return count;
+}
+
+TEST(source_proof_rlimit_budget_fails_closed_without_leak_and_retries) {
+    enum { CONSTRAINED_HEADROOM = 32, TREE_LEVELS = 12 };
+    char xdg[128], base[MAX_PATH_LEN], external[MAX_PATH_LEN];
+    char current[MAX_PATH_LEN], child[MAX_PATH_LEN], sibling[MAX_PATH_LEN];
+    char fingerprint[GPG_FINGERPRINT_BUFSIZE];
+    char diagnostic[512];
+    struct rlimit original_limit;
+    struct rlimit constrained_limit;
+    struct rlimit restored_limit;
+    const char *inherited_gnupghome = getenv("GNUPGHOME");
+    bool had_gnupghome = inherited_gnupghome != NULL;
+    char *saved_gnupghome = had_gnupghome
+                                ? strdup(inherited_gnupghome)
+                                : NULL;
+    command_runner_fn previous;
+    int before_fds;
+    int after_fds;
+    int rc;
+    int level;
+    int initial_fds;
+
+    if (had_gnupghome && !saved_gnupghome) {
+        CHECK(!"failed to retain GNUPGHOME for RLIMIT fixture");
+        return;
+    }
+    if (getrlimit(RLIMIT_NOFILE, &original_limit) != 0) {
+        free(saved_gnupghome);
+        CHECK(!"failed to inspect RLIMIT_NOFILE");
+        return;
+    }
+    initial_fds = count_open_fds();
+    if (initial_fds < 0 ||
+        original_limit.rlim_cur <
+            (rlim_t)initial_fds + CONSTRAINED_HEADROOM) {
+        free(saved_gnupghome);
+        TS_SKIP("source-proof-rlimit",
+                "RLIMIT_NOFILE lacks the causal fixture headroom");
+    }
+    CHECK_EQ_INT(make_runtime(xdg, sizeof(xdg)), 0);
+    CHECK_EQ_INT(safe_snprintf(base, sizeof(base),
+                               "%s/gitswitch-gpg", xdg), 0);
+    CHECK_EQ_INT(safe_snprintf(external, sizeof(external),
+                               "%s/external", xdg), 0);
+    CHECK_EQ_INT(mkdir(base, 0700), 0);
+    CHECK_EQ_INT(mkdir(external, 0700), 0);
+    CHECK_EQ_INT(safe_strncpy(current, base, sizeof(current)), 0);
+    for (level = 0; level < TREE_LEVELS; level++) {
+        CHECK_EQ_INT(safe_snprintf(child, sizeof(child), "%s/d%02d",
+                                   current, level), 0);
+        CHECK_EQ_INT(safe_snprintf(sibling, sizeof(sibling), "%s/w%02d",
+                                   current, level), 0);
+        CHECK_EQ_INT(mkdir(child, 0700), 0);
+        CHECK_EQ_INT(mkdir(sibling, 0700), 0);
+        CHECK_EQ_INT(safe_strncpy(current, child, sizeof(current)), 0);
+    }
+    CHECK_EQ_INT(setenv("GNUPGHOME", external, 1), 0);
+    CHECK_EQ_INT(stat(external, &g_expected_source_identity), 0);
+
+    constrained_limit = original_limit;
+    constrained_limit.rlim_cur =
+        (rlim_t)initial_fds + CONSTRAINED_HEADROOM;
+    CHECK_EQ_INT(setrlimit(RLIMIT_NOFILE, &constrained_limit), 0);
+    before_fds = count_open_fds();
+    g_source_identity_calls = 0;
+    previous = run_set_runner(source_identity_runner);
+    rc = gpg_manager_resolve_system_key("01234567", true, fingerprint,
+                                        sizeof(fingerprint));
+    CHECK_EQ_INT(safe_strncpy(diagnostic, get_last_error()->message,
+                              sizeof(diagnostic)), 0);
+    run_set_runner(previous);
+    after_fds = count_open_fds();
+
+    CHECK_EQ_INT(rc, -1);
+    CHECK_EQ_INT(g_source_identity_calls, 0);
+    CHECK_EQ_INT(after_fds, before_fds);
+    CHECK(strstr(diagnostic,
+                 "descriptor-budgeted retained proof bound") != NULL);
+    CHECK_EQ_INT(setrlimit(RLIMIT_NOFILE, &original_limit), 0);
+    CHECK_EQ_INT(getrlimit(RLIMIT_NOFILE, &restored_limit), 0);
+    CHECK(restored_limit.rlim_cur == original_limit.rlim_cur);
+    CHECK(restored_limit.rlim_max == original_limit.rlim_max);
+
+    g_source_identity_calls = 0;
+    g_source_identity_pinned = false;
+    previous = run_set_runner(source_identity_runner);
+    rc = gpg_manager_resolve_system_key("01234567", true, fingerprint,
+                                        sizeof(fingerprint));
+    run_set_runner(previous);
+    CHECK_EQ_INT(rc, 0);
+    CHECK_EQ_INT(g_source_identity_calls, 1);
+    CHECK(g_source_identity_pinned);
+    CHECK_STR_EQ(fingerprint, PRIMARY_FPR);
+
+    if (had_gnupghome) {
+        CHECK_EQ_INT(setenv("GNUPGHOME", saved_gnupghome, 1), 0);
+    } else {
+        CHECK_EQ_INT(unsetenv("GNUPGHOME"), 0);
+    }
+    free(saved_gnupghome);
 }
 
 enum source_proof_mutation_mode {
@@ -3517,6 +3689,7 @@ TEST_MAIN_BEGIN()
     RUN_TEST(nullfs_alias_of_managed_home_is_rejected_before_helper_launch);
 #endif
     RUN_TEST(source_proof_rejects_managed_tree_mutation_during_helper);
+    RUN_TEST(source_proof_rlimit_budget_fails_closed_without_leak_and_retries);
     RUN_TEST(ambiguous_selector_exports_and_imports_nothing);
     RUN_TEST(unique_selector_threads_fingerprint_through_import_and_publication);
     RUN_TEST(post_import_fingerprint_mismatch_is_not_signing_readiness);

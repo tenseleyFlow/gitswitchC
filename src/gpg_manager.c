@@ -19,6 +19,7 @@
 #include <sys/wait.h>
 #include <sys/stat.h>
 #include <sys/file.h>
+#include <sys/resource.h>
 #include <signal.h>
 #include <errno.h>
 #include <fcntl.h>
@@ -170,6 +171,10 @@ static bool gpg_same_file_version(const struct stat *left,
 static int gpg_user_source_home(char *buf, size_t size);
 static int gpg_open_user_source_home(gpg_source_home_t *source);
 static int gpg_validate_source_home(const gpg_source_home_t *source);
+static int gpg_run_source_helper(
+    const gpg_source_home_t *source, const char *const argv[],
+    const run_opts_t *opts, const run_launch_witness_t *witness,
+    run_result_t *result, int *helper_rc);
 static int gpg_validate_source_home_binding(
     const gpg_source_home_t *source);
 static void gpg_close_source_home(gpg_source_home_t *source);
@@ -1857,7 +1862,9 @@ enum {
     GPG_SOURCE_PROOF_MAX_DEPTH = 64,
     GPG_SOURCE_PROOF_MAX_DIRECTORIES = 16384,
     GPG_SOURCE_PROOF_MAX_ENTRIES = 65536,
-    GPG_SOURCE_PROOF_MAX_NULLFS_HOPS = 32
+    GPG_SOURCE_PROOF_MAX_NULLFS_HOPS = 32,
+    GPG_SOURCE_PROOF_HELPER_FD_RESERVE = 8,
+    GPG_SOURCE_PROOF_VALIDATION_FD_HEADROOM = 2
 };
 
 #define GPG_ROLLBACK_PREFIX ".gitswitch-gpg-rollback."
@@ -7845,12 +7852,14 @@ static int gpg_query_secret_listing_contract(
             argv, &opts, &gpg_config->executable_witness, &result);
         if (gpg_validate_pinned_home(home) != 0) return -1;
     } else {
-        if (gpg_validate_source_home(source) != 0) return -1;
         opts.cwd_fd = source->fd;
         opts.use_cwd_fd = true;
-        run_rc = run_argv_with_expected_launch(
-            argv, &opts, &gpg_config->executable_witness, &result);
-        if (gpg_validate_source_home(source) != 0) return -1;
+        if (gpg_run_source_helper(
+            source,
+            argv, &opts, &gpg_config->executable_witness, &result,
+            &run_rc) != 0) {
+            return -1;
+        }
     }
     if (result.out_truncated) {
         set_error(ERR_GPG_KEY_FAILED,
@@ -7942,16 +7951,12 @@ static int gpg_capture_secret_listing(const gpg_config_t *gpg_config,
             return -1;
         }
     } else {
-        if (gpg_validate_source_home(source) != 0) {
-            secure_zero_memory(listing, GPG_KEY_LISTING_CAP);
-            free(listing);
-            return -1;
-        }
         opts.cwd_fd = source->fd;
         opts.use_cwd_fd = true;
-        run_rc = run_argv_with_expected_launch(
-            argv, &opts, &gpg_config->executable_witness, &res);
-        if (gpg_validate_source_home(source) != 0) {
+        if (gpg_run_source_helper(
+            source,
+            argv, &opts, &gpg_config->executable_witness, &res,
+            &run_rc) != 0) {
             secure_zero_memory(listing, GPG_KEY_LISTING_CAP);
             free(listing);
             return -1;
@@ -8173,15 +8178,10 @@ static int copy_key_from_system_keyring(const gpg_config_t *gpg_config,
         opts.extra_env = export_env;
         opts.cwd_fd = source.fd;
         opts.use_cwd_fd = true;
-        if (gpg_validate_source_home(&source) != 0) {
-            secure_zero_memory(key_data, KEY_DATA_CAP);
-            free(key_data);
-            gpg_close_source_home(&source);
-            return -1;
-        }
-        export_rc = run_argv_with_expected_launch(
-            export_argv, &opts, &gpg_config->executable_witness, &res);
-        if (gpg_validate_source_home(&source) != 0) {
+        if (gpg_run_source_helper(
+            &source,
+            export_argv, &opts, &gpg_config->executable_witness, &res,
+            &export_rc) != 0) {
             secure_zero_memory(key_data, KEY_DATA_CAP);
             free(key_data);
             gpg_close_source_home(&source);
@@ -9624,6 +9624,9 @@ struct gpg_source_proof {
     gpg_source_proof_entry_t *entries;
     size_t count;
     size_t capacity;
+    size_t retained_limit;
+    int helper_reserve[GPG_SOURCE_PROOF_HELPER_FD_RESERVE];
+    size_t helper_reserve_count;
     bool base_absent;
     char base_path[MAX_PATH_LEN];
     struct stat base_identity;
@@ -9634,6 +9637,9 @@ static void gpg_source_proof_destroy(gpg_source_proof_t *proof) {
     size_t index;
 
     if (!proof) return;
+    for (index = 0; index < proof->helper_reserve_count; index++) {
+        close(proof->helper_reserve[index]);
+    }
     for (index = 0; index < proof->count; index++) {
         if (proof->entries[index].fd >= 0) {
             close(proof->entries[index].fd);
@@ -9641,6 +9647,197 @@ static void gpg_source_proof_destroy(gpg_source_proof_t *proof) {
     }
     free(proof->entries);
     free(proof);
+}
+
+static int gpg_source_proof_dup_cloexec(int fd) {
+#ifdef F_DUPFD_CLOEXEC
+    return fcntl(fd, F_DUPFD_CLOEXEC, STDERR_FILENO + 1);
+#else
+    int duplicate = fcntl(fd, F_DUPFD, STDERR_FILENO + 1);
+
+    if (duplicate >= 0 &&
+        fcntl(duplicate, F_SETFD, FD_CLOEXEC) != 0) {
+        int saved_errno = errno;
+        close(duplicate);
+        errno = saved_errno;
+        return -1;
+    }
+    return duplicate;
+#endif
+}
+
+/* Reserve real descriptor-table slots while a proof is retained. Arithmetic
+ * alone cannot account for unrelated descriptors already open in the process;
+ * duplicating the pinned source makes the launch headroom both path-free and
+ * observable. The reserve is dropped only around a source helper launch and
+ * immediately rebuilt before the post-launch proof validation. */
+static int gpg_source_proof_acquire_helper_reserve(
+    gpg_source_proof_t *proof, int trusted_fd) {
+    while (proof &&
+           proof->helper_reserve_count <
+               GPG_SOURCE_PROOF_HELPER_FD_RESERVE) {
+        int duplicate = gpg_source_proof_dup_cloexec(trusted_fd);
+
+        if (duplicate < 0) {
+            set_system_error(
+                ERR_PERMISSION_DENIED,
+                "Insufficient descriptor headroom for a GPG source helper");
+            return -1;
+        }
+        proof->helper_reserve[proof->helper_reserve_count++] = duplicate;
+    }
+    return proof ? 0 : -1;
+}
+
+static void gpg_source_proof_release_helper_reserve(
+    gpg_source_proof_t *proof) {
+    while (proof && proof->helper_reserve_count > 0) {
+        proof->helper_reserve_count--;
+        close(proof->helper_reserve[proof->helper_reserve_count]);
+        proof->helper_reserve[proof->helper_reserve_count] = -1;
+    }
+}
+
+static int gpg_source_proof_count_open_descriptors(
+    rlim_t soft_limit, size_t *count_out, size_t *capacity_out) {
+    enum { GPG_SOURCE_PROOF_FD_SCAN_MAX = 65536 };
+    const char *const fd_paths[] = {"/proc/self/fd", "/dev/fd", NULL};
+    DIR *descriptor_dir = NULL;
+    size_t path_index;
+    size_t count = 0;
+
+    if (!count_out || !capacity_out) {
+        errno = EINVAL;
+        return -1;
+    }
+    for (path_index = 0; fd_paths[path_index]; path_index++) {
+        descriptor_dir = opendir(fd_paths[path_index]);
+        if (descriptor_dir) break;
+    }
+    if (descriptor_dir) {
+        struct dirent *entry;
+        int scan_errno = 0;
+        int close_errno = 0;
+        int scan_fd = dirfd(descriptor_dir);
+
+        for (;;) {
+            char *end = NULL;
+            long value;
+
+            errno = 0;
+            entry = readdir(descriptor_dir);
+            if (!entry) {
+                scan_errno = errno;
+                break;
+            }
+            errno = 0;
+            value = strtol(entry->d_name, &end, 10);
+            if (errno == 0 && end && *end == '\0' && value >= 0 &&
+                value <= INT_MAX && value != scan_fd) {
+                count++;
+            }
+        }
+        if (closedir(descriptor_dir) != 0) close_errno = errno;
+        if (scan_errno != 0 || close_errno != 0) {
+            errno = scan_errno != 0 ? scan_errno : close_errno;
+            return -1;
+        }
+        *count_out = count;
+        *capacity_out = soft_limit == RLIM_INFINITY
+                            ? SIZE_MAX
+                            : (size_t)soft_limit;
+        return 0;
+    }
+
+    /* procfs and fdescfs are optional. Fall back to a bounded POSIX fcntl
+     * probe so source proof remains available without either filesystem.
+     * Only the scanned descriptor-number window is reported as capacity:
+     * ordinary opens consume its lowest free slots, while the real reserved
+     * descriptors remain the fail-closed guard for sparse higher-numbered
+     * descriptors that this bounded fallback cannot observe. */
+    {
+        size_t scan_limit = GPG_SOURCE_PROOF_FD_SCAN_MAX;
+        size_t fd;
+
+        if (soft_limit != RLIM_INFINITY &&
+            soft_limit < (rlim_t)scan_limit) {
+            scan_limit = (size_t)soft_limit;
+        } else if (soft_limit == RLIM_INFINITY) {
+            long open_max = sysconf(_SC_OPEN_MAX);
+
+            if (open_max > 0 &&
+                (unsigned long)open_max < scan_limit) {
+                scan_limit = (size_t)open_max;
+            }
+        }
+        for (fd = 0; fd < scan_limit; fd++) {
+            int rc;
+
+            do {
+                rc = fcntl((int)fd, F_GETFD);
+            } while (rc < 0 && errno == EINTR);
+            if (rc >= 0) {
+                count++;
+            } else if (errno != EBADF) {
+                return -1;
+            }
+        }
+        *capacity_out = scan_limit;
+    }
+    *count_out = count;
+    return 0;
+}
+
+static int gpg_source_proof_set_descriptor_budget(
+    gpg_source_proof_t *proof, int trusted_fd) {
+    const size_t maximum = GPG_SOURCE_PROOF_MAX_DIRECTORIES +
+                           GPG_SOURCE_PROOF_MAX_NULLFS_HOPS + 1U;
+    size_t open_descriptors = 0;
+    size_t descriptor_capacity = 0;
+    struct rlimit limit;
+
+    if (!proof || trusted_fd < 0) {
+        errno = EINVAL;
+        set_error(ERR_INVALID_ARGS,
+                  "Invalid GPG source-proof descriptor budget");
+        return -1;
+    }
+    if (getrlimit(RLIMIT_NOFILE, &limit) != 0) {
+        set_system_error(ERR_PERMISSION_DENIED,
+                         "Cannot determine the GPG source-proof descriptor limit");
+        return -1;
+    }
+    if (gpg_source_proof_count_open_descriptors(
+            limit.rlim_cur, &open_descriptors,
+            &descriptor_capacity) != 0) {
+        set_system_error(
+            ERR_PERMISSION_DENIED,
+            "Cannot enumerate open descriptors for the GPG source proof");
+        return -1;
+    }
+    if (descriptor_capacity == SIZE_MAX) {
+        proof->retained_limit = maximum;
+    } else if (open_descriptors <= descriptor_capacity &&
+               descriptor_capacity - open_descriptors >
+                   GPG_SOURCE_PROOF_HELPER_FD_RESERVE +
+                       GPG_SOURCE_PROOF_VALIDATION_FD_HEADROOM) {
+        size_t available =
+            descriptor_capacity - open_descriptors -
+            GPG_SOURCE_PROOF_HELPER_FD_RESERVE -
+            GPG_SOURCE_PROOF_VALIDATION_FD_HEADROOM;
+
+        /* The tree walk charges its live DFS scan depth separately. Shallow
+         * wide trees therefore retain all genuinely available descriptors,
+         * while deep trees still stop before traversal can consume the
+         * helper reserve or fall through to EMFILE. */
+        proof->retained_limit = available;
+        if (proof->retained_limit > maximum) {
+            proof->retained_limit = maximum;
+        }
+    } else {
+        proof->retained_limit = 0;
+    }
+    return gpg_source_proof_acquire_helper_reserve(proof, trusted_fd);
 }
 
 /* Transfer one descriptor into the retained proof. Managed-tree entries keep
@@ -9665,10 +9862,12 @@ static int gpg_source_proof_add_owned(
         set_error(ERR_INVALID_ARGS, "Invalid retained GPG source proof");
         return -1;
     }
-    if (proof->count >= maximum) {
+    if (proof->count >= maximum ||
+        proof->count >= proof->retained_limit) {
         errno = E2BIG;
         set_error(ERR_PERMISSION_DENIED,
-                  "Managed GPG ancestry exceeds the retained proof bound");
+                  "Managed GPG ancestry exceeds the descriptor-budgeted "
+                  "retained proof bound");
         return -1;
     }
     if (proof->count == proof->capacity) {
@@ -10064,6 +10263,15 @@ static int gpg_source_matches_managed_tree_at(
                   "Managed GPG ancestry exceeds the retained directory bound");
         return -1;
     }
+    if (proof->count >= proof->retained_limit ||
+        (size_t)depth + 1U > proof->retained_limit - proof->count) {
+        close(directory_fd);
+        errno = E2BIG;
+        set_error(ERR_PERMISSION_DENIED,
+                  "Managed GPG ancestry exceeds the descriptor-budgeted "
+                  "retained proof bound");
+        return -1;
+    }
     errno = 0;
     if (fstat(directory_fd, &directory_before) != 0 ||
         !S_ISDIR(directory_before.st_mode) ||
@@ -10246,6 +10454,10 @@ static int gpg_source_matches_managed_home(
                   "Cannot allocate the managed GPG ancestry proof");
         return -1;
     }
+    if (gpg_source_proof_set_descriptor_budget(proof, source->fd) != 0) {
+        gpg_source_proof_destroy(proof);
+        return -1;
+    }
 
     base_fd = gpg_open_base_dir(base, sizeof(base), false, &absent);
     if (base_fd < 0) {
@@ -10366,6 +10578,28 @@ static int gpg_validate_source_home(const gpg_source_home_t *source) {
         return -1;
     }
     return gpg_source_proof_revalidate(source->proof);
+}
+
+static int gpg_run_source_helper(
+    const gpg_source_home_t *source, const char *const argv[],
+    const run_opts_t *opts, const run_launch_witness_t *witness,
+    run_result_t *result, int *helper_rc) {
+
+    if (!helper_rc) {
+        errno = EINVAL;
+        set_error(ERR_INVALID_ARGS, "Invalid GPG source-helper outcome");
+        return -1;
+    }
+    *helper_rc = -1;
+    if (gpg_validate_source_home(source) != 0) return -1;
+    gpg_source_proof_release_helper_reserve(source->proof);
+    *helper_rc =
+        run_argv_with_expected_launch(argv, opts, witness, result);
+    if (gpg_source_proof_acquire_helper_reserve(
+            source->proof, source->fd) != 0) {
+        return -1;
+    }
+    return gpg_validate_source_home(source);
 }
 
 /* Cache acceptance is stricter than a real descriptor-pinned listing: no
