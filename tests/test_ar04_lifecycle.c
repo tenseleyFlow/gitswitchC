@@ -25,6 +25,7 @@
 #include <sys/types.h>
 #include <sys/un.h>
 #include <sys/wait.h>
+#include <time.h>
 #include <unistd.h>
 
 static char g_bin[PATH_MAX];
@@ -155,6 +156,29 @@ static int write_live_agent_record(const char *runtime, const char *name,
     rc = ssh_manager_test_write_pid_sidecar(dir_fd, name, &record);
     if (close(dir_fd) != 0) rc = -1;
     return rc;
+}
+
+static void stop_external_process(pid_t pid) {
+    const struct timespec delay = {.tv_sec = 0, .tv_nsec = 10000000L};
+    int attempt;
+
+    if (pid <= 1) return;
+    errno = 0;
+    if (kill(pid, 0) != 0 && errno == ESRCH) return;
+
+    (void)kill(pid, SIGTERM);
+    for (attempt = 0; attempt < 50; ++attempt) {
+        errno = 0;
+        if (kill(pid, 0) != 0 && errno == ESRCH) return;
+        (void)nanosleep(&delay, NULL);
+    }
+
+    (void)kill(pid, SIGKILL);
+    for (attempt = 0; attempt < 50; ++attempt) {
+        errno = 0;
+        if (kill(pid, 0) != 0 && errno == ESRCH) return;
+        (void)nanosleep(&delay, NULL);
+    }
 }
 
 static int write_all(int fd, const void *data, size_t length) {
@@ -918,9 +942,7 @@ static void exercise_remove_runtime_teardown(const char *ssh_agent_path) {
     CHECK(strstr(contents, "name = \"work\"") == NULL);
     CHECK(strstr(contents, "active_account = \"work\"") == NULL);
 
-    if (agent_pid > 1 && kill(agent_pid, 0) == 0) {
-        (void)kill(agent_pid, SIGKILL);
-    }
+    stop_external_process(agent_pid);
 
     remove_tree(home);
     remove_tree(runtime);
@@ -1329,6 +1351,7 @@ TEST(remove_tears_down_runtime_before_deleting_account) {
     exercise_remove_runtime_teardown(NULL);
 }
 
+#if defined(__linux__)
 TEST(remove_reaps_real_agent_before_deleting_account) {
     char ssh_agent_path[PATH_MAX];
 
@@ -1338,6 +1361,7 @@ TEST(remove_reaps_real_agent_before_deleting_account) {
     }
     exercise_remove_runtime_teardown(ssh_agent_path);
 }
+#endif
 
 TEST(remove_save_failure_keeps_retry_handle_after_runtime_teardown) {
     char home[256], runtime[256], shims[512];
@@ -1457,18 +1481,27 @@ TEST(remove_save_failure_keeps_retry_handle_after_runtime_teardown) {
     CHECK(retry_pid > 1);
 
     CHECK_EQ_INT(run_remove(home, runtime, shims, "work", output), 0);
+#if defined(__linux__)
     if (retry_pid > 1) {
         errno = 0;
         CHECK(kill(retry_pid, 0) != 0);
         CHECK_EQ_INT(errno, ESRCH);
     }
+#endif
+    errno = 0;
+    CHECK(lstat(pid_path, &st) != 0);
+    CHECK_EQ_INT(errno, ENOENT);
+    errno = 0;
+    CHECK(lstat(socket_path, &st) != 0);
+    CHECK_EQ_INT(errno, ENOENT);
+    errno = 0;
+    CHECK(lstat(current_path, &st) != 0);
+    CHECK_EQ_INT(errno, ENOENT);
     snprintf(path, sizeof(path), "%s/.config/gitswitch/accounts.toml", home);
     slurp(path, contents, sizeof(contents));
     CHECK(strstr(contents, "name = \"work\"") == NULL);
 
-    if (retry_pid > 1 && kill(retry_pid, 0) == 0) {
-        (void)kill(retry_pid, SIGKILL);
-    }
+    stop_external_process(retry_pid);
 
     remove_tree(home);
     remove_tree(runtime);
@@ -1834,7 +1867,9 @@ int main(int argc, char **argv) {
     RUN_TEST(active_live_field_edits_are_rejected_without_mutation);
     RUN_TEST(active_description_edit_and_inactive_live_edits_still_work);
     RUN_TEST(remove_tears_down_runtime_before_deleting_account);
+#if defined(__linux__)
     RUN_TEST(remove_reaps_real_agent_before_deleting_account);
+#endif
     RUN_TEST(remove_save_failure_keeps_retry_handle_after_runtime_teardown);
     RUN_TEST(remove_failure_retains_account_and_attempts_other_manager);
     RUN_TEST(remove_inactive_account_with_no_runtime_preserves_active_account);
