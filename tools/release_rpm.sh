@@ -29,14 +29,94 @@ rpm_topdir_identity=
 rpm_topdir_device=
 rpm_topdir_inode=
 rpm_home_physical=
+rpm_sha256_tool=
+
+# Fixed release descriptors are an internal ABI.  Discard any caller-owned
+# generations before commands can inherit them, then assign each slot below.
+exec 3<&-
+exec 4<&-
+exec 5<&-
+exec 6<&-
+exec 7<&-
+exec 8<&-
+exec 9<&-
 
 rpm_path_identity()
 {
     case $rpm_host_os in
-        Linux) stat -c '%d:%i' "$1" ;;
-        Darwin|FreeBSD) stat -f '%d:%i' "$1" ;;
+        Linux) stat -L -c '%d:%i' "$1" ;;
+        Darwin|FreeBSD) stat -L -f '%d:%i' "$1" ;;
         *) return 1 ;;
     esac
+}
+
+rpm_regular_path_identity()
+{
+    case $rpm_host_os in
+        Linux) stat -L -c '%d:%i:%s' "$1" ;;
+        Darwin|FreeBSD) stat -L -f '%d:%i:%z' "$1" ;;
+        *) return 1 ;;
+    esac
+}
+
+rpm_regular_fd_identity()
+{
+    rpm_regular_identity_fd=$1
+    rpm_regular_path_identity "/dev/fd/$rpm_regular_identity_fd"
+}
+
+rpm_sha256_fd()
+{
+    rpm_hash_fd=$1
+    case $rpm_hash_fd in
+        6)
+            exec 3<&- 4<&- 5<&- 7<&- 8<&- 9<&-
+            ;;
+        8)
+            exec 3<&- 4<&- 5<&- 6<&- 7<&- 9<&-
+            ;;
+        9)
+            exec 3<&- 4<&- 5<&- 6<&- 7<&- 8<&-
+            ;;
+        *) return 1 ;;
+    esac
+    case $rpm_sha256_tool in
+        sha256sum)
+            rpm_hash_output=$(sha256sum "/dev/fd/$rpm_hash_fd") ||
+                return 1
+            rpm_hash_output=${rpm_hash_output%% *}
+            ;;
+        shasum)
+            rpm_hash_output=$(shasum -a 256 "/dev/fd/$rpm_hash_fd") ||
+                return 1
+            rpm_hash_output=${rpm_hash_output%% *}
+            ;;
+        sha256)
+            rpm_hash_output=$(sha256 -q "/dev/fd/$rpm_hash_fd") ||
+                return 1
+            ;;
+        *) return 1 ;;
+    esac
+    [ "${#rpm_hash_output}" -eq 64 ] || return 1
+    case $rpm_hash_output in
+        *[!0-9a-fA-F]*) return 1 ;;
+    esac
+    printf '%s\n' "$rpm_hash_output"
+}
+
+rpm_open_archive()
+{
+    exec 6<&-
+    exec 6<"$rpm_archive" || return 1
+    [ "$(rpm_regular_fd_identity 6)" = \
+        "$rpm_archive_identity" ]
+}
+
+rpm_open_source()
+{
+    exec 8<&-
+    exec 8<"$rpm_source" || return 1
+    [ "$(rpm_regular_fd_identity 8)" = "$rpm_source_identity" ]
 }
 
 rpm_normalize_private_acl()
@@ -103,6 +183,13 @@ rpm_cleanup()
         rpm_cleanup_status=$rpm_cleanup_forced
     fi
     trap - 0 1 2 3 15
+    exec 3<&-
+    exec 4<&-
+    exec 5<&-
+    exec 6<&-
+    exec 7<&-
+    exec 8<&-
+    exec 9<&-
     rpm_cleanup_failed=0
     if [ -n "$rpm_topdir" ]; then
         if [ ! -e "$rpm_topdir" ] && [ ! -L "$rpm_topdir" ]; then
@@ -160,6 +247,23 @@ case $rpm_host_os in
     Linux|Darwin|FreeBSD) ;;
     *) rpm_fail "unsupported host platform: $rpm_host_os" ;;
 esac
+case $rpm_host_os in
+    Linux)
+        command -v sha256sum >/dev/null 2>&1 ||
+            rpm_fail "sha256sum is unavailable"
+        rpm_sha256_tool=sha256sum
+        ;;
+    Darwin)
+        command -v shasum >/dev/null 2>&1 ||
+            rpm_fail "shasum is unavailable"
+        rpm_sha256_tool=shasum
+        ;;
+    FreeBSD)
+        command -v sha256 >/dev/null 2>&1 ||
+            rpm_fail "sha256 is unavailable"
+        rpm_sha256_tool=sha256
+        ;;
+esac
 
 case $rpm_root in
     /*) ;;
@@ -179,6 +283,8 @@ esac
     rpm_fail "archive is outside the canonical release directory"
 [ -s "$rpm_archive" ] && [ -f "$rpm_archive" ] && [ ! -L "$rpm_archive" ] ||
     rpm_fail "canonical release archive is not a nonempty regular file"
+rpm_archive_identity=$(rpm_regular_path_identity "$rpm_archive") ||
+    rpm_fail "cannot identify canonical release archive"
 [ -x "$rpm_publisher" ] && [ -f "$rpm_publisher" ] && [ ! -L "$rpm_publisher" ] ||
     rpm_fail "release publisher is not an executable regular file"
 command -v rpmbuild >/dev/null 2>&1 ||
@@ -255,34 +361,111 @@ rpm_srpms_identity=$(rpm_path_identity "$rpm_topdir/SRPMS") ||
     rpm_fail "cannot identify private SRPMS directory"
 rpm_publish_identity=$(rpm_path_identity "$rpm_topdir/PUBLISH") ||
     rpm_fail "cannot identify private PUBLISH directory"
+rpm_rpms_device=${rpm_rpms_identity%%:*}
+rpm_rpms_inode=${rpm_rpms_identity#*:}
+rpm_srpms_device=${rpm_srpms_identity%%:*}
+rpm_srpms_inode=${rpm_srpms_identity#*:}
+rpm_publish_device=${rpm_publish_identity%%:*}
+rpm_publish_inode=${rpm_publish_identity#*:}
+for rpm_directory_identity_part in \
+    "$rpm_rpms_device" "$rpm_rpms_inode" \
+    "$rpm_srpms_device" "$rpm_srpms_inode" \
+    "$rpm_publish_device" "$rpm_publish_inode"; do
+    case $rpm_directory_identity_part in
+        ''|*[!0-9]*) rpm_fail "private RPM directory identity is invalid" ;;
+    esac
+done
 
+exec 3<"$rpm_topdir/RPMS" ||
+    rpm_fail "cannot pin private RPMS directory"
+exec 4<"$rpm_topdir/SRPMS" ||
+    rpm_fail "cannot pin private SRPMS directory"
+exec 5<"$rpm_topdir/PUBLISH" ||
+    rpm_fail "cannot pin private PUBLISH directory"
+rpm_open_archive ||
+    rpm_fail "cannot pin canonical release archive"
+rpm_archive_digest=$(rpm_sha256_fd 6) ||
+    rpm_fail "cannot hash canonical release archive"
+rpm_open_archive ||
+    rpm_fail "canonical release archive changed identity before copying"
 rpm_source=$rpm_topdir/SOURCES/$rpm_archive_name
-cp "$rpm_archive" "$rpm_source" || rpm_fail "cannot copy private RPM source"
-chmod 0600 "$rpm_source" || rpm_fail "cannot secure private RPM source"
-if [ ! -f "$rpm_source" ] || [ -L "$rpm_source" ] ||
-   ! cmp -s "$rpm_archive" "$rpm_source"; then
+(
+    exec 3<&- 4<&- 5<&- 7<&- 8<&- 9<&-
+    /bin/cat /dev/fd/6
+) >"$rpm_source" ||
+    rpm_fail "cannot copy private RPM source from descriptor"
+exec 8<"$rpm_source" || rpm_fail "cannot open private RPM source"
+rpm_source_identity=$(rpm_regular_fd_identity 8) ||
+    rpm_fail "cannot identify private RPM source descriptor"
+[ -s /dev/fd/8 ] && [ -f /dev/fd/8 ] ||
+    rpm_fail "private RPM source is not a nonempty regular file"
+chmod 0400 /dev/fd/8 || rpm_fail "cannot seal private RPM source"
+rpm_source_digest=$(rpm_sha256_fd 8) ||
+    rpm_fail "cannot hash private RPM source"
+[ "$rpm_source_digest" = "$rpm_archive_digest" ] ||
     rpm_fail "private RPM source copy changed bytes"
-fi
 
 rpm_spec=$rpm_topdir/SPECS/$rpm_package.spec
-tar -xOf "$rpm_source" "$rpm_dist_root/$rpm_package.spec" >"$rpm_spec" ||
+rpm_open_source ||
+    rpm_fail "private RPM source changed identity before spec extraction"
+(
+    exec 3<&- 4<&- 5<&- 6<&- 7<&- 9<&-
+    tar -xOf /dev/fd/8 "$rpm_dist_root/$rpm_package.spec"
+) >"$rpm_spec" ||
     rpm_fail "cannot extract the archive-embedded RPM spec"
-chmod 0600 "$rpm_spec" || rpm_fail "cannot secure private RPM spec"
-[ -s "$rpm_spec" ] && [ -f "$rpm_spec" ] && [ ! -L "$rpm_spec" ] ||
+exec 9<"$rpm_spec" ||
+    rpm_fail "cannot open archive-embedded RPM spec"
+rpm_spec_identity=$(rpm_regular_fd_identity 9) ||
+    rpm_fail "cannot identify archive-embedded RPM spec"
+[ -s /dev/fd/9 ] && [ -f /dev/fd/9 ] ||
     rpm_fail "archive-embedded RPM spec is not a nonempty regular file"
+chmod 0400 /dev/fd/9 || rpm_fail "cannot seal private RPM spec"
+rpm_spec_digest=$(rpm_sha256_fd 9) ||
+    rpm_fail "cannot hash archive-embedded RPM spec"
+exec 9<&-
+exec 9<"$rpm_spec" ||
+    rpm_fail "cannot reopen archive-embedded RPM spec"
+[ "$(rpm_regular_fd_identity 9)" = "$rpm_spec_identity" ] ||
+    rpm_fail "archive-embedded RPM spec changed identity before rpmbuild"
+exec 6<&-
+exec 8<&-
 
 printf '%s\n' 'Building RPM packages in a private rpmbuild namespace...'
-rpmbuild \
-    --define "_topdir $rpm_topdir" \
-    --define "_builddir $rpm_topdir/BUILD" \
-    --define "_buildrootdir $rpm_topdir/BUILDROOT" \
-    --define "_rpmdir $rpm_topdir/RPMS" \
-    --define "_sourcedir $rpm_topdir/SOURCES" \
-    --define "_specdir $rpm_topdir/SPECS" \
-    --define "_srcrpmdir $rpm_topdir/SRPMS" \
-    --define "_tmppath $rpm_topdir/TMP" \
-    --define '_rpmfilename %{ARCH}/%{NAME}-%{VERSION}-%{RELEASE}.%{ARCH}.rpm' \
-    -ba "$rpm_spec" || rpm_fail "rpmbuild failed"
+(
+    exec 3<&-
+    exec 4<&-
+    exec 5<&-
+    exec 6<&-
+    exec 7<&-
+    exec 8<&-
+    rpmbuild \
+        --define "_topdir $rpm_topdir" \
+        --define "_builddir $rpm_topdir/BUILD" \
+        --define "_buildrootdir $rpm_topdir/BUILDROOT" \
+        --define "_rpmdir $rpm_topdir/RPMS" \
+        --define "_sourcedir $rpm_topdir/SOURCES" \
+        --define "_specdir $rpm_topdir/SPECS" \
+        --define "_srcrpmdir $rpm_topdir/SRPMS" \
+        --define "_tmppath $rpm_topdir/TMP" \
+        --define '_rpmfilename %{ARCH}/%{NAME}-%{VERSION}-%{RELEASE}.%{ARCH}.rpm' \
+        -ba /dev/fd/9
+) || rpm_fail "rpmbuild failed"
+
+rpm_open_source ||
+    rpm_fail "private RPM source changed identity during rpmbuild"
+rpm_postbuild_source_digest=$(rpm_sha256_fd 8) ||
+    rpm_fail "cannot hash private RPM source after rpmbuild"
+[ "$rpm_postbuild_source_digest" = "$rpm_source_digest" ] ||
+    rpm_fail "private RPM source changed bytes during rpmbuild"
+exec 9<&-
+exec 9<"$rpm_spec" ||
+    rpm_fail "cannot reopen archive-embedded RPM spec after rpmbuild"
+[ "$(rpm_regular_fd_identity 9)" = "$rpm_spec_identity" ] ||
+    rpm_fail "archive-embedded RPM spec changed identity during rpmbuild"
+rpm_postbuild_spec_digest=$(rpm_sha256_fd 9) ||
+    rpm_fail "cannot hash archive-embedded RPM spec after rpmbuild"
+[ "$rpm_postbuild_spec_digest" = "$rpm_spec_digest" ] ||
+    rpm_fail "archive-embedded RPM spec changed bytes during rpmbuild"
 
 rpm_directory_is_exact "$rpm_topdir" &&
 [ "$(rpm_path_identity "$rpm_topdir")" = "$rpm_topdir_identity" ] ||
@@ -297,85 +480,104 @@ rpm_directory_is_exact "$rpm_topdir/PUBLISH" &&
 [ "$(rpm_path_identity "$rpm_topdir/PUBLISH")" = "$rpm_publish_identity" ] ||
     rpm_fail "private PUBLISH directory changed identity"
 
-rpm_binary_count=0
-for rpm_arch_dir in "$rpm_topdir"/RPMS/*; do
-    if [ ! -e "$rpm_arch_dir" ] && [ ! -L "$rpm_arch_dir" ]; then
-        continue
-    fi
-    [ ! -L "$rpm_arch_dir" ] ||
-        rpm_fail "rpmbuild produced a symlinked binary RPM directory"
-    if [ ! -d "$rpm_arch_dir" ]; then
-        continue
-    fi
-    rpm_directory_is_exact "$rpm_arch_dir" ||
-        rpm_fail "rpmbuild produced an unsafe binary RPM directory"
-    rpm_normalize_private_acl "$rpm_arch_dir" ||
-        rpm_fail "cannot secure binary RPM directory ACL"
-    rpm_directory_is_exact "$rpm_arch_dir" ||
-        rpm_fail "binary RPM directory changed during ACL normalization"
-    case $rpm_arch_dir in
-        "$rpm_topdir/RPMS/"*) ;;
-        *) rpm_fail "binary RPM directory escaped the private namespace" ;;
-    esac
-    for rpm_file in "$rpm_arch_dir"/*.rpm; do
-        if [ ! -e "$rpm_file" ] && [ ! -L "$rpm_file" ]; then
-            continue
-        fi
-        [ -s "$rpm_file" ] && [ -f "$rpm_file" ] && [ ! -L "$rpm_file" ] ||
-            rpm_fail "rpmbuild produced an unsafe or empty binary RPM"
-        rpm_name=${rpm_file##*/}
-        [ ! -e "$rpm_topdir/PUBLISH/$rpm_name" ] &&
-        [ ! -L "$rpm_topdir/PUBLISH/$rpm_name" ] ||
-            rpm_fail "rpmbuild produced a duplicate RPM name: $rpm_name"
-        cp "$rpm_file" "$rpm_topdir/PUBLISH/$rpm_name" ||
-            rpm_fail "cannot stage binary RPM: $rpm_name"
-        chmod 0400 "$rpm_topdir/PUBLISH/$rpm_name" ||
-            rpm_fail "cannot seal staged binary RPM: $rpm_name"
-        cmp -s "$rpm_file" "$rpm_topdir/PUBLISH/$rpm_name" ||
-            rpm_fail "staged binary RPM changed bytes: $rpm_name"
-        rpm_binary_count=$((rpm_binary_count + 1))
-    done
-done
-
-rpm_source_count=0
-for rpm_file in "$rpm_topdir"/SRPMS/*.src.rpm; do
-    if [ ! -e "$rpm_file" ] && [ ! -L "$rpm_file" ]; then
-        continue
-    fi
-    [ -s "$rpm_file" ] && [ -f "$rpm_file" ] && [ ! -L "$rpm_file" ] ||
-        rpm_fail "rpmbuild produced an unsafe or empty source RPM"
-    rpm_name=${rpm_file##*/}
-    [ ! -e "$rpm_topdir/PUBLISH/$rpm_name" ] &&
-    [ ! -L "$rpm_topdir/PUBLISH/$rpm_name" ] ||
-        rpm_fail "rpmbuild produced a duplicate RPM name: $rpm_name"
-    cp "$rpm_file" "$rpm_topdir/PUBLISH/$rpm_name" ||
-        rpm_fail "cannot stage source RPM: $rpm_name"
-    chmod 0400 "$rpm_topdir/PUBLISH/$rpm_name" ||
-        rpm_fail "cannot seal staged source RPM: $rpm_name"
-    cmp -s "$rpm_file" "$rpm_topdir/PUBLISH/$rpm_name" ||
-        rpm_fail "staged source RPM changed bytes: $rpm_name"
-    rpm_source_count=$((rpm_source_count + 1))
-done
-
-[ "$rpm_binary_count" -gt 0 ] ||
-    rpm_fail "rpmbuild produced no regular binary RPM"
-[ "$rpm_source_count" -gt 0 ] ||
-    rpm_fail "rpmbuild produced no regular source RPM"
+exec 6<&-
+exec 7<&-
+exec 8<&-
+exec 9<&-
+rpm_stage_records=$(
+    exec 6<&-
+    exec 7<&-
+    exec 8<&-
+    exec 9<&-
+    "$rpm_publisher" --internal-rpm-stage-v1 3 "$rpm_rpms_device" \
+        "$rpm_rpms_inode" \
+        4 "$rpm_srpms_device" "$rpm_srpms_inode" \
+        5 "$rpm_publish_device" "$rpm_publish_inode"
+) ||
+    rpm_fail "cannot validate and stage the complete RPM output set"
+[ -n "$rpm_stage_records" ] ||
+    rpm_fail "RPM staging helper returned no package records"
+rpm_record_newline='
+'
+rpm_saved_ifs=$IFS
+case $- in
+    *f*) rpm_globbing_was_disabled=true ;;
+    *) rpm_globbing_was_disabled=false ;;
+esac
+set -f
+IFS=$rpm_record_newline
+# The C helper rejects whitespace and glob metacharacters in names and bounds
+# record count/length; disabled globbing leaves newline as the sole separator.
+# shellcheck disable=SC2086
+set -- $rpm_stage_records
+IFS=$rpm_saved_ifs
+if [ "$rpm_globbing_was_disabled" = false ]; then
+    set +f
+fi
+[ "$#" -ge 1 ] && [ "$#" -le 1024 ] ||
+    rpm_fail "RPM staging helper returned an invalid record count"
 # Publication is atomic per leaf, not across the whole package set.  Rolling
 # back a leaf after the publisher reports a post-publication durability error
 # could destroy the only completed artifact.  Failures therefore retain every
 # possibly durable leaf under its no-replace name and give an exact, bounded
 # recovery set; the next invocation refuses those names until the operator has
-# inspected and removed only these release outputs.
+# inspected the exact expected digests and resolved only matching outputs.
 rpm_report_incomplete_set()
 {
     printf '%s\n' \
         'release-rpm: ERROR: RPM set publication is incomplete; validated leaves may remain in build/dist' \
-        'release-rpm: ERROR: inspect and remove only these exact no-replace outputs before retry:' \
+        'release-rpm: ERROR: inspect these exact no-replace outputs before retry; remove a leaf only after its digest matches:' \
         >&2
-    for rpm_recovery_file in "$rpm_topdir"/PUBLISH/*.rpm; do
-        printf '  build/dist/%s\n' "${rpm_recovery_file##*/}" >&2
+    for rpm_recovery_record do
+        rpm_validate_record "$rpm_recovery_record"
+        printf '  build/dist/%s (expected sha256 %s; inspect before removal)\n' \
+            "$rpm_name" "$rpm_recorded_digest" >&2
     done
+}
+
+rpm_validate_record()
+{
+    rpm_record=$1
+    rpm_name=${rpm_record%%,*}
+    rpm_recorded_remainder=${rpm_record#*,}
+    rpm_recorded_identity=${rpm_recorded_remainder%%,*}
+    rpm_recorded_digest=${rpm_recorded_remainder#*,}
+    [ "$rpm_recorded_remainder" != "$rpm_record" ] &&
+    [ "$rpm_recorded_digest" != "$rpm_recorded_remainder" ] ||
+        rpm_fail "private RPM record contains incomplete fields"
+    case $rpm_recorded_digest in
+        *,*) rpm_fail "private RPM record contains excess fields" ;;
+    esac
+    case $rpm_name in
+        ''|*[!A-Za-z0-9._+~-]*)
+            rpm_fail "private RPM record contains an unsafe name"
+            ;;
+    esac
+    case $rpm_name in
+        *.rpm) ;;
+        *) rpm_fail "private RPM record contains a non-RPM name" ;;
+    esac
+    rpm_recorded_device=${rpm_recorded_identity%%:*}
+    rpm_recorded_remainder=${rpm_recorded_identity#*:}
+    rpm_recorded_inode=${rpm_recorded_remainder%%:*}
+    rpm_recorded_size=${rpm_recorded_remainder#*:}
+    [ "$rpm_recorded_remainder" != "$rpm_recorded_identity" ] &&
+    [ "$rpm_recorded_size" != "$rpm_recorded_remainder" ] &&
+    [ "${rpm_recorded_size%%:*}" = "$rpm_recorded_size" ] ||
+        rpm_fail "private RPM record contains an incomplete identity"
+    for rpm_identity_part in \
+        "$rpm_recorded_device" "$rpm_recorded_inode" "$rpm_recorded_size"; do
+        case $rpm_identity_part in
+            ''|*[!0-9]*) rpm_fail "private RPM record identity is invalid" ;;
+        esac
+    done
+    [ "$rpm_recorded_size" -gt 0 ] ||
+        rpm_fail "private RPM record contains an empty leaf"
+    [ "${#rpm_recorded_digest}" -eq 64 ] ||
+        rpm_fail "private RPM record digest has the wrong length"
+    case $rpm_recorded_digest in
+        *[!0-9a-f]*) rpm_fail "private RPM record digest is invalid" ;;
+    esac
 }
 
 rpm_directory_is_exact "$rpm_topdir/PUBLISH" &&
@@ -385,32 +587,38 @@ rpm_directory_is_exact "$rpm_topdir/PUBLISH" &&
 # Reject every known collision before publishing the first leaf.  The C helper
 # repeats this check atomically and owns final identity plus durability.  A
 # prior interrupted invocation gets the same exact recovery inventory.
-for rpm_private_file in "$rpm_topdir"/PUBLISH/*.rpm; do
-    rpm_name=${rpm_private_file##*/}
-    [ -s "$rpm_private_file" ] && [ -f "$rpm_private_file" ] &&
-    [ ! -L "$rpm_private_file" ] ||
-        rpm_fail "private RPM staging contains an unsafe output"
+rpm_record_count=0
+for rpm_record do
+    rpm_validate_record "$rpm_record"
     if [ -e "$rpm_root/build/dist/$rpm_name" ] ||
        [ -L "$rpm_root/build/dist/$rpm_name" ]; then
-        rpm_report_incomplete_set
-        rpm_fail "release output already exists: build/dist/$rpm_name"
+        rpm_failed_name=$rpm_name
+        rpm_report_incomplete_set "$@"
+        rpm_fail "release output already exists: build/dist/$rpm_failed_name"
     fi
+    rpm_record_count=$((rpm_record_count + 1))
 done
+[ "$rpm_record_count" -eq "$#" ] ||
+    rpm_fail "private RPM record validation count changed"
 
-for rpm_private_file in "$rpm_topdir"/PUBLISH/*.rpm; do
-    rpm_name=${rpm_private_file##*/}
-    if ! "$rpm_publisher" --internal-release-tree-v1 \
-            "$rpm_root" build dist "$rpm_name" -- \
-            /bin/cat "$rpm_private_file"; then
-        rpm_report_incomplete_set
-        rpm_fail "cannot publish RPM without replacement: $rpm_name"
-    fi
-    if [ ! -s "$rpm_root/build/dist/$rpm_name" ] ||
-       [ ! -f "$rpm_root/build/dist/$rpm_name" ] ||
-       [ -L "$rpm_root/build/dist/$rpm_name" ] ||
-       ! cmp -s "$rpm_private_file" "$rpm_root/build/dist/$rpm_name"; then
-        rpm_report_incomplete_set
-        rpm_fail "published RPM changed bytes: $rpm_name"
+for rpm_record do
+    rpm_validate_record "$rpm_record"
+    if ! (
+        exec 3<&-
+        exec 4<&-
+        exec 6<&-
+        exec 7<&-
+        exec 8<&-
+        exec 9<&-
+        "$rpm_publisher" --internal-release-tree-from-dir-v1 \
+            "$rpm_root" build dist "$rpm_name" 5 \
+            "$rpm_publish_device" "$rpm_publish_inode" \
+            "$rpm_recorded_device" "$rpm_recorded_inode" \
+            "$rpm_recorded_size" "$rpm_recorded_digest"
+    ); then
+        rpm_failed_name=$rpm_name
+        rpm_report_incomplete_set "$@"
+        rpm_fail "cannot publish RPM without replacement: $rpm_failed_name"
     fi
 done
 

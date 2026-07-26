@@ -1380,6 +1380,12 @@ check_manifest_contract()
     rpm_alpha_pid=
     rpm_beta_pid=
     rpm_retire_pid=
+    rpm_produced_swap_pid=
+    rpm_produced_swap_release=
+    rpm_subset_pid=
+    rpm_subset_release=
+    rpm_publish_swap_pid=
+    rpm_publish_swap_release=
     stop_background()
     {
         background_pid=$1
@@ -1416,6 +1422,18 @@ check_manifest_contract()
         stop_background "$rpm_alpha_pid"
         stop_background "$rpm_beta_pid"
         stop_background "$rpm_retire_pid"
+        if [ -n "$rpm_produced_swap_release" ]; then
+            : >"$rpm_produced_swap_release" 2>/dev/null || :
+        fi
+        if [ -n "$rpm_subset_release" ]; then
+            : >"$rpm_subset_release" 2>/dev/null || :
+        fi
+        if [ -n "$rpm_publish_swap_release" ]; then
+            : >"$rpm_publish_swap_release" 2>/dev/null || :
+        fi
+        stop_background "$rpm_produced_swap_pid"
+        stop_background "$rpm_subset_pid"
+        stop_background "$rpm_publish_swap_pid"
         if [ -n "$copy_status_release" ]; then
             : >"$copy_status_release" 2>/dev/null || :
         fi
@@ -4558,45 +4576,24 @@ EOF
         fail "cannot create hostile user RPM macro fixture"
     cp "$rpm_home/.rpmmacros" "$rpm_fixture/rpmmacros.expected" ||
         fail "cannot preserve hostile user RPM macros"
-    rpm_real_cmp=$(command -v cmp) || fail "cmp is unavailable for RPM fixture"
-    printf '%s\n' "$rpm_real_cmp" >"$rpm_shims/real-cmp" ||
-        fail "cannot record real cmp for RPM fixture"
-    cat >"$rpm_shims/cmp" <<'EOF'
-#!/bin/sh
-shim_dir=${0%/*}
-IFS= read -r real_cmp <"$shim_dir/real-cmp" || exit 96
-"$real_cmp" "$@"
-cmp_status=$?
-if [ "$cmp_status" -eq 0 ] &&
-   [ "${AR11_RPM_MODE-}" = symlink-srpms ] &&
-   [ "$#" -eq 3 ] && [ "$1" = -s ]; then
-    cmp_canonical=false
-    cmp_private=false
-    case $2 in
-        "$AR11_RPM_REPO_ROOT/build/dist/"*.tar.gz) cmp_canonical=true ;;
-    esac
-    case $3 in
-        "$AR11_RPM_HOME/.gitswitch-rpmbuild."??????/SOURCES/*.tar.gz)
-            cmp_private=true ;;
-    esac
-    if [ "$cmp_canonical" = true ] && [ "$cmp_private" = true ] &&
-       [ ! -e "$AR11_RPM_STATE/archive-swap.marker" ]; then
-        cp "$2" "$AR11_RPM_STATE/archive-swap.original" || exit 95
-        chmod 0600 "$2" || exit 94
-        printf '%s\n' 'canonical archive replaced after private-copy proof' \
-            >"$2" || exit 93
-        : >"$AR11_RPM_STATE/archive-swap.marker" || exit 92
-    fi
-fi
-exit "$cmp_status"
-EOF
-    chmod 0700 "$rpm_shims/cmp" ||
-        fail "cannot activate canonical-archive swap shim"
-
     git clone --quiet "$root" "$rpm_alpha_repo" ||
         fail "cannot clone alpha RPM fixture"
     git clone --quiet "$root" "$rpm_beta_repo" ||
         fail "cannot clone beta RPM fixture"
+    cp "$root/tools/release_rpm.sh" "$rpm_alpha_repo/tools/release_rpm.sh" ||
+        fail "cannot refresh alpha RPM helper from the working tree"
+    cp "$root/tools/release_rpm.sh" "$rpm_beta_repo/tools/release_rpm.sh" ||
+        fail "cannot refresh beta RPM helper from the working tree"
+    cp "$root/tools/release_publish.c" \
+        "$rpm_alpha_repo/tools/release_publish.c" ||
+        fail "cannot refresh alpha release publisher from the working tree"
+    cp "$root/tools/release_publish.c" \
+        "$rpm_beta_repo/tools/release_publish.c" ||
+        fail "cannot refresh beta release publisher from the working tree"
+    cp "$root/Makefile" "$rpm_alpha_repo/Makefile" ||
+        fail "cannot refresh alpha release-publisher build rules"
+    cp "$root/Makefile" "$rpm_beta_repo/Makefile" ||
+        fail "cannot refresh beta release-publisher build rules"
     for rpm_lane in alpha beta; do
         case $rpm_lane in
             alpha) rpm_lane_repo=$rpm_alpha_repo ;;
@@ -4608,7 +4605,9 @@ EOF
         printf '\nAR11_RPM_SOURCE: %s\n' "$rpm_lane" \
             >>"$rpm_lane_repo/README.md" ||
             fail "cannot mark $rpm_lane RPM source"
-        git -C "$rpm_lane_repo" add -- gitswitcher.spec README.md ||
+        git -C "$rpm_lane_repo" add -- \
+            Makefile gitswitcher.spec README.md \
+            tools/release_rpm.sh tools/release_publish.c ||
             fail "cannot stage $rpm_lane RPM fixture"
         git -C "$rpm_lane_repo" \
             -c user.name='AR-11 RPM fixture' \
@@ -4743,7 +4742,7 @@ esac
 [ "$rpm_specdir" = "$rpm_topdir/SPECS" ] &&
 [ "$rpm_srcrpmdir" = "$rpm_topdir/SRPMS" ] &&
 [ "$rpm_tmppath" = "$rpm_topdir/TMP" ] ||
-    rpm_die "subordinate RPM macros escaped the private _topdir"
+    rpm_die "rpmbuild macros escaped the pinned private namespace"
 [ "$rpm_filename_macro" = \
     '%{ARCH}/%{NAME}-%{VERSION}-%{RELEASE}.%{ARCH}.rpm' ] ||
     rpm_die "RPM output filename layout was not pinned"
@@ -4759,10 +4758,31 @@ for rpm_component in BUILD BUILDROOT PUBLISH RPMS SOURCES SPECS SRPMS TMP; do
         -print 2>/dev/null)" = "$rpm_component_path" ] ||
         rpm_die "private $rpm_component directory is not mode 0700"
 done
-[ "$rpm_spec" = "$rpm_topdir/SPECS/gitswitcher.spec" ] ||
-    rpm_die "-ba did not receive the private spec"
-[ -f "$rpm_spec" ] && [ ! -L "$rpm_spec" ] ||
-    rpm_die "private spec is not a regular file"
+[ "$rpm_spec" = /dev/fd/9 ] ||
+    rpm_die "-ba did not receive descriptor-pinned spec fd 9"
+[ -f "$rpm_spec" ] ||
+    rpm_die "descriptor-pinned spec is not a regular file"
+
+rpm_spec_fd=$rpm_spec
+rpm_named_spec=$rpm_topdir/SPECS/gitswitcher.spec
+if [ "$AR11_RPM_MODE" = descriptor-inputs ]; then
+    mv "$rpm_named_spec" "$AR11_RPM_STATE/descriptor-inputs.spec.original" ||
+        rpm_die "cannot move the descriptor-pinned spec pathname"
+    printf '%s\n' '# substituted private spec pathname' >"$rpm_named_spec" ||
+        rpm_die "cannot install substituted private spec pathname"
+    : >"$AR11_RPM_STATE/descriptor-inputs.spec-swapped" ||
+        rpm_die "cannot record private spec substitution"
+fi
+
+# Plain FreeBSD fdescfs duplicates fd 9 with a shared offset. Consume that
+# descriptor exactly once, after the causal pathname substitution above, then
+# perform every fixture read against a private regular snapshot.
+rpm_spec=$AR11_RPM_STATE/.spec-snapshot.$AR11_RPM_MODE.$$
+(umask 077 && /bin/cat "$rpm_spec_fd" >"$rpm_spec") ||
+    rpm_die "cannot snapshot descriptor-pinned spec"
+chmod 0600 "$rpm_spec" || rpm_die "cannot secure private spec snapshot"
+[ -s "$rpm_spec" ] && [ -f "$rpm_spec" ] && [ ! -L "$rpm_spec" ] ||
+    rpm_die "private spec snapshot is not a nonempty regular file"
 
 rpm_lane=$(sed -n 's/^# AR11_RPM_LANE: //p' "$rpm_spec" | sed -n '1p')
 case $rpm_lane in
@@ -4776,11 +4796,24 @@ rpm_version=$(sed -n 's/^Version:[[:space:]]*//p' "$rpm_spec" | sed -n '1p')
 rpm_source=$rpm_topdir/SOURCES/$rpm_package-$rpm_version.tar.gz
 rpm_canonical_source=$AR11_RPM_REPO_ROOT/build/dist/$rpm_package-$rpm_version.tar.gz
 [ -f "$rpm_source" ] && [ ! -L "$rpm_source" ] ||
-    rpm_die "private Source0 is not a regular file"
+    rpm_die "descriptor-relative Source0 is not a regular file"
 rpm_source_oracle=$rpm_canonical_source
-if [ "$AR11_RPM_MODE" = symlink-srpms ] &&
-   [ -f "$AR11_RPM_STATE/archive-swap.marker" ]; then
-    rpm_source_oracle=$AR11_RPM_STATE/archive-swap.original
+case $AR11_RPM_MODE in
+    descriptor-inputs|symlink-srpms)
+        cp "$rpm_canonical_source" \
+            "$AR11_RPM_STATE/$AR11_RPM_MODE.archive-swap.original" ||
+            rpm_die "cannot preserve the descriptor-pinned canonical archive"
+        chmod 0600 "$rpm_canonical_source" ||
+            rpm_die "cannot make the canonical archive pathname mutable"
+        printf '%s\n' 'canonical archive pathname substituted after fd pin' \
+            >"$rpm_canonical_source" ||
+            rpm_die "cannot substitute the canonical archive pathname"
+        : >"$AR11_RPM_STATE/$AR11_RPM_MODE.archive-swap.marker" ||
+            rpm_die "cannot record canonical archive substitution"
+        rpm_source_oracle=$AR11_RPM_STATE/$AR11_RPM_MODE.archive-swap.original
+        ;;
+esac
+if [ "$rpm_source_oracle" != "$rpm_canonical_source" ]; then
     if cmp -s "$rpm_canonical_source" "$rpm_source"; then
         rpm_die "canonical archive swap did not separate the private source"
     fi
@@ -4802,15 +4835,29 @@ cmp -s "$rpm_archived_spec" "$rpm_spec" ||
 grep -Fx "AR11_RPM_SOURCE: $rpm_lane" "$rpm_archived_readme" >/dev/null ||
     rpm_die "private Source0 belongs to the other build"
 rm -f "$rpm_archived_spec" "$rpm_archived_readme"
-if [ "$AR11_RPM_MODE" = symlink-srpms ]; then
-    cp "$AR11_RPM_STATE/archive-swap.original" "$rpm_canonical_source" ||
+case $AR11_RPM_MODE in
+    descriptor-inputs|symlink-srpms)
+    cp "$AR11_RPM_STATE/$AR11_RPM_MODE.archive-swap.original" \
+        "$rpm_canonical_source" ||
         rpm_die "cannot restore canonical archive after private extraction"
     chmod 0444 "$rpm_canonical_source" ||
         rpm_die "cannot restore canonical archive mode"
-    cmp -s "$AR11_RPM_STATE/archive-swap.original" "$rpm_canonical_source" ||
+    cmp -s "$AR11_RPM_STATE/$AR11_RPM_MODE.archive-swap.original" \
+        "$rpm_canonical_source" ||
         rpm_die "restored canonical archive changed bytes"
-    : >"$AR11_RPM_STATE/archive-swap.restored" ||
+    : >"$AR11_RPM_STATE/$AR11_RPM_MODE.archive-swap.restored" ||
         rpm_die "cannot record private archive extraction proof"
+    ;;
+esac
+if [ "$AR11_RPM_MODE" = descriptor-inputs ]; then
+    rm -f "$rpm_named_spec" ||
+        rpm_die "cannot remove substituted private spec pathname"
+    mv "$AR11_RPM_STATE/descriptor-inputs.spec.original" "$rpm_named_spec" ||
+        rpm_die "cannot restore the descriptor-pinned spec pathname"
+    cmp -s "$rpm_spec" "$rpm_named_spec" ||
+        rpm_die "restored spec pathname differs from pinned spec"
+    : >"$AR11_RPM_STATE/descriptor-inputs.spec-restored" ||
+        rpm_die "cannot record private spec restoration"
 fi
 
 rpm_source_hash=$(git hash-object "$rpm_source") ||
@@ -4825,6 +4872,7 @@ printf '%s\n%s\n%s\n%s\n%s\n' \
     rpm_die "cannot record private RPM inputs"
 mv "$rpm_report_tmp" "$rpm_report" ||
     rpm_die "cannot publish private RPM input report"
+rm -f "$rpm_spec" || rpm_die "cannot retire private spec snapshot"
 
 rpm_wait_for_pair()
 {
@@ -4862,6 +4910,18 @@ if [ "$AR11_RPM_MODE" = concurrent ]; then
     rpm_wait_for_pair checked
 fi
 
+if [ "$AR11_RPM_MODE" = descriptor-dirs ]; then
+    for rpm_swapped_component in RPMS SRPMS PUBLISH; do
+        mv "$rpm_topdir/$rpm_swapped_component" \
+            "$AR11_RPM_STATE/descriptor-dirs.$rpm_swapped_component.original" ||
+            rpm_die "cannot move pinned $rpm_swapped_component directory"
+        mkdir -m 0700 "$rpm_topdir/$rpm_swapped_component" ||
+            rpm_die "cannot install replacement $rpm_swapped_component directory"
+    done
+    : >"$AR11_RPM_STATE/descriptor-dirs.swapped" ||
+        rpm_die "cannot record private directory substitutions"
+fi
+
 rpm_binary_dir=$rpm_topdir/RPMS/noarch
 mkdir -m 0700 "$rpm_binary_dir" || rpm_die "cannot create binary RPM directory"
 rpm_binary_name=$rpm_package-$rpm_version-1.noarch.rpm
@@ -4872,6 +4932,17 @@ printf 'kind=binary\nlane=%s\nmode=%s\nsource=%s\nspec=%s\n' \
 cp "$rpm_binary" \
     "$AR11_RPM_STATE/$AR11_RPM_MODE.$rpm_lane.binary.expected" ||
     rpm_die "cannot preserve expected binary RPM"
+if [ "$AR11_RPM_MODE" = binary-subset ]; then
+    rpm_binary_extra_name=$rpm_package-extra-$rpm_version-1.noarch.rpm
+    rpm_binary_extra=$rpm_binary_dir/$rpm_binary_extra_name
+    printf 'kind=binary-extra\nlane=%s\nmode=%s\nsource=%s\nspec=%s\n' \
+        "$rpm_lane" "$AR11_RPM_MODE" "$rpm_source_hash" "$rpm_spec_hash" \
+        >"$rpm_binary_extra" ||
+        rpm_die "cannot create second causal binary RPM"
+    cp "$rpm_binary_extra" \
+        "$AR11_RPM_STATE/$AR11_RPM_MODE.$rpm_lane.binary-extra.expected" ||
+        rpm_die "cannot preserve expected second binary RPM"
+fi
 
 if [ "$AR11_RPM_MODE" = symlink-srpms ]; then
     rpm_escape_dir=$AR11_RPM_STATE/symlink-srpms.$rpm_lane.escape
@@ -4889,8 +4960,14 @@ printf 'kind=source\nlane=%s\nmode=%s\nsource=%s\nspec=%s\n' \
 cp "$rpm_built_source" \
     "$AR11_RPM_STATE/$AR11_RPM_MODE.$rpm_lane.source.expected" ||
     rpm_die "cannot preserve expected source RPM"
-printf '%s\n' 'must not be published' >"$rpm_topdir/RPMS/ignored.txt" ||
-    rpm_die "cannot create non-RPM output decoy"
+if [ "$AR11_RPM_MODE" = source0-swap ]; then
+    mv "$rpm_source" "$AR11_RPM_STATE/source0-swap.original" ||
+        rpm_die "cannot move the pinned Source0 pathname"
+    printf '%s\n' 'persistent substituted Source0 pathname' >"$rpm_source" ||
+        rpm_die "cannot install substituted Source0 pathname"
+    : >"$AR11_RPM_STATE/source0-swap.marker" ||
+        rpm_die "cannot record persistent Source0 substitution"
+fi
 EOF
     chmod 0700 "$rpm_shims/rpmbuild" ||
         fail "cannot activate private-rpmbuild shim"
@@ -5101,6 +5178,22 @@ EOF
     [ -f "$rpm_beta_named_publisher" ] &&
     [ ! -L "$rpm_beta_named_publisher" ] ||
         fail "beta RPM fixture lacks its named-test release publisher"
+    rpm_beta_race_publisher=$rpm_shims/race-publisher
+    cat >"$rpm_beta_race_publisher" <<'EOF'
+#!/bin/sh
+set -u
+: "${AR11_RPM_NAMED_PUBLISHER:?}"
+if [ "${1-}" = --internal-release-tree-from-dir-v1 ] &&
+   [ -n "${GITSWITCH_RELEASE_TEST_RELEASE_SOURCE_MARKER-}" ] &&
+   [ -e "$GITSWITCH_RELEASE_TEST_RELEASE_SOURCE_MARKER" ] &&
+   [ -e "${GITSWITCH_RELEASE_TEST_RELEASE_SOURCE_RELEASE-}" ]; then
+    unset GITSWITCH_RELEASE_TEST_RELEASE_SOURCE_MARKER
+    unset GITSWITCH_RELEASE_TEST_RELEASE_SOURCE_RELEASE
+fi
+exec "$AR11_RPM_NAMED_PUBLISHER" "$@"
+EOF
+    chmod 0700 "$rpm_beta_race_publisher" ||
+        fail "cannot activate RPM C-helper race wrapper"
     rpm_helper=$rpm_beta_repo/tools/release_rpm.sh
     [ -f "$rpm_helper" ] && [ ! -L "$rpm_helper" ] ||
         fail "RPM release helper is unavailable to direct fixtures"
@@ -5108,6 +5201,393 @@ EOF
     rpm_fixture_dist_root=gitswitcher-$rpm_fixture_version
     rpm_binary_name=gitswitcher-$rpm_fixture_version-1.noarch.rpm
     rpm_source_name=gitswitcher-$rpm_fixture_version-1.src.rpm
+
+    # AR-14 M27: these pathname spellings are the vulnerable reopen sites.
+    # Keep mutation-visible structural guards beside the causal shims so a
+    # later refactor cannot silently restore pathname consumption while still
+    # satisfying the happy-path package assertions.
+    if grep -F "cp \"\$rpm_archive\"" "$rpm_helper" >/dev/null ||
+       grep -F "cmp -s \"\$rpm_archive\"" "$rpm_helper" >/dev/null; then
+        fail "RPM helper restored canonical archive pathname consumption"
+    fi
+    grep -F -- "--define \"_rpmdir \$rpm_topdir/RPMS\"" \
+        "$rpm_helper" >/dev/null &&
+    grep -F -- "--define \"_srcrpmdir \$rpm_topdir/SRPMS\"" \
+        "$rpm_helper" >/dev/null &&
+    grep -F -- "--define \"_sourcedir \$rpm_topdir/SOURCES\"" \
+        "$rpm_helper" >/dev/null &&
+    grep -F -- '-ba /dev/fd/9' "$rpm_helper" >/dev/null ||
+        fail "RPM helper lost its portable rpmbuild/spec ABI"
+    if grep -F -- "-ba \"\$rpm_spec\"" "$rpm_helper" >/dev/null; then
+        fail "RPM helper restored private spec pathname consumption"
+    fi
+    grep -F -- "--internal-rpm-stage-v1 3 \"\$rpm_rpms_device\"" \
+        "$rpm_helper" >/dev/null &&
+    grep -F "4 \"\$rpm_srpms_device\" \"\$rpm_srpms_inode\"" \
+        "$rpm_helper" >/dev/null &&
+    grep -F "5 \"\$rpm_publish_device\" \"\$rpm_publish_inode\"" \
+        "$rpm_helper" >/dev/null &&
+    grep -F -- '--internal-release-tree-from-dir-v1' \
+        "$rpm_helper" >/dev/null ||
+        fail "RPM helper lost descriptor-relative C staging/publication"
+    if grep -F "/bin/cat \"\$rpm_private_file\"" \
+        "$rpm_helper" >/dev/null; then
+        fail "RPM helper restored staged RPM pathname consumption"
+    fi
+    if grep -E "/dev/fd/[345]/|\"\\\\\$rpm_topdir\"/(RPMS|SRPMS|PUBLISH)/?\\\\\\*" \
+        "$rpm_helper" >/dev/null; then
+        fail "RPM helper restored descriptor-child or glob enumeration"
+    fi
+
+    # Replace and restore both canonical input pathnames after the helper has
+    # pinned archive/Source0 through fd 6/fd 8 and passed the spec to rpmbuild
+    # through fd 9. The package retains the original committed archive/spec.
+    rm -f "$rpm_beta_repo/build/dist/$rpm_binary_name" \
+        "$rpm_beta_repo/build/dist/$rpm_source_name" ||
+        fail "cannot reset descriptor-input RPM outputs"
+    rpm_descriptor_input_out=$rpm_fixture/descriptor-inputs.out
+    HOME="$rpm_home" PATH="$rpm_shims:$PATH" \
+    AR11_RPM_STATE="$rpm_state" AR11_RPM_MODE=descriptor-inputs \
+    AR11_RPM_HOME="$rpm_home" AR11_RPM_REPO_ROOT="$rpm_beta_root" \
+        sh "$rpm_helper" "$rpm_beta_root" "$rpm_beta_archive" \
+        "$rpm_archive_name" "$rpm_fixture_dist_root" gitswitcher \
+        "$rpm_beta_publisher" >"$rpm_descriptor_input_out" 2>&1 || {
+        sed -n '1,240p' "$rpm_descriptor_input_out" >&2
+        fail "descriptor-pinned RPM input substitution fixture failed"
+    }
+    for rpm_descriptor_marker in \
+        descriptor-inputs.archive-swap.marker \
+        descriptor-inputs.archive-swap.restored \
+        descriptor-inputs.spec-swapped \
+        descriptor-inputs.spec-restored; do
+        [ -f "$rpm_state/$rpm_descriptor_marker" ] ||
+            fail "RPM input substitution missed $rpm_descriptor_marker"
+    done
+    cmp -s "$rpm_state/descriptor-inputs.archive-swap.original" \
+        "$rpm_beta_archive" ||
+        fail "descriptor-input fixture did not restore canonical archive bytes"
+    rpm_assert_publication "$rpm_beta_repo" beta descriptor-inputs
+    rpm_descriptor_input_topdir=$(sed -n '1p' \
+        "$rpm_state/descriptor-inputs.beta.observed")
+    [ -n "$rpm_descriptor_input_topdir" ] ||
+        fail "descriptor-input fixture omitted its private topdir"
+    rpm_assert_private_retirement "$rpm_descriptor_input_topdir" \
+        "$rpm_descriptor_input_out"
+    rpm_assert_no_private_residue "$rpm_beta_repo"
+
+    # A persistent Source0 replacement is detectable even though stock
+    # rpmbuild necessarily opens that mandatory named leaf. This is distinct
+    # from the documented colluding replace/read/restore residual: the helper
+    # must re-prove the original Source0 generation after rpmbuild returns.
+    rm -f "$rpm_beta_repo/build/dist/$rpm_binary_name" \
+        "$rpm_beta_repo/build/dist/$rpm_source_name" ||
+        fail "cannot reset persistent Source0 substitution outputs"
+    rpm_source0_swap_out=$rpm_fixture/source0-swap.out
+    if HOME="$rpm_home" PATH="$rpm_shims:$PATH" \
+        AR11_RPM_STATE="$rpm_state" AR11_RPM_MODE=source0-swap \
+        AR11_RPM_HOME="$rpm_home" AR11_RPM_REPO_ROOT="$rpm_beta_root" \
+        sh "$rpm_helper" "$rpm_beta_root" "$rpm_beta_archive" \
+        "$rpm_archive_name" "$rpm_fixture_dist_root" gitswitcher \
+        "$rpm_beta_publisher" >"$rpm_source0_swap_out" 2>&1; then
+        fail "RPM helper accepted a persistent Source0 replacement"
+    fi
+    [ -f "$rpm_state/source0-swap.marker" ] ||
+        fail "persistent Source0 substitution did not reach rpmbuild"
+    cmp -s "$rpm_state/source0-swap.original" "$rpm_beta_archive" ||
+        fail "persistent Source0 fixture did not preserve original bytes"
+    [ ! -e "$rpm_beta_repo/build/dist/$rpm_binary_name" ] &&
+    [ ! -L "$rpm_beta_repo/build/dist/$rpm_binary_name" ] &&
+    [ ! -e "$rpm_beta_repo/build/dist/$rpm_source_name" ] &&
+    [ ! -L "$rpm_beta_repo/build/dist/$rpm_source_name" ] ||
+        fail "persistent Source0 replacement exposed a public RPM"
+    rpm_source0_swap_topdir=$(sed -n '1p' \
+        "$rpm_state/source0-swap.beta.observed")
+    [ -n "$rpm_source0_swap_topdir" ] ||
+        fail "persistent Source0 substitution omitted its private topdir"
+    rpm_assert_private_retirement "$rpm_source0_swap_topdir" \
+        "$rpm_source0_swap_out"
+    rpm_assert_no_private_residue "$rpm_beta_repo"
+
+    # Pause the C staging helper after it pins and hashes the selected produced
+    # leaf. Replacing the descriptor-relative pathname at that exact boundary
+    # may preserve the already-open generation or fail closed; attacker bytes
+    # must never reach PUBLISH or build/dist.
+    for rpm_produced_swap_mode in binary-leaf-swap source-leaf-swap; do
+        rpm_produced_swap_pid=
+        rpm_produced_swap_release=
+        rm -f "$rpm_beta_repo/build/dist/$rpm_binary_name" \
+            "$rpm_beta_repo/build/dist/$rpm_source_name" ||
+            fail "cannot reset $rpm_produced_swap_mode outputs"
+        rpm_produced_swap_out=$rpm_fixture/$rpm_produced_swap_mode.out
+        rpm_produced_swap_marker=$rpm_state/$rpm_produced_swap_mode.hook
+        rpm_produced_swap_release=$rpm_state/$rpm_produced_swap_mode.release
+        case $rpm_produced_swap_mode in
+            binary-leaf-swap) rpm_produced_swap_name=$rpm_binary_name ;;
+            source-leaf-swap) rpm_produced_swap_name=$rpm_source_name ;;
+        esac
+        HOME="$rpm_home" PATH="$rpm_shims:$PATH" \
+            AR11_RPM_STATE="$rpm_state" \
+            AR11_RPM_MODE="$rpm_produced_swap_mode" \
+            AR11_RPM_HOME="$rpm_home" AR11_RPM_REPO_ROOT="$rpm_beta_root" \
+            AR11_RPM_NAMED_PUBLISHER="$rpm_beta_named_publisher" \
+            GITSWITCH_RELEASE_TEST_RPM_STAGE_MARKER="$rpm_produced_swap_marker" \
+            GITSWITCH_RELEASE_TEST_RPM_STAGE_RELEASE="$rpm_produced_swap_release" \
+            GITSWITCH_RELEASE_TEST_RPM_STAGE_TARGET="$rpm_produced_swap_name" \
+            sh "$rpm_helper" "$rpm_beta_root" "$rpm_beta_archive" \
+            "$rpm_archive_name" "$rpm_fixture_dist_root" gitswitcher \
+            "$rpm_beta_race_publisher" >"$rpm_produced_swap_out" 2>&1 &
+        rpm_produced_swap_pid=$!
+        rpm_produced_swap_wait=0
+        while [ ! -e "$rpm_produced_swap_marker" ] &&
+              kill -0 "$rpm_produced_swap_pid" 2>/dev/null &&
+              [ "$rpm_produced_swap_wait" -lt 100 ]; do
+            sleep 0.1
+            rpm_produced_swap_wait=$((rpm_produced_swap_wait + 1))
+        done
+        [ -f "$rpm_produced_swap_marker" ] || {
+            sed -n '1,240p' "$rpm_produced_swap_out" >&2
+            fail "$rpm_produced_swap_mode missed its digest-proof boundary"
+        }
+        rpm_produced_swap_topdir=$(sed -n '1p' \
+            "$rpm_state/$rpm_produced_swap_mode.beta.observed")
+        [ -n "$rpm_produced_swap_topdir" ] ||
+            fail "$rpm_produced_swap_mode omitted its private topdir"
+        case $rpm_produced_swap_mode in
+            binary-leaf-swap)
+                rpm_produced_swap_expected=$rpm_state/$rpm_produced_swap_mode.beta.binary.expected
+                rpm_produced_swap_path=$rpm_produced_swap_topdir/RPMS/noarch/$rpm_produced_swap_name
+                ;;
+            source-leaf-swap)
+                rpm_produced_swap_expected=$rpm_state/$rpm_produced_swap_mode.beta.source.expected
+                rpm_produced_swap_path=$rpm_produced_swap_topdir/SRPMS/$rpm_produced_swap_name
+                ;;
+        esac
+        mv "$rpm_produced_swap_path" \
+            "$rpm_state/$rpm_produced_swap_mode.$rpm_produced_swap_name.original" ||
+            fail "cannot move $rpm_produced_swap_mode pinned generation"
+        printf '%s\n' 'substituted produced RPM pathname' \
+            >"$rpm_produced_swap_path" ||
+            fail "cannot install $rpm_produced_swap_mode replacement"
+        : >"$rpm_produced_swap_release" ||
+            fail "cannot release $rpm_produced_swap_mode C helper"
+        if wait "$rpm_produced_swap_pid"; then
+            rpm_produced_swap_status=0
+        else
+            rpm_produced_swap_status=$?
+        fi
+        rpm_produced_swap_pid=
+        rpm_produced_swap_release=
+        cmp -s \
+            "$rpm_state/$rpm_produced_swap_mode.$rpm_produced_swap_name.original" \
+            "$rpm_produced_swap_expected" ||
+            fail "$rpm_produced_swap_mode changed the pinned output bytes"
+        if [ "$rpm_produced_swap_status" -eq 0 ]; then
+            rpm_assert_publication "$rpm_beta_repo" beta \
+                "$rpm_produced_swap_mode"
+        else
+            [ ! -e "$rpm_beta_repo/build/dist/$rpm_binary_name" ] &&
+            [ ! -L "$rpm_beta_repo/build/dist/$rpm_binary_name" ] &&
+            [ ! -e "$rpm_beta_repo/build/dist/$rpm_source_name" ] &&
+            [ ! -L "$rpm_beta_repo/build/dist/$rpm_source_name" ] ||
+                fail "$rpm_produced_swap_mode exposed a public RPM"
+        fi
+        rpm_assert_private_retirement "$rpm_produced_swap_topdir" \
+            "$rpm_produced_swap_out"
+        rpm_assert_no_private_residue "$rpm_beta_repo"
+    done
+
+    # The C stager must enumerate the already-open RPMS generation, not a
+    # replacement pathname exposing only one of two valid binary outputs.
+    rpm_binary_extra_name=gitswitcher-extra-$rpm_fixture_version-1.noarch.rpm
+    rm -f "$rpm_beta_repo/build/dist/$rpm_binary_name" \
+        "$rpm_beta_repo/build/dist/$rpm_binary_extra_name" \
+        "$rpm_beta_repo/build/dist/$rpm_source_name" ||
+        fail "cannot reset complete-enumeration RPM outputs"
+    rpm_subset_out=$rpm_fixture/binary-subset.out
+    rpm_subset_marker=$rpm_state/binary-subset.hook
+    rpm_subset_pid=
+    rpm_subset_release=
+    rpm_subset_release=$rpm_state/binary-subset.release
+    HOME="$rpm_home" PATH="$rpm_shims:$PATH" \
+        AR11_RPM_STATE="$rpm_state" AR11_RPM_MODE=binary-subset \
+        AR11_RPM_HOME="$rpm_home" AR11_RPM_REPO_ROOT="$rpm_beta_root" \
+        AR11_RPM_NAMED_PUBLISHER="$rpm_beta_named_publisher" \
+        GITSWITCH_RELEASE_TEST_RPM_STAGE_MARKER="$rpm_subset_marker" \
+        GITSWITCH_RELEASE_TEST_RPM_STAGE_RELEASE="$rpm_subset_release" \
+        GITSWITCH_RELEASE_TEST_RPM_STAGE_TARGET="$rpm_binary_name" \
+        sh "$rpm_helper" "$rpm_beta_root" "$rpm_beta_archive" \
+        "$rpm_archive_name" "$rpm_fixture_dist_root" gitswitcher \
+        "$rpm_beta_race_publisher" >"$rpm_subset_out" 2>&1 &
+    rpm_subset_pid=$!
+    rpm_subset_wait=0
+    while [ ! -e "$rpm_subset_marker" ] &&
+          kill -0 "$rpm_subset_pid" 2>/dev/null &&
+          [ "$rpm_subset_wait" -lt 100 ]; do
+        sleep 0.1
+        rpm_subset_wait=$((rpm_subset_wait + 1))
+    done
+    [ -f "$rpm_subset_marker" ] || {
+        sed -n '1,240p' "$rpm_subset_out" >&2
+        fail "complete-enumeration fixture missed its pinned-leaf boundary"
+    }
+    rpm_subset_topdir=$(sed -n '1p' \
+        "$rpm_state/binary-subset.beta.observed")
+    [ -n "$rpm_subset_topdir" ] ||
+        fail "complete-enumeration fixture omitted its private topdir"
+    mv "$rpm_subset_topdir/RPMS" "$rpm_state/binary-subset.RPMS.original" ||
+        fail "cannot move the enumerated RPMS generation"
+    mkdir -m 0700 "$rpm_subset_topdir/RPMS" \
+        "$rpm_subset_topdir/RPMS/noarch" ||
+        fail "cannot install subset RPMS replacement"
+    cp "$rpm_state/binary-subset.RPMS.original/noarch/$rpm_binary_name" \
+        "$rpm_subset_topdir/RPMS/noarch/$rpm_binary_name" ||
+        fail "cannot seed one-leaf RPMS replacement"
+    : >"$rpm_subset_release" ||
+        fail "cannot release complete-enumeration C helper"
+    if wait "$rpm_subset_pid"; then
+        rpm_subset_status=0
+    else
+        rpm_subset_status=$?
+    fi
+    rpm_subset_pid=
+    rpm_subset_release=
+    if [ "$rpm_subset_status" -eq 0 ]; then
+        set -- "$rpm_beta_repo/build/dist"/*.rpm
+        [ "$#" -eq 3 ] ||
+            fail "descriptor-relative enumeration published a package subset"
+        cmp -s "$rpm_beta_repo/build/dist/$rpm_binary_name" \
+            "$rpm_state/binary-subset.beta.binary.expected" &&
+        cmp -s "$rpm_beta_repo/build/dist/$rpm_binary_extra_name" \
+            "$rpm_state/binary-subset.beta.binary-extra.expected" &&
+        cmp -s "$rpm_beta_repo/build/dist/$rpm_source_name" \
+            "$rpm_state/binary-subset.beta.source.expected" ||
+            fail "descriptor-relative enumeration published wrong package bytes"
+    else
+        grep -F 'cannot validate and stage the complete RPM output set' \
+            "$rpm_subset_out" >/dev/null ||
+            fail "subset race did not fail at complete-set staging"
+        if grep -F 'RPM set publication is incomplete' \
+            "$rpm_subset_out" >/dev/null; then
+            fail "failed complete-set staging leaked partial records"
+        fi
+        [ ! -e "$rpm_beta_repo/build/dist/$rpm_binary_name" ] &&
+        [ ! -L "$rpm_beta_repo/build/dist/$rpm_binary_name" ] &&
+        [ ! -e "$rpm_beta_repo/build/dist/$rpm_binary_extra_name" ] &&
+        [ ! -L "$rpm_beta_repo/build/dist/$rpm_binary_extra_name" ] &&
+        [ ! -e "$rpm_beta_repo/build/dist/$rpm_source_name" ] &&
+        [ ! -L "$rpm_beta_repo/build/dist/$rpm_source_name" ] ||
+            fail "failed-closed enumeration exposed a package subset"
+    fi
+    rm -f "$rpm_beta_repo/build/dist/$rpm_binary_name" \
+        "$rpm_beta_repo/build/dist/$rpm_binary_extra_name" \
+        "$rpm_beta_repo/build/dist/$rpm_source_name" ||
+        fail "cannot reset complete-enumeration publications"
+    rpm_assert_private_retirement "$rpm_subset_topdir" "$rpm_subset_out"
+    rpm_assert_no_private_residue "$rpm_beta_repo"
+
+    # Pause publication after the C helper proves the staged source identity
+    # and digest. It must publish from that open generation, not reopen the
+    # substituted PUBLISH pathname.
+    rm -f "$rpm_beta_repo/build/dist/$rpm_binary_name" \
+        "$rpm_beta_repo/build/dist/$rpm_source_name" ||
+        fail "cannot reset staged-leaf substitution outputs"
+    rpm_publish_swap_out=$rpm_fixture/publish-leaf-swap.out
+    rpm_publish_swap_marker=$rpm_state/publish-leaf-swap.hook
+    rpm_publish_swap_pid=
+    rpm_publish_swap_release=
+    rpm_publish_swap_release=$rpm_state/publish-leaf-swap.release
+    HOME="$rpm_home" PATH="$rpm_shims:$PATH" \
+        AR11_RPM_STATE="$rpm_state" AR11_RPM_MODE=publish-leaf-swap \
+        AR11_RPM_HOME="$rpm_home" AR11_RPM_REPO_ROOT="$rpm_beta_root" \
+        AR11_RPM_NAMED_PUBLISHER="$rpm_beta_named_publisher" \
+        GITSWITCH_RELEASE_TEST_RELEASE_SOURCE_MARKER="$rpm_publish_swap_marker" \
+        GITSWITCH_RELEASE_TEST_RELEASE_SOURCE_RELEASE="$rpm_publish_swap_release" \
+        sh "$rpm_helper" "$rpm_beta_root" "$rpm_beta_archive" \
+        "$rpm_archive_name" "$rpm_fixture_dist_root" gitswitcher \
+        "$rpm_beta_race_publisher" >"$rpm_publish_swap_out" 2>&1 &
+    rpm_publish_swap_pid=$!
+    rpm_publish_swap_wait=0
+    while [ ! -e "$rpm_publish_swap_marker" ] &&
+          kill -0 "$rpm_publish_swap_pid" 2>/dev/null &&
+          [ "$rpm_publish_swap_wait" -lt 100 ]; do
+        sleep 0.1
+        rpm_publish_swap_wait=$((rpm_publish_swap_wait + 1))
+    done
+    [ -f "$rpm_publish_swap_marker" ] || {
+        sed -n '1,240p' "$rpm_publish_swap_out" >&2
+        fail "staged-leaf substitution missed its digest-proof boundary"
+    }
+    rpm_publish_swap_topdir=$(sed -n '1p' \
+        "$rpm_state/publish-leaf-swap.beta.observed")
+    [ -n "$rpm_publish_swap_topdir" ] ||
+        fail "staged-leaf substitution omitted its private topdir"
+    rpm_publish_swap_path=$rpm_publish_swap_topdir/PUBLISH/$rpm_binary_name
+    mv "$rpm_publish_swap_path" \
+        "$rpm_state/publish-leaf-swap.$rpm_binary_name.original" ||
+        fail "cannot move descriptor-pinned staged RPM"
+    printf '%s\n' 'substituted staged RPM pathname' >"$rpm_publish_swap_path" ||
+        fail "cannot install substituted staged RPM pathname"
+    : >"$rpm_publish_swap_release" ||
+        fail "cannot release staged-leaf publication helper"
+    if wait "$rpm_publish_swap_pid"; then
+        rpm_publish_swap_status=0
+    else
+        rpm_publish_swap_status=$?
+    fi
+    rpm_publish_swap_pid=
+    rpm_publish_swap_release=
+    if [ "$rpm_publish_swap_status" -eq 0 ]; then
+        rpm_assert_publication "$rpm_beta_repo" beta publish-leaf-swap
+    else
+        [ ! -e "$rpm_beta_repo/build/dist/$rpm_binary_name" ] &&
+        [ ! -L "$rpm_beta_repo/build/dist/$rpm_binary_name" ] &&
+        [ ! -e "$rpm_beta_repo/build/dist/$rpm_source_name" ] &&
+        [ ! -L "$rpm_beta_repo/build/dist/$rpm_source_name" ] ||
+            fail "failed-closed staged substitution exposed a public RPM"
+    fi
+    rpm_assert_private_retirement "$rpm_publish_swap_topdir" \
+        "$rpm_publish_swap_out"
+    rpm_assert_no_private_residue "$rpm_beta_repo"
+
+    # Replace all three output-directory pathnames during rpmbuild. Stock
+    # rpmbuild may write into those hostile generations, but the helper's
+    # post-build identity fence must reject them before the descriptor-relative
+    # C staging helper can inspect or publish any package.
+    rm -f "$rpm_beta_repo/build/dist/$rpm_binary_name" \
+        "$rpm_beta_repo/build/dist/$rpm_source_name" ||
+        fail "cannot reset descriptor-directory substitution outputs"
+    rpm_descriptor_dirs_out=$rpm_fixture/descriptor-dirs.out
+    if HOME="$rpm_home" PATH="$rpm_shims:$PATH" \
+        AR11_RPM_STATE="$rpm_state" AR11_RPM_MODE=descriptor-dirs \
+        AR11_RPM_HOME="$rpm_home" AR11_RPM_REPO_ROOT="$rpm_beta_root" \
+        sh "$rpm_helper" "$rpm_beta_root" "$rpm_beta_archive" \
+        "$rpm_archive_name" "$rpm_fixture_dist_root" gitswitcher \
+        "$rpm_beta_publisher" >"$rpm_descriptor_dirs_out" 2>&1; then
+        rpm_descriptor_dirs_status=0
+    else
+        rpm_descriptor_dirs_status=$?
+    fi
+    [ -f "$rpm_state/descriptor-dirs.swapped" ] ||
+        fail "descriptor-directory substitution did not reach rpmbuild"
+    [ -z "$(find "$rpm_state/descriptor-dirs.RPMS.original" \
+        -mindepth 1 -print -quit)" ] &&
+    [ -z "$(find "$rpm_state/descriptor-dirs.SRPMS.original" \
+        -mindepth 1 -print -quit)" ] ||
+        fail "rpmbuild unexpectedly wrote through the moved directory generation"
+    rpm_descriptor_dirs_topdir=$(sed -n '1p' \
+        "$rpm_state/descriptor-dirs.beta.observed")
+    [ -n "$rpm_descriptor_dirs_topdir" ] ||
+        fail "descriptor-directory substitution omitted its private topdir"
+    [ "$rpm_descriptor_dirs_status" -ne 0 ] ||
+        fail "RPM helper accepted replaced output-directory pathnames"
+    [ ! -e "$rpm_beta_repo/build/dist/$rpm_binary_name" ] &&
+    [ ! -L "$rpm_beta_repo/build/dist/$rpm_binary_name" ] &&
+    [ ! -e "$rpm_beta_repo/build/dist/$rpm_source_name" ] &&
+    [ ! -L "$rpm_beta_repo/build/dist/$rpm_source_name" ] ||
+        fail "rejected directory substitution exposed an RPM"
+    rpm_assert_private_retirement "$rpm_descriptor_dirs_topdir" \
+        "$rpm_descriptor_dirs_out"
+    rpm_assert_no_private_residue "$rpm_beta_repo"
 
     # A wrong generation must not begin a partial walk. This fixture also
     # contains an external symlink: FreeBSD 14.4 can bind its removal to an
@@ -5440,16 +5920,18 @@ EOF
             sed -n '1,200p' "$rpm_incomplete_log" >&2
             fail "partial RPM publication lacked explicit recovery guidance"
         fi
-        if ! grep -E 'inspect and remove only .*exact no-replace outputs' \
+        if ! grep -F \
+            'inspect these exact no-replace outputs before retry; remove a leaf only after its digest matches:' \
             "$rpm_incomplete_log" >/dev/null; then
             sed -n '1,200p' "$rpm_incomplete_log" >&2
-            fail "partial RPM publication lacked exact cleanup guidance"
+            fail "partial RPM publication lacked digest-conditioned cleanup guidance"
         fi
         for rpm_incomplete_name in "$rpm_binary_name" "$rpm_source_name"; do
-            grep -F "build/dist/$rpm_incomplete_name" \
+            grep -E \
+                "build/dist/$rpm_incomplete_name \\(expected sha256 [0-9a-f]{64}; inspect before removal\\)" \
                 "$rpm_incomplete_log" >/dev/null || {
                 sed -n '1,200p' "$rpm_incomplete_log" >&2
-                fail "partial RPM diagnostic omitted $rpm_incomplete_name"
+                fail "partial RPM diagnostic omitted $rpm_incomplete_name digest"
             }
         done
     }
@@ -5476,7 +5958,14 @@ set -u
 if [ "${1-}" = --internal-retire-tree-v1 ]; then
     exec "$AR11_RPM_REAL_PUBLISHER" "$@"
 fi
-[ "${1-}" = --internal-release-tree-v1 ] || exit 93
+if [ "${1-}" = --internal-rpm-stage-v1 ]; then
+    [ "$#" -eq 10 ] && [ "$2" = 3 ] && [ "$5" = 4 ] && [ "$8" = 5 ] ||
+        exit 93
+    exec "$AR11_RPM_REAL_PUBLISHER" "$@"
+fi
+[ "${1-}" = --internal-release-tree-from-dir-v1 ] || exit 92
+[ "$#" -eq 12 ] || exit 91
+[ "$6" = 5 ] || exit 90
 partial_count=0
 if [ -f "$AR11_RPM_PUBLISH_COUNT" ]; then
     IFS= read -r partial_count <"$AR11_RPM_PUBLISH_COUNT" || exit 96
@@ -5665,11 +6154,12 @@ EOF
         sed -n '1,240p' "$rpm_symlink_out" >&2
         fail "SRPMS substitution fixture failed before rpmbuild"
     }
-    [ -f "$rpm_state/archive-swap.marker" ] &&
-    [ -f "$rpm_state/archive-swap.original" ] &&
-    [ -f "$rpm_state/archive-swap.restored" ] ||
+    [ -f "$rpm_state/symlink-srpms.archive-swap.marker" ] &&
+    [ -f "$rpm_state/symlink-srpms.archive-swap.original" ] &&
+    [ -f "$rpm_state/symlink-srpms.archive-swap.restored" ] ||
         fail "private-source fixture did not replace the canonical archive"
-    cmp -s "$rpm_state/archive-swap.original" "$rpm_alpha_archive" ||
+    cmp -s "$rpm_state/symlink-srpms.archive-swap.original" \
+        "$rpm_alpha_archive" ||
         fail "private-source fixture did not restore the canonical archive"
     rpm_symlink_topdir=$(sed -n '1p' "$rpm_symlink_report")
     [ -n "$rpm_symlink_topdir" ] ||
