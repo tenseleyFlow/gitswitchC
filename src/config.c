@@ -134,7 +134,8 @@ enum {
 
 #ifdef GITSWITCH_TESTING
 typedef enum {
-    SWITCH_GUARD_INSTALL_AFTER_STAGE_SYNC = 0,
+    SWITCH_GUARD_INSTALL_BEFORE_INITIAL_FSTAT = 0,
+    SWITCH_GUARD_INSTALL_AFTER_STAGE_SYNC,
     SWITCH_GUARD_CLEAR_AFTER_UNLINK
 } switch_guard_test_stage_t;
 typedef int (*switch_guard_test_hook_fn)(
@@ -168,7 +169,8 @@ static int config_switch_guard_test_checkpoint(
     config_switch_guard_test_checkpoint((stage), (fd))
 #else
 enum {
-    SWITCH_GUARD_INSTALL_AFTER_STAGE_SYNC = 0,
+    SWITCH_GUARD_INSTALL_BEFORE_INITIAL_FSTAT = 0,
+    SWITCH_GUARD_INSTALL_AFTER_STAGE_SYNC,
     SWITCH_GUARD_CLEAR_AFTER_UNLINK
 };
 #define SWITCH_GUARD_TEST_CHECKPOINT(stage, fd) \
@@ -6601,7 +6603,8 @@ static int config_switch_guard_make_handle(
 
 static int config_switch_guard_stage_write_at(
     int directory_fd, const unsigned char *data, size_t length,
-    struct stat *stage_identity, bool *stage_created) {
+    struct stat *stage_identity, bool *stage_created,
+    bool *stage_identity_known) {
     struct stat opened;
     struct stat after_write;
     struct stat named;
@@ -6611,12 +6614,13 @@ static int config_switch_guard_stage_write_at(
 
     if (directory_fd < 0 || !data || length == 0U ||
         length > CONFIG_SWITCH_GUARD_MAX_BYTES || !stage_identity ||
-        !stage_created) {
+        !stage_created || !stage_identity_known) {
         errno = EINVAL;
         return -1;
     }
     memset(stage_identity, 0, sizeof(*stage_identity));
     *stage_created = false;
+    *stage_identity_known = false;
     fd = openat(
         directory_fd, CONFIG_SWITCH_STAGE_NAME,
         O_WRONLY | O_CREAT | O_EXCL | O_CLOEXEC | O_NOFOLLOW,
@@ -6629,11 +6633,17 @@ static int config_switch_guard_stage_write_at(
             "Cannot create private switch transition stage");
         return -1;
     }
-    if (fstat(fd, &opened) != 0) {
+    /* O_EXCL establishes that this call created one generation, but the
+     * pathname is not cleanup authority until its descriptor identity has
+     * been captured. If that first observation fails, retain the fixed stage
+     * for the next lock-held reconciliation rather than risking deletion of
+     * a same-UID replacement. */
+    *stage_created = true;
+    if (SWITCH_GUARD_TEST_CHECKPOINT(
+            SWITCH_GUARD_INSTALL_BEFORE_INITIAL_FSTAT,
+            directory_fd) != 0 ||
+        fstat(fd, &opened) != 0) {
         saved_errno = errno ? errno : EIO;
-        (void)unlinkat(
-            directory_fd, CONFIG_SWITCH_STAGE_NAME, 0);
-        (void)fsync(directory_fd);
         close(fd);
         errno = saved_errno;
         set_system_error(
@@ -6642,7 +6652,7 @@ static int config_switch_guard_stage_write_at(
         return -1;
     }
     *stage_identity = opened;
-    *stage_created = true;
+    *stage_identity_known = true;
     if (fchmod(fd, PERM_USER_RW) != 0 ||
         fstat(fd, &opened) != 0 ||
         !config_metadata_file_is_safe(&opened, true)) {
@@ -6831,6 +6841,7 @@ int config_switch_guard_install_or_adopt(
     int result = -1;
     int saved_errno = EIO;
     bool stage_created = false;
+    bool stage_identity_known = false;
 
     if (!guard || *guard) {
         errno = EINVAL;
@@ -6995,7 +7006,8 @@ int config_switch_guard_install_or_adopt(
             &expected_length) != 0 ||
         config_switch_guard_stage_write_at(
             directory_fd, expected_data, expected_length,
-            &stage_identity, &stage_created) != 0 ||
+            &stage_identity, &stage_created,
+            &stage_identity_known) != 0 ||
         SWITCH_GUARD_TEST_CHECKPOINT(
             SWITCH_GUARD_INSTALL_AFTER_STAGE_SYNC,
             directory_fd) != 0 ||
@@ -7084,7 +7096,16 @@ install_done:
         (void)error_accumulator_add(
             &failures, "switch guard installation",
             &primary_error);
-        if (stage_created && directory_fd >= 0 && lock_fd >= 0 &&
+        if (stage_created && !stage_identity_known) {
+            errno = ESTALE;
+            set_system_error(
+                ERR_FILE_IO,
+                "Switch transition stage identity is unknown; retained "
+                "'.switch-transition' for locked recovery rather than risk "
+                "deleting a replacement generation");
+            (void)error_accumulator_add_last(
+                &failures, "switch stage cleanup");
+        } else if (stage_created && directory_fd >= 0 && lock_fd >= 0 &&
             config_switch_guard_cleanup_owned_stage_at(
                 directory_fd, lock_fd, directory,
                 &directory_identity, &stage_identity,
@@ -7402,6 +7423,7 @@ int config_switch_guard_retain(
     error_context_t primary_error;
     int primary_errno = 0;
     bool stage_created = false;
+    bool stage_identity_known = false;
     bool primary_failure = false;
 
     if (!guard_ptr || !*guard_ptr) {
@@ -7459,7 +7481,7 @@ int config_switch_guard_retain(
         if (config_switch_guard_stage_write_at(
                 guard->directory_fd, guard->marker_data,
                 guard->marker_length, &stage_identity,
-                &stage_created) != 0 ||
+                &stage_created, &stage_identity_known) != 0 ||
             config_switch_guard_publish_stage_at(
                 guard->directory_fd, &stage_identity,
                 &published_identity) != 0) {
@@ -7559,7 +7581,16 @@ retain_fail:
     (void)error_accumulator_add(
         &failures, "switch recovery retention",
         &primary_error);
-    if (stage_created &&
+    if (stage_created && !stage_identity_known) {
+        errno = ESTALE;
+        set_system_error(
+            ERR_FILE_IO,
+            "Switch transition stage identity is unknown; retained "
+            "'.switch-transition' for locked recovery rather than risk "
+            "deleting a replacement generation");
+        (void)error_accumulator_add_last(
+            &failures, "switch recovery stage cleanup");
+    } else if (stage_created &&
         config_switch_guard_cleanup_owned_stage_at(
             guard->directory_fd, guard->lock_fd,
             guard->directory, &guard->directory_identity,

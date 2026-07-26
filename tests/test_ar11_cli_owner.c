@@ -37,7 +37,8 @@ switch_rollback_publish_test_hook_fn
 gitswitch_test_set_switch_rollback_publish_hook(
     switch_rollback_publish_test_hook_fn hook);
 typedef enum {
-    SWITCH_GUARD_INSTALL_AFTER_STAGE_SYNC = 0,
+    SWITCH_GUARD_INSTALL_BEFORE_INITIAL_FSTAT = 0,
+    SWITCH_GUARD_INSTALL_AFTER_STAGE_SYNC,
     SWITCH_GUARD_CLEAR_AFTER_UNLINK
 } switch_guard_test_stage_t;
 typedef int (*switch_guard_test_hook_fn)(
@@ -112,9 +113,13 @@ static bool g_h1_fault_armed;
 static int g_h1_fault_calls;
 static int g_h1_fault_mutation_rc;
 static bool g_switch_guard_fail_stage;
+static bool g_switch_guard_replace_before_initial_fstat;
 static bool g_switch_guard_fail_clear;
 static int g_switch_guard_clear_failures_remaining;
 static int g_switch_guard_hook_calls;
+static int g_switch_guard_replacement_rc;
+static struct stat g_switch_guard_displaced_stage;
+static struct stat g_switch_guard_replacement_stage;
 static volatile sig_atomic_t g_returning_signal_calls;
 
 typedef enum {
@@ -481,7 +486,44 @@ static bool replace_h1_git_during_state_commit_and_allow_sync(
 
 static int fail_switch_guard_lifecycle(
     switch_guard_test_stage_t stage, int directory_fd) {
-    (void)directory_fd;
+    static const char replacement[] = "foreign-switch-transition\n";
+
+    if (stage == SWITCH_GUARD_INSTALL_BEFORE_INITIAL_FSTAT &&
+        g_switch_guard_replace_before_initial_fstat) {
+        int replacement_fd = -1;
+        ssize_t written;
+
+        g_switch_guard_replace_before_initial_fstat = false;
+        g_switch_guard_hook_calls++;
+        g_switch_guard_replacement_rc = -1;
+        if (fstatat(
+                directory_fd, ".switch-transition",
+                &g_switch_guard_displaced_stage,
+                AT_SYMLINK_NOFOLLOW) != 0 ||
+            unlinkat(
+                directory_fd, ".switch-transition", 0) != 0) {
+            errno = EIO;
+            return -1;
+        }
+        replacement_fd = openat(
+            directory_fd, ".switch-transition",
+            O_WRONLY | O_CREAT | O_EXCL | O_CLOEXEC | O_NOFOLLOW,
+            0600);
+        if (replacement_fd < 0) return -1;
+        written = write(
+            replacement_fd, replacement, sizeof(replacement) - 1U);
+        if (written != (ssize_t)(sizeof(replacement) - 1U) ||
+            fsync(replacement_fd) != 0 ||
+            fstat(replacement_fd, &g_switch_guard_replacement_stage) != 0 ||
+            close(replacement_fd) != 0) {
+            if (replacement_fd >= 0) (void)close(replacement_fd);
+            errno = EIO;
+            return -1;
+        }
+        g_switch_guard_replacement_rc = 0;
+        errno = EIO;
+        return -1;
+    }
     if ((stage == SWITCH_GUARD_INSTALL_AFTER_STAGE_SYNC &&
          g_switch_guard_fail_stage) ||
         (stage == SWITCH_GUARD_CLEAR_AFTER_UNLINK &&
@@ -741,9 +783,15 @@ static void h1_guard_case_end(h1_guard_case_t *guard_case) {
     if (!guard_case) return;
     (void)gitswitch_test_set_switch_guard_hook(NULL);
     g_switch_guard_fail_stage = false;
+    g_switch_guard_replace_before_initial_fstat = false;
     g_switch_guard_fail_clear = false;
     g_switch_guard_clear_failures_remaining = 0;
     g_switch_guard_hook_calls = 0;
+    g_switch_guard_replacement_rc = -1;
+    memset(&g_switch_guard_displaced_stage, 0,
+           sizeof(g_switch_guard_displaced_stage));
+    memset(&g_switch_guard_replacement_stage, 0,
+           sizeof(g_switch_guard_replacement_stage));
     if (guard_case->guard) {
         config_switch_guard_abandon(&guard_case->guard);
     }
@@ -3576,6 +3624,82 @@ TEST(parent_guard_stage_failure_removes_exact_fresh_stage) {
     ts_rm_rf(fixture.root);
 }
 
+TEST(parent_guard_initial_fstat_failure_preserves_replacement_for_retry) {
+    static const char replacement[] = "foreign-switch-transition\n";
+    cli_owner_fixture_t fixture = {0};
+    h1_guard_case_t guard_case = {0};
+    const error_context_t *error;
+    struct stat retained = {0};
+    struct stat state = {0};
+    char observed[64] = {0};
+    int begin_result = -1;
+    int fixture_result;
+
+    fixture_result = h1_fixture_setup(&fixture);
+    CHECK_EQ_INT(fixture_result, 0);
+    if (fixture_result == 0) {
+        begin_result = h1_guard_case_begin(&fixture, &guard_case);
+    }
+    CHECK_EQ_INT(begin_result, 0);
+    if (begin_result == 0) {
+        g_switch_guard_fail_stage = false;
+        g_switch_guard_replace_before_initial_fstat = true;
+        g_switch_guard_fail_clear = false;
+        g_switch_guard_clear_failures_remaining = 0;
+        g_switch_guard_hook_calls = 0;
+        g_switch_guard_replacement_rc = -1;
+        (void)gitswitch_test_set_switch_guard_hook(
+            fail_switch_guard_lifecycle);
+        CHECK_EQ_INT(
+            config_switch_guard_install_or_adopt(
+                guard_case.ctx, guard_case.target, GIT_SCOPE_GLOBAL,
+                guard_case.destinations, guard_case.destination_count,
+                &guard_case.guard),
+            -1);
+        (void)gitswitch_test_set_switch_guard_hook(NULL);
+
+        CHECK(!guard_case.guard);
+        CHECK_EQ_INT(g_switch_guard_hook_calls, 1);
+        CHECK_EQ_INT(g_switch_guard_replacement_rc, 0);
+        CHECK(!h1_same_file_state(
+            &g_switch_guard_displaced_stage,
+            &g_switch_guard_replacement_stage));
+        CHECK(read_text(
+                  fixture.switch_stage, observed,
+                  sizeof(observed)) > 0U);
+        CHECK(strcmp(observed, replacement) == 0);
+        CHECK_EQ_INT(lstat(fixture.switch_stage, &retained), 0);
+        CHECK(h1_same_file_state(
+            &retained, &g_switch_guard_replacement_stage));
+        error = get_last_error();
+        CHECK(error != NULL);
+        if (error) {
+            CHECK(strstr(error->details,
+                         "identity is unknown; retained") != NULL);
+        }
+
+        /* The failed call leaves a truthful fixed-stage recovery obligation.
+         * A later lock holder first reconciles that stable pre-mutation stage,
+         * then creates and publishes a fresh exact generation. */
+        CHECK_EQ_INT(
+            config_switch_guard_install_or_adopt(
+                guard_case.ctx, guard_case.target, GIT_SCOPE_GLOBAL,
+                guard_case.destinations, guard_case.destination_count,
+                &guard_case.guard),
+            0);
+        CHECK(guard_case.guard != NULL);
+        CHECK(config_switch_guard_was_created(guard_case.guard));
+        errno = 0;
+        CHECK(lstat(fixture.switch_stage, &state) != 0 &&
+              errno == ENOENT);
+        CHECK_EQ_INT(
+            config_switch_guard_clear(&guard_case.guard), 0);
+        CHECK(!guard_case.guard);
+    }
+    h1_guard_case_end(&guard_case);
+    ts_rm_rf(fixture.root);
+}
+
 TEST(parent_guard_abandon_then_adopt_reuses_exact_authority) {
     unsigned char marker_before[16384] = {0};
     unsigned char marker_after[sizeof(marker_before)] = {0};
@@ -3748,6 +3872,8 @@ TEST_MAIN_BEGIN()
     RUN_TEST(ordinary_guard_restore_failure_fences_next_cli_entry);
     RUN_TEST(ordinary_dispatch_restore_failure_fences_next_cli_entry);
     RUN_TEST(parent_guard_stage_failure_removes_exact_fresh_stage);
+    RUN_TEST(
+        parent_guard_initial_fstat_failure_preserves_replacement_for_retry);
     RUN_TEST(parent_guard_abandon_then_adopt_reuses_exact_authority);
     RUN_TEST(parent_guard_retain_republishes_exact_unlinked_marker);
 TEST_MAIN_END()
