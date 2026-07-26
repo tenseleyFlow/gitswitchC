@@ -188,6 +188,17 @@ static void replace_destination_after_write(int stage, const char *dst_path) {
     }
 }
 
+static void replace_destination_before_permission_change(
+    int stage, const char *dst_path) {
+    if (stage != COPY_FILE_TEST_AFTER_DESTINATION_OPEN) return;
+    g_replacement_hook_calls++;
+    if (!g_replacement_displaced || !g_race_replacement_content ||
+        rename(dst_path, g_replacement_displaced) != 0 ||
+        write_text_mode(dst_path, g_race_replacement_content, 0644) != 0) {
+        g_replacement_hook_error = errno ? errno : EIO;
+    }
+}
+
 static void replace_destination_parent_after_write(int stage,
                                                    const char *dst_path) {
     const char *leaf;
@@ -555,6 +566,47 @@ TEST(destination_leaf_replacement_after_open_is_detected_without_corruption) {
     CHECK_STR_EQ(replacement.content, "replacement-must-stay-intact");
 }
 
+/* AR-14 L39: the permission transition belongs to the already-open
+ * destination inode. Replace its pathname at the checkpoint immediately
+ * before the transition: descriptor-bound fchmod changes the displaced inode,
+ * while a pathname chmod mutation corrupts the replacement and leaves the
+ * opened inode permissive. */
+TEST(permission_change_is_bound_to_the_open_destination_descriptor) {
+    char root[] = "/tmp/gs_copy_fchmod_witness_XXXXXX";
+    char src[512], dst[512], displaced[512];
+    file_state_t replacement_after;
+    file_state_t displaced_after;
+
+    CHECK(ts_mkdtemp(root) != NULL);
+    CHECK((size_t)snprintf(src, sizeof(src), "%s/source", root) < sizeof(src));
+    CHECK((size_t)snprintf(dst, sizeof(dst), "%s/destination", root) <
+          sizeof(dst));
+    CHECK((size_t)snprintf(displaced, sizeof(displaced), "%s/displaced", root) <
+          sizeof(displaced));
+    CHECK_EQ_INT(write_text_mode(src, "descriptor-bound-source", 0600), 0);
+    CHECK_EQ_INT(write_text_mode(dst, "permissive-destination", 0666), 0);
+
+    g_replacement_displaced = displaced;
+    g_race_replacement_content = "replacement-must-retain-mode";
+    g_replacement_hook_calls = 0;
+    g_replacement_hook_error = 0;
+    (void)gitswitch_test_set_copy_file_hook(
+        replace_destination_before_permission_change);
+    CHECK_EQ_INT(copy_file(src, dst), -1);
+    (void)gitswitch_test_set_copy_file_hook(NULL);
+    g_replacement_displaced = NULL;
+    g_race_replacement_content = NULL;
+
+    CHECK_EQ_INT(g_replacement_hook_calls, 1);
+    CHECK_EQ_INT(g_replacement_hook_error, 0);
+    CHECK_EQ_INT(get_last_error()->code, ERR_FILE_IO);
+    CHECK_EQ_INT(read_file_state(dst, &replacement_after), 0);
+    CHECK_STR_EQ(replacement_after.content, "replacement-must-retain-mode");
+    CHECK_EQ_INT(replacement_after.mode, 0644);
+    CHECK_EQ_INT(read_file_state(displaced, &displaced_after), 0);
+    CHECK_EQ_INT(displaced_after.mode, 0600);
+}
+
 TEST(destination_parent_replacement_after_open_is_detected_without_corruption) {
     char root[] = "/tmp/gs_copy_parent_replace_XXXXXX";
     char parent[512], moved[512], src[512], dst[512], replacement_path[512];
@@ -778,6 +830,7 @@ int main(void) {
     RUN_TEST(empty_backup_suffix_is_rejected_without_mutation);
     RUN_TEST(destination_replaced_with_alias_before_open_is_rejected);
     RUN_TEST(destination_leaf_replacement_after_open_is_detected_without_corruption);
+    RUN_TEST(permission_change_is_bound_to_the_open_destination_descriptor);
     RUN_TEST(destination_parent_replacement_after_open_is_detected_without_corruption);
     RUN_TEST(destination_leaf_shape_is_rejected_before_open);
     RUN_TEST(preexisting_fifo_source_is_rejected_promptly_and_preserved);
