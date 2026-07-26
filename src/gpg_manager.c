@@ -112,6 +112,28 @@ typedef enum {
     GPG_SOURCE_PATH_MANAGED_CANONICAL = 1,
     GPG_SOURCE_PATH_MANAGED_DESCENDANT = 2
 } gpg_source_path_class_t;
+
+enum { GPG_HELPER_DIAGNOSTIC_CAP = 256 };
+
+static void gpg_set_helper_failure(error_code_t code, const char *operation,
+                                   const char *diagnostic,
+                                   const run_result_t *result) {
+    const char *captured =
+        diagnostic && diagnostic[0] != '\0'
+            ? diagnostic
+            : "<no diagnostic output captured>";
+
+    if (!operation || !result) {
+        set_error(code, "GPG helper failed without outcome metadata");
+        return;
+    }
+    set_error(code,
+              "%s [spawned=%s exit=%d signal=%d output-truncated=%s]: %s",
+              operation, result->spawned ? "yes" : "no",
+              result->exit_code, result->term_signal,
+              result->out_truncated ? "yes" : "no", captured);
+}
+
 static int copy_key_from_system_keyring(const gpg_config_t *gpg_config,
                                         const gpg_pinned_home_t *home,
                                         const char *selector,
@@ -7338,7 +7360,7 @@ static int copy_key_from_system_keyring(const gpg_config_t *gpg_config,
     /* AR-12 L12: run_argv has early-return paths that never touch the
      * capture buffer; initialize so a pre-spawn failure cannot format
      * uninitialized stack bytes into the user-facing diagnostic. */
-    char import_diag[1024] = "";
+    char import_diag[GPG_HELPER_DIAGNOSTIC_CAP] = "";
     const char *env[2] = {"GNUPGHOME=.", NULL};
     char *key_data;
     char imported_fingerprint[GPG_FINGERPRINT_BUFSIZE];
@@ -7524,6 +7546,7 @@ static int copy_key_from_system_keyring(const gpg_config_t *gpg_config,
             import_argv, &opts, &gpg_config->executable_witness,
             &import_result);
         if (gpg_validate_pinned_home(home) != 0) {
+            secure_zero_memory(import_diag, sizeof(import_diag));
             secure_zero_memory(key_data, KEY_DATA_CAP);
             free(key_data);
             return -1;
@@ -7534,11 +7557,14 @@ static int copy_key_from_system_keyring(const gpg_config_t *gpg_config,
             import_result.out_truncated) {
             secure_zero_memory(key_data, KEY_DATA_CAP);
             free(key_data);
-            set_error(ERR_GPG_KEY_FAILED,
-                      "Failed to import GPG key into isolated environment: %s",
-                      import_diag);
+            gpg_set_helper_failure(
+                ERR_GPG_KEY_FAILED,
+                "Failed to import GPG key into isolated environment",
+                import_diag, &import_result);
+            secure_zero_memory(import_diag, sizeof(import_diag));
             return -1;
         }
+        secure_zero_memory(import_diag, sizeof(import_diag));
     }
 
     secure_zero_memory(key_data, KEY_DATA_CAP);
@@ -8456,6 +8482,7 @@ static int gpg_reload_agent_config(const gpg_pinned_home_t *home,
                                    gpg_agent_config_update_t *update) {
     const char *env[] = {"GNUPGHOME=.", NULL};
     const char *argv[4];
+    char reload_diag[GPG_HELPER_DIAGNOSTIC_CAP] = "";
     run_opts_t opts;
     run_result_t result;
     int run_rc;
@@ -8490,19 +8517,25 @@ static int gpg_reload_agent_config(const gpg_pinned_home_t *home,
     memset(&opts, 0, sizeof(opts));
     memset(&result, 0, sizeof(result));
     result.exit_code = -1;
+    opts.out = reload_diag;
+    opts.out_size = sizeof(reload_diag);
+    opts.merge_stderr = true;
     opts.unset_env = g_gpg_child_unset_env;
     opts.extra_env = env;
-    opts.stderr_to_devnull = true;
     opts.cwd_fd = home->home_fd;
     opts.use_cwd_fd = true;
     run_rc = run_argv_with_expected_launch(
         argv, &opts, &update->gpgconf_witness, &result);
     if (run_rc != 0 || !result.spawned || result.exit_code != 0 ||
         result.term_signal != 0 || result.out_truncated) {
-        set_error(ERR_SYSTEM_COMMAND_FAILED,
-                  "Failed to reload GPG agent configuration; retry required");
+        gpg_set_helper_failure(
+            ERR_SYSTEM_COMMAND_FAILED,
+            "Failed to reload GPG agent configuration; retry required",
+            reload_diag, &result);
+        secure_zero_memory(reload_diag, sizeof(reload_diag));
         return -1;
     }
+    secure_zero_memory(reload_diag, sizeof(reload_diag));
     if (gpg_validate_pinned_home(home) != 0 ||
         !run_launch_witness_revalidate(
             update->gpg_config->executable_path,

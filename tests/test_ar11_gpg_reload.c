@@ -73,6 +73,7 @@ static int g_reload_protocol_errors;
 static int g_gpg_listing_calls;
 static int g_config_commits;
 static bool g_fail_reload;
+static bool g_reload_capture_is_merged;
 typedef enum {
     M20_COMPONENT_METADATA_VALID = 0,
     M20_COMPONENT_METADATA_MISMATCHED_GPG,
@@ -358,7 +359,21 @@ static int m20_runner(const char *const argv[], const run_opts_t *opts,
                 }
             }
             if (g_fail_reload) {
-                if (result) result->exit_code = 9;
+                static const char diagnostic[] =
+                    "gpgconf: reload failed: agent refused configuration";
+
+                g_reload_capture_is_merged =
+                    opts && opts->merge_stderr &&
+                    !opts->stderr_to_devnull && opts->out &&
+                    opts->out_size > sizeof(diagnostic);
+                if (opts && opts->out && opts->out_size > 0U) {
+                    snprintf(opts->out, opts->out_size, "%s", diagnostic);
+                }
+                if (result) {
+                    result->exit_code = 9;
+                    result->out_len =
+                        opts && opts->out ? strlen(opts->out) : 0U;
+                }
                 return -1;
             }
             if (g_replace_toolchain_after_reload) {
@@ -505,6 +520,7 @@ static void m20_reset_observation(const m20_fixture_t *fixture,
     g_reload_protocol_errors = 0;
     g_gpg_listing_calls = 0;
     g_fail_reload = fail_reload;
+    g_reload_capture_is_merged = false;
     g_component_metadata = M20_COMPONENT_METADATA_VALID;
     g_replace_gpgconf_after_components = false;
     g_replace_toolchain_after_reload = false;
@@ -752,6 +768,8 @@ TEST(reload_failure_prevents_activation_and_identity_publication) {
     command_runner_fn old_runner;
     gpg_config_t config;
     char installed[256];
+    struct stat reload_state;
+    error_context_t failure;
     int switch_rc;
 
     CHECK_EQ_INT(m20_make_fixture(&fixture, m20_config_a, true), 0);
@@ -759,11 +777,23 @@ TEST(reload_failure_prevents_activation_and_identity_publication) {
     m20_reset_observation(&fixture, m20_config_a, true);
     old_runner = run_set_runner(m20_runner);
     switch_rc = gpg_switch_account(&config, &fixture.account);
+    failure = *get_last_error();
     run_set_runner(old_runner);
 
     CHECK_EQ_INT(switch_rc, -1);
     CHECK_EQ_INT(g_reload_calls, 1);
     CHECK_EQ_INT(g_reload_protocol_errors, 0);
+    CHECK(g_reload_capture_is_merged);
+    CHECK(strstr(failure.message,
+                 "gpgconf: reload failed: agent refused configuration") !=
+          NULL);
+    CHECK(strstr(failure.message, "spawned=yes") != NULL);
+    CHECK(strstr(failure.message, "exit=9") != NULL);
+    CHECK(strstr(failure.message, "signal=0") != NULL);
+    CHECK(strstr(failure.message, "output-truncated=no") != NULL);
+    CHECK(strstr(failure.message, "retry required") != NULL);
+    CHECK_EQ_INT(stat(fixture.reload_state, &reload_state), 0);
+    CHECK_EQ_INT(reload_state.st_size, 0);
     CHECK_EQ_INT(g_gpg_listing_calls, 0);
     CHECK(m20_identity_is_unpublished(&config, &fixture));
     CHECK_STR_EQ(getenv("GNUPGHOME"), fixture.source_home);

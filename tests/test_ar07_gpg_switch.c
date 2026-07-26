@@ -534,7 +534,11 @@ enum listing_result_mode {
     LISTING_RESULT_SIGNAL_FAILURE,
     LISTING_RESULT_PIPE_FAILURE,
     LISTING_RESULT_GPG_FAILURE,
-    LISTING_RESULT_TRUNCATED
+    LISTING_RESULT_TRUNCATED,
+    LISTING_RESULT_IMPORT_SPAWN_FAILURE,
+    LISTING_RESULT_IMPORT_EXIT_FAILURE,
+    LISTING_RESULT_IMPORT_SIGNAL_FAILURE,
+    LISTING_RESULT_IMPORT_TRUNCATED
 };
 
 static enum listing_result_mode g_listing_result_mode;
@@ -563,6 +567,10 @@ static int listing_result_runner(const char *const argv[],
             g_listing_result_capacity = opts ? opts->out_size : 0;
             switch (g_listing_result_mode) {
                 case LISTING_RESULT_MISS:
+                case LISTING_RESULT_IMPORT_SPAWN_FAILURE:
+                case LISTING_RESULT_IMPORT_EXIT_FAILURE:
+                case LISTING_RESULT_IMPORT_SIGNAL_FAILURE:
+                case LISTING_RESULT_IMPORT_TRUNCATED:
                     if (opts && opts->out && opts->out_size > 0) {
                         snprintf(opts->out, opts->out_size, "%s",
                                  STATUS_NO_SECRET_KEY);
@@ -727,6 +735,36 @@ static int listing_result_runner(const char *const argv[],
     }
     if (import_key) {
         g_listing_result_imports++;
+        if (g_listing_result_mode >= LISTING_RESULT_IMPORT_SPAWN_FAILURE) {
+            static const char diagnostic[] =
+                "gpg: key import failed: invalid packet";
+
+            if (g_listing_result_mode !=
+                    LISTING_RESULT_IMPORT_SPAWN_FAILURE &&
+                opts && opts->out && opts->out_size > 0U) {
+                snprintf(opts->out, opts->out_size, "%s", diagnostic);
+            }
+            if (result) {
+                result->out_len =
+                    opts && opts->out ? strlen(opts->out) : 0U;
+                if (g_listing_result_mode ==
+                    LISTING_RESULT_IMPORT_SPAWN_FAILURE) {
+                    result->spawned = false;
+                    result->exit_code = -1;
+                } else if (g_listing_result_mode ==
+                           LISTING_RESULT_IMPORT_EXIT_FAILURE) {
+                    result->exit_code = 2;
+                } else if (g_listing_result_mode ==
+                           LISTING_RESULT_IMPORT_SIGNAL_FAILURE) {
+                    result->exit_code = -1;
+                    result->term_signal = SIGTERM;
+                } else {
+                    result->exit_code = 2;
+                    result->out_truncated = true;
+                }
+            }
+            return -1;
+        }
         return 0;
     }
     return 0;
@@ -1022,6 +1060,58 @@ TEST(truncated_secret_listing_is_one_shot_at_the_documented_cap) {
     CHECK_EQ_INT(imports, 0);
     CHECK_EQ_INT((long long)capacity, (long long)(512U * 1024U));
     CHECK(strstr(diagnostic, "one-shot 524288-byte capture limit") != NULL);
+}
+
+TEST(import_failures_preserve_diagnostic_and_exact_outcome) {
+    static const struct {
+        enum listing_result_mode mode;
+        const char *spawned;
+        const char *exit_status;
+        const char *signal_status;
+        const char *truncated;
+        const char *diagnostic;
+    } failures[] = {
+        {
+            LISTING_RESULT_IMPORT_SPAWN_FAILURE,
+            "spawned=no", "exit=-1", "signal=0", "output-truncated=no",
+            "<no diagnostic output captured>"
+        },
+        {
+            LISTING_RESULT_IMPORT_EXIT_FAILURE,
+            "spawned=yes", "exit=2", "signal=0", "output-truncated=no",
+            "gpg: key import failed: invalid packet"
+        },
+        {
+            LISTING_RESULT_IMPORT_SIGNAL_FAILURE,
+            "spawned=yes", "exit=-1", "signal=15", "output-truncated=no",
+            "gpg: key import failed: invalid packet"
+        },
+        {
+            LISTING_RESULT_IMPORT_TRUNCATED,
+            "spawned=yes", "exit=2", "signal=0", "output-truncated=yes",
+            "gpg: key import failed: invalid packet"
+        }
+    };
+    char diagnostic[512];
+    size_t i;
+
+    for (i = 0U; i < sizeof(failures) / sizeof(failures[0]); i++) {
+        int listings;
+        int exports;
+        int imports;
+
+        CHECK_EQ_INT(run_listing_result_case(
+                         failures[i].mode, &listings, &exports, &imports,
+                         NULL, diagnostic, sizeof(diagnostic)), -1);
+        CHECK_EQ_INT(listings, 2);
+        CHECK_EQ_INT(exports, 1);
+        CHECK_EQ_INT(imports, 1);
+        CHECK(strstr(diagnostic, failures[i].diagnostic) != NULL);
+        CHECK(strstr(diagnostic, failures[i].spawned) != NULL);
+        CHECK(strstr(diagnostic, failures[i].exit_status) != NULL);
+        CHECK(strstr(diagnostic, failures[i].signal_status) != NULL);
+        CHECK(strstr(diagnostic, failures[i].truncated) != NULL);
+    }
 }
 
 static char g_source_swap_original[MAX_PATH_LEN];
@@ -3418,6 +3508,7 @@ TEST_MAIN_BEGIN()
     RUN_TEST(structured_status_distinguishes_absence_from_keyring_failure);
     RUN_TEST(unexpected_structured_statuses_fail_before_secret_key_transfer);
     RUN_TEST(truncated_secret_listing_is_one_shot_at_the_documented_cap);
+    RUN_TEST(import_failures_preserve_diagnostic_and_exact_outcome);
     RUN_TEST(system_key_helper_stays_on_pinned_source_after_directory_replacement);
 #ifdef __linux__
     RUN_TEST(bind_alias_of_managed_home_is_rejected_before_helper_launch);
