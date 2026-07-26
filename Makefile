@@ -1579,6 +1579,17 @@ $(BINDIR)/test_ar07_reset: $(OBJDIR)/test_ar07_reset.o \
 	@echo "Linking test $@..."
 	$(CC) $(LDFLAGS) $^ -o $@ $(LIBS) $(RELEASE_ENFORCED_LDFLAGS)
 
+# AR-14 coverage reconciliation drives stable parsing and early-dispatch
+# contracts through the renamed CLI entry in the parent test process so
+# coverage data is flushed by normal return rather than being discarded by an
+# isolated child's _exit().
+$(BINDIR)/test_ar14_cli_entry: $(OBJDIR)/test_ar14_cli_entry.o \
+		$(AR07_RESET_MAIN_OBJECT) \
+		$(AR09_DISPATCH_SIGNALS_OBJECT) \
+		$(filter-out $(OBJDIR)/main.o $(OBJDIR)/signals.o,$(OBJECTS)) | $(BINDIR)
+	@echo "Linking test $@..."
+	$(CC) $(LDFLAGS) $^ -o $@ $(LIBS) $(RELEASE_ENFORCED_LDFLAGS)
+
 # AR-11 M17 drives remove, targeted reset, and all-account reset through the
 # real CLI entry while injecting only the existing private Git-retirement
 # checkpoints. The production entry point remains unchanged.

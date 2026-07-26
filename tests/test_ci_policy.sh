@@ -391,6 +391,9 @@ check_policy()
         function is_linux_coverage_policy_gate(command) {
             return command == "COVERAGE_POLICY_MAKE=/usr/bin/make /bin/sh tests/test_coverage.sh --static Makefile"
         }
+        function is_linux_gcovr_version_probe(command) {
+            return command == "test \"$(\"$gcovr_path\" --version | /usr/bin/sed -n " single_quote "1p" single_quote ")\" = " single_quote "gcovr 8.6" single_quote
+        }
         function record_block_command(raw_line, source, line, i, c, escaped,
                                       quote_at_start, continued_at_start,
                                       depth_at_start, eligible) {
@@ -514,13 +517,24 @@ check_policy()
                                        first_gate_serial,
                                        direct_release_test,
                                        sanitizer_release_test,
-                                       repro_release_test) {
+                                       repro_release_test,
+                                       coverage_release_test,
+                                       gcovr_probe) {
             step_gate_count = 0
             first_gate_serial = 0
             for (i = 1; i <= step_command_count; i++) {
-                if (!step_command_eligible[i]) continue
                 command = step_command_text[i]
                 source = step_command_source[i]
+                if (current_job == "linux" && source == "direct") {
+                    gcovr_probe = command
+                    gsub(single_quote, " ", gcovr_probe)
+                    gsub(/"/, " ", gcovr_probe)
+                    if (gcovr_probe ~ /(^|[[:space:]])(\/usr\/bin\/)?gcovr([<>=!~[:space:]]|$)/ &&
+                        !is_linux_gcovr_version_probe(command)) {
+                        linux_untrusted_gcovr_install = 1
+                    }
+                }
+                if (!step_command_eligible[i]) continue
                 gate = ""
                 if (current_job == "freebsd" && source == "direct" &&
                     command == "set -eu") {
@@ -549,6 +563,7 @@ check_policy()
                     else if (command == "/usr/bin/make coverage") {
                         gate = "linux-coverage"
                         direct_release_test = 1
+                        coverage_release_test = 1
                     } else if (command == "test \"$(/usr/bin/sed -n '\''1s/|.*//p'\'' build/obj/.buildconfig)\" = coverage && test -s build/coverage/coverage.json") {
                         gate = "linux-coverage-provenance"
                     } else if (command == "/usr/bin/make clean") {
@@ -653,7 +668,13 @@ check_policy()
                        step_command_count != 1 || step_gate_count != 1) {
                 reject("required release gate must be the sole command in its step")
             } else if (step_env_unsafe ||
-                       (direct_release_test &&
+                       (coverage_release_test &&
+                        (step_env_map_count != 1 || step_env_count != 2 ||
+                         step_caps_count != 1 ||
+                         step_caps_value != "pty,readline,bash,zsh,fish,sh,dash,ksh,openssh,gpg,unix-sockets,mount-namespace" ||
+                         step_gcovr_count != 1 ||
+                         step_gcovr_value != "${{ steps.gcovr.outputs.path }}")) ||
+                       (direct_release_test && !coverage_release_test &&
                         (step_env_map_count != 1 || step_env_count != 1 ||
                          step_caps_count != 1 ||
                          step_caps_value != (current_job == "linux" ? \
@@ -674,6 +695,56 @@ check_policy()
                         (step_env_map_count != 0 || step_env_count != 0))) {
                 reject("required release gate environment is missing or unsafe")
             }
+        }
+        function validate_linux_gcovr_step() {
+            if (current_job != "linux" || step_id_value != "gcovr") return
+            if (step_id_count != 1 || step_use_count != 0 ||
+                step_direct_run_count != 1 || step_direct_run_style != "|" ||
+                step_action_run_count != 0 || step_command_count != 17 ||
+                step_if_count != 0 || step_continue_count != 0 ||
+                step_shell_count != 0 || step_workdir_count != 0 ||
+                step_env_map_count != 0 || step_env_count != 0 ||
+                step_unsafe_script || step_terminates_early)
+                reject("gcovr provisioning step shape is missing or unsafe")
+            if (step_command_text[1] != "set -eu" ||
+                step_command_text[2] != "umask 077" ||
+                step_command_text[3] != "test \"$(/usr/bin/uname -m)\" = x86_64" ||
+                step_command_text[4] != "gcovr_url=" single_quote "https://github.com/gcovr/gcovr/releases/download/8.6/gcovr-8.6-linux-x86_64" single_quote ||
+                step_command_text[5] != "gcovr_sha256=" single_quote "dbeacffd6d1ed7bac9ef706c7405a80415c03ce37471fb77ec9db1937d780bc8" single_quote ||
+                step_command_text[6] != "gcovr_dir=$(/usr/bin/mktemp -d \"$RUNNER_TEMP/gcovr.XXXXXX\")" ||
+                step_command_text[7] != "test \"$(/usr/bin/stat -c " single_quote "%u:%a:%F" single_quote " \"$gcovr_dir\")\" = \"$(/usr/bin/id -u):700:directory\"" ||
+                step_command_text[8] != "gcovr_download=\"$gcovr_dir/gcovr-8.6-linux-x86_64.download\"" ||
+                step_command_text[9] != "gcovr_path=\"$gcovr_dir/gcovr-8.6-linux-x86_64\"" ||
+                step_command_text[10] != "/usr/bin/curl --fail --show-error --silent --location --retry 5 --retry-all-errors --proto " single_quote "=https" single_quote " --proto-redir " single_quote "=https" single_quote " --tlsv1.2 \"$gcovr_url\" --output \"$gcovr_download\"" ||
+                step_command_text[11] != "printf " single_quote "%s  %s\\n" single_quote " \"$gcovr_sha256\" \"$gcovr_download\" | /usr/bin/sha256sum --check --strict -" ||
+                step_command_text[12] != "/usr/bin/install -m 0555 \"$gcovr_download\" \"$gcovr_path\"" ||
+                step_command_text[13] != "test \"$(/usr/bin/stat -c " single_quote "%u:%a:%F" single_quote " \"$gcovr_path\")\" = \"$(/usr/bin/id -u):555:regular file\"" ||
+                step_command_text[14] != "printf " single_quote "%s  %s\\n" single_quote " \"$gcovr_sha256\" \"$gcovr_path\" | /usr/bin/sha256sum --check --strict -" ||
+                step_command_text[15] != "/usr/bin/rm -- \"$gcovr_download\"" ||
+                !is_linux_gcovr_version_probe(step_command_text[16]) ||
+                step_command_text[17] != "printf " single_quote "path=%s\\n" single_quote " \"$gcovr_path\" >> \"$GITHUB_OUTPUT\"")
+                reject("gcovr provisioning commands must match the exact reviewed provenance contract")
+            linux_gcovr_step_count++
+            linux_gcovr_step_serial = step_serial
+        }
+        function validate_linux_dependency_step() {
+            if (current_job != "linux" ||
+                step_command_text[1] != "sudo sysctl -w kernel.apparmor_restrict_unprivileged_userns=0")
+                return
+            if (step_id_count != 0 || step_use_count != 0 ||
+                step_direct_run_count != 1 || step_direct_run_style != "|" ||
+                step_action_run_count != 0 || step_command_count != 5 ||
+                step_if_count != 0 || step_continue_count != 0 ||
+                step_shell_count != 0 || step_workdir_count != 0 ||
+                step_env_map_count != 0 || step_env_count != 0 ||
+                step_unsafe_script || step_terminates_early ||
+                step_command_text[2] != "sudo apt-get update" ||
+                step_command_text[3] != "sudo apt-get install -y \\" ||
+                step_command_text[4] != "bash binutils dash fish gnupg ksh libreadline-dev openssh-client zsh \\" ||
+                step_command_text[5] != "cppcheck curl flawfinder rpm shellcheck valgrind")
+                reject("Linux native dependency provisioning must match the exact reviewed package contract")
+            linux_dependency_step_count++
+            linux_dependency_step_serial = step_serial
         }
         function require_release_gate(key) {
             if (release_gate_count[key] != 1)
@@ -769,6 +840,8 @@ check_policy()
             step_shell_value = ""
             step_workdir_count = 0
             step_workdir_value = ""
+            step_id_count = 0
+            step_id_value = ""
             step_unsafe_script = 0
             step_terminates_early = 0
             step_in_env = 0
@@ -781,12 +854,16 @@ check_policy()
             step_ubsan_env_count = 0
             step_caps_count = 0
             step_caps_value = ""
+            step_gcovr_count = 0
+            step_gcovr_value = ""
             block_scalar_purpose = ""
             clear_step_commands()
         }
         function close_step(normalized_action) {
             if (!step_active) return
             if (step_use_count > 1) reject()
+            validate_linux_dependency_step()
+            validate_linux_gcovr_step()
             normalized_action = tolower(step_action)
             if (normalized_action ~ /^actions\/checkout@/) {
                 checkout_count++
@@ -1299,6 +1376,9 @@ check_policy()
                 if (entry_key == "GITSWITCH_TEST_REQUIRED_CAPS") {
                     step_caps_count++
                     step_caps_value = scalar_value
+                } else if (entry_key == "GCOVR") {
+                    step_gcovr_count++
+                    step_gcovr_value = scalar_value
                 } else if (entry_key == "ASAN_OPTIONS") {
                     # AR-12 M9: the sanitizer lane pins its exact strictness;
                     # a weakened option set is the same silent-deletion class.
@@ -1359,6 +1439,13 @@ check_policy()
                 decode_scalar(entry_value)
                 if (!scalar_ok || scalar_value == "") reject()
                 step_workdir_value = scalar_value
+                next
+            }
+            if (step_direct_field && entry_key == "id") {
+                step_id_count++
+                decode_scalar(entry_value)
+                if (!scalar_ok || scalar_value == "") reject()
+                step_id_value = scalar_value
                 next
             }
             if ((step_direct_field || step_action_input) &&
@@ -1451,12 +1538,18 @@ check_policy()
             require_release_gate("freebsd-artifact")
             require_release_gate("freebsd-contract")
             if (release_runner_count["linux"] != 1 ||
-                release_runner_value["linux"] != "ubuntu-latest" ||
+                release_runner_value["linux"] != "ubuntu-24.04" ||
                 release_runner_count["macos"] != 1 ||
                 release_runner_value["macos"] != "macos-latest" ||
                 release_runner_count["freebsd"] != 1 ||
-                release_runner_value["freebsd"] != "ubuntu-latest")
+                release_runner_value["freebsd"] != "ubuntu-24.04")
                 reject("required release job runner is missing or incorrect")
+            if (linux_gcovr_step_count != 1)
+                reject("Linux coverage requires one exact gcovr provenance step")
+            if (linux_dependency_step_count != 1)
+                reject("Linux requires one exact native dependency provisioning step")
+            if (linux_untrusted_gcovr_install)
+                reject("Linux cannot install or invoke an unverified gcovr")
             if (release_job_dynamic_env["linux"] ||
                 release_job_dynamic_env["macos"] ||
                 release_job_dynamic_env["freebsd"])
@@ -1480,8 +1573,14 @@ check_policy()
                 reject("Linux CI policy validation must precede every make invocation")
             if (checkout_step_serial["linux"] + 1 != release_gate_step_serial["linux-policy"])
                 reject("Linux CI policy self-check must immediately follow checkout")
+            if (release_gate_step_serial["linux-policy"] >= linux_dependency_step_serial ||
+                linux_dependency_step_serial >= release_gate_step_serial["linux-make-provenance"])
+                reject("Linux dependency provisioning must precede build-tool provenance")
             if (release_gate_step_serial["linux-make-provenance"] + 1 != release_gate_step_serial["linux-coverage-policy"])
                 reject("Linux behavioral coverage policy must immediately follow Make provenance")
+            if (release_gate_step_serial["linux-coverage-policy"] + 1 != linux_gcovr_step_serial ||
+                linux_gcovr_step_serial >= release_gate_step_serial["linux-coverage"])
+                reject("Linux gcovr provenance must follow coverage policy and precede coverage")
             if (linux_unqualified_make)
                 reject("Linux build commands must use verified /usr/bin/make")
             if (macos_unqualified_make)
@@ -1614,6 +1713,23 @@ mutate_release_command()
                 changed = 1
                 next
             }
+        }
+        { print }
+        END { if (!changed) exit 1 }
+    ' "$workflow" >"$mutate_output"
+}
+
+mutate_workflow_literal()
+{
+    mutate_from=$1
+    mutate_to=$2
+    mutate_output=$3
+    awk -v from="$mutate_from" -v to="$mutate_to" '
+        !changed && (at = index($0, from)) {
+            line = substr($0, 1, at - 1) to substr($0, at + length(from))
+            print line
+            changed = 1
+            next
         }
         { print }
         END { if (!changed) exit 1 }
@@ -1848,6 +1964,151 @@ awk '
 expect_structural_rejected_for "extra behavioral coverage policy command" \
     "$tmp/extra-command-coverage-policy.yml" "$today" \
     "required release gate must be the sole command in its step"
+
+# The coverage reporter is an executable supply-chain input, not an ambient
+# package. Its runner architecture, upstream release URL, digest, download
+# transport, installation mode, post-install verification, version, output,
+# and consumer handoff are one exact causal contract.
+mutate_workflow_literal \
+    "test \"\$(/usr/bin/uname -m)\" = x86_64" \
+    "test \"\$(/usr/bin/uname -m)\" = aarch64" \
+    "$tmp/gcovr-wrong-arch.yml"
+expect_structural_rejected_for "wrong gcovr runner architecture" \
+    "$tmp/gcovr-wrong-arch.yml" "$today" \
+    "gcovr provisioning commands must match the exact reviewed provenance contract"
+
+mutate_workflow_literal \
+    'releases/download/8.6/gcovr-8.6-linux-x86_64' \
+    'releases/latest/download/gcovr-linux-x86_64' \
+    "$tmp/gcovr-latest-url.yml"
+expect_structural_rejected_for "mutable latest gcovr URL" \
+    "$tmp/gcovr-latest-url.yml" "$today" \
+    "gcovr provisioning commands must match the exact reviewed provenance contract"
+
+mutate_workflow_literal \
+    dbeacffd6d1ed7bac9ef706c7405a80415c03ce37471fb77ec9db1937d780bc8 \
+    abeacffd6d1ed7bac9ef706c7405a80415c03ce37471fb77ec9db1937d780bc8 \
+    "$tmp/gcovr-wrong-digest.yml"
+expect_structural_rejected_for "wrong gcovr release digest" \
+    "$tmp/gcovr-wrong-digest.yml" "$today" \
+    "gcovr provisioning commands must match the exact reviewed provenance contract"
+
+mutate_workflow_literal "--proto-redir '=https' " "" \
+    "$tmp/gcovr-weakened-tls.yml"
+expect_structural_rejected_for "weakened gcovr redirect protocol" \
+    "$tmp/gcovr-weakened-tls.yml" "$today" \
+    "gcovr provisioning commands must match the exact reviewed provenance contract"
+
+mutate_workflow_literal '--check --strict -' '--check -' \
+    "$tmp/gcovr-weakened-hash.yml"
+expect_structural_rejected_for "weakened gcovr hash verification" \
+    "$tmp/gcovr-weakened-hash.yml" "$today" \
+    "gcovr provisioning commands must match the exact reviewed provenance contract"
+
+mutate_workflow_literal \
+    "/usr/bin/install -m 0555 \"\$gcovr_download\" \"\$gcovr_path\"" \
+    "/usr/bin/install -m 0755 \"\$gcovr_download\" \"\$gcovr_path\"" \
+    "$tmp/gcovr-writable-install.yml"
+expect_structural_rejected_for "writable gcovr installation" \
+    "$tmp/gcovr-writable-install.yml" "$today" \
+    "gcovr provisioning commands must match the exact reviewed provenance contract"
+
+mutate_workflow_literal "= 'gcovr 8.6'" "= 'gcovr 8.5'" \
+    "$tmp/gcovr-wrong-version.yml"
+expect_structural_rejected_for "wrong gcovr runtime version" \
+    "$tmp/gcovr-wrong-version.yml" "$today" \
+    "gcovr provisioning commands must match the exact reviewed provenance contract"
+
+mutate_workflow_literal ">> \"\$GITHUB_OUTPUT\"" "> \"\$GITHUB_OUTPUT\"" \
+    "$tmp/gcovr-overwrite-output.yml"
+expect_structural_rejected_for "noncanonical gcovr step output" \
+    "$tmp/gcovr-overwrite-output.yml" "$today" \
+    "gcovr provisioning commands must match the exact reviewed provenance contract"
+
+mutate_workflow_literal "\${{ steps.gcovr.outputs.path }}" '/usr/bin/gcovr' \
+    "$tmp/gcovr-bypassed-handoff.yml"
+expect_structural_rejected_for "bypassed gcovr step output handoff" \
+    "$tmp/gcovr-bypassed-handoff.yml" "$today" \
+    "required release gate environment is missing or unsafe"
+
+awk '
+    $0 == "          set -eu" && !changed {
+        print "          umask 077"
+        print "          set -eu"
+        changed = 1
+        skip = 1
+        next
+    }
+    skip && $0 == "          umask 077" { skip = 0; next }
+    { print }
+    END { if (!changed || skip) exit 1 }
+' "$workflow" >"$tmp/gcovr-reordered-verification.yml"
+expect_structural_rejected_for "reordered gcovr provenance commands" \
+    "$tmp/gcovr-reordered-verification.yml" "$today" \
+    "gcovr provisioning commands must match the exact reviewed provenance contract"
+
+awk '
+    $0 == "        id: gcovr" && !changed { changed = 1; next }
+    { print }
+    END { if (!changed) exit 1 }
+' "$workflow" >"$tmp/gcovr-missing-output-id.yml"
+expect_structural_rejected_for "missing gcovr output producer id" \
+    "$tmp/gcovr-missing-output-id.yml" "$today" \
+    "Linux coverage requires one exact gcovr provenance step"
+
+awk '
+    { print }
+    $0 == "        run: COVERAGE_POLICY_MAKE=/usr/bin/make /bin/sh tests/test_coverage.sh --static Makefile" &&
+        !changed {
+        print "      - name: Break gcovr provenance adjacency"
+        print "        run: /bin/true"
+        changed = 1
+    }
+    END { if (!changed) exit 1 }
+' "$workflow" >"$tmp/gcovr-reordered-step.yml"
+expect_structural_rejected_for "reordered gcovr provenance step" \
+    "$tmp/gcovr-reordered-step.yml" "$today" \
+    "Linux gcovr provenance must follow coverage policy and precede coverage"
+
+mutate_workflow_literal \
+    'cppcheck curl flawfinder rpm shellcheck valgrind' \
+    'cppcheck flawfinder rpm shellcheck valgrind' \
+    "$tmp/gcovr-missing-curl.yml"
+expect_structural_rejected_for "missing pinned-gcovr curl dependency" \
+    "$tmp/gcovr-missing-curl.yml" "$today" \
+    "Linux native dependency provisioning must match the exact reviewed package contract"
+
+for untrusted_gcovr_command in \
+    "sudo apt-get install -y gcovr" \
+    "python3 -m pip install gcovr" \
+    "python3 -m pip install gcovr==8.6" \
+    "python3 -m pip install 'gcovr>=8'" \
+    "pipx install gcovr" \
+    "/usr/bin/gcovr --version"; do
+    awk -v injected="$untrusted_gcovr_command" '
+        { print }
+        $0 == "        run: /usr/bin/dpkg --verify make" && !changed {
+            print "      - name: Untrusted gcovr installation fixture"
+            print "        run: " injected
+            changed = 1
+        }
+        END { if (!changed) exit 1 }
+    ' "$workflow" >"$tmp/gcovr-untrusted-install.yml"
+    expect_structural_rejected_for "untrusted gcovr installation: $untrusted_gcovr_command" \
+        "$tmp/gcovr-untrusted-install.yml" "$today" \
+        "Linux cannot install or invoke an unverified gcovr"
+done
+
+mutate_release_runner linux ubuntu-latest "$tmp/gcovr-unpinned-linux.yml"
+expect_structural_rejected_for "unpinned Linux host runner" \
+    "$tmp/gcovr-unpinned-linux.yml" "$today" \
+    "required release job runner is missing or incorrect"
+
+mutate_release_runner freebsd ubuntu-latest \
+    "$tmp/gcovr-unpinned-freebsd-host.yml"
+expect_structural_rejected_for "unpinned FreeBSD host runner" \
+    "$tmp/gcovr-unpinned-freebsd-host.yml" "$today" \
+    "required release job runner is missing or incorrect"
 
 # A full, immutable SHA is necessary but not sufficient for the foundational
 # checkout action. All required jobs must use the single reviewed release,

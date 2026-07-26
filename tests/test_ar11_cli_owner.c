@@ -76,6 +76,22 @@ typedef struct {
     char gpg_current[PATH_MAX];
 } h5_fixture_t;
 
+typedef struct {
+    const char *name;
+    char *value;
+    bool present;
+    bool captured;
+} h1_saved_env_t;
+
+typedef struct {
+    gitswitch_ctx_t *ctx;
+    publication_record_t *destinations;
+    size_t destination_count;
+    account_t *target;
+    config_switch_guard_t *guard;
+    h1_saved_env_t environment[6];
+} h1_guard_case_t;
+
 static runtime_holder_t g_runtime_holder = { -1, -1 };
 static bool g_hook_should_hold_runtime;
 static int g_hook_called;
@@ -644,6 +660,109 @@ static int h1_fixture_setup(cli_owner_fixture_t *fixture) {
                                  h1_old_gitconfig) == 0
                ? 0
                : -1;
+}
+
+static int h1_guard_environment_begin(
+    const cli_owner_fixture_t *fixture, h1_guard_case_t *guard_case) {
+    static const char *const names[] = {
+        "HOME", "XDG_RUNTIME_DIR", "GIT_CONFIG_GLOBAL",
+        "GIT_CONFIG_NOSYSTEM", "XDG_CONFIG_HOME", "GNUPGHOME"
+    };
+
+    if (!fixture || !guard_case) return -1;
+    for (size_t i = 0U; i < sizeof(names) / sizeof(names[0]); i++) {
+        const char *value = getenv(names[i]);
+
+        guard_case->environment[i].name = names[i];
+        guard_case->environment[i].present = value != NULL;
+        if (value) {
+            guard_case->environment[i].value = strdup(value);
+            if (!guard_case->environment[i].value) return -1;
+        }
+        guard_case->environment[i].captured = true;
+    }
+    if (setenv("HOME", fixture->home, 1) != 0 ||
+        setenv("XDG_RUNTIME_DIR", fixture->runtime, 1) != 0 ||
+        setenv("GIT_CONFIG_GLOBAL", fixture->gitconfig, 1) != 0 ||
+        setenv("GIT_CONFIG_NOSYSTEM", "1", 1) != 0 ||
+        unsetenv("XDG_CONFIG_HOME") != 0 ||
+        unsetenv("GNUPGHOME") != 0) {
+        return -1;
+    }
+    return 0;
+}
+
+static void h1_guard_environment_end(h1_guard_case_t *guard_case) {
+    if (!guard_case) return;
+    for (size_t i = 0U;
+         i < sizeof(guard_case->environment) /
+                 sizeof(guard_case->environment[0]);
+         i++) {
+        h1_saved_env_t *saved = &guard_case->environment[i];
+
+        if (!saved->captured) continue;
+        if (saved->present && saved->value) {
+            (void)setenv(saved->name, saved->value, 1);
+        } else {
+            (void)unsetenv(saved->name);
+        }
+        free(saved->value);
+        saved->value = NULL;
+        saved->captured = false;
+    }
+}
+
+static int h1_guard_case_begin(
+    const cli_owner_fixture_t *fixture, h1_guard_case_t *guard_case) {
+    memset(guard_case, 0, sizeof(*guard_case));
+    if (h1_guard_environment_begin(fixture, guard_case) != 0) return -1;
+    guard_case->ctx = calloc(1U, sizeof(*guard_case->ctx));
+    guard_case->destinations = calloc(
+        CONFIG_SWITCH_DESTINATION_MAX,
+        sizeof(*guard_case->destinations));
+    if (!guard_case->ctx || !guard_case->destinations ||
+        config_init(guard_case->ctx) != 0) {
+        return -1;
+    }
+    guard_case->target =
+        config_find_account_exact(guard_case->ctx, "work");
+    if (!guard_case->target ||
+        git_config_snapshot(GIT_SCOPE_GLOBAL) != 0 ||
+        git_config_snapshot_export_destinations(
+            guard_case->destinations,
+            CONFIG_SWITCH_DESTINATION_MAX,
+            &guard_case->destination_count) != 0) {
+        return -1;
+    }
+    return 0;
+}
+
+static void h1_guard_case_end(h1_guard_case_t *guard_case) {
+    if (!guard_case) return;
+    (void)gitswitch_test_set_switch_guard_hook(NULL);
+    g_switch_guard_fail_stage = false;
+    g_switch_guard_fail_clear = false;
+    g_switch_guard_clear_failures_remaining = 0;
+    g_switch_guard_hook_calls = 0;
+    if (guard_case->guard) {
+        config_switch_guard_abandon(&guard_case->guard);
+    }
+    git_config_commit();
+    if (guard_case->destinations) {
+        secure_zero_memory(
+            guard_case->destinations,
+            CONFIG_SWITCH_DESTINATION_MAX *
+                sizeof(*guard_case->destinations));
+        free(guard_case->destinations);
+        guard_case->destinations = NULL;
+    }
+    if (guard_case->ctx) {
+        secure_zero_memory(
+            guard_case->ctx, sizeof(*guard_case->ctx));
+        free(guard_case->ctx);
+        guard_case->ctx = NULL;
+    }
+    h1_guard_environment_end(guard_case);
 }
 
 static int h1_numeric_name_fixture_setup(
@@ -3408,6 +3527,207 @@ TEST(ordinary_dispatch_restore_failure_fences_next_cli_entry) {
     }
 }
 
+TEST(parent_guard_stage_failure_removes_exact_fresh_stage) {
+    cli_owner_fixture_t fixture = {0};
+    h1_guard_case_t guard_case = {0};
+    config_switch_guard_recovery_t recovery;
+    struct stat state;
+    bool blocked = true;
+    int begin_result = -1;
+    int fixture_result;
+
+    fixture_result = h1_fixture_setup(&fixture);
+    CHECK_EQ_INT(fixture_result, 0);
+    if (fixture_result == 0) {
+        begin_result = h1_guard_case_begin(&fixture, &guard_case);
+    }
+    CHECK_EQ_INT(begin_result, 0);
+    if (begin_result == 0) {
+        g_switch_guard_fail_stage = true;
+        g_switch_guard_fail_clear = false;
+        g_switch_guard_clear_failures_remaining = 0;
+        g_switch_guard_hook_calls = 0;
+        (void)gitswitch_test_set_switch_guard_hook(
+            fail_switch_guard_lifecycle);
+        CHECK_EQ_INT(
+            config_switch_guard_install_or_adopt(
+                guard_case.ctx, guard_case.target, GIT_SCOPE_GLOBAL,
+                guard_case.destinations, guard_case.destination_count,
+                &guard_case.guard),
+            -1);
+        (void)gitswitch_test_set_switch_guard_hook(NULL);
+        CHECK(!guard_case.guard);
+        CHECK_EQ_INT(g_switch_guard_hook_calls, 1);
+        errno = 0;
+        CHECK(lstat(fixture.switch_stage, &state) != 0 &&
+              errno == ENOENT);
+        errno = 0;
+        CHECK(lstat(fixture.switch_fence, &state) != 0 &&
+              errno == ENOENT);
+        memset(&recovery, 0, sizeof(recovery));
+        CHECK_EQ_INT(
+            config_switch_guard_probe(
+                fixture.config, &blocked, &recovery),
+            0);
+        CHECK(!blocked);
+        CHECK(!recovery.valid);
+    }
+    h1_guard_case_end(&guard_case);
+    ts_rm_rf(fixture.root);
+}
+
+TEST(parent_guard_abandon_then_adopt_reuses_exact_authority) {
+    unsigned char marker_before[16384] = {0};
+    unsigned char marker_after[sizeof(marker_before)] = {0};
+    cli_owner_fixture_t fixture = {0};
+    h1_guard_case_t guard_case = {0};
+    struct stat before_state = {0};
+    struct stat after_state = {0};
+    struct stat state = {0};
+    size_t before_length = 0U;
+    size_t after_length = 0U;
+    int begin_result = -1;
+    int fixture_result;
+
+    fixture_result = h1_fixture_setup(&fixture);
+    CHECK_EQ_INT(fixture_result, 0);
+    if (fixture_result == 0) {
+        begin_result = h1_guard_case_begin(&fixture, &guard_case);
+    }
+    CHECK_EQ_INT(begin_result, 0);
+    if (begin_result == 0) {
+        CHECK_EQ_INT(
+            config_switch_guard_install_or_adopt(
+                guard_case.ctx, guard_case.target, GIT_SCOPE_GLOBAL,
+                guard_case.destinations, guard_case.destination_count,
+                &guard_case.guard),
+            0);
+        CHECK(config_switch_guard_was_created(guard_case.guard));
+        before_length = h1_read_bounded_file(
+            fixture.switch_fence, marker_before,
+            sizeof(marker_before), &before_state);
+        CHECK(before_length > 0U);
+        config_switch_guard_abandon(&guard_case.guard);
+        CHECK(!guard_case.guard);
+
+        CHECK_EQ_INT(
+            config_switch_guard_install_or_adopt(
+                guard_case.ctx, guard_case.target, GIT_SCOPE_GLOBAL,
+                guard_case.destinations, guard_case.destination_count,
+                &guard_case.guard),
+            0);
+        CHECK(!config_switch_guard_was_created(guard_case.guard));
+        after_length = h1_read_bounded_file(
+            fixture.switch_fence, marker_after,
+            sizeof(marker_after), &after_state);
+        CHECK_EQ_INT((int)after_length, (int)before_length);
+        if (before_length > 0U && after_length == before_length) {
+            CHECK(memcmp(marker_before, marker_after, before_length) == 0);
+            CHECK(h1_same_file_state(&before_state, &after_state));
+        }
+        CHECK_EQ_INT(
+            config_switch_guard_clear(&guard_case.guard), 0);
+        CHECK(!guard_case.guard);
+        errno = 0;
+        CHECK(lstat(fixture.switch_fence, &state) != 0 &&
+              errno == ENOENT);
+    }
+    h1_guard_case_end(&guard_case);
+    secure_zero_memory(marker_before, sizeof(marker_before));
+    secure_zero_memory(marker_after, sizeof(marker_after));
+    ts_rm_rf(fixture.root);
+}
+
+TEST(parent_guard_retain_republishes_exact_unlinked_marker) {
+    unsigned char marker_before[16384] = {0};
+    unsigned char marker_after[sizeof(marker_before)] = {0};
+    cli_owner_fixture_t fixture = {0};
+    h1_guard_case_t guard_case = {0};
+    config_switch_guard_recovery_t recovery;
+    struct stat before_state = {0};
+    struct stat after_state = {0};
+    struct stat state = {0};
+    size_t before_length = 0U;
+    size_t after_length = 0U;
+    bool blocked = false;
+    int begin_result = -1;
+    int fixture_result;
+
+    fixture_result = h1_fixture_setup(&fixture);
+    CHECK_EQ_INT(fixture_result, 0);
+    if (fixture_result == 0) {
+        begin_result = h1_guard_case_begin(&fixture, &guard_case);
+    }
+    CHECK_EQ_INT(begin_result, 0);
+    if (begin_result == 0) {
+        CHECK_EQ_INT(
+            config_switch_guard_install_or_adopt(
+                guard_case.ctx, guard_case.target, GIT_SCOPE_GLOBAL,
+                guard_case.destinations, guard_case.destination_count,
+                &guard_case.guard),
+            0);
+        before_length = h1_read_bounded_file(
+            fixture.switch_fence, marker_before,
+            sizeof(marker_before), &before_state);
+        CHECK(before_length > 0U);
+
+        g_switch_guard_fail_stage = false;
+        g_switch_guard_fail_clear = true;
+        g_switch_guard_clear_failures_remaining = 0;
+        g_switch_guard_hook_calls = 0;
+        (void)gitswitch_test_set_switch_guard_hook(
+            fail_switch_guard_lifecycle);
+        CHECK_EQ_INT(
+            config_switch_guard_clear(&guard_case.guard), -1);
+        (void)gitswitch_test_set_switch_guard_hook(NULL);
+        CHECK(guard_case.guard != NULL);
+        CHECK_EQ_INT(g_switch_guard_hook_calls, 1);
+        errno = 0;
+        CHECK(lstat(fixture.switch_fence, &state) != 0 &&
+              errno == ENOENT);
+
+        CHECK_EQ_INT(
+            config_switch_guard_retain(&guard_case.guard), 0);
+        CHECK(!guard_case.guard);
+        after_length = h1_read_bounded_file(
+            fixture.switch_fence, marker_after,
+            sizeof(marker_after), &after_state);
+        CHECK_EQ_INT((int)after_length, (int)before_length);
+        if (before_length > 0U && after_length == before_length) {
+            CHECK(memcmp(marker_before, marker_after, after_length) == 0);
+            CHECK(S_ISREG(after_state.st_mode));
+            CHECK_EQ_INT(after_state.st_mode & 0777, 0600);
+        }
+
+        memset(&recovery, 0, sizeof(recovery));
+        CHECK_EQ_INT(
+            config_switch_guard_probe(
+                fixture.config, &blocked, &recovery),
+            0);
+        CHECK(blocked);
+        CHECK(recovery.valid);
+        CHECK_EQ_INT(recovery.target.id, guard_case.target->id);
+        CHECK_EQ_INT(
+            (int)recovery.destination_count,
+            (int)guard_case.destination_count);
+
+        CHECK_EQ_INT(
+            config_switch_guard_install_or_adopt(
+                guard_case.ctx, guard_case.target, GIT_SCOPE_GLOBAL,
+                guard_case.destinations, guard_case.destination_count,
+                &guard_case.guard),
+            0);
+        CHECK(!config_switch_guard_was_created(guard_case.guard));
+        CHECK_EQ_INT(
+            config_switch_guard_clear(&guard_case.guard), 0);
+        CHECK(!guard_case.guard);
+    }
+    h1_guard_case_end(&guard_case);
+    secure_zero_memory(marker_before, sizeof(marker_before));
+    secure_zero_memory(marker_after, sizeof(marker_after));
+    ts_rm_rf(fixture.root);
+}
+
 TEST_MAIN_BEGIN()
     RUN_TEST(one_shot_exact_abort_releases_cli_context);
     RUN_TEST(persistent_runtime_lock_retains_then_settles_before_next_entry);
@@ -3427,4 +3747,7 @@ TEST_MAIN_BEGIN()
     RUN_TEST(fenced_resume_uses_exact_numeric_account_name_not_colliding_id);
     RUN_TEST(ordinary_guard_restore_failure_fences_next_cli_entry);
     RUN_TEST(ordinary_dispatch_restore_failure_fences_next_cli_entry);
+    RUN_TEST(parent_guard_stage_failure_removes_exact_fresh_stage);
+    RUN_TEST(parent_guard_abandon_then_adopt_reuses_exact_authority);
+    RUN_TEST(parent_guard_retain_republishes_exact_unlinked_marker);
 TEST_MAIN_END()

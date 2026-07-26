@@ -1495,6 +1495,130 @@ TEST(hardlinked_destination_is_refused_without_mutation) {
     at_bytes_clear(&before);
 }
 
+TEST(outer_abort_restores_exact_bytes_and_exports_reconciled_witness) {
+    at_fixture_t fixture;
+    at_bytes_t before = {0};
+    const account_t *accounts[1];
+    const publication_record_t *publications[1];
+    git_retirement_transaction_t *transaction = NULL;
+    publication_identity_t expected_identity;
+    publication_identity_t restored_identity;
+    struct stat restored_stat = {0};
+    char restored_path[MAX_PATH_LEN] = {0};
+    size_t cleared = 99U;
+    int query_result;
+    int stat_result;
+
+    CHECK_EQ_INT(at_fixture_init(&fixture, PUBLICATION_SCOPE_GLOBAL,
+                                 false, 0640), 0);
+    CHECK_EQ_INT(at_read_bytes(fixture.config_path, &before), 0);
+    accounts[0] = &fixture.account;
+    publications[0] = &fixture.publication;
+
+    CHECK_EQ_INT(git_retirement_transaction_prepare(
+                     accounts, publications, 1U, &transaction), 0);
+    CHECK(transaction != NULL);
+    CHECK(access(fixture.lock_path, F_OK) == 0);
+    if (!transaction) goto cleanup;
+
+    CHECK_EQ_INT(git_retirement_transaction_publish(
+                     transaction, &cleared), 0);
+    CHECK_EQ_INT((long)cleared, (long)AT_KEY_COUNT);
+    at_check_owned_absent(&fixture);
+    CHECK(access(fixture.lock_path, F_OK) == 0);
+
+    CHECK_EQ_INT(git_retirement_transaction_abort(transaction), 0);
+    CHECK(at_file_equals_bytes(fixture.config_path, &before));
+    CHECK_EQ_INT(
+        (long)git_retirement_transaction_restored_destination_count(
+            transaction),
+        1);
+    CHECK(access(fixture.lock_path, F_OK) == 0);
+
+    memset(&restored_identity, 0, sizeof(restored_identity));
+    query_result = git_retirement_transaction_restored_destination(
+        transaction, 0U, restored_path,
+        sizeof(restored_path), &restored_identity);
+    CHECK_EQ_INT(query_result, 0);
+    if (query_result == 0) {
+        CHECK_STR_EQ(restored_path, fixture.config_path);
+        stat_result = stat(fixture.config_path, &restored_stat);
+        CHECK_EQ_INT(stat_result, 0);
+        if (stat_result == 0) {
+            publication_identity_from_stat(&expected_identity,
+                                           &restored_stat);
+            CHECK(publication_identity_equal(&restored_identity,
+                                             &expected_identity));
+        }
+    }
+    CHECK(at_file_equals_bytes(fixture.config_path, &before));
+    errno = 0;
+    CHECK(access(fixture.lock_path, F_OK) != 0 && errno == ENOENT);
+
+cleanup:
+    if (transaction) {
+        CHECK_EQ_INT(git_retirement_transaction_commit(&transaction), 0);
+    }
+    CHECK(transaction == NULL);
+    CHECK(at_file_equals_bytes(fixture.config_path, &before));
+    errno = 0;
+    CHECK(access(fixture.lock_path, F_OK) != 0 && errno == ENOENT);
+    at_bytes_clear(&before);
+}
+
+TEST(absent_recorded_destination_retires_without_recreation) {
+    static const char neighboring_contents[] =
+        "neighboring file must remain exact\n";
+    at_fixture_t fixture;
+    at_bytes_t neighbor_before = {0};
+    const account_t *accounts[1];
+    const publication_record_t *publications[1];
+    git_retirement_transaction_t *transaction = NULL;
+    size_t cleared = 99U;
+
+    CHECK_EQ_INT(at_fixture_init(&fixture, PUBLICATION_SCOPE_GLOBAL,
+                                 false, 0600), 0);
+    CHECK_EQ_INT(at_write_file(fixture.replacement_path,
+                               neighboring_contents, 0600), 0);
+    CHECK_EQ_INT(at_read_bytes(fixture.replacement_path,
+                               &neighbor_before), 0);
+    CHECK_EQ_INT(unlink(fixture.config_path), 0);
+    accounts[0] = &fixture.account;
+    publications[0] = &fixture.publication;
+
+    CHECK_EQ_INT(git_retirement_transaction_prepare(
+                     accounts, publications, 1U, &transaction), 0);
+    CHECK(transaction != NULL);
+    errno = 0;
+    CHECK(access(fixture.config_path, F_OK) != 0 && errno == ENOENT);
+    CHECK(access(fixture.lock_path, F_OK) == 0);
+    CHECK(at_file_equals_bytes(fixture.replacement_path,
+                               &neighbor_before));
+    if (!transaction) goto cleanup;
+
+    CHECK_EQ_INT(git_retirement_transaction_publish(
+                     transaction, &cleared), 0);
+    CHECK_EQ_INT((long)cleared, 0);
+    errno = 0;
+    CHECK(access(fixture.config_path, F_OK) != 0 && errno == ENOENT);
+    CHECK(access(fixture.lock_path, F_OK) == 0);
+    CHECK(at_file_equals_bytes(fixture.replacement_path,
+                               &neighbor_before));
+
+cleanup:
+    if (transaction) {
+        CHECK_EQ_INT(git_retirement_transaction_commit(&transaction), 0);
+    }
+    CHECK(transaction == NULL);
+    errno = 0;
+    CHECK(access(fixture.config_path, F_OK) != 0 && errno == ENOENT);
+    errno = 0;
+    CHECK(access(fixture.lock_path, F_OK) != 0 && errno == ENOENT);
+    CHECK(at_file_equals_bytes(fixture.replacement_path,
+                               &neighbor_before));
+    at_bytes_clear(&neighbor_before);
+}
+
 TEST(successful_publication_preserves_nondefault_file_mode) {
     at_fixture_t fixture;
     struct stat before;
@@ -1538,5 +1662,7 @@ TEST_MAIN_BEGIN()
     RUN_TEST(maximum_snapshot_recovery_marker_crosses_old_reader_limit);
     RUN_TEST(post_exchange_foreign_stage_is_never_reverse_published);
     RUN_TEST(hardlinked_destination_is_refused_without_mutation);
+    RUN_TEST(outer_abort_restores_exact_bytes_and_exports_reconciled_witness);
+    RUN_TEST(absent_recorded_destination_retires_without_recreation);
     RUN_TEST(successful_publication_preserves_nondefault_file_mode);
 TEST_MAIN_END()
