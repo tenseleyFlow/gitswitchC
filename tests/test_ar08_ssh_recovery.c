@@ -3343,6 +3343,40 @@ static int failed_with_truncated_pid_and_socket_runner(
     return -1;
 }
 
+static int successful_with_truncated_pid_and_socket_runner(
+    const char *const argv[], const run_opts_t *opts, run_result_t *result) {
+    const char *socket_arg;
+
+    if (is_key_fingerprint_command(argv)) {
+        return emit_fixture_key_fingerprint(opts, result);
+    }
+    if (result) {
+        memset(result, 0, sizeof(*result));
+        result->spawned = true;
+        result->exit_code = 0;
+        result->out_truncated = true;
+    }
+    if (opts && opts->out && opts->out_size > 0) opts->out[0] = '\0';
+    if (!argv || !argv[0] || !is_ssh_agent_command(argv[0])) return 0;
+    if (certify_agent_launch(argv[0], result) != 0) return -1;
+
+    socket_arg = runner_socket_arg(argv);
+    if (!socket_arg || bind_runner_socket(socket_arg, 0600, opts) != 0) {
+        return -1;
+    }
+    make_runner_socket_stale();
+    if (opts && opts->out) {
+        int written = snprintf(
+            opts->out, opts->out_size,
+            "SSH_AUTH_SOCK=%s; export SSH_AUTH_SOCK;\n"
+            "SSH_AGENT_PID=%ld",
+            socket_arg, (long)TEST_PID);
+        if (written < 0 || (size_t)written >= opts->out_size) return -1;
+        if (result) result->out_len = (size_t)written;
+    }
+    return 0;
+}
+
 static int successful_agent_runner(const char *const argv[],
                                    const run_opts_t *opts,
                                    run_result_t *result) {
@@ -3570,6 +3604,46 @@ TEST(socket_evidence_recovers_without_trusting_truncated_pid) {
     CHECK(!config.agent_owned);
     CHECK(!path_exists(fixture.socket));
     CHECK(!path_exists(fixture.sidecar));
+    CHECK(strstr(get_last_error()->message,
+                 "spawned runtime removed") != NULL);
+    close(fixture.dir_fd);
+}
+
+TEST(successful_launch_rejects_truncated_pid_capture) {
+    ssh_fixture_t fixture;
+    account_t account;
+    ssh_config_t config;
+    command_runner_fn previous_runner;
+    ssh_reap_fn previous_reap;
+
+    CHECK_EQ_INT(make_fixture(&fixture, "gsar14runtruncated"), 0);
+    if (fixture.dir_fd < 0) return;
+    memset(&account, 0, sizeof(account));
+    account.id = 1;
+    CHECK_EQ_INT(safe_strncpy(account.name, "work",
+                              sizeof(account.name)), 0);
+    CHECK_EQ_INT(safe_strncpy(account.email, "work@example.invalid",
+                              sizeof(account.email)), 0);
+    account.ssh_enabled = true;
+    CHECK((size_t)snprintf(account.ssh_key_path,
+                           sizeof(account.ssh_key_path), "%s/key",
+                           fixture.xdg) < sizeof(account.ssh_key_path));
+    memset(&config, 0, sizeof(config));
+    config.mode = SSH_AGENT_ISOLATED;
+    config.agent_pid = -1;
+
+    previous_runner = run_set_runner(
+        successful_with_truncated_pid_and_socket_runner);
+    previous_reap = ssh_manager_set_reap_fn(reap_indeterminate);
+    CHECK_EQ_INT(ssh_start_isolated_agent(&config, &account), -1);
+    ssh_manager_set_reap_fn(previous_reap);
+    run_set_runner(previous_runner);
+
+    CHECK_EQ_INT(config.agent_pid, -1);
+    CHECK(!config.agent_owned);
+    CHECK(!path_exists(fixture.socket));
+    CHECK(!path_exists(fixture.sidecar));
+    CHECK(!path_exists(fixture.current));
     CHECK(strstr(get_last_error()->message,
                  "spawned runtime removed") != NULL);
     close(fixture.dir_fd);
@@ -4002,6 +4076,7 @@ TEST_MAIN_BEGIN()
     RUN_TEST(unrecorded_launch_cleanup_keeps_original_captured_generation);
     RUN_TEST(runner_failure_indeterminate_reap_publishes_retry_tuple);
     RUN_TEST(socket_evidence_recovers_without_trusting_truncated_pid);
+    RUN_TEST(successful_launch_rejects_truncated_pid_capture);
     RUN_TEST(pre_sidecar_failed_reap_publishes_retry_tuple);
     RUN_TEST(pre_sidecar_replaced_generation_retains_socket_unowned);
     RUN_TEST(failed_retry_sidecar_publication_retains_artifact_without_ownership);

@@ -162,7 +162,9 @@ static int publish_current_socket_link(int dir_fd, const char *socket_path,
                                        ssh_current_link_identity_t *identity);
 static int remove_current_socket_link_if_unchanged(
     int dir_fd, const ssh_current_link_identity_t *identity);
-static int parse_ssh_agent_output(const char *output, ssh_config_t *ssh_config);
+static int parse_ssh_agent_output(const char *output, size_t output_len,
+                                  bool output_truncated,
+                                  ssh_config_t *ssh_config);
 static bool parse_complete_ssh_agent_pid(const char *output,
                                          size_t output_len,
                                          bool output_truncated,
@@ -3956,6 +3958,8 @@ static int ssh_start_isolated_agent_with_key(
     bool reuse_pin_active = false;
     error_context_t causal_match_error;
     run_launch_witness_t agent_launch_witness;
+    size_t launch_output_len = 0U;
+    bool launch_output_truncated = false;
     bool preserve_causal_match_error = false;
     int causal_match_errno = 0;
     int dir_fd = -1;
@@ -4344,6 +4348,8 @@ static int ssh_start_isolated_agent_with_key(
                 launch_result.out_len--;
                 output[launch_result.out_len] = '\0';
             }
+            launch_output_len = launch_result.out_len;
+            launch_output_truncated = launch_result.out_truncated;
         }
         if (unlinkat(dir_fd, provenance_marker, AT_REMOVEDIR) != 0 &&
             errno != ENOENT) {
@@ -4423,7 +4429,8 @@ static int ssh_start_isolated_agent_with_key(
      * directory to `-a`; the public `socket_path` assembled above is therefore
      * the authoritative exported path. Use it directly and keep only the
      * parsed PID. */
-    if (parse_ssh_agent_output(output, ssh_config) != 0) {
+    if (parse_ssh_agent_output(output, launch_output_len,
+                               launch_output_truncated, ssh_config) != 0) {
         ssh_unrecorded_result_t recovery;
         set_error(ERR_SSH_AGENT_START_FAILED, "Failed to parse ssh-agent output");
         /* The agent is typically already alive and bound to socket_path here,
@@ -9452,14 +9459,20 @@ static bool parse_complete_ssh_agent_pid(const char *output,
     return found;
 }
 
-static int parse_ssh_agent_output(const char *output, ssh_config_t *ssh_config) {
+static int parse_ssh_agent_output(const char *output, size_t output_len,
+                                  bool output_truncated,
+                                  ssh_config_t *ssh_config) {
     char *line;
     char *output_copy;
     char *saveptr;
+    pid_t parsed_pid = -1;
     
-    if (!output || !ssh_config) {
+    if (!output || !ssh_config ||
+        !parse_complete_ssh_agent_pid(output, output_len,
+                                      output_truncated, &parsed_pid)) {
         return -1;
     }
+    ssh_config->agent_pid = parsed_pid;
     
     /* Make a copy of output for parsing */
     output_copy = strdup(output);
@@ -9495,36 +9508,6 @@ static int parse_ssh_agent_output(const char *output, ssh_config_t *ssh_config) 
             }
             safe_strncpy(ssh_config->agent_socket_path, socket_start,
                         sizeof(ssh_config->agent_socket_path));
-        }
-        
-        /* Look for SSH_AGENT_PID */
-        if (strstr(line, "SSH_AGENT_PID=")) {
-            char *pid_start = strchr(line, '=') + 1;
-            char *pid_end = strchr(pid_start, ';');
-            if (pid_end) {
-                *pid_end = '\0';
-            }
-            ssh_config->agent_pid = (pid_t)strtol(pid_start, NULL, 10);
-        }
-
-        /* Preserve a recovery PID even when the surrounding output syntax is
-         * not one the activation parser accepts. OpenSSH's diagnostic line is
-         * emitted after both Bourne and csh forms; retaining it lets the
-         * pre-sidecar failure path publish a durable retry tuple. This does
-         * not make the overall parse succeed without SSH_AUTH_SOCK. */
-        if (ssh_config->agent_pid <= 1) {
-            char *agent_pid = strstr(line, "Agent pid ");
-            if (agent_pid) {
-                char *end = NULL;
-                long parsed;
-                errno = 0;
-                agent_pid += strlen("Agent pid ");
-                parsed = strtol(agent_pid, &end, 10);
-                if (errno == 0 && end != agent_pid && parsed > 1 &&
-                    (long)(pid_t)parsed == parsed) {
-                    ssh_config->agent_pid = (pid_t)parsed;
-                }
-            }
         }
         
         line = strtok_r(NULL, "\n", &saveptr);
