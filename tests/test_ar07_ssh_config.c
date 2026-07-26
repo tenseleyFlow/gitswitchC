@@ -637,7 +637,7 @@ TEST(identityfile_quoting_and_hostname_are_serialized_safely) {
     char *content;
 
     CHECK_EQ_INT(setup_home(home, config), 0);
-    snprintf(key, sizeof(key), "%s/key dir/id\\backslash", home);
+    snprintf(key, sizeof(key), "%s/key dir/id'apostrophe%%literal", home);
     make_account(&account, key);
     CHECK_EQ_INT(ssh_configure_host_alias(&account), 0);
     content = read_bytes(config, &config_len);
@@ -645,7 +645,8 @@ TEST(identityfile_quoting_and_hostname_are_serialized_safely) {
     if (content) {
         CHECK(strstr(content, "HostName " TEST_HOSTNAME "\n") != NULL);
         CHECK(strstr(content, "IdentityFile \"") != NULL);
-        CHECK(strstr(content, "key dir/id\\backslash\"") != NULL);
+        CHECK(strstr(content,
+                     "key dir/id'apostrophe%%literal\"") != NULL);
         free(content);
     }
 }
@@ -755,7 +756,7 @@ TEST(identityfile_quoting_and_hostname_match_openssh_oracle) {
         TS_SKIP("openssh", "ssh unavailable in trusted PATH");
     }
     CHECK_EQ_INT(setup_home(home, config), 0);
-    snprintf(key, sizeof(key), "%s/key dir/id\\backslash", home);
+    snprintf(key, sizeof(key), "%s/key dir/id'apostrophe", home);
     make_account(&account, key);
     CHECK_EQ_INT(safe_strncpy(account.ssh_hostname, ipv6_hostname,
                               sizeof(account.ssh_hostname)), 0);
