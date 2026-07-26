@@ -186,9 +186,11 @@ int accounts_edit_abort(gitswitch_ctx_t *ctx);
  * accounts_remove_finalize(): DURABLE after proven directory sync, UNCERTAIN
  * after installation without proven durability, or PREINSTALL_FAILED only
  * when the account document was not installed. The commit/abort wrappers are
- * retained for direct one-call compatibility. Finalization retires only an
- * exclusively owned SSH alias after installation; a pre-install failure
- * deliberately leaves it paired with the retained durable account. */
+ * retained for direct one-call compatibility. Finalization retires only the
+ * captured, exclusively owned SSH alias after installation and settles the
+ * marker independently from any post-install cleanup diagnostic. A
+ * pre-install failure deliberately leaves the alias paired with the retained
+ * durable account. */
 int accounts_remove(gitswitch_ctx_t *ctx, const char *identifier);
 int accounts_remove_commit(gitswitch_ctx_t *ctx);
 int accounts_remove_abort(gitswitch_ctx_t *ctx);

@@ -245,6 +245,19 @@ typedef struct {
     char account_incarnation[ACCOUNT_INCARNATION_LEN];
 } config_retirement_owner_t;
 
+/* Optional, remove-only durable obligation to retire one managed OpenSSH
+ * alias from the exact HOME namespace in which it was installed. `known`
+ * distinguishes an explicit no-obligation marker (including legacy RESET)
+ * from a v1 REMOVE projection whose SSH obligation is unknowable. */
+typedef struct {
+    bool known;
+    bool present;
+    char ssh_host_alias[MAX_NAME_LEN];
+    char home_path[MAX_PATH_LEN];
+    publication_identity_t home_identity;
+    publication_identity_t ssh_directory_identity;
+} config_retirement_ssh_alias_obligation_t;
+
 typedef struct {
     char config_path[MAX_PATH_LEN];
     publication_identity_t post_config;
@@ -257,9 +270,11 @@ typedef struct config_retirement_guard config_retirement_guard_t;
  * exact completed marker/certificate pairs return a zeroed projection. */
 typedef struct {
     bool valid;
+    unsigned int marker_version;
     config_retirement_kind_t kind;
     config_retirement_owner_t owners[MAX_ACCOUNTS];
     size_t owner_count;
+    config_retirement_ssh_alias_obligation_t ssh_alias_obligation;
 } config_retirement_recovery_t;
 
 /* Under an internally owned retirement lifecycle lock, install a fresh
@@ -277,6 +292,12 @@ typedef struct {
 int config_retirement_guard_install_or_adopt(
     const char *config_path, config_retirement_kind_t kind,
     const config_retirement_owner_t *owners, size_t owner_count,
+    config_retirement_guard_t **guard);
+
+int config_retirement_guard_install_or_adopt_with_ssh_alias_obligation(
+    const char *config_path, config_retirement_kind_t kind,
+    const config_retirement_owner_t *owners, size_t owner_count,
+    const config_retirement_ssh_alias_obligation_t *obligation,
     config_retirement_guard_t **guard);
 
 /* Read one stable, token-free recovery projection without creating, locking,
@@ -301,6 +322,12 @@ int config_retirement_guard_adopt(
     const config_retirement_owner_t *owners, size_t owner_count,
     config_retirement_guard_t **guard);
 
+int config_retirement_guard_adopt_with_ssh_alias_obligation(
+    const char *config_path, config_retirement_kind_t kind,
+    const config_retirement_owner_t *owners, size_t owner_count,
+    const config_retirement_ssh_alias_obligation_t *obligation,
+    config_retirement_guard_t **guard);
+
 /* Read-only retirement gate. On return 0, `blocked` is false only when both
  * fixed records are absent or one jointly revalidated canonical marker and
  * byte-identical `.retirement-complete` certificate form an exact pair. A
@@ -317,6 +344,14 @@ int config_retirement_guard_probe(const char *config_path, bool *blocked);
  * preserve the older incomplete witness.
  */
 bool config_retirement_guard_was_created(
+    const config_retirement_guard_t *guard);
+
+/* Re-prove that a lock-owning handle still names its exact incomplete marker
+ * generation. This is read-only: it neither reacquires the lifecycle lock nor
+ * mutates, clears, or frees the handle or any retirement namespace record.
+ * Replacement, byte/token change, stage/certificate interference, settlement,
+ * or directory namespace replacement fails closed. */
+int config_retirement_guard_revalidate(
     const config_retirement_guard_t *guard);
 
 /* Complete only the exact owned marker generation (inode, complete bytes, and

@@ -306,6 +306,17 @@ int ssh_configure_host_alias_result(
     const account_t *account,
     ssh_config_publication_state_t *publication);
 
+/* Structured alias-removal result. Always initializes `publication` when it
+ * is non-NULL and rejects a NULL/empty alias as PREINSTALL_FAILED; the legacy
+ * wrapper retains its historical NULL/empty no-op. UNCHANGED means the alias
+ * was already absent and that observed state passed the applicable durability
+ * and final public-namespace checks. A nonzero return with an
+ * installed/uncertain publication is a committed-state warning, not
+ * authorization to restore the removed alias. */
+int ssh_remove_host_alias_result(
+    const char *alias,
+    ssh_config_publication_state_t *publication);
+
 /**
  * Remove the managed host-alias block for `alias` from ~/.ssh/config (AR-06
  * F15). No-op if the config or the block is absent. Returns 0 on success

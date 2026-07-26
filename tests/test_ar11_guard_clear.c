@@ -150,6 +150,80 @@ static bool guard_mutate_token(
     return true;
 }
 
+static size_t guard_make_v1_marker(
+    const guard_fixture_t *fixture, config_retirement_kind_t kind,
+    unsigned char legacy[GUARD_MAX_BYTES]) {
+    static const char v2_header[] =
+        "gitswitch-retirement-incomplete-v2";
+    static const char obligation_line[] = "ssh_obligation=none\n";
+    static const char reset_line[] = "operation=reset\n";
+    static const char remove_line[] = "operation=remove\n";
+    unsigned char *line;
+    size_t legacy_length;
+    size_t line_offset;
+    size_t tail_offset;
+    size_t tail_length;
+
+    if (!fixture || !legacy ||
+        fixture->marker_length > GUARD_MAX_BYTES ||
+        fixture->marker_length < sizeof(v2_header) - 1U ||
+        memcmp(fixture->marker_data, v2_header,
+               sizeof(v2_header) - 1U) != 0 ||
+        (kind != CONFIG_RETIREMENT_RESET &&
+         kind != CONFIG_RETIREMENT_REMOVE)) {
+        return 0U;
+    }
+    memcpy(legacy, fixture->marker_data, fixture->marker_length);
+    legacy[sizeof(v2_header) - 2U] = (unsigned char)'1';
+    line = memmem(legacy, fixture->marker_length, obligation_line,
+                  sizeof(obligation_line) - 1U);
+    if (!line) return 0U;
+    legacy_length = (size_t)(line - legacy);
+    if (kind == CONFIG_RETIREMENT_RESET) return legacy_length;
+
+    line = memmem(legacy, legacy_length, reset_line,
+                  sizeof(reset_line) - 1U);
+    if (!line ||
+        legacy_length + sizeof(remove_line) - sizeof(reset_line) >
+            GUARD_MAX_BYTES) {
+        return 0U;
+    }
+    line_offset = (size_t)(line - legacy);
+    tail_offset = line_offset + sizeof(reset_line) - 1U;
+    tail_length = legacy_length - tail_offset;
+    memmove(legacy + line_offset + sizeof(remove_line) - 1U,
+            legacy + tail_offset, tail_length);
+    memcpy(legacy + line_offset, remove_line,
+           sizeof(remove_line) - 1U);
+    return legacy_length + sizeof(remove_line) - sizeof(reset_line);
+}
+
+static bool guard_make_alias_obligation(
+    const guard_fixture_t *fixture, const char *alias,
+    config_retirement_ssh_alias_obligation_t *obligation) {
+    struct stat home;
+
+    if (!fixture || !alias || !obligation ||
+        stat(fixture->directory, &home) != 0) {
+        return false;
+    }
+    memset(obligation, 0, sizeof(*obligation));
+    obligation->known = true;
+    obligation->present = true;
+    if ((size_t)snprintf(
+            obligation->ssh_host_alias,
+            sizeof(obligation->ssh_host_alias), "%s", alias) >=
+            sizeof(obligation->ssh_host_alias) ||
+        (size_t)snprintf(
+            obligation->home_path, sizeof(obligation->home_path),
+            "%s", fixture->directory) >=
+            sizeof(obligation->home_path)) {
+        return false;
+    }
+    publication_identity_from_stat(&obligation->home_identity, &home);
+    return true;
+}
+
 static int guard_count_retirement_entries(
     const char *directory, int *unexpected) {
     DIR *stream;
@@ -650,6 +724,9 @@ TEST(recovery_projection_adopts_only_the_exact_active_owner_set) {
     CHECK_EQ_INT(config_retirement_guard_recovery_probe(
                      fixture.config_path, &recovery), 0);
     CHECK(recovery.valid);
+    CHECK_EQ_INT(recovery.marker_version, 2);
+    CHECK(recovery.ssh_alias_obligation.known);
+    CHECK(!recovery.ssh_alias_obligation.present);
     CHECK_EQ_INT(recovery.kind, CONFIG_RETIREMENT_RESET);
     CHECK_EQ_INT((long)recovery.owner_count, 1);
     CHECK_EQ_INT(recovery.owners[0].account_id,
@@ -686,6 +763,428 @@ TEST(recovery_projection_adopts_only_the_exact_active_owner_set) {
                      fixture.config_path, &recovery), 0);
     CHECK(!recovery.valid);
     CHECK_EQ_INT((long)recovery.owner_count, 0);
+    guard_fixture_cleanup(&fixture);
+}
+
+TEST(v2_remove_alias_obligation_roundtrips_and_adopts_exactly) {
+    guard_fixture_t fixture;
+    config_retirement_ssh_alias_obligation_t obligation;
+    config_retirement_recovery_t recovery;
+    config_retirement_guard_t *adopted = NULL;
+
+    CHECK_EQ_INT(guard_fixture_init(&fixture), 0);
+    CHECK_EQ_INT(config_retirement_guard_clear(&fixture.guard), 0);
+    CHECK(guard_make_alias_obligation(
+        &fixture, "github.com-work", &obligation));
+    CHECK_EQ_INT(
+        config_retirement_guard_install_or_adopt_with_ssh_alias_obligation(
+            fixture.config_path, CONFIG_RETIREMENT_REMOVE,
+            &fixture.owner, 1U, &obligation, &fixture.guard), 0);
+    config_retirement_guard_abandon(&fixture.guard);
+
+    memset(&recovery, 0, sizeof(recovery));
+    CHECK_EQ_INT(config_retirement_guard_recovery_probe(
+                     fixture.config_path, &recovery), 0);
+    CHECK(recovery.valid);
+    CHECK_EQ_INT(recovery.marker_version, 2);
+    CHECK(recovery.ssh_alias_obligation.known);
+    CHECK(recovery.ssh_alias_obligation.present);
+    CHECK(strcmp(recovery.ssh_alias_obligation.ssh_host_alias,
+                 obligation.ssh_host_alias) == 0);
+    CHECK(strcmp(recovery.ssh_alias_obligation.home_path,
+                 obligation.home_path) == 0);
+    CHECK(publication_identity_equal(
+        &recovery.ssh_alias_obligation.home_identity,
+        &obligation.home_identity));
+    CHECK(publication_identity_equal(
+        &recovery.ssh_alias_obligation.ssh_directory_identity,
+        &obligation.ssh_directory_identity));
+    CHECK_EQ_INT(
+        config_retirement_guard_adopt_with_ssh_alias_obligation(
+            fixture.config_path, recovery.kind, recovery.owners,
+            recovery.owner_count, &recovery.ssh_alias_obligation,
+            &adopted), 0);
+    CHECK_EQ_INT(config_retirement_guard_clear(&adopted), 0);
+    guard_fixture_cleanup(&fixture);
+}
+
+TEST(v1_reset_projects_no_alias_obligation_and_legacy_wrappers_adopt) {
+    guard_fixture_t fixture;
+    config_retirement_recovery_t recovery;
+    config_retirement_guard_t *adopted = NULL;
+    unsigned char legacy[GUARD_MAX_BYTES];
+    size_t legacy_length;
+    int directory_fd;
+
+    CHECK_EQ_INT(guard_fixture_init(&fixture), 0);
+    config_retirement_guard_abandon(&fixture.guard);
+    legacy_length = guard_make_v1_marker(
+        &fixture, CONFIG_RETIREMENT_RESET, legacy);
+    CHECK(legacy_length > 0U);
+    directory_fd = open(
+        fixture.directory,
+        O_RDONLY | O_CLOEXEC | O_DIRECTORY | O_NOFOLLOW);
+    CHECK(directory_fd >= 0);
+    if (directory_fd >= 0) {
+        CHECK_EQ_INT(guard_atomic_replace_at(
+                         directory_fd, GUARD_NAME, legacy,
+                         legacy_length), 0);
+        CHECK_EQ_INT(close(directory_fd), 0);
+    }
+
+    memset(&recovery, 0xA5, sizeof(recovery));
+    CHECK_EQ_INT(config_retirement_guard_recovery_probe(
+                     fixture.config_path, &recovery), 0);
+    CHECK(recovery.valid);
+    CHECK_EQ_INT(recovery.marker_version, 1);
+    CHECK(recovery.ssh_alias_obligation.known);
+    CHECK(!recovery.ssh_alias_obligation.present);
+    CHECK_EQ_INT(config_retirement_guard_install_or_adopt(
+                     fixture.config_path, recovery.kind,
+                     recovery.owners, recovery.owner_count, &adopted), 0);
+    CHECK(adopted != NULL);
+    CHECK(!config_retirement_guard_was_created(adopted));
+    config_retirement_guard_abandon(&adopted);
+    CHECK_EQ_INT(config_retirement_guard_adopt(
+                     fixture.config_path, recovery.kind,
+                     recovery.owners, recovery.owner_count, &adopted), 0);
+    CHECK_EQ_INT(config_retirement_guard_clear(&adopted), 0);
+    guard_fixture_cleanup(&fixture);
+}
+
+TEST(v1_remove_projects_unknown_alias_and_cannot_be_adopted) {
+    guard_fixture_t fixture;
+    config_retirement_recovery_t recovery;
+    config_retirement_guard_t *adopted = NULL;
+    unsigned char legacy[GUARD_MAX_BYTES];
+    unsigned char observed[GUARD_MAX_BYTES];
+    struct stat legacy_identity;
+    struct stat after;
+    size_t legacy_length;
+    int directory_fd;
+
+    CHECK_EQ_INT(guard_fixture_init(&fixture), 0);
+    config_retirement_guard_abandon(&fixture.guard);
+    legacy_length = guard_make_v1_marker(
+        &fixture, CONFIG_RETIREMENT_REMOVE, legacy);
+    CHECK(legacy_length > 0U);
+    directory_fd = open(
+        fixture.directory,
+        O_RDONLY | O_CLOEXEC | O_DIRECTORY | O_NOFOLLOW);
+    CHECK(directory_fd >= 0);
+    if (directory_fd >= 0) {
+        CHECK_EQ_INT(guard_atomic_replace_at(
+                         directory_fd, GUARD_NAME, legacy,
+                         legacy_length), 0);
+        CHECK_EQ_INT(close(directory_fd), 0);
+    }
+    CHECK_EQ_INT(stat(fixture.marker_path, &legacy_identity), 0);
+
+    memset(&recovery, 0xA5, sizeof(recovery));
+    CHECK_EQ_INT(config_retirement_guard_recovery_probe(
+                     fixture.config_path, &recovery), 0);
+    CHECK(recovery.valid);
+    CHECK_EQ_INT(recovery.marker_version, 1);
+    CHECK_EQ_INT(recovery.kind, CONFIG_RETIREMENT_REMOVE);
+    CHECK(!recovery.ssh_alias_obligation.known);
+    CHECK(!recovery.ssh_alias_obligation.present);
+    CHECK_EQ_INT(config_retirement_guard_install_or_adopt(
+                     fixture.config_path, recovery.kind,
+                     recovery.owners, recovery.owner_count, &adopted), -1);
+    CHECK(adopted == NULL);
+    CHECK_EQ_INT(config_retirement_guard_adopt(
+                     fixture.config_path, recovery.kind,
+                     recovery.owners, recovery.owner_count, &adopted), -1);
+    CHECK(adopted == NULL);
+    CHECK_EQ_INT(
+        config_retirement_guard_adopt_with_ssh_alias_obligation(
+            fixture.config_path, recovery.kind, recovery.owners,
+            recovery.owner_count, &recovery.ssh_alias_obligation,
+            &adopted), -1);
+    CHECK(adopted == NULL);
+    CHECK_EQ_INT(stat(fixture.marker_path, &after), 0);
+    CHECK(ts_same_identity(&legacy_identity, &after));
+    CHECK_EQ_INT((long)guard_read_file(
+                     fixture.marker_path, observed, sizeof(observed)),
+                 (long)legacy_length);
+    CHECK(memcmp(observed, legacy, legacy_length) == 0);
+    guard_fixture_cleanup(&fixture);
+}
+
+TEST(changed_alias_obligation_never_adopts_or_mutates_marker) {
+    guard_fixture_t fixture;
+    config_retirement_ssh_alias_obligation_t obligation;
+    config_retirement_ssh_alias_obligation_t changed;
+    config_retirement_guard_t *adopted = NULL;
+    unsigned char marker[GUARD_MAX_BYTES];
+    struct stat identity;
+    struct stat after;
+    size_t marker_length;
+
+    CHECK_EQ_INT(guard_fixture_init(&fixture), 0);
+    CHECK_EQ_INT(config_retirement_guard_clear(&fixture.guard), 0);
+    CHECK(guard_make_alias_obligation(
+        &fixture, "github.com-work", &obligation));
+    CHECK_EQ_INT(
+        config_retirement_guard_install_or_adopt_with_ssh_alias_obligation(
+            fixture.config_path, CONFIG_RETIREMENT_REMOVE,
+            &fixture.owner, 1U, &obligation, &fixture.guard), 0);
+    config_retirement_guard_abandon(&fixture.guard);
+    marker_length = guard_read_file(
+        fixture.marker_path, marker, sizeof(marker));
+    CHECK(marker_length > 0U);
+    CHECK_EQ_INT(stat(fixture.marker_path, &identity), 0);
+
+    changed = obligation;
+    memcpy(changed.ssh_host_alias, "github.com-other",
+           sizeof("github.com-other"));
+    CHECK_EQ_INT(
+        config_retirement_guard_adopt_with_ssh_alias_obligation(
+            fixture.config_path, CONFIG_RETIREMENT_REMOVE,
+            &fixture.owner, 1U, &changed, &adopted), -1);
+    changed = obligation;
+    changed.home_path[strlen(changed.home_path) - 1U] ^= 1;
+    CHECK_EQ_INT(
+        config_retirement_guard_adopt_with_ssh_alias_obligation(
+            fixture.config_path, CONFIG_RETIREMENT_REMOVE,
+            &fixture.owner, 1U, &changed, &adopted), -1);
+    changed = obligation;
+    changed.home_identity.inode++;
+    CHECK_EQ_INT(
+        config_retirement_guard_adopt_with_ssh_alias_obligation(
+            fixture.config_path, CONFIG_RETIREMENT_REMOVE,
+            &fixture.owner, 1U, &changed, &adopted), -1);
+    CHECK(adopted == NULL);
+    CHECK_EQ_INT(stat(fixture.marker_path, &after), 0);
+    CHECK(ts_same_identity(&identity, &after));
+    CHECK_EQ_INT((long)guard_read_file(
+                     fixture.marker_path, hook_replacement,
+                     sizeof(hook_replacement)),
+                 (long)marker_length);
+    CHECK(memcmp(marker, hook_replacement, marker_length) == 0);
+    guard_fixture_cleanup(&fixture);
+}
+
+TEST(malformed_v2_alias_field_is_rejected_without_rewrite) {
+    guard_fixture_t fixture;
+    config_retirement_ssh_alias_obligation_t obligation;
+    config_retirement_recovery_t recovery;
+    unsigned char malformed[GUARD_MAX_BYTES];
+    unsigned char observed[GUARD_MAX_BYTES];
+    static const char alias_prefix[] = "ssh_alias=";
+    unsigned char *alias;
+    struct stat identity;
+    struct stat after;
+    size_t length;
+    int directory_fd;
+
+    CHECK_EQ_INT(guard_fixture_init(&fixture), 0);
+    CHECK_EQ_INT(config_retirement_guard_clear(&fixture.guard), 0);
+    CHECK(guard_make_alias_obligation(
+        &fixture, "github.com-work", &obligation));
+    CHECK_EQ_INT(
+        config_retirement_guard_install_or_adopt_with_ssh_alias_obligation(
+            fixture.config_path, CONFIG_RETIREMENT_REMOVE,
+            &fixture.owner, 1U, &obligation, &fixture.guard), 0);
+    config_retirement_guard_abandon(&fixture.guard);
+    length = guard_read_file(
+        fixture.marker_path, malformed, sizeof(malformed));
+    alias = memmem(malformed, length, alias_prefix,
+                   sizeof(alias_prefix) - 1U);
+    CHECK(alias != NULL);
+    if (alias) {
+        alias[sizeof(alias_prefix) - 1U] = (unsigned char)'Z';
+    }
+    directory_fd = open(
+        fixture.directory,
+        O_RDONLY | O_CLOEXEC | O_DIRECTORY | O_NOFOLLOW);
+    CHECK(directory_fd >= 0);
+    if (directory_fd >= 0) {
+        CHECK_EQ_INT(guard_atomic_replace_at(
+                         directory_fd, GUARD_NAME, malformed,
+                         length), 0);
+        CHECK_EQ_INT(close(directory_fd), 0);
+    }
+    CHECK_EQ_INT(stat(fixture.marker_path, &identity), 0);
+    memset(&recovery, 0xA5, sizeof(recovery));
+    CHECK_EQ_INT(config_retirement_guard_recovery_probe(
+                     fixture.config_path, &recovery), -1);
+    CHECK(!recovery.valid);
+    CHECK_EQ_INT(stat(fixture.marker_path, &after), 0);
+    CHECK(ts_same_identity(&identity, &after));
+    CHECK_EQ_INT((long)guard_read_file(
+                     fixture.marker_path, observed, sizeof(observed)),
+                 (long)length);
+    CHECK(memcmp(malformed, observed, length) == 0);
+    guard_fixture_cleanup(&fixture);
+}
+
+TEST(alias_obligation_is_remove_only_and_single_owner) {
+    guard_fixture_t fixture;
+    config_retirement_ssh_alias_obligation_t obligation;
+    config_retirement_owner_t owners[2];
+    config_retirement_guard_t *guard = NULL;
+
+    CHECK_EQ_INT(guard_fixture_init(&fixture), 0);
+    CHECK_EQ_INT(config_retirement_guard_clear(&fixture.guard), 0);
+    CHECK(guard_make_alias_obligation(
+        &fixture, "github.com-work", &obligation));
+    CHECK_EQ_INT(
+        config_retirement_guard_install_or_adopt_with_ssh_alias_obligation(
+            fixture.config_path, CONFIG_RETIREMENT_RESET,
+            &fixture.owner, 1U, &obligation, &guard), -1);
+    owners[0] = fixture.owner;
+    owners[1] = fixture.owner;
+    owners[1].account_id = UINT32_C(2);
+    CHECK_EQ_INT(
+        config_retirement_guard_install_or_adopt_with_ssh_alias_obligation(
+            fixture.config_path, CONFIG_RETIREMENT_REMOVE,
+            owners, 2U, &obligation, &guard), -1);
+    CHECK(guard == NULL);
+    guard_fixture_cleanup(&fixture);
+}
+
+TEST(handle_revalidation_accepts_only_its_exact_active_generation) {
+    guard_fixture_t fixture;
+    unsigned char observed[GUARD_MAX_BYTES];
+
+    CHECK_EQ_INT(guard_fixture_init(&fixture), 0);
+    CHECK_EQ_INT(config_retirement_guard_revalidate(fixture.guard), 0);
+    CHECK(fixture.guard != NULL);
+    CHECK_EQ_INT((long)guard_read_file(
+                     fixture.marker_path, observed, sizeof(observed)),
+                 (long)fixture.marker_length);
+    CHECK(memcmp(observed, fixture.marker_data,
+                 fixture.marker_length) == 0);
+    guard_fixture_cleanup(&fixture);
+}
+
+TEST(handle_revalidation_rejects_marker_replacement_without_mutation) {
+    guard_fixture_t fixture;
+    unsigned char observed[GUARD_MAX_BYTES];
+    struct stat replacement;
+    int directory_fd;
+
+    CHECK_EQ_INT(guard_fixture_init(&fixture), 0);
+    directory_fd = open(
+        fixture.directory,
+        O_RDONLY | O_CLOEXEC | O_DIRECTORY | O_NOFOLLOW);
+    CHECK(directory_fd >= 0);
+    if (directory_fd >= 0) {
+        CHECK_EQ_INT(guard_atomic_replace_at(
+                         directory_fd, GUARD_NAME,
+                         fixture.marker_data,
+                         fixture.marker_length), 0);
+        CHECK_EQ_INT(close(directory_fd), 0);
+    }
+    CHECK_EQ_INT(stat(fixture.marker_path, &replacement), 0);
+    CHECK(!ts_same_identity(
+        &fixture.marker_identity, &replacement));
+    CHECK_EQ_INT(config_retirement_guard_revalidate(fixture.guard), -1);
+    CHECK(fixture.guard != NULL);
+    CHECK_EQ_INT((long)guard_read_file(
+                     fixture.marker_path, observed, sizeof(observed)),
+                 (long)fixture.marker_length);
+    CHECK(memcmp(observed, fixture.marker_data,
+                 fixture.marker_length) == 0);
+    guard_fixture_cleanup(&fixture);
+}
+
+TEST(handle_revalidation_rejects_obligation_change_without_rewrite) {
+    guard_fixture_t fixture;
+    config_retirement_ssh_alias_obligation_t obligation;
+    unsigned char changed[GUARD_MAX_BYTES];
+    unsigned char observed[GUARD_MAX_BYTES];
+    static const char alias_prefix[] = "ssh_alias=";
+    unsigned char *alias;
+    size_t changed_length;
+    int directory_fd;
+
+    CHECK_EQ_INT(guard_fixture_init(&fixture), 0);
+    CHECK_EQ_INT(config_retirement_guard_clear(&fixture.guard), 0);
+    CHECK(guard_make_alias_obligation(
+        &fixture, "github.com-work", &obligation));
+    CHECK_EQ_INT(
+        config_retirement_guard_install_or_adopt_with_ssh_alias_obligation(
+            fixture.config_path, CONFIG_RETIREMENT_REMOVE,
+            &fixture.owner, 1U, &obligation, &fixture.guard), 0);
+    changed_length = guard_read_file(
+        fixture.marker_path, changed, sizeof(changed));
+    alias = memmem(changed, changed_length, alias_prefix,
+                   sizeof(alias_prefix) - 1U);
+    CHECK(alias != NULL);
+    if (alias) {
+        alias += sizeof(alias_prefix) - 1U;
+        *alias = *alias == (unsigned char)'6'
+                     ? (unsigned char)'7'
+                     : (unsigned char)'6';
+    }
+    directory_fd = open(
+        fixture.directory,
+        O_RDONLY | O_CLOEXEC | O_DIRECTORY | O_NOFOLLOW);
+    CHECK(directory_fd >= 0);
+    if (directory_fd >= 0) {
+        CHECK_EQ_INT(guard_atomic_replace_at(
+                         directory_fd, GUARD_NAME, changed,
+                         changed_length), 0);
+        CHECK_EQ_INT(close(directory_fd), 0);
+    }
+    CHECK_EQ_INT(config_retirement_guard_revalidate(fixture.guard), -1);
+    CHECK_EQ_INT((long)guard_read_file(
+                     fixture.marker_path, observed, sizeof(observed)),
+                 (long)changed_length);
+    CHECK(memcmp(observed, changed, changed_length) == 0);
+    guard_fixture_cleanup(&fixture);
+}
+
+TEST(handle_revalidation_rejects_stage_and_certificate_interference) {
+    guard_fixture_t fixture;
+    unsigned char observed[GUARD_MAX_BYTES];
+    int directory_fd;
+
+    CHECK_EQ_INT(guard_fixture_init(&fixture), 0);
+    directory_fd = open(
+        fixture.directory,
+        O_RDONLY | O_CLOEXEC | O_DIRECTORY | O_NOFOLLOW);
+    CHECK(directory_fd >= 0);
+    if (directory_fd >= 0) {
+        CHECK_EQ_INT(guard_atomic_replace_at(
+                         directory_fd, STAGE_NAME,
+                         fixture.marker_data,
+                         fixture.marker_length), 0);
+    }
+    CHECK_EQ_INT(config_retirement_guard_revalidate(fixture.guard), -1);
+    CHECK_EQ_INT(unlink(fixture.stage_path), 0);
+    if (directory_fd >= 0) {
+        CHECK_EQ_INT(guard_atomic_replace_at(
+                         directory_fd, COMPLETE_NAME,
+                         fixture.marker_data,
+                         fixture.marker_length), 0);
+        CHECK_EQ_INT(close(directory_fd), 0);
+    }
+    CHECK_EQ_INT(config_retirement_guard_revalidate(fixture.guard), -1);
+    CHECK_EQ_INT((long)guard_read_file(
+                     fixture.marker_path, observed, sizeof(observed)),
+                 (long)fixture.marker_length);
+    CHECK(memcmp(observed, fixture.marker_data,
+                 fixture.marker_length) == 0);
+    guard_fixture_cleanup(&fixture);
+}
+
+TEST(handle_revalidation_rejects_directory_namespace_replacement) {
+    guard_fixture_t fixture;
+    char displaced[160];
+
+    CHECK_EQ_INT(guard_fixture_init(&fixture), 0);
+    CHECK((size_t)snprintf(
+              displaced, sizeof(displaced), "%s.displaced",
+              fixture.directory) < sizeof(displaced));
+    CHECK_EQ_INT(rename(fixture.directory, displaced), 0);
+    CHECK_EQ_INT(mkdir(fixture.directory, 0700), 0);
+    CHECK_EQ_INT(config_retirement_guard_revalidate(fixture.guard), -1);
+    CHECK(fixture.guard != NULL);
+    CHECK_EQ_INT(rmdir(fixture.directory), 0);
+    CHECK_EQ_INT(rename(displaced, fixture.directory), 0);
     guard_fixture_cleanup(&fixture);
 }
 
@@ -854,6 +1353,17 @@ TEST_MAIN_BEGIN()
     RUN_TEST(unproven_install_is_not_adopted_until_directory_sync_succeeds);
     RUN_TEST(abandon_after_failed_clear_never_reopens);
     RUN_TEST(recovery_projection_adopts_only_the_exact_active_owner_set);
+    RUN_TEST(v2_remove_alias_obligation_roundtrips_and_adopts_exactly);
+    RUN_TEST(v1_reset_projects_no_alias_obligation_and_legacy_wrappers_adopt);
+    RUN_TEST(v1_remove_projects_unknown_alias_and_cannot_be_adopted);
+    RUN_TEST(changed_alias_obligation_never_adopts_or_mutates_marker);
+    RUN_TEST(malformed_v2_alias_field_is_rejected_without_rewrite);
+    RUN_TEST(alias_obligation_is_remove_only_and_single_owner);
+    RUN_TEST(handle_revalidation_accepts_only_its_exact_active_generation);
+    RUN_TEST(handle_revalidation_rejects_marker_replacement_without_mutation);
+    RUN_TEST(handle_revalidation_rejects_obligation_change_without_rewrite);
+    RUN_TEST(handle_revalidation_rejects_stage_and_certificate_interference);
+    RUN_TEST(handle_revalidation_rejects_directory_namespace_replacement);
     RUN_TEST(adopt_only_never_creates_or_rotates_a_marker);
     RUN_TEST(exact_staged_clear_is_projected_adopted_and_settled);
     RUN_TEST(foreign_staged_generation_remains_fail_closed_and_untouched);

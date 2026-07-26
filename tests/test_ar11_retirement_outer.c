@@ -9,6 +9,7 @@
 #include "error.h"
 #include "git_ops.h"
 #include "publication.h"
+#include "ssh_manager.h"
 #include "utils.h"
 
 #include <dirent.h>
@@ -21,6 +22,7 @@
     "1818181818181818181818181818181818181818181818181818181818181818"
 #define M18_SECOND_INCARNATION \
     "2828282828282828282828282828282828282828282828282828282828282828"
+#define M24_ALIAS "github.com-work"
 
 int gitswitch_cli_main(int argc, char **argv);
 int gitswitch_test_context_allocations(void);
@@ -37,7 +39,8 @@ typedef enum {
     GIT_RETIREMENT_TEST_AFTER_EXCHANGE,
     GIT_RETIREMENT_TEST_BEFORE_MARKER_PUBLISH,
     GIT_RETIREMENT_TEST_RESTORED_WITNESS_AFTER_CLOSE,
-    GIT_RETIREMENT_TEST_BEFORE_ABSENT_REVALIDATE
+    GIT_RETIREMENT_TEST_BEFORE_ABSENT_REVALIDATE,
+    GIT_RETIREMENT_TEST_RECOVERY_END_BEFORE_FINAL_PROOF
 } git_retirement_test_stage_t;
 typedef bool (*git_retirement_test_hook_fn)(
     git_retirement_test_stage_t stage, const char *path,
@@ -62,6 +65,9 @@ typedef int (*retirement_guard_clear_test_hook_fn)(
 retirement_guard_clear_test_hook_fn
 gitswitch_test_set_retirement_guard_clear_hook(
     retirement_guard_clear_test_hook_fn hook);
+typedef void (*remove_test_hook_fn)(int stage);
+remove_test_hook_fn gitswitch_test_set_remove_hook(
+    remove_test_hook_fn hook);
 
 typedef enum {
     M18_COMMAND_REMOVE = 0,
@@ -85,6 +91,7 @@ typedef struct {
 typedef struct {
     char root[MAX_PATH_LEN];
     char home[MAX_PATH_LEN];
+    char config_parent[MAX_PATH_LEN];
     char runtime[MAX_PATH_LEN];
     char config_dir[MAX_PATH_LEN];
     char accounts_path[MAX_PATH_LEN];
@@ -100,6 +107,8 @@ typedef struct {
     char git_program[MAX_PATH_LEN];
     char ssh_program[MAX_PATH_LEN];
     char ssh_key[MAX_PATH_LEN];
+    char ssh_dir[MAX_PATH_LEN];
+    char ssh_config[MAX_PATH_LEN];
     char ssh_command[PUBLICATION_SSH_COMMAND_MAX];
     publication_record_t record;
     publication_record_t shared_record;
@@ -125,9 +134,57 @@ static bool m18_absent_recreation_guard_observed;
 static int m18_absent_recreation_error;
 static const m18_fixture_t *m18_absent_recreation_fixture;
 static m18_bytes_t m18_absent_recreation_bytes;
+static bool m24_alias_postrename_failure;
+static bool m24_alias_dirsync_failure;
+static bool m24_alias_prerename_failure;
+static bool m24_alias_fault_observed;
+static bool m24_recovery_claimant_requested;
+static bool m24_recovery_claimant_observed;
+static int m24_recovery_claimant_error;
+static const m18_fixture_t *m24_recovery_claimant_fixture;
+static bool m24_recovery_end_failure_requested;
+static bool m24_recovery_end_failure_observed;
+static char m24_home_override[MAX_PATH_LEN];
 
 static int m18_write_file(const char *path, const void *data,
                           size_t length, mode_t mode);
+static int m24_fixture_replace_with_live_alias_claimant(
+    const m18_fixture_t *fixture);
+
+static int m24_fail_alias_postrename(int dir_fd) {
+    (void)dir_fd;
+    m24_alias_fault_observed = true;
+    errno = EIO;
+    return -1;
+}
+
+static int m24_fail_alias_dirsync(int dir_fd) {
+    (void)dir_fd;
+    m24_alias_fault_observed = true;
+    errno = EIO;
+    return -1;
+}
+
+static int m24_fail_alias_prerename(int dir_fd, const char *temp_name) {
+    (void)dir_fd;
+    (void)temp_name;
+    m24_alias_fault_observed = true;
+    errno = EIO;
+    return -1;
+}
+
+static void m24_remove_recovery_checkpoint(int stage) {
+    if (stage != 5 || !m24_recovery_claimant_requested ||
+        m24_recovery_claimant_observed) {
+        return;
+    }
+    m24_recovery_claimant_observed = true;
+    if (!m24_recovery_claimant_fixture ||
+        m24_fixture_replace_with_live_alias_claimant(
+            m24_recovery_claimant_fixture) != 0) {
+        m24_recovery_claimant_error = errno ? errno : EIO;
+    }
+}
 
 static bool m18_config_fault(config_io_boundary_t boundary) {
     if (boundary != m18_fault_boundary) return false;
@@ -217,6 +274,12 @@ static bool m18_retirement_witness_hook(
     const char *key, const char *value) {
     (void)key;
     (void)value;
+    if (stage ==
+            GIT_RETIREMENT_TEST_RECOVERY_END_BEFORE_FINAL_PROOF &&
+        m24_recovery_end_failure_requested) {
+        m24_recovery_end_failure_observed = true;
+        return true;
+    }
     if (stage == GIT_RETIREMENT_TEST_BEFORE_ABSENT_REVALIDATE &&
         m18_absent_recreation_requested) {
         if (m18_absent_recreation_observed) return false;
@@ -429,7 +492,6 @@ static int m18_fixture_setup(m18_fixture_t *fixture) {
      * Keep this fixture under the checked-out, same-uid workspace so its
      * private git wrapper exercises the production trusted-PATH resolver. */
     char root_template[] = ".gsw-ar11-m18-XXXXXX";
-    char config_parent[MAX_PATH_LEN];
     char config_body[2U * MAX_PATH_LEN];
     char git_body[PUBLICATION_SSH_COMMAND_MAX + 128U];
     struct stat st;
@@ -446,10 +508,11 @@ static int m18_fixture_setup(m18_fixture_t *fixture) {
                       "%s/home", fixture->root) != 0 ||
         safe_snprintf(fixture->runtime, sizeof(fixture->runtime),
                       "%s/runtime", fixture->root) != 0 ||
-        safe_snprintf(config_parent, sizeof(config_parent),
+        safe_snprintf(fixture->config_parent,
+                      sizeof(fixture->config_parent),
                       "%s/.config", fixture->home) != 0 ||
         safe_snprintf(fixture->config_dir, sizeof(fixture->config_dir),
-                      "%s/gitswitch", config_parent) != 0 ||
+                      "%s/gitswitch", fixture->config_parent) != 0 ||
         safe_snprintf(fixture->accounts_path,
                       sizeof(fixture->accounts_path),
                       "%s/accounts.toml", fixture->config_dir) != 0 ||
@@ -481,9 +544,13 @@ static int m18_fixture_setup(m18_fixture_t *fixture) {
                       "%s/ssh-program", fixture->home) != 0 ||
         safe_snprintf(fixture->ssh_key, sizeof(fixture->ssh_key),
                       "%s/id_key", fixture->home) != 0 ||
+        safe_snprintf(fixture->ssh_dir, sizeof(fixture->ssh_dir),
+                      "%s/.ssh", fixture->home) != 0 ||
+        safe_snprintf(fixture->ssh_config, sizeof(fixture->ssh_config),
+                      "%s/config", fixture->ssh_dir) != 0 ||
         mkdir(fixture->home, 0700) != 0 ||
         mkdir(fixture->runtime, 0700) != 0 ||
-        mkdir(config_parent, 0700) != 0 ||
+        mkdir(fixture->config_parent, 0700) != 0 ||
         mkdir(fixture->config_dir, 0700) != 0) {
         return -1;
     }
@@ -552,6 +619,74 @@ static int m18_fixture_setup(m18_fixture_t *fixture) {
                                    &st);
     if (publication_record_validate(&fixture->record) != 0) return -1;
     return m18_write_state(fixture);
+}
+
+static int m24_fixture_add_managed_alias(m18_fixture_t *fixture) {
+    char config_body[2U * MAX_PATH_LEN];
+    char ssh_body[2U * MAX_PATH_LEN];
+    int config_written;
+    int ssh_written;
+
+    if (!fixture || mkdir(fixture->ssh_dir, 0700) != 0) return -1;
+    config_written = snprintf(
+        config_body, sizeof(config_body),
+        "[settings]\n"
+        "default_scope = \"global\"\n"
+        "active_account = \"work\"\n"
+        "[accounts.1]\n"
+        "incarnation = \"%s\"\n"
+        "name = \"work\"\n"
+        "email = \"work@example.test\"\n"
+        "preferred_scope = \"global\"\n"
+        "ssh_key = \"%s\"\n"
+        "ssh_host = \"" M24_ALIAS "\"\n"
+        "ssh_hostname = \"github.com\"\n",
+        M18_INCARNATION, fixture->ssh_key);
+    ssh_written = snprintf(
+        ssh_body, sizeof(ssh_body),
+        "Host preserved\n"
+        "  User git\n"
+        "# >>> gitswitch " M24_ALIAS " >>>\n"
+        "Host " M24_ALIAS "\n"
+        "  HostName github.com\n"
+        "  IdentityFile \"%s\"\n"
+        "  IdentitiesOnly yes\n"
+        "# <<< gitswitch " M24_ALIAS " <<<\n",
+        fixture->ssh_key);
+    if (config_written < 0 ||
+        (size_t)config_written >= sizeof(config_body) ||
+        ssh_written < 0 || (size_t)ssh_written >= sizeof(ssh_body) ||
+        m18_write_file(fixture->accounts_path, config_body,
+                       (size_t)config_written, 0600) != 0 ||
+        m18_write_file(fixture->ssh_config, ssh_body,
+                       (size_t)ssh_written, 0600) != 0) {
+        return -1;
+    }
+    return 0;
+}
+
+static int m24_fixture_replace_with_live_alias_claimant(
+    const m18_fixture_t *fixture) {
+    char config_body[2U * MAX_PATH_LEN];
+    int written;
+
+    if (!fixture) return -1;
+    written = snprintf(
+        config_body, sizeof(config_body),
+        "[settings]\n"
+        "default_scope = \"global\"\n"
+        "[accounts.2]\n"
+        "incarnation = \"%s\"\n"
+        "name = \"replacement\"\n"
+        "email = \"replacement@example.test\"\n"
+        "preferred_scope = \"global\"\n"
+        "ssh_key = \"%s\"\n"
+        "ssh_host = \"" M24_ALIAS "\"\n"
+        "ssh_hostname = \"github.com\"\n",
+        M18_SECOND_INCARNATION, fixture->ssh_key);
+    if (written < 0 || (size_t)written >= sizeof(config_body)) return -1;
+    return m18_write_file(fixture->accounts_path, config_body,
+                          (size_t)written, 0600);
 }
 
 static int m18_fixture_add_shared_and_no_op_destinations(
@@ -791,14 +926,20 @@ static int m18_run_cli_after_matches(
         char trusted_path[2U * MAX_PATH_LEN];
         char **argv;
         int argc;
-        char observed = '0';
+        unsigned char observed = 0U;
+        const char *command_home =
+            m24_home_override[0] != '\0'
+                ? m24_home_override
+                : fixture->home;
         int rc;
 
         (void)close(observed_pipe[0]);
         if (safe_snprintf(trusted_path, sizeof(trusted_path),
                           "%s:/usr/bin:/bin", fixture->home) != 0 ||
             setenv("PATH", trusted_path, 1) != 0 ||
-            setenv("HOME", fixture->home, 1) != 0 ||
+            setenv("HOME", command_home, 1) != 0 ||
+            (m24_home_override[0] != '\0' &&
+             setenv("XDG_CONFIG_HOME", fixture->config_parent, 1) != 0) ||
             setenv("XDG_RUNTIME_DIR", fixture->runtime, 1) != 0 ||
             setenv("GITSWITCH_ALLOW_TMP_GPG", "1", 1) != 0 ||
             setenv("GIT_CONFIG_GLOBAL", fixture->git_path, 1) != 0 ||
@@ -846,6 +987,10 @@ static int m18_run_cli_after_matches(
         m18_absent_recreation_observed = false;
         m18_absent_recreation_guard_observed = false;
         m18_absent_recreation_error = 0;
+        m24_alias_fault_observed = false;
+        m24_recovery_claimant_observed = false;
+        m24_recovery_claimant_error = 0;
+        m24_recovery_end_failure_observed = false;
         if (fault_limit != M18_FAULT_NONE) {
             (void)config_set_io_fault_fn(m18_config_fault);
         }
@@ -854,12 +999,32 @@ static int m18_run_cli_after_matches(
                 m18_retirement_clear_fault);
         }
         if (m18_witness_ctime_drifts_remaining != 0U ||
-            m18_absent_recreation_requested) {
+            m18_absent_recreation_requested ||
+            m24_recovery_end_failure_requested) {
             (void)git_ops_test_set_retirement_hook(
                 m18_retirement_witness_hook);
         }
+        if (m24_recovery_claimant_requested) {
+            (void)gitswitch_test_set_remove_hook(
+                m24_remove_recovery_checkpoint);
+        }
+        if (m24_alias_prerename_failure) {
+            (void)ssh_manager_set_config_commit_hook_fn(
+                m24_fail_alias_prerename);
+        }
+        if (m24_alias_postrename_failure) {
+            (void)ssh_manager_set_config_postrename_hook_fn(
+                m24_fail_alias_postrename);
+        }
+        if (m24_alias_dirsync_failure) {
+            (void)ssh_manager_set_dirsync_fn(m24_fail_alias_dirsync);
+        }
         optind = 1;
         rc = gitswitch_cli_main(argc, argv);
+        (void)gitswitch_test_set_remove_hook(NULL);
+        (void)ssh_manager_set_config_commit_hook_fn(NULL);
+        (void)ssh_manager_set_config_postrename_hook_fn(NULL);
+        (void)ssh_manager_set_dirsync_fn(NULL);
         (void)gitswitch_test_set_retirement_guard_clear_hook(NULL);
         (void)git_ops_test_set_retirement_hook(NULL);
         if (m18_witness_ctime_drift_error != 0 ||
@@ -882,11 +1047,30 @@ static int m18_run_cli_after_matches(
                 m18_absent_recreation_error);
             _exit(125);
         }
+        if (m24_recovery_claimant_requested &&
+            (!m24_recovery_claimant_observed ||
+             m24_recovery_claimant_error != 0)) {
+            fprintf(
+                stderr,
+                "[M24 claimant hook incomplete: observed=%d error=%d]\n",
+                m24_recovery_claimant_observed,
+                m24_recovery_claimant_error);
+            _exit(126);
+        }
+        if (m24_recovery_end_failure_requested &&
+            !m24_recovery_end_failure_observed) {
+            fprintf(stderr,
+                    "[M24 recovery-end hook was not observed]\n");
+            _exit(127);
+        }
         if (m18_fault_observed ||
             m18_clear_after_stage_write_observed ||
             m18_absent_recreation_observed) {
-            observed = '1';
+            observed |= 1U;
         }
+        if (m24_alias_fault_observed) observed |= 2U;
+        if (m24_recovery_claimant_observed) observed |= 4U;
+        if (m24_recovery_end_failure_observed) observed |= 8U;
         if (write(observed_pipe[1], &observed, 1U) != 1) _exit(121);
         (void)close(observed_pipe[1]);
         if (gitswitch_test_context_allocations() != 0) _exit(122);
@@ -894,15 +1078,21 @@ static int m18_run_cli_after_matches(
     }
     (void)close(observed_pipe[1]);
     {
-        char observed = '0';
+        unsigned char observed = 0U;
         ssize_t got;
 
         do {
             got = read(observed_pipe[0], &observed, 1U);
         } while (got < 0 && errno == EINTR);
         if (fault_observed && got == 1) {
-            *fault_observed = observed == '1';
+            *fault_observed = (observed & 1U) != 0U;
         }
+        m24_alias_fault_observed =
+            got == 1 && (observed & 2U) != 0U;
+        m24_recovery_claimant_observed =
+            got == 1 && (observed & 4U) != 0U;
+        m24_recovery_end_failure_observed =
+            got == 1 && (observed & 8U) != 0U;
     }
     (void)close(observed_pipe[0]);
     {
@@ -1237,9 +1427,12 @@ static bool m18_guard_has_exact_completion_pair(
         blocked) {
         goto cleanup;
     }
-    matches = strstr(
-                  (const char *)marker.data,
-                  "gitswitch-retirement-incomplete-v1\n") != NULL &&
+    matches = (strstr(
+                   (const char *)marker.data,
+                   "gitswitch-retirement-incomplete-v1\n") != NULL ||
+               strstr(
+                   (const char *)marker.data,
+                   "gitswitch-retirement-incomplete-v2\n") != NULL) &&
               strstr((const char *)marker.data,
                      "operation=remove\n") != NULL &&
               strstr((const char *)marker.data, "owners=1\n") != NULL &&
@@ -1436,14 +1629,119 @@ static bool m18_guard_is_private_and_blocking(
         m18_bytes_clear(&marker);
         return false;
     }
-    valid = strstr((const char *)marker.data,
-                   "gitswitch-retirement-incomplete-v1\n") != NULL &&
+    valid = (strstr((const char *)marker.data,
+                    "gitswitch-retirement-incomplete-v1\n") != NULL ||
+             strstr((const char *)marker.data,
+                    "gitswitch-retirement-incomplete-v2\n") != NULL) &&
             strstr((const char *)marker.data, operation_line) != NULL &&
             strstr((const char *)marker.data, "owners=1\n") != NULL &&
             strstr((const char *)marker.data,
                    "owner=1:" M18_INCARNATION "\n") != NULL;
     m18_bytes_clear(&marker);
     return valid;
+}
+
+static bool m24_guard_has_exact_alias_obligation(
+    const m18_fixture_t *fixture,
+    const publication_identity_t *expected_home,
+    const publication_identity_t *expected_ssh_directory) {
+    config_retirement_recovery_t recovery;
+
+    memset(&recovery, 0, sizeof(recovery));
+    if (!fixture || !expected_home || !expected_ssh_directory ||
+        config_retirement_guard_recovery_probe(
+            fixture->accounts_path, &recovery) != 0 ||
+        !recovery.valid || recovery.marker_version != 2U ||
+        recovery.kind != CONFIG_RETIREMENT_REMOVE ||
+        recovery.owner_count != 1U ||
+        recovery.owners[0].account_id != UINT32_C(1) ||
+        strcmp(recovery.owners[0].account_incarnation,
+               M18_INCARNATION) != 0 ||
+        !recovery.ssh_alias_obligation.known ||
+        !recovery.ssh_alias_obligation.present ||
+        strcmp(recovery.ssh_alias_obligation.ssh_host_alias,
+               M24_ALIAS) != 0 ||
+        strcmp(recovery.ssh_alias_obligation.home_path,
+               fixture->home) != 0) {
+        return false;
+    }
+    return publication_identity_equal(
+               &recovery.ssh_alias_obligation.home_identity,
+               expected_home) &&
+           publication_identity_equal(
+               &recovery.ssh_alias_obligation.ssh_directory_identity,
+               expected_ssh_directory);
+}
+
+static bool m24_alias_is_absent(const m18_fixture_t *fixture) {
+    m18_bytes_t config = {0};
+    bool absent = false;
+
+    if (fixture && m18_read_bytes(fixture->ssh_config, &config) == 0) {
+        absent = strstr((const char *)config.data, M24_ALIAS) == NULL &&
+                 strstr((const char *)config.data,
+                        "Host preserved\n  User git\n") != NULL;
+    }
+    m18_bytes_clear(&config);
+    return absent;
+}
+
+static int m24_capture_alias_namespace(
+    const m18_fixture_t *fixture,
+    publication_identity_t *home_identity,
+    publication_identity_t *ssh_directory_identity) {
+    struct stat home_st;
+    struct stat ssh_st;
+
+    if (!fixture || !home_identity || !ssh_directory_identity ||
+        stat(fixture->home, &home_st) != 0 ||
+        stat(fixture->ssh_dir, &ssh_st) != 0) {
+        return -1;
+    }
+    publication_identity_from_stat(home_identity, &home_st);
+    publication_identity_from_stat(ssh_directory_identity, &ssh_st);
+    return 0;
+}
+
+static int m24_remove_publication_ledger(
+    const m18_fixture_t *fixture) {
+    static const char state[] = "ssh\nactive=work\n";
+
+    if (!fixture) return -1;
+    return m18_write_file(fixture->state_path, state,
+                          sizeof(state) - 1U, 0600);
+}
+
+static int m24_rewrite_marker_as_v1_unknown(
+    const m18_fixture_t *fixture) {
+    static const char header[] =
+        "gitswitch-retirement-incomplete-v2\n";
+    static const char obligation[] = "ssh_obligation=none\n";
+    m18_bytes_t marker = {0};
+    char *obligation_line;
+    int result = -1;
+
+    if (!fixture || m18_read_bytes(fixture->guard_path, &marker) != 0 ||
+        marker.length < sizeof(header) - 1U ||
+        memcmp(marker.data, header, sizeof(header) - 1U) != 0) {
+        goto done;
+    }
+    obligation_line = strstr(
+        (char *)marker.data, obligation);
+    if (!obligation_line ||
+        (size_t)(obligation_line - (char *)marker.data) +
+                sizeof(obligation) - 1U !=
+            marker.length) {
+        goto done;
+    }
+    marker.data[sizeof(header) - 3U] = '1';
+    result = m18_write_file(
+        fixture->guard_path, marker.data,
+        (size_t)(obligation_line - (char *)marker.data), 0600);
+
+done:
+    m18_bytes_clear(&marker);
+    return result;
 }
 
 static bool m18_output_contains(const m18_bytes_t *output,
@@ -2267,6 +2565,545 @@ TEST(restored_witness_retries_multiple_delayed_ctime_steps) {
     m18_fixture_cleanup(&fixture);
 }
 
+TEST(remove_alias_postrename_uncertainty_retains_exact_v2_obligation) {
+    m18_fixture_t fixture;
+    publication_identity_t home_identity;
+    publication_identity_t ssh_identity;
+    bool observed = false;
+    int status;
+
+    CHECK_EQ_INT(m18_fixture_setup(&fixture), 0);
+    CHECK_EQ_INT(m24_fixture_add_managed_alias(&fixture), 0);
+    CHECK_EQ_INT(m24_capture_alias_namespace(
+                     &fixture, &home_identity, &ssh_identity), 0);
+
+    m24_alias_postrename_failure = true;
+    status = m18_run_cli(
+        &fixture, M18_COMMAND_REMOVE_NUMERIC, M18_FAULT_NONE,
+        CONFIG_IO_DEFAULT_AFTER_TEMP, &observed);
+    m24_alias_postrename_failure = false;
+    CHECK(WIFEXITED(status));
+    if (WIFEXITED(status)) CHECK_EQ_INT(WEXITSTATUS(status), EXIT_FAILURE);
+    CHECK(!observed);
+    CHECK(m24_alias_fault_observed);
+    CHECK(m18_accounts_omit_work(&fixture));
+    CHECK(!m18_git_has_command(&fixture));
+    CHECK(m24_alias_is_absent(&fixture));
+    CHECK(m18_guard_is_private_and_blocking(&fixture, "remove"));
+    CHECK(m24_guard_has_exact_alias_obligation(
+        &fixture, &home_identity, &ssh_identity));
+    CHECK(m18_completion_absent(&fixture));
+
+    m18_fixture_cleanup(&fixture);
+}
+
+TEST(remove_alias_dirsync_uncertainty_retains_exact_v2_obligation) {
+    m18_fixture_t fixture;
+    publication_identity_t home_identity;
+    publication_identity_t ssh_identity;
+    bool observed = false;
+    int status;
+
+    CHECK_EQ_INT(m18_fixture_setup(&fixture), 0);
+    CHECK_EQ_INT(m24_fixture_add_managed_alias(&fixture), 0);
+    CHECK_EQ_INT(m24_capture_alias_namespace(
+                     &fixture, &home_identity, &ssh_identity), 0);
+
+    m24_alias_dirsync_failure = true;
+    status = m18_run_cli(
+        &fixture, M18_COMMAND_REMOVE_NUMERIC, M18_FAULT_NONE,
+        CONFIG_IO_DEFAULT_AFTER_TEMP, &observed);
+    m24_alias_dirsync_failure = false;
+    CHECK(WIFEXITED(status));
+    if (WIFEXITED(status)) CHECK_EQ_INT(WEXITSTATUS(status), EXIT_FAILURE);
+    CHECK(!observed);
+    CHECK(m24_alias_fault_observed);
+    CHECK(m18_accounts_omit_work(&fixture));
+    CHECK(!m18_git_has_command(&fixture));
+    CHECK(m24_alias_is_absent(&fixture));
+    CHECK(m18_guard_is_private_and_blocking(&fixture, "remove"));
+    CHECK(m24_guard_has_exact_alias_obligation(
+        &fixture, &home_identity, &ssh_identity));
+    CHECK(m18_completion_absent(&fixture));
+
+    m18_fixture_cleanup(&fixture);
+}
+
+TEST(fresh_remove_recovery_settles_absent_alias_without_rewrite) {
+    m18_fixture_t fixture;
+    m18_bytes_t marker = {0};
+    m18_bytes_t ssh_after_failure = {0};
+    m18_bytes_t git_after_failure = {0};
+    struct stat ssh_before_recovery;
+    struct stat ssh_after_recovery;
+    int status;
+
+    CHECK_EQ_INT(m18_fixture_setup(&fixture), 0);
+    CHECK_EQ_INT(m24_fixture_add_managed_alias(&fixture), 0);
+    m24_alias_postrename_failure = true;
+    status = m18_run_cli(
+        &fixture, M18_COMMAND_REMOVE_NUMERIC, M18_FAULT_NONE,
+        CONFIG_IO_DEFAULT_AFTER_TEMP, NULL);
+    m24_alias_postrename_failure = false;
+    CHECK(WIFEXITED(status));
+    if (WIFEXITED(status)) CHECK_EQ_INT(WEXITSTATUS(status), EXIT_FAILURE);
+    CHECK(m24_alias_fault_observed);
+    CHECK(m24_alias_is_absent(&fixture));
+    CHECK_EQ_INT(m18_read_bytes(fixture.guard_path, &marker), 0);
+    CHECK_EQ_INT(m18_read_bytes(
+                     fixture.ssh_config, &ssh_after_failure), 0);
+    CHECK_EQ_INT(m18_read_bytes(
+                     fixture.git_path, &git_after_failure), 0);
+    CHECK_EQ_INT(lstat(fixture.ssh_config, &ssh_before_recovery), 0);
+    CHECK_EQ_INT(m18_write_file(
+                     fixture.git_trace_path, "", 0U, 0600), 0);
+
+    status = m18_run_cli(
+        &fixture, M18_COMMAND_REMOVE_NUMERIC, M18_FAULT_NONE,
+        CONFIG_IO_DEFAULT_AFTER_TEMP, NULL);
+    CHECK(WIFEXITED(status));
+    if (WIFEXITED(status)) CHECK_EQ_INT(WEXITSTATUS(status), EXIT_SUCCESS);
+    CHECK(m18_file_equals(fixture.ssh_config, &ssh_after_failure));
+    CHECK(m18_file_equals(fixture.git_path, &git_after_failure));
+    CHECK_EQ_INT(lstat(fixture.ssh_config, &ssh_after_recovery), 0);
+    CHECK(m18_same_without_ctime(
+        &ssh_before_recovery, &ssh_after_recovery));
+    CHECK(m18_same_ctime(&ssh_before_recovery, &ssh_after_recovery));
+    CHECK(!m18_git_trace_has_unset(&fixture));
+    CHECK(m18_guard_has_exact_completion_pair(&fixture, &marker));
+    CHECK(m18_guard_is_unblocked_and_bounded(&fixture));
+
+    m18_bytes_clear(&marker);
+    m18_bytes_clear(&ssh_after_failure);
+    m18_bytes_clear(&git_after_failure);
+    m18_fixture_cleanup(&fixture);
+}
+
+TEST(alias_only_uncertain_removal_keeps_guard_and_recovers_without_git_write) {
+    m18_fixture_t fixture;
+    m18_bytes_t marker = {0};
+    m18_bytes_t git_before = {0};
+    int status;
+
+    CHECK_EQ_INT(m18_fixture_setup(&fixture), 0);
+    CHECK_EQ_INT(m24_fixture_add_managed_alias(&fixture), 0);
+    CHECK_EQ_INT(m24_remove_publication_ledger(&fixture), 0);
+    CHECK_EQ_INT(m18_read_bytes(fixture.git_path, &git_before), 0);
+
+    m24_alias_postrename_failure = true;
+    status = m18_run_cli(
+        &fixture, M18_COMMAND_REMOVE_NUMERIC, M18_FAULT_NONE,
+        CONFIG_IO_DEFAULT_AFTER_TEMP, NULL);
+    m24_alias_postrename_failure = false;
+    CHECK(WIFEXITED(status));
+    if (WIFEXITED(status)) CHECK_EQ_INT(WEXITSTATUS(status), EXIT_FAILURE);
+    CHECK(m24_alias_fault_observed);
+    CHECK(m18_accounts_omit_work(&fixture));
+    CHECK(m24_alias_is_absent(&fixture));
+    CHECK(m18_file_equals(fixture.git_path, &git_before));
+    CHECK(m18_guard_is_private_and_blocking(&fixture, "remove"));
+    CHECK_EQ_INT(m18_read_bytes(fixture.guard_path, &marker), 0);
+    CHECK_EQ_INT(m18_write_file(
+                     fixture.git_trace_path, "", 0U, 0600), 0);
+
+    status = m18_run_cli(
+        &fixture, M18_COMMAND_REMOVE_NUMERIC, M18_FAULT_NONE,
+        CONFIG_IO_DEFAULT_AFTER_TEMP, NULL);
+    CHECK(WIFEXITED(status));
+    if (WIFEXITED(status)) CHECK_EQ_INT(WEXITSTATUS(status), EXIT_SUCCESS);
+    CHECK(m18_file_equals(fixture.git_path, &git_before));
+    CHECK(!m18_git_trace_has_unset(&fixture));
+    CHECK(m18_guard_has_exact_completion_pair(&fixture, &marker));
+    CHECK(m18_guard_is_unblocked_and_bounded(&fixture));
+
+    m18_bytes_clear(&marker);
+    m18_bytes_clear(&git_before);
+    m18_fixture_cleanup(&fixture);
+}
+
+TEST(alias_recovery_rejects_retargeted_home_without_touching_either_config) {
+    static const char alternate_config[] =
+        "Host " M24_ALIAS "\n  HostName alternate.invalid\n";
+    m18_fixture_t fixture;
+    m18_bytes_t original_config = {0};
+    m18_bytes_t alternate_before = {0};
+    m18_bytes_t marker = {0};
+    char alternate_home[MAX_PATH_LEN];
+    char alternate_ssh[MAX_PATH_LEN];
+    char alternate_path[MAX_PATH_LEN];
+    int status;
+
+    CHECK_EQ_INT(m18_fixture_setup(&fixture), 0);
+    CHECK_EQ_INT(m24_fixture_add_managed_alias(&fixture), 0);
+    m24_alias_postrename_failure = true;
+    status = m18_run_cli(
+        &fixture, M18_COMMAND_REMOVE_NUMERIC, M18_FAULT_NONE,
+        CONFIG_IO_DEFAULT_AFTER_TEMP, NULL);
+    m24_alias_postrename_failure = false;
+    CHECK(WIFEXITED(status));
+    if (WIFEXITED(status)) CHECK_EQ_INT(WEXITSTATUS(status), EXIT_FAILURE);
+    CHECK(m24_alias_fault_observed);
+    CHECK_EQ_INT(m18_read_bytes(
+                     fixture.ssh_config, &original_config), 0);
+    CHECK_EQ_INT(m18_read_bytes(fixture.guard_path, &marker), 0);
+
+    CHECK_EQ_INT(safe_snprintf(
+                     alternate_home, sizeof(alternate_home),
+                     "%s/retargeted-home", fixture.root), 0);
+    CHECK_EQ_INT(safe_snprintf(
+                     alternate_ssh, sizeof(alternate_ssh),
+                     "%s/.ssh", alternate_home), 0);
+    CHECK_EQ_INT(safe_snprintf(
+                     alternate_path, sizeof(alternate_path),
+                     "%s/config", alternate_ssh), 0);
+    CHECK_EQ_INT(mkdir(alternate_home, 0700), 0);
+    CHECK_EQ_INT(mkdir(alternate_ssh, 0700), 0);
+    CHECK_EQ_INT(m18_write_file(
+                     alternate_path, alternate_config,
+                     sizeof(alternate_config) - 1U, 0600), 0);
+    CHECK_EQ_INT(m18_read_bytes(
+                     alternate_path, &alternate_before), 0);
+    CHECK_EQ_INT(safe_strncpy(
+                     m24_home_override, alternate_home,
+                     sizeof(m24_home_override)), 0);
+
+    status = m18_run_cli(
+        &fixture, M18_COMMAND_REMOVE_NUMERIC, M18_FAULT_NONE,
+        CONFIG_IO_DEFAULT_AFTER_TEMP, NULL);
+    m24_home_override[0] = '\0';
+    CHECK(WIFEXITED(status));
+    if (WIFEXITED(status)) CHECK_EQ_INT(WEXITSTATUS(status), EXIT_FAILURE);
+    CHECK(m18_file_equals(fixture.ssh_config, &original_config));
+    CHECK(m18_file_equals(alternate_path, &alternate_before));
+    CHECK(m18_file_equals(fixture.guard_path, &marker));
+    CHECK(m18_guard_is_private_and_blocking(&fixture, "remove"));
+    CHECK(m18_completion_absent(&fixture));
+
+    m18_bytes_clear(&original_config);
+    m18_bytes_clear(&alternate_before);
+    m18_bytes_clear(&marker);
+    m18_fixture_cleanup(&fixture);
+}
+
+TEST(alias_recovery_rejects_new_live_claimant_without_mutation) {
+    m18_fixture_t fixture;
+    m18_bytes_t accounts_before = {0};
+    m18_bytes_t ssh_before = {0};
+    m18_bytes_t git_before = {0};
+    m18_bytes_t marker = {0};
+    int status;
+
+    CHECK_EQ_INT(m18_fixture_setup(&fixture), 0);
+    CHECK_EQ_INT(m24_fixture_add_managed_alias(&fixture), 0);
+    m24_alias_postrename_failure = true;
+    status = m18_run_cli(
+        &fixture, M18_COMMAND_REMOVE_NUMERIC, M18_FAULT_NONE,
+        CONFIG_IO_DEFAULT_AFTER_TEMP, NULL);
+    m24_alias_postrename_failure = false;
+    CHECK(WIFEXITED(status));
+    if (WIFEXITED(status)) CHECK_EQ_INT(WEXITSTATUS(status), EXIT_FAILURE);
+    CHECK(m24_alias_fault_observed);
+    CHECK_EQ_INT(
+        m24_fixture_replace_with_live_alias_claimant(&fixture), 0);
+    CHECK_EQ_INT(m18_read_bytes(
+                     fixture.accounts_path, &accounts_before), 0);
+    CHECK_EQ_INT(m18_read_bytes(fixture.ssh_config, &ssh_before), 0);
+    CHECK_EQ_INT(m18_read_bytes(fixture.git_path, &git_before), 0);
+    CHECK_EQ_INT(m18_read_bytes(fixture.guard_path, &marker), 0);
+
+    status = m18_run_cli(
+        &fixture, M18_COMMAND_REMOVE_NUMERIC, M18_FAULT_NONE,
+        CONFIG_IO_DEFAULT_AFTER_TEMP, NULL);
+    CHECK(WIFEXITED(status));
+    if (WIFEXITED(status)) CHECK_EQ_INT(WEXITSTATUS(status), EXIT_FAILURE);
+    CHECK(m18_file_equals(fixture.accounts_path, &accounts_before));
+    CHECK(m18_file_equals(fixture.ssh_config, &ssh_before));
+    CHECK(m18_file_equals(fixture.git_path, &git_before));
+    CHECK(m18_file_equals(fixture.guard_path, &marker));
+    CHECK(m18_guard_is_private_and_blocking(&fixture, "remove"));
+    CHECK(m18_completion_absent(&fixture));
+
+    m18_bytes_clear(&accounts_before);
+    m18_bytes_clear(&ssh_before);
+    m18_bytes_clear(&git_before);
+    m18_bytes_clear(&marker);
+    m18_fixture_cleanup(&fixture);
+}
+
+TEST(remove_preinstall_save_failure_never_attempts_alias_removal) {
+    m18_fixture_t fixture;
+    m18_bytes_t accounts_before = {0};
+    m18_bytes_t ssh_before = {0};
+    bool observed = false;
+    int status;
+
+    CHECK_EQ_INT(m18_fixture_setup(&fixture), 0);
+    CHECK_EQ_INT(m24_fixture_add_managed_alias(&fixture), 0);
+    CHECK_EQ_INT(m18_read_bytes(
+                     fixture.accounts_path, &accounts_before), 0);
+    CHECK_EQ_INT(m18_read_bytes(fixture.ssh_config, &ssh_before), 0);
+
+    m24_alias_postrename_failure = true;
+    status = m18_run_cli(
+        &fixture, M18_COMMAND_REMOVE_NUMERIC, M18_FAULT_ONCE,
+        CONFIG_IO_DOCUMENT_BEFORE_RENAME, &observed);
+    m24_alias_postrename_failure = false;
+    CHECK(WIFEXITED(status));
+    if (WIFEXITED(status)) CHECK_EQ_INT(WEXITSTATUS(status), EXIT_FAILURE);
+    CHECK(observed);
+    CHECK(!m24_alias_fault_observed);
+    CHECK(m18_file_equals(fixture.accounts_path, &accounts_before));
+    CHECK(m18_file_equals(fixture.ssh_config, &ssh_before));
+    CHECK(m18_git_has_command(&fixture));
+    CHECK(m18_guard_is_unblocked_and_bounded(&fixture));
+
+    m18_bytes_clear(&accounts_before);
+    m18_bytes_clear(&ssh_before);
+    m18_fixture_cleanup(&fixture);
+}
+
+TEST(remove_outer_uncertainty_retains_marker_after_alias_cleanup_settles) {
+    m18_fixture_t fixture;
+    m18_bytes_t marker = {0};
+    bool observed = false;
+    int status;
+
+    CHECK_EQ_INT(m18_fixture_setup(&fixture), 0);
+    CHECK_EQ_INT(m24_fixture_add_managed_alias(&fixture), 0);
+
+    status = m18_run_cli(
+        &fixture, M18_COMMAND_REMOVE_NUMERIC, M18_FAULT_ONCE,
+        CONFIG_IO_DOCUMENT_BEFORE_DIR_SYNC, &observed);
+    CHECK(WIFEXITED(status));
+    if (WIFEXITED(status)) CHECK_EQ_INT(WEXITSTATUS(status), EXIT_FAILURE);
+    CHECK(observed);
+    CHECK(!m24_alias_fault_observed);
+    CHECK(m18_accounts_omit_work(&fixture));
+    CHECK(!m18_git_has_command(&fixture));
+    CHECK(m24_alias_is_absent(&fixture));
+    CHECK(m18_guard_is_private_and_blocking(&fixture, "remove"));
+    CHECK_EQ_INT(m18_read_bytes(fixture.guard_path, &marker), 0);
+    CHECK(m18_completion_absent(&fixture));
+
+    m18_bytes_clear(&marker);
+    m18_fixture_cleanup(&fixture);
+}
+
+TEST(durable_remove_settles_managed_alias_and_completion_pair) {
+    m18_fixture_t fixture;
+    m18_bytes_t marker = {0};
+    int status;
+
+    CHECK_EQ_INT(m18_fixture_setup(&fixture), 0);
+    CHECK_EQ_INT(m24_fixture_add_managed_alias(&fixture), 0);
+    status = m18_run_cli(
+        &fixture, M18_COMMAND_REMOVE_NUMERIC, M18_FAULT_NONE,
+        CONFIG_IO_DEFAULT_AFTER_TEMP, NULL);
+    CHECK(WIFEXITED(status));
+    if (WIFEXITED(status)) CHECK_EQ_INT(WEXITSTATUS(status), EXIT_SUCCESS);
+    CHECK(m18_accounts_omit_work(&fixture));
+    CHECK(!m18_git_has_command(&fixture));
+    CHECK(m24_alias_is_absent(&fixture));
+    CHECK_EQ_INT(m18_read_bytes(fixture.guard_path, &marker), 0);
+    CHECK(m18_guard_has_exact_completion_pair(&fixture, &marker));
+    CHECK(m18_guard_is_unblocked_and_bounded(&fixture));
+
+    m18_bytes_clear(&marker);
+    m18_fixture_cleanup(&fixture);
+}
+
+TEST(v1_remove_recovery_remains_blocked_when_alias_obligation_is_unknown) {
+    m18_fixture_t fixture;
+    m18_bytes_t accounts = {0};
+    m18_bytes_t state = {0};
+    m18_bytes_t git = {0};
+    m18_bytes_t marker = {0};
+    m18_bytes_t output = {0};
+    bool observed = false;
+    int status;
+
+    CHECK_EQ_INT(m18_fixture_setup(&fixture), 0);
+    status = m18_run_cli(
+        &fixture, M18_COMMAND_REMOVE_NUMERIC, M18_FAULT_ONCE,
+        CONFIG_IO_DOCUMENT_BEFORE_DIR_SYNC, &observed);
+    CHECK(WIFEXITED(status));
+    if (WIFEXITED(status)) CHECK_EQ_INT(WEXITSTATUS(status), EXIT_FAILURE);
+    CHECK(observed);
+    CHECK(m18_guard_is_private_and_blocking(&fixture, "remove"));
+    CHECK_EQ_INT(m24_rewrite_marker_as_v1_unknown(&fixture), 0);
+    CHECK_EQ_INT(m18_read_bytes(fixture.accounts_path, &accounts), 0);
+    CHECK_EQ_INT(m18_read_bytes(fixture.state_path, &state), 0);
+    CHECK_EQ_INT(m18_read_bytes(fixture.git_path, &git), 0);
+    CHECK_EQ_INT(m18_read_bytes(fixture.guard_path, &marker), 0);
+    CHECK(m18_guard_is_private_and_blocking(&fixture, "remove"));
+
+    status = m18_run_cli(
+        &fixture, M18_COMMAND_REMOVE_NUMERIC, M18_FAULT_NONE,
+        CONFIG_IO_DEFAULT_AFTER_TEMP, NULL);
+    CHECK(WIFEXITED(status));
+    if (WIFEXITED(status)) CHECK_EQ_INT(WEXITSTATUS(status), EXIT_FAILURE);
+    CHECK(m18_file_equals(fixture.accounts_path, &accounts));
+    CHECK(m18_file_equals(fixture.state_path, &state));
+    CHECK(m18_file_equals(fixture.git_path, &git));
+    CHECK(m18_file_equals(fixture.guard_path, &marker));
+    CHECK(m18_guard_is_private_and_blocking(&fixture, "remove"));
+    CHECK(m18_completion_absent(&fixture));
+    CHECK_EQ_INT(m18_read_bytes(fixture.output_path, &output), 0);
+    CHECK(m18_output_contains(
+        &output, "SSH alias obligation is unknown"));
+
+    m18_bytes_clear(&accounts);
+    m18_bytes_clear(&state);
+    m18_bytes_clear(&git);
+    m18_bytes_clear(&marker);
+    m18_bytes_clear(&output);
+    m18_fixture_cleanup(&fixture);
+}
+
+TEST(recovery_source_change_before_alias_mutation_retains_exact_marker) {
+    m18_fixture_t fixture;
+    m18_bytes_t ssh_before_recovery = {0};
+    m18_bytes_t git_before_recovery = {0};
+    m18_bytes_t marker = {0};
+    int status;
+
+    CHECK_EQ_INT(m18_fixture_setup(&fixture), 0);
+    CHECK_EQ_INT(m24_fixture_add_managed_alias(&fixture), 0);
+
+    /* Leave the alias public while the durable account deletion and Git
+     * retirement retain an exact recovery obligation. */
+    m24_alias_prerename_failure = true;
+    status = m18_run_cli(
+        &fixture, M18_COMMAND_REMOVE_NUMERIC, M18_FAULT_NONE,
+        CONFIG_IO_DEFAULT_AFTER_TEMP, NULL);
+    m24_alias_prerename_failure = false;
+    CHECK(WIFEXITED(status));
+    if (WIFEXITED(status)) CHECK_EQ_INT(WEXITSTATUS(status), EXIT_FAILURE);
+    CHECK(m24_alias_fault_observed);
+    CHECK(m18_accounts_omit_work(&fixture));
+    CHECK(!m18_git_has_command(&fixture));
+    CHECK(!m24_alias_is_absent(&fixture));
+    CHECK(m18_guard_is_private_and_blocking(&fixture, "remove"));
+    CHECK_EQ_INT(m18_read_bytes(
+                     fixture.ssh_config, &ssh_before_recovery), 0);
+    CHECK_EQ_INT(m18_read_bytes(
+                     fixture.git_path, &git_before_recovery), 0);
+    CHECK_EQ_INT(m18_read_bytes(fixture.guard_path, &marker), 0);
+
+    /* The recovery checkpoint runs after the early source and Git proofs but
+     * before alias mutation. Introduce a live claimant there. The subsequent
+     * authorization barrier must stop before touching either publication
+     * namespace. */
+    m24_recovery_claimant_requested = true;
+    m24_recovery_claimant_fixture = &fixture;
+    status = m18_run_cli(
+        &fixture, M18_COMMAND_REMOVE_NUMERIC, M18_FAULT_NONE,
+        CONFIG_IO_DEFAULT_AFTER_TEMP, NULL);
+    m24_recovery_claimant_requested = false;
+    m24_recovery_claimant_fixture = NULL;
+    CHECK(WIFEXITED(status));
+    if (WIFEXITED(status)) CHECK_EQ_INT(WEXITSTATUS(status), EXIT_FAILURE);
+    CHECK(m24_recovery_claimant_observed);
+    CHECK(m18_file_equals(fixture.ssh_config, &ssh_before_recovery));
+    CHECK(m18_file_equals(fixture.git_path, &git_before_recovery));
+    CHECK(m18_file_equals(fixture.guard_path, &marker));
+    CHECK(m18_guard_is_private_and_blocking(&fixture, "remove"));
+    CHECK(m18_completion_absent(&fixture));
+
+    m18_bytes_clear(&ssh_before_recovery);
+    m18_bytes_clear(&git_before_recovery);
+    m18_bytes_clear(&marker);
+    m18_fixture_cleanup(&fixture);
+}
+
+TEST(git_recovery_end_failure_retains_exact_blocking_marker) {
+    m18_fixture_t fixture;
+    m18_bytes_t marker = {0};
+    m18_bytes_t git_before_recovery = {0};
+    m18_bytes_t output = {0};
+    int status;
+
+    CHECK_EQ_INT(m18_fixture_setup(&fixture), 0);
+    CHECK_EQ_INT(m24_fixture_add_managed_alias(&fixture), 0);
+    m24_alias_prerename_failure = true;
+    status = m18_run_cli(
+        &fixture, M18_COMMAND_REMOVE_NUMERIC, M18_FAULT_NONE,
+        CONFIG_IO_DEFAULT_AFTER_TEMP, NULL);
+    m24_alias_prerename_failure = false;
+    CHECK(WIFEXITED(status));
+    if (WIFEXITED(status)) CHECK_EQ_INT(WEXITSTATUS(status), EXIT_FAILURE);
+    CHECK(m24_alias_fault_observed);
+    CHECK_EQ_INT(m18_read_bytes(fixture.guard_path, &marker), 0);
+    CHECK_EQ_INT(m18_read_bytes(
+                     fixture.git_path, &git_before_recovery), 0);
+
+    m24_recovery_end_failure_requested = true;
+    status = m18_run_cli(
+        &fixture, M18_COMMAND_REMOVE_NUMERIC, M18_FAULT_NONE,
+        CONFIG_IO_DEFAULT_AFTER_TEMP, NULL);
+    m24_recovery_end_failure_requested = false;
+    CHECK(WIFEXITED(status));
+    if (WIFEXITED(status)) CHECK_EQ_INT(WEXITSTATUS(status), EXIT_FAILURE);
+    CHECK(m24_recovery_end_failure_observed);
+    CHECK(m24_alias_is_absent(&fixture));
+    CHECK(m18_file_equals(fixture.git_path, &git_before_recovery));
+    CHECK(m18_file_equals(fixture.guard_path, &marker));
+    CHECK(m18_guard_is_private_and_blocking(&fixture, "remove"));
+    CHECK(m18_completion_absent(&fixture));
+    CHECK_EQ_INT(m18_read_bytes(fixture.output_path, &output), 0);
+    CHECK(m18_output_contains(
+        &output, "Injected Git retirement recovery final proof failure"));
+
+    m18_bytes_clear(&marker);
+    m18_bytes_clear(&git_before_recovery);
+    m18_bytes_clear(&output);
+    m18_fixture_cleanup(&fixture);
+}
+
+TEST(alias_diagnostic_and_git_end_failure_are_both_retained) {
+    m18_fixture_t fixture;
+    m18_bytes_t marker = {0};
+    m18_bytes_t output = {0};
+    int status;
+
+    CHECK_EQ_INT(m18_fixture_setup(&fixture), 0);
+    CHECK_EQ_INT(m24_fixture_add_managed_alias(&fixture), 0);
+    m24_alias_prerename_failure = true;
+    status = m18_run_cli(
+        &fixture, M18_COMMAND_REMOVE_NUMERIC, M18_FAULT_NONE,
+        CONFIG_IO_DEFAULT_AFTER_TEMP, NULL);
+    m24_alias_prerename_failure = false;
+    CHECK(WIFEXITED(status));
+    if (WIFEXITED(status)) CHECK_EQ_INT(WEXITSTATUS(status), EXIT_FAILURE);
+    CHECK(m24_alias_fault_observed);
+    CHECK_EQ_INT(m18_read_bytes(fixture.guard_path, &marker), 0);
+
+    m24_alias_postrename_failure = true;
+    m24_recovery_end_failure_requested = true;
+    status = m18_run_cli(
+        &fixture, M18_COMMAND_REMOVE_NUMERIC, M18_FAULT_NONE,
+        CONFIG_IO_DEFAULT_AFTER_TEMP, NULL);
+    m24_alias_postrename_failure = false;
+    m24_recovery_end_failure_requested = false;
+    CHECK(WIFEXITED(status));
+    if (WIFEXITED(status)) CHECK_EQ_INT(WEXITSTATUS(status), EXIT_FAILURE);
+    CHECK(m24_alias_fault_observed);
+    CHECK(m24_recovery_end_failure_observed);
+    CHECK(m24_alias_is_absent(&fixture));
+    CHECK(m18_file_equals(fixture.guard_path, &marker));
+    CHECK(m18_guard_is_private_and_blocking(&fixture, "remove"));
+    CHECK(m18_completion_absent(&fixture));
+    CHECK_EQ_INT(m18_read_bytes(fixture.output_path, &output), 0);
+    CHECK(m18_output_contains(
+        &output, "SSH config was installed but injected post-rename"));
+    CHECK(m18_output_contains(
+        &output, "Injected Git retirement recovery final proof failure"));
+
+    m18_bytes_clear(&marker);
+    m18_bytes_clear(&output);
+    m18_fixture_cleanup(&fixture);
+}
+
 TEST(reset_state_boundary_matrix_preserves_outer_coherence) {
     static const config_io_boundary_t clean_boundaries[] = {
         CONFIG_IO_STATE_AFTER_TEMP,
@@ -2403,6 +3240,19 @@ TEST_MAIN_BEGIN()
     RUN_TEST(same_filesystem_repository_move_retains_guard_and_retry_authority);
     RUN_TEST(remove_backup_verification_fault_restores_exact_outer_state);
     RUN_TEST(restored_witness_retries_multiple_delayed_ctime_steps);
+    RUN_TEST(remove_alias_postrename_uncertainty_retains_exact_v2_obligation);
+    RUN_TEST(remove_alias_dirsync_uncertainty_retains_exact_v2_obligation);
+    RUN_TEST(fresh_remove_recovery_settles_absent_alias_without_rewrite);
+    RUN_TEST(alias_only_uncertain_removal_keeps_guard_and_recovers_without_git_write);
+    RUN_TEST(alias_recovery_rejects_retargeted_home_without_touching_either_config);
+    RUN_TEST(alias_recovery_rejects_new_live_claimant_without_mutation);
+    RUN_TEST(remove_preinstall_save_failure_never_attempts_alias_removal);
+    RUN_TEST(remove_outer_uncertainty_retains_marker_after_alias_cleanup_settles);
+    RUN_TEST(durable_remove_settles_managed_alias_and_completion_pair);
+    RUN_TEST(v1_remove_recovery_remains_blocked_when_alias_obligation_is_unknown);
+    RUN_TEST(recovery_source_change_before_alias_mutation_retains_exact_marker);
+    RUN_TEST(git_recovery_end_failure_retains_exact_blocking_marker);
+    RUN_TEST(alias_diagnostic_and_git_end_failure_are_both_retained);
     RUN_TEST(reset_state_boundary_matrix_preserves_outer_coherence);
     RUN_TEST(reset_persistent_preinstall_fault_retains_guard_and_blocks_switch);
     RUN_TEST(reset_all_clean_rollback_refreshes_shared_and_no_op_destinations);

@@ -2396,16 +2396,27 @@ static int config_directory_for_path(const char *config_path, char *dir,
 #define CONFIG_RETIREMENT_COMPLETE_NAME ".retirement-complete"
 #define CONFIG_RETIREMENT_STAGE_NAME ".retirement-transition"
 #define CONFIG_RETIREMENT_LOCK_NAME ".retirement.lock"
-#define CONFIG_RETIREMENT_GUARD_HEADER \
+#define CONFIG_RETIREMENT_GUARD_HEADER_V1 \
     "gitswitch-retirement-incomplete-v1"
-#define CONFIG_RETIREMENT_GUARD_MAX_BYTES 8192U
+#define CONFIG_RETIREMENT_GUARD_HEADER_V2 \
+    "gitswitch-retirement-incomplete-v2"
+#define CONFIG_RETIREMENT_GUARD_MAX_BYTES 32768U
 
 typedef struct {
+    unsigned int version;
     config_retirement_kind_t kind;
     config_retirement_owner_t owners[MAX_ACCOUNTS];
     size_t owner_count;
+    config_retirement_ssh_alias_obligation_t ssh_alias_obligation;
     char token[ACCOUNT_INCARNATION_LEN];
 } config_retirement_guard_model_t;
+
+static int config_switch_parse_identity(
+    const unsigned char *value, size_t length,
+    publication_identity_t *identity);
+static int config_switch_decode_hex(
+    const unsigned char *value, size_t length, char *out,
+    size_t out_size);
 
 struct config_retirement_guard {
     int directory_fd;
@@ -2482,6 +2493,109 @@ static int config_retirement_canonicalize_owners(
         }
     }
     return 0;
+}
+
+static bool config_retirement_identity_is_zero(
+    const publication_identity_t *identity) {
+    return identity && !identity->present &&
+           identity->device == 0U && identity->inode == 0U &&
+           identity->mode == 0U && identity->uid == 0U &&
+           identity->gid == 0U && identity->link_count == 0U &&
+           identity->size == 0U && identity->mtime_seconds == 0 &&
+           identity->mtime_nanoseconds == 0U &&
+           identity->ctime_seconds == 0 &&
+           identity->ctime_nanoseconds == 0U;
+}
+
+static bool config_retirement_path_is_canonical_absolute(
+    const char *path, size_t size) {
+    const char *component;
+
+    if (!path || !memchr(path, '\0', size) || path[0] != '/') {
+        return false;
+    }
+    if (path[1] == '\0') return true;
+    if (path[strlen(path) - 1U] == '/') return false;
+    component = path + 1U;
+    while (*component) {
+        const char *separator = strchr(component, '/');
+        size_t length = separator ? (size_t)(separator - component)
+                                  : strlen(component);
+
+        if (length == 0U ||
+            (length == 1U && component[0] == '.') ||
+            (length == 2U && component[0] == '.' &&
+             component[1] == '.')) {
+            return false;
+        }
+        if (!separator) break;
+        component = separator + 1U;
+    }
+    return true;
+}
+
+static bool config_retirement_directory_identity_valid(
+    const publication_identity_t *identity, bool optional) {
+    mode_t mode;
+
+    if (!identity) return false;
+    if (!identity->present) {
+        return optional && config_retirement_identity_is_zero(identity);
+    }
+    mode = (mode_t)identity->mode;
+    return (uintmax_t)mode == identity->mode && S_ISDIR(mode) &&
+           identity->link_count > 0U &&
+           identity->mtime_nanoseconds <= UINT32_C(999999999) &&
+           identity->ctime_nanoseconds <= UINT32_C(999999999);
+}
+
+static bool config_retirement_obligation_valid(
+    config_retirement_kind_t kind,
+    const config_retirement_ssh_alias_obligation_t *obligation,
+    size_t owner_count, bool allow_unknown) {
+    if (!obligation) return false;
+    if (!obligation->known) {
+        return allow_unknown && !obligation->present &&
+               obligation->ssh_host_alias[0] == '\0' &&
+               obligation->home_path[0] == '\0' &&
+               config_retirement_identity_is_zero(
+                   &obligation->home_identity) &&
+               config_retirement_identity_is_zero(
+                   &obligation->ssh_directory_identity);
+    }
+    if (!obligation->present) {
+        return obligation->ssh_host_alias[0] == '\0' &&
+               obligation->home_path[0] == '\0' &&
+               config_retirement_identity_is_zero(
+                   &obligation->home_identity) &&
+               config_retirement_identity_is_zero(
+                   &obligation->ssh_directory_identity);
+    }
+    return kind == CONFIG_RETIREMENT_REMOVE && owner_count == 1U &&
+           memchr(obligation->ssh_host_alias, '\0',
+                  sizeof(obligation->ssh_host_alias)) != NULL &&
+           toml_validate_ssh_host_alias(obligation->ssh_host_alias) &&
+           config_retirement_path_is_canonical_absolute(
+               obligation->home_path,
+               sizeof(obligation->home_path)) &&
+           config_retirement_directory_identity_valid(
+               &obligation->home_identity, false) &&
+           config_retirement_directory_identity_valid(
+               &obligation->ssh_directory_identity, true);
+}
+
+static bool config_retirement_obligations_equal(
+    const config_retirement_ssh_alias_obligation_t *left,
+    const config_retirement_ssh_alias_obligation_t *right) {
+    return left && right && left->known == right->known &&
+           left->present == right->present &&
+           strcmp(left->ssh_host_alias, right->ssh_host_alias) == 0 &&
+           strcmp(left->home_path, right->home_path) == 0 &&
+           publication_identity_equal(
+               &left->home_identity, &right->home_identity) &&
+           publication_identity_equal(
+               &left->ssh_directory_identity,
+               &right->ssh_directory_identity);
 }
 
 static bool config_retirement_next_line(const unsigned char **cursor,
@@ -2565,6 +2679,11 @@ static int config_retirement_guard_parse(
     static const char operation_prefix[] = "operation=";
     static const char owners_prefix[] = "owners=";
     static const char owner_prefix[] = "owner=";
+    static const char obligation_prefix[] = "ssh_obligation=";
+    static const char alias_prefix[] = "ssh_alias=";
+    static const char home_path_prefix[] = "home_path=";
+    static const char home_identity_prefix[] = "home_identity=";
+    static const char ssh_identity_prefix[] = "ssh_directory_identity=";
     const unsigned char *cursor = data;
     const unsigned char *end;
     const unsigned char *line;
@@ -2577,9 +2696,18 @@ static int config_retirement_guard_parse(
     memset(model, 0, sizeof(*model));
     end = data + length;
 
-    if (!config_retirement_next_line(&cursor, end, &line, &line_length) ||
-        !config_retirement_line_equals(
-            line, line_length, CONFIG_RETIREMENT_GUARD_HEADER)) {
+    if (!config_retirement_next_line(&cursor, end, &line, &line_length)) {
+        goto malformed;
+    }
+    if (config_retirement_line_equals(
+            line, line_length, CONFIG_RETIREMENT_GUARD_HEADER_V1)) {
+        model->version = 1U;
+    } else if (config_retirement_line_equals(
+                   line, line_length,
+                   CONFIG_RETIREMENT_GUARD_HEADER_V2)) {
+        model->version = 2U;
+        model->ssh_alias_obligation.known = true;
+    } else {
         goto malformed;
     }
     if (!config_retirement_next_line(&cursor, end, &line, &line_length) ||
@@ -2605,6 +2733,12 @@ static int config_retirement_guard_parse(
         model->kind = CONFIG_RETIREMENT_REMOVE;
     } else if (config_retirement_line_equals(line, line_length, "reset")) {
         model->kind = CONFIG_RETIREMENT_RESET;
+        /* RESET has never carried an SSH-alias cleanup obligation. Preserve
+         * pre-v2 recovery by projecting that historical invariant as an
+         * explicit known-none obligation; only a v1 REMOVE is unknowable. */
+        if (model->version == 1U) {
+            model->ssh_alias_obligation.known = true;
+        }
     } else {
         goto malformed;
     }
@@ -2654,6 +2788,71 @@ static int config_retirement_guard_parse(
             goto malformed;
         }
     }
+    if (model->version == 2U) {
+        if (!config_retirement_next_line(
+                &cursor, end, &line, &line_length) ||
+            line_length <= sizeof(obligation_prefix) - 1U ||
+            memcmp(line, obligation_prefix,
+                   sizeof(obligation_prefix) - 1U) != 0) {
+            goto malformed;
+        }
+        line += sizeof(obligation_prefix) - 1U;
+        line_length -= sizeof(obligation_prefix) - 1U;
+        if (config_retirement_line_equals(
+                line, line_length, "none")) {
+            model->ssh_alias_obligation.present = false;
+        } else if (config_retirement_line_equals(
+                       line, line_length, "present")) {
+            model->ssh_alias_obligation.present = true;
+#define CONFIG_RETIREMENT_PARSE_FIELD(prefix, action)                    \
+            do {                                                          \
+                if (!config_retirement_next_line(                         \
+                        &cursor, end, &line, &line_length) ||              \
+                    line_length <= sizeof(prefix) - 1U ||                 \
+                    memcmp(line, prefix, sizeof(prefix) - 1U) != 0 ||      \
+                    (action) != 0) {                                      \
+                    goto malformed;                                       \
+                }                                                         \
+            } while (0)
+            CONFIG_RETIREMENT_PARSE_FIELD(
+                alias_prefix,
+                config_switch_decode_hex(
+                    line + sizeof(alias_prefix) - 1U,
+                    line_length - (sizeof(alias_prefix) - 1U),
+                    model->ssh_alias_obligation.ssh_host_alias,
+                    sizeof(model->ssh_alias_obligation.ssh_host_alias)));
+            CONFIG_RETIREMENT_PARSE_FIELD(
+                home_path_prefix,
+                config_switch_decode_hex(
+                    line + sizeof(home_path_prefix) - 1U,
+                    line_length - (sizeof(home_path_prefix) - 1U),
+                    model->ssh_alias_obligation.home_path,
+                    sizeof(model->ssh_alias_obligation.home_path)));
+            CONFIG_RETIREMENT_PARSE_FIELD(
+                home_identity_prefix,
+                config_switch_parse_identity(
+                    line + sizeof(home_identity_prefix) - 1U,
+                    line_length -
+                        (sizeof(home_identity_prefix) - 1U),
+                    &model->ssh_alias_obligation.home_identity));
+            CONFIG_RETIREMENT_PARSE_FIELD(
+                ssh_identity_prefix,
+                config_switch_parse_identity(
+                    line + sizeof(ssh_identity_prefix) - 1U,
+                    line_length -
+                        (sizeof(ssh_identity_prefix) - 1U),
+                    &model->ssh_alias_obligation
+                         .ssh_directory_identity));
+#undef CONFIG_RETIREMENT_PARSE_FIELD
+        } else {
+            goto malformed;
+        }
+        if (!config_retirement_obligation_valid(
+                model->kind, &model->ssh_alias_obligation,
+                model->owner_count, false)) {
+            goto malformed;
+        }
+    }
     if (cursor != end) goto malformed;
     return 0;
 
@@ -2668,6 +2867,7 @@ malformed:
 static int config_retirement_guard_serialize(
     config_retirement_kind_t kind,
     const config_retirement_owner_t *owners, size_t owner_count,
+    const config_retirement_ssh_alias_obligation_t *obligation,
     const char token[ACCOUNT_INCARNATION_LEN],
     unsigned char **serialized, size_t *serialized_length) {
     unsigned char *data;
@@ -2677,6 +2877,8 @@ static int config_retirement_guard_serialize(
 
     if (!kind_name || !owners || owner_count == 0U ||
         owner_count > MAX_ACCOUNTS ||
+        !config_retirement_obligation_valid(
+            kind, obligation, owner_count, false) ||
         !account_incarnation_is_valid(token) || !serialized ||
         !serialized_length) {
         errno = EINVAL;
@@ -2709,7 +2911,7 @@ static int config_retirement_guard_serialize(
 
     written = snprintf((char *)data + used,
                        CONFIG_RETIREMENT_GUARD_MAX_BYTES - used,
-                       "%s\n", CONFIG_RETIREMENT_GUARD_HEADER);
+                       "%s\n", CONFIG_RETIREMENT_GUARD_HEADER_V2);
     CONFIG_RETIREMENT_ACCEPT_WRITE();
     written = snprintf((char *)data + used,
                        CONFIG_RETIREMENT_GUARD_MAX_BYTES - used,
@@ -2730,6 +2932,78 @@ static int config_retirement_guard_serialize(
                            (unsigned int)owners[i].account_id,
                            owners[i].account_incarnation);
         CONFIG_RETIREMENT_ACCEPT_WRITE();
+    }
+    written = snprintf(
+        (char *)data + used,
+        CONFIG_RETIREMENT_GUARD_MAX_BYTES - used,
+        "ssh_obligation=%s\n",
+        obligation->present ? "present" : "none");
+    CONFIG_RETIREMENT_ACCEPT_WRITE();
+    if (obligation->present) {
+        static const char digits[] = "0123456789ABCDEF";
+        const char *names[2] = {"ssh_alias=", "home_path="};
+        const char *values[2] = {
+            obligation->ssh_host_alias, obligation->home_path
+        };
+        const publication_identity_t *identities[2] = {
+            &obligation->home_identity,
+            &obligation->ssh_directory_identity
+        };
+        const char *identity_names[2] = {
+            "home_identity=", "ssh_directory_identity="
+        };
+
+        for (size_t field = 0U; field < 2U; field++) {
+            written = snprintf(
+                (char *)data + used,
+                CONFIG_RETIREMENT_GUARD_MAX_BYTES - used, "%s",
+                names[field]);
+            CONFIG_RETIREMENT_ACCEPT_WRITE();
+            for (const unsigned char *value =
+                     (const unsigned char *)values[field];
+                 *value; value++) {
+                written = snprintf(
+                    (char *)data + used,
+                    CONFIG_RETIREMENT_GUARD_MAX_BYTES - used,
+                    "%c%c", digits[*value >> 4U],
+                    digits[*value & 0x0fU]);
+                CONFIG_RETIREMENT_ACCEPT_WRITE();
+            }
+            written = snprintf(
+                (char *)data + used,
+                CONFIG_RETIREMENT_GUARD_MAX_BYTES - used, "\n");
+            CONFIG_RETIREMENT_ACCEPT_WRITE();
+        }
+        for (size_t field = 0U; field < 2U; field++) {
+            const publication_identity_t *identity = identities[field];
+
+            written = snprintf(
+                (char *)data + used,
+                CONFIG_RETIREMENT_GUARD_MAX_BYTES - used, "%s",
+                identity_names[field]);
+            CONFIG_RETIREMENT_ACCEPT_WRITE();
+            if (!identity->present) {
+                written = snprintf(
+                    (char *)data + used,
+                    CONFIG_RETIREMENT_GUARD_MAX_BYTES - used, "-\n");
+            } else {
+                written = snprintf(
+                    (char *)data + used,
+                    CONFIG_RETIREMENT_GUARD_MAX_BYTES - used,
+                    "%" PRIuMAX ":%" PRIuMAX ":%" PRIuMAX
+                    ":%" PRIuMAX ":%" PRIuMAX ":%" PRIuMAX
+                    ":%" PRIuMAX ":%" PRId64 ":%" PRIu32
+                    ":%" PRId64 ":%" PRIu32 "\n",
+                    identity->device, identity->inode, identity->mode,
+                    identity->uid, identity->gid,
+                    identity->link_count, identity->size,
+                    identity->mtime_seconds,
+                    identity->mtime_nanoseconds,
+                    identity->ctime_seconds,
+                    identity->ctime_nanoseconds);
+            }
+            CONFIG_RETIREMENT_ACCEPT_WRITE();
+        }
     }
 #undef CONFIG_RETIREMENT_ACCEPT_WRITE
     *serialized = data;
@@ -3094,9 +3368,12 @@ static bool config_retirement_guard_pair_exact(
 static bool config_retirement_owner_sets_equal(
     const config_retirement_guard_model_t *model,
     config_retirement_kind_t kind,
-    const config_retirement_owner_t *owners, size_t owner_count) {
+    const config_retirement_owner_t *owners, size_t owner_count,
+    const config_retirement_ssh_alias_obligation_t *obligation) {
     if (!model || model->kind != kind ||
-        model->owner_count != owner_count) {
+        model->owner_count != owner_count || !obligation ||
+        !config_retirement_obligations_equal(
+            &model->ssh_alias_obligation, obligation)) {
         return false;
     }
     for (size_t i = 0; i < owner_count; i++) {
@@ -3276,14 +3553,17 @@ static int config_retirement_guard_revalidate_adoption_at(
     const struct stat *directory_identity,
     config_retirement_kind_t kind,
     const config_retirement_owner_t *owners, size_t owner_count,
+    const config_retirement_ssh_alias_obligation_t *obligation,
     const config_retirement_guard_pair_t *observed,
     config_retirement_guard_pair_t *revalidated) {
     if (directory_fd < 0 || !directory || !directory_identity ||
-        !owners || owner_count == 0U || !observed || !revalidated ||
+        !owners || owner_count == 0U || !obligation ||
+        !observed || !revalidated ||
         observed->marker_absent || observed->stage_present ||
         config_retirement_guard_pair_exact(observed) ||
         !config_retirement_owner_sets_equal(
-            &observed->marker_model, kind, owners, owner_count)) {
+            &observed->marker_model, kind, owners, owner_count,
+            obligation)) {
         errno = EBUSY;
         set_error(
             ERR_CONFIG_INVALID,
@@ -3306,7 +3586,8 @@ static int config_retirement_guard_revalidate_adoption_at(
         config_retirement_guard_pair_exact(revalidated) ||
         !config_retirement_guard_pairs_same(observed, revalidated) ||
         !config_retirement_owner_sets_equal(
-            &revalidated->marker_model, kind, owners, owner_count) ||
+            &revalidated->marker_model, kind, owners, owner_count,
+            obligation) ||
         !config_named_directory_matches(
             directory, directory_identity)) {
         errno = errno ? errno : ESTALE;
@@ -3543,9 +3824,10 @@ static int config_retirement_guard_make_handle(
     return 0;
 }
 
-int config_retirement_guard_install_or_adopt(
+int config_retirement_guard_install_or_adopt_with_ssh_alias_obligation(
     const char *config_path, config_retirement_kind_t kind,
     const config_retirement_owner_t *owners, size_t owner_count,
+    const config_retirement_ssh_alias_obligation_t *obligation,
     config_retirement_guard_t **guard) {
     static const char hexadecimal[] = "0123456789ABCDEF";
     config_retirement_owner_t canonical[MAX_ACCOUNTS];
@@ -3565,7 +3847,9 @@ int config_retirement_guard_install_or_adopt(
     bool legacy_residue = false;
 
     if (!guard || *guard || !config_path ||
-        !config_retirement_kind_name(kind)) {
+        !config_retirement_kind_name(kind) ||
+        !config_retirement_obligation_valid(
+            kind, obligation, owner_count, false)) {
         errno = EINVAL;
         set_error(ERR_INVALID_ARGS,
                   "Invalid retirement guard installation arguments");
@@ -3630,7 +3914,8 @@ int config_retirement_guard_install_or_adopt(
     if (!pair.marker_absent &&
         !config_retirement_guard_pair_exact(&pair)) {
         if (!config_retirement_owner_sets_equal(
-                &pair.marker_model, kind, canonical, owner_count)) {
+                &pair.marker_model, kind, canonical, owner_count,
+                obligation)) {
             errno = EBUSY;
             set_error(
                 ERR_CONFIG_INVALID,
@@ -3639,7 +3924,7 @@ int config_retirement_guard_install_or_adopt(
         }
         if (config_retirement_guard_revalidate_adoption_at(
                 directory_fd, directory, &directory_identity,
-                kind, canonical, owner_count, &pair,
+                kind, canonical, owner_count, obligation, &pair,
                 &revalidated_pair) != 0) {
             goto install_done;
         }
@@ -3672,7 +3957,8 @@ int config_retirement_guard_install_or_adopt(
                 token, sizeof(token), hexadecimal) != 0 ||
             !account_incarnation_is_valid(token) ||
             config_retirement_guard_serialize(
-                kind, canonical, owner_count, token, &marker_data,
+                kind, canonical, owner_count, obligation, token,
+                &marker_data,
                 &marker_length) != 0) {
             goto install_done;
         }
@@ -3776,6 +4062,18 @@ install_done:
     return result;
 }
 
+int config_retirement_guard_install_or_adopt(
+    const char *config_path, config_retirement_kind_t kind,
+    const config_retirement_owner_t *owners, size_t owner_count,
+    config_retirement_guard_t **guard) {
+    config_retirement_ssh_alias_obligation_t obligation;
+
+    memset(&obligation, 0, sizeof(obligation));
+    obligation.known = true;
+    return config_retirement_guard_install_or_adopt_with_ssh_alias_obligation(
+        config_path, kind, owners, owner_count, &obligation, guard);
+}
+
 int config_retirement_guard_recovery_probe(
     const char *config_path,
     config_retirement_recovery_t *recovery) {
@@ -3863,10 +4161,13 @@ int config_retirement_guard_recovery_probe(
         goto recovery_probe_done;
     }
 
+    recovery->marker_version = pair.marker_model.version;
     recovery->kind = pair.marker_model.kind;
     recovery->owner_count = pair.marker_model.owner_count;
     memcpy(recovery->owners, pair.marker_model.owners,
            recovery->owner_count * sizeof(recovery->owners[0]));
+    recovery->ssh_alias_obligation =
+        pair.marker_model.ssh_alias_obligation;
     recovery->valid = true;
     result = 0;
 
@@ -3880,9 +4181,10 @@ recovery_probe_done:
     return result;
 }
 
-int config_retirement_guard_adopt(
+int config_retirement_guard_adopt_with_ssh_alias_obligation(
     const char *config_path, config_retirement_kind_t kind,
     const config_retirement_owner_t *owners, size_t owner_count,
+    const config_retirement_ssh_alias_obligation_t *obligation,
     config_retirement_guard_t **guard) {
     config_retirement_owner_t canonical[MAX_ACCOUNTS];
     config_retirement_guard_pair_t pair;
@@ -3900,7 +4202,9 @@ int config_retirement_guard_adopt(
     bool legacy_residue = false;
 
     if (!guard || *guard || !config_path ||
-        !config_retirement_kind_name(kind)) {
+        !config_retirement_kind_name(kind) ||
+        !config_retirement_obligation_valid(
+            kind, obligation, owner_count, false)) {
         errno = EINVAL;
         set_error(ERR_INVALID_ARGS,
                   "Invalid retirement guard adoption arguments");
@@ -3968,7 +4272,8 @@ int config_retirement_guard_adopt(
         goto adopt_done;
     }
     if (!config_retirement_owner_sets_equal(
-            &pair.marker_model, kind, canonical, owner_count)) {
+            &pair.marker_model, kind, canonical, owner_count,
+            obligation)) {
         errno = EBUSY;
         set_error(
             ERR_CONFIG_INVALID,
@@ -3998,7 +4303,7 @@ int config_retirement_guard_adopt(
     } else {
         if (config_retirement_guard_revalidate_adoption_at(
                 directory_fd, directory, &directory_identity,
-                kind, canonical, owner_count, &pair,
+                kind, canonical, owner_count, obligation, &pair,
                 &revalidated_pair) != 0) {
             goto adopt_done;
         }
@@ -4031,6 +4336,18 @@ adopt_done:
     secure_zero_memory(token, sizeof(token));
     if (result != 0) errno = saved_errno;
     return result;
+}
+
+int config_retirement_guard_adopt(
+    const char *config_path, config_retirement_kind_t kind,
+    const config_retirement_owner_t *owners, size_t owner_count,
+    config_retirement_guard_t **guard) {
+    config_retirement_ssh_alias_obligation_t obligation;
+
+    memset(&obligation, 0, sizeof(obligation));
+    obligation.known = true;
+    return config_retirement_guard_adopt_with_ssh_alias_obligation(
+        config_path, kind, owners, owner_count, &obligation, guard);
 }
 
 int config_retirement_guard_probe(
@@ -4098,6 +4415,49 @@ static bool config_retirement_guard_pair_matches_handle(
            memcmp(guard->marker_data, pair->marker_data,
                   guard->marker_length) == 0 &&
            strcmp(guard->token, pair->marker_model.token) == 0;
+}
+
+int config_retirement_guard_revalidate(
+    const config_retirement_guard_t *guard) {
+    config_retirement_guard_pair_t pair;
+    int result = -1;
+    int saved_errno = EIO;
+
+    if (!guard || guard->directory_fd < 0 || guard->lock_fd < 0 ||
+        !guard->marker_data || guard->marker_length == 0U ||
+        g_retirement_guard_owner_pid != getpid()) {
+        errno = EINVAL;
+        set_error(ERR_INVALID_ARGS,
+                  "Invalid retirement guard revalidation handle");
+        return -1;
+    }
+    memset(&pair, 0, sizeof(pair));
+    errno = 0;
+    if (config_retirement_guard_pair_read_at(
+            guard->directory_fd, &pair) != 0) {
+        saved_errno = errno ? errno : EIO;
+        goto revalidate_done;
+    }
+    if (pair.stage_present || !pair.completion_absent ||
+        !config_retirement_guard_pair_matches_handle(guard, &pair) ||
+        !config_named_directory_matches(
+            guard->directory, &guard->directory_identity)) {
+        saved_errno = ESTALE;
+        errno = saved_errno;
+        set_error(
+            ERR_CONFIG_INVALID,
+            "Retirement guard is no longer the exact active generation");
+        goto revalidate_done;
+    }
+    result = 0;
+
+revalidate_done:
+    if (result != 0 && saved_errno == EIO && errno != 0) {
+        saved_errno = errno;
+    }
+    config_retirement_guard_pair_clear(&pair);
+    if (result != 0) errno = saved_errno;
+    return result;
 }
 
 int config_retirement_guard_clear(

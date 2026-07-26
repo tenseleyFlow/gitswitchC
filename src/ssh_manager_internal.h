@@ -2,9 +2,23 @@
 #define SSH_MANAGER_INTERNAL_H
 
 #include "ssh_manager.h"
+#include "config.h"
 
 #ifdef GITSWITCH_INTERNAL_API
 typedef struct ssh_key_admission ssh_key_admission_t;
+
+/* Capture and later consume one remove-only alias obligation against the exact
+ * canonical HOME and optional safe ~/.ssh directory generation. Capture and
+ * revalidation are read-only. Removal refuses a changed namespace before
+ * reading or publishing config bytes. */
+int ssh_capture_host_alias_obligation(
+    const char *alias,
+    config_retirement_ssh_alias_obligation_t *obligation);
+int ssh_remove_host_alias_obligation_result(
+    const config_retirement_ssh_alias_obligation_t *obligation,
+    ssh_config_publication_state_t *publication);
+int ssh_revalidate_host_alias_obligation(
+    const config_retirement_ssh_alias_obligation_t *obligation);
 
 /* Read and structurally validate the current ~/.ssh/config snapshot before an
  * account switch can mutate runtime or Git state. This creates no directory,

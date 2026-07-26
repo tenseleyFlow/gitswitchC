@@ -256,7 +256,8 @@ typedef enum {
     GIT_RETIREMENT_TEST_AFTER_EXCHANGE,
     GIT_RETIREMENT_TEST_BEFORE_MARKER_PUBLISH,
     GIT_RETIREMENT_TEST_RESTORED_WITNESS_AFTER_CLOSE,
-    GIT_RETIREMENT_TEST_BEFORE_ABSENT_REVALIDATE
+    GIT_RETIREMENT_TEST_BEFORE_ABSENT_REVALIDATE,
+    GIT_RETIREMENT_TEST_RECOVERY_END_BEFORE_FINAL_PROOF
 } git_retirement_test_stage_t;
 typedef bool (*git_retirement_test_hook_fn)(
     git_retirement_test_stage_t stage, const char *path,
@@ -9722,7 +9723,18 @@ int git_retirement_recovery_end(
     if (!recovery_ptr || !*recovery_ptr) return 0;
     recovery = *recovery_ptr;
     error_accumulator_init(&failures);
-    if (git_retirement_recovery_verify(recovery) != 0) {
+    if (g_retirement_test_hook &&
+        g_retirement_test_hook(
+            GIT_RETIREMENT_TEST_RECOVERY_END_BEFORE_FINAL_PROOF,
+            NULL, NULL, NULL)) {
+        errno = EIO;
+        set_error(
+            ERR_GIT_CONFIG_FAILED,
+            "Injected Git retirement recovery final proof failure");
+        (void)error_accumulator_add_last(
+            &failures, "retirement recovery final proof");
+        result = -1;
+    } else if (git_retirement_recovery_verify(recovery) != 0) {
         (void)error_accumulator_add_last(
             &failures, "retirement recovery final proof");
         result = -1;

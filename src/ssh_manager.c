@@ -4601,6 +4601,16 @@ static bool same_ssh_config_ctime(const struct stat *left,
 #endif
 }
 
+static bool same_ssh_config_directory_revision(const struct stat *left,
+                                               const struct stat *right) {
+    return same_ssh_config_directory(left, right) &&
+           left->st_gid == right->st_gid &&
+           left->st_nlink == right->st_nlink &&
+           left->st_size == right->st_size &&
+           same_ssh_config_mtime(left, right) &&
+           same_ssh_config_ctime(left, right);
+}
+
 static bool same_ssh_config_snapshot_except_ctime(const struct stat *left,
                                                   const struct stat *right) {
     return left->st_dev == right->st_dev &&
@@ -4669,6 +4679,9 @@ typedef struct {
     bool home_entry_synced;
 } ssh_config_directory_t;
 
+static bool ssh_directory_publication_matches(
+    const publication_identity_t *expected, const struct stat *observed);
+
 static int recheck_ssh_home_directory(
     const char *home, const ssh_config_directory_t *directory) {
     struct stat pinned;
@@ -4683,6 +4696,223 @@ static int recheck_ssh_home_directory(
         return -1;
     }
     return 0;
+}
+
+/* Prove a missing ~/.ssh entry against one pinned HOME generation. The
+ * exclusive HOME lock serializes this observation with gitswitch's first-time
+ * .ssh creation path; the strict directory revision checks reject namespace
+ * activity by other writers across the absence observation and parent fsync. */
+static int prove_absent_ssh_config_directory_durable(
+    const char *home,
+    const config_retirement_ssh_alias_obligation_t *obligation,
+    ssh_config_publication_state_t *publication) {
+    char canonical_home[MAX_PATH_LEN];
+    struct stat named_before;
+    struct stat pinned_before;
+    struct stat pinned_after;
+    struct stat named_after;
+    struct stat unexpected;
+    int home_fd = -1;
+    int lock_rc;
+    int rc = -1;
+    int saved_errno;
+    bool locked = false;
+
+    if (obligation &&
+        (realpath(home, canonical_home) == NULL ||
+         strcmp(canonical_home, obligation->home_path) != 0)) {
+        errno = EAGAIN;
+        set_system_error(
+            ERR_FILE_IO,
+            "HOME namespace does not match SSH alias obligation");
+        return -1;
+    }
+    if (stat(home, &named_before) != 0) {
+        set_system_error(
+            ERR_FILE_IO,
+            "Cannot inspect HOME while proving absent SSH config directory");
+        return -1;
+    }
+    if (!S_ISDIR(named_before.st_mode)) {
+        errno = ENOTDIR;
+        set_system_error(
+            ERR_FILE_IO,
+            "HOME is not a directory while proving absent SSH config "
+            "directory");
+        return -1;
+    }
+    home_fd = open(home, O_RDONLY | O_CLOEXEC | O_DIRECTORY);
+    if (home_fd < 0) {
+        set_system_error(
+            ERR_FILE_IO,
+            "Failed to pin HOME while proving absent SSH config directory");
+        return -1;
+    }
+    if (fstat(home_fd, &pinned_before) != 0) {
+        set_system_error(
+            ERR_FILE_IO,
+            "Failed to inspect pinned HOME while proving absent SSH config "
+            "directory");
+        goto done;
+    }
+    if (!same_ssh_config_directory(&named_before, &pinned_before)) {
+        errno = EAGAIN;
+        set_system_error(
+            ERR_FILE_IO,
+            "HOME changed while proving absent SSH config directory");
+        goto done;
+    }
+    if (obligation &&
+        !ssh_directory_publication_matches(
+            &obligation->home_identity, &pinned_before)) {
+        errno = EAGAIN;
+        set_system_error(
+            ERR_FILE_IO,
+            "HOME generation does not match SSH alias obligation");
+        goto done;
+    }
+
+    do {
+        lock_rc = flock(home_fd, LOCK_EX);
+    } while (lock_rc != 0 && errno == EINTR);
+    if (lock_rc != 0) {
+        set_system_error(
+            ERR_FILE_IO,
+            "Failed to lock HOME while proving absent SSH config directory");
+        goto done;
+    }
+    locked = true;
+
+    if (fstat(home_fd, &pinned_before) != 0) {
+        set_system_error(
+            ERR_FILE_IO,
+            "Failed to reinspect pinned HOME while proving absent SSH config "
+            "directory");
+        goto done;
+    }
+    if (stat(home, &named_before) != 0) {
+        set_system_error(
+            ERR_FILE_IO,
+            "Failed to rebind HOME while proving absent SSH config directory");
+        goto done;
+    }
+    if (!same_ssh_config_directory(&pinned_before, &named_before)) {
+        errno = EAGAIN;
+        set_system_error(
+            ERR_FILE_IO,
+            "HOME changed while proving absent SSH config directory");
+        goto done;
+    }
+    if (obligation &&
+        (!ssh_directory_publication_matches(
+             &obligation->home_identity, &pinned_before) ||
+         realpath(home, canonical_home) == NULL ||
+         strcmp(canonical_home, obligation->home_path) != 0)) {
+        errno = EAGAIN;
+        set_system_error(
+            ERR_FILE_IO,
+            "HOME namespace changed before proving absent SSH directory");
+        goto done;
+    }
+    if (fstatat(home_fd, ".ssh", &unexpected, AT_SYMLINK_NOFOLLOW) == 0) {
+        errno = EAGAIN;
+        set_system_error(
+            ERR_FILE_IO,
+            "SSH config directory appeared while proving its absence");
+        goto done;
+    }
+    if (errno != ENOENT) {
+        set_system_error(
+            ERR_FILE_IO,
+            "Failed to verify absent SSH config directory");
+        goto done;
+    }
+
+    if (g_ssh_dirsync(home_fd) != 0) {
+        if (publication) {
+            *publication = SSH_CONFIG_PUBLICATION_DURABILITY_UNCERTAIN;
+        }
+        set_system_error(
+            ERR_FILE_IO,
+            "SSH config directory is absent but the pinned HOME sync failed; "
+            "alias-removal durability remains uncertain");
+        goto done;
+    }
+    if (fstatat(home_fd, ".ssh", &unexpected, AT_SYMLINK_NOFOLLOW) == 0) {
+        errno = EAGAIN;
+        set_system_error(
+            ERR_FILE_IO,
+            "SSH config directory appeared after its absence was synced");
+        goto done;
+    }
+    if (errno != ENOENT) {
+        set_system_error(
+            ERR_FILE_IO,
+            "Failed to reverify absent SSH config directory after HOME sync");
+        goto done;
+    }
+    if (fstat(home_fd, &pinned_after) != 0) {
+        set_system_error(
+            ERR_FILE_IO,
+            "Failed to reinspect synced HOME while proving absent SSH config "
+            "directory");
+        goto done;
+    }
+    if (stat(home, &named_after) != 0) {
+        set_system_error(
+            ERR_FILE_IO,
+            "Failed to rebind synced HOME while proving absent SSH config "
+            "directory");
+        goto done;
+    }
+    if (!same_ssh_config_directory_revision(&pinned_before, &pinned_after) ||
+        !same_ssh_config_directory_revision(&pinned_before, &named_after)) {
+        errno = EAGAIN;
+        set_system_error(
+            ERR_FILE_IO,
+            "HOME changed while finalizing absent SSH config directory");
+        goto done;
+    }
+    if (obligation &&
+        (!ssh_directory_publication_matches(
+             &obligation->home_identity, &pinned_after) ||
+         realpath(home, canonical_home) == NULL ||
+         strcmp(canonical_home, obligation->home_path) != 0)) {
+        errno = EAGAIN;
+        set_system_error(
+            ERR_FILE_IO,
+            "HOME namespace changed while finalizing SSH alias obligation");
+        goto done;
+    }
+
+    rc = 0;
+done:
+    /* Cleanup must not replace the errno that explains the primary proof
+     * failure. A cleanup failure is promoted only after an otherwise
+     * successful proof. */
+    saved_errno = errno;
+    if (locked) {
+        do {
+            lock_rc = flock(home_fd, LOCK_UN);
+        } while (lock_rc != 0 && errno == EINTR);
+        if (lock_rc != 0 && rc == 0) {
+            saved_errno = errno;
+            set_system_error(
+                ERR_FILE_IO,
+                "Failed to unlock HOME after proving absent SSH config "
+                "directory");
+            rc = -1;
+        }
+    }
+    if (home_fd >= 0 && close(home_fd) != 0 && rc == 0) {
+        saved_errno = errno;
+        set_system_error(
+            ERR_FILE_IO,
+            "Failed to close HOME after proving absent SSH config directory");
+        rc = -1;
+    }
+    if (rc != 0) errno = saved_errno;
+    return rc;
 }
 
 static int recheck_ssh_config_directory(
@@ -4895,6 +5125,334 @@ fail: {
         errno = saved_errno;
         return -1;
     }
+}
+
+static bool ssh_publication_identity_is_zero(
+    const publication_identity_t *identity) {
+    publication_identity_t zero;
+
+    if (!identity) return false;
+    memset(&zero, 0, sizeof(zero));
+    return memcmp(identity, &zero, sizeof(zero)) == 0;
+}
+
+static bool ssh_directory_publication_matches(
+    const publication_identity_t *expected, const struct stat *observed) {
+    return expected && observed && expected->present &&
+           expected->device == (uintmax_t)observed->st_dev &&
+           expected->inode == (uintmax_t)observed->st_ino &&
+           expected->mode == (uintmax_t)observed->st_mode &&
+           expected->uid == (uintmax_t)observed->st_uid &&
+           expected->gid == (uintmax_t)observed->st_gid &&
+           S_ISDIR(observed->st_mode);
+}
+
+static bool ssh_directory_publication_equal_stable(
+    const publication_identity_t *left,
+    const publication_identity_t *right) {
+    return left && right && left->present == right->present &&
+           (!left->present ||
+            (left->device == right->device &&
+             left->inode == right->inode &&
+             left->mode == right->mode &&
+             left->uid == right->uid &&
+             left->gid == right->gid));
+}
+
+static bool ssh_alias_obligation_is_valid(
+    const config_retirement_ssh_alias_obligation_t *obligation) {
+    mode_t home_mode;
+    mode_t ssh_mode;
+
+    if (!obligation || !obligation->known || !obligation->present ||
+        memchr(obligation->ssh_host_alias, '\0',
+               sizeof(obligation->ssh_host_alias)) == NULL ||
+        !valid_ssh_host_alias(obligation->ssh_host_alias) ||
+        memchr(obligation->home_path, '\0',
+               sizeof(obligation->home_path)) == NULL ||
+        obligation->home_path[0] != '/' ||
+        !obligation->home_identity.present) {
+        return false;
+    }
+    home_mode = (mode_t)obligation->home_identity.mode;
+    if ((uintmax_t)home_mode != obligation->home_identity.mode ||
+        !S_ISDIR(home_mode)) {
+        return false;
+    }
+    if (!obligation->ssh_directory_identity.present) {
+        return ssh_publication_identity_is_zero(
+            &obligation->ssh_directory_identity);
+    }
+    ssh_mode = (mode_t)obligation->ssh_directory_identity.mode;
+    return (uintmax_t)ssh_mode ==
+               obligation->ssh_directory_identity.mode &&
+           S_ISDIR(ssh_mode);
+}
+
+int ssh_capture_host_alias_obligation(
+    const char *alias,
+    config_retirement_ssh_alias_obligation_t *obligation) {
+    config_retirement_ssh_alias_obligation_t captured;
+    const char *home = getenv("HOME");
+    char canonical_home[MAX_PATH_LEN];
+    char final_canonical_home[MAX_PATH_LEN];
+    struct stat named_home;
+    struct stat pinned_home;
+    struct stat final_home;
+    struct stat named_ssh;
+    struct stat pinned_ssh;
+    struct stat final_ssh;
+    int home_fd = -1;
+    int ssh_fd = -1;
+    int rc = -1;
+    int saved_errno;
+
+    if (obligation) memset(obligation, 0, sizeof(*obligation));
+    memset(&captured, 0, sizeof(captured));
+    if (!obligation || !alias || !valid_ssh_host_alias(alias)) {
+        set_error(ERR_INVALID_ARGS,
+                  "Cannot capture an invalid SSH alias obligation");
+        return -1;
+    }
+    if (!home || !*home) {
+        set_error(
+            ERR_INVALID_PATH,
+            "HOME is not set for SSH alias retirement");
+        return -1;
+    }
+    if (realpath(home, canonical_home) == NULL) {
+        set_system_error(
+            ERR_FILE_IO,
+            "Failed to resolve HOME for SSH alias retirement");
+        return -1;
+    }
+    if (stat(canonical_home, &named_home) != 0) {
+        set_system_error(
+            ERR_FILE_IO,
+            "Failed to inspect canonical HOME for SSH alias retirement");
+        return -1;
+    }
+    if (!S_ISDIR(named_home.st_mode)) {
+        errno = ENOTDIR;
+        set_system_error(
+            ERR_FILE_IO,
+            "Canonical HOME is not a directory for SSH alias retirement");
+        return -1;
+    }
+    home_fd = open(canonical_home,
+                   O_RDONLY | O_CLOEXEC | O_DIRECTORY);
+    if (home_fd < 0) {
+        set_system_error(
+            ERR_FILE_IO,
+            "Failed to pin canonical HOME for SSH alias retirement");
+        return -1;
+    }
+    if (fstat(home_fd, &pinned_home) != 0) {
+        set_system_error(
+            ERR_FILE_IO,
+            "Failed to inspect pinned HOME during SSH alias capture");
+        goto done;
+    }
+    if (!same_ssh_config_directory(&named_home, &pinned_home)) {
+        errno = EAGAIN;
+        set_system_error(
+            ERR_FILE_IO,
+            "Canonical HOME changed during SSH alias capture");
+        goto done;
+    }
+
+    if (fstatat(home_fd, ".ssh", &named_ssh, AT_SYMLINK_NOFOLLOW) == 0) {
+        if (!ssh_config_directory_is_safe(&named_ssh)) {
+            set_error(
+                ERR_PERMISSION_DENIED,
+                "Refusing unsafe SSH directory during alias capture");
+            goto done;
+        }
+        ssh_fd = openat(home_fd, ".ssh",
+                        O_RDONLY | O_CLOEXEC | O_DIRECTORY | O_NOFOLLOW);
+        if (ssh_fd < 0 || fstat(ssh_fd, &pinned_ssh) != 0) {
+            set_system_error(
+                ERR_FILE_IO,
+                "Failed to pin SSH directory during alias capture");
+            goto done;
+        }
+        if (!ssh_config_directory_is_safe(&pinned_ssh) ||
+            !same_ssh_config_directory(&named_ssh, &pinned_ssh) ||
+            fstatat(home_fd, ".ssh", &final_ssh,
+                    AT_SYMLINK_NOFOLLOW) != 0 ||
+            !same_ssh_config_directory(&pinned_ssh, &final_ssh)) {
+            errno = EAGAIN;
+            set_system_error(
+                ERR_FILE_IO,
+                "SSH directory changed during alias capture");
+            goto done;
+        }
+        publication_identity_from_stat(
+            &captured.ssh_directory_identity, &pinned_ssh);
+    } else if (errno != ENOENT) {
+        set_system_error(
+            ERR_FILE_IO,
+            "Failed to inspect SSH directory during alias capture");
+        goto done;
+    }
+
+    if (fstat(home_fd, &final_home) != 0 ||
+        stat(canonical_home, &named_home) != 0 ||
+        realpath(home, final_canonical_home) == NULL) {
+        set_system_error(
+            ERR_FILE_IO,
+            "Failed to recheck HOME while finalizing SSH alias capture");
+        goto done;
+    }
+    if (strcmp(final_canonical_home, canonical_home) != 0 ||
+        !same_ssh_config_directory(&pinned_home, &final_home) ||
+        !same_ssh_config_directory(&pinned_home, &named_home)) {
+        errno = EAGAIN;
+        set_system_error(
+            ERR_FILE_IO,
+            "Canonical HOME changed while finalizing SSH alias capture");
+        goto done;
+    }
+    if (!captured.ssh_directory_identity.present) {
+        if (fstatat(home_fd, ".ssh", &final_ssh,
+                    AT_SYMLINK_NOFOLLOW) == 0 ||
+            errno != ENOENT) {
+            errno = EAGAIN;
+            set_system_error(
+                ERR_FILE_IO,
+                "SSH directory appeared while finalizing alias capture");
+            goto done;
+        }
+    }
+
+    captured.known = true;
+    captured.present = true;
+    memcpy(captured.ssh_host_alias, alias, strlen(alias) + 1U);
+    memcpy(captured.home_path, canonical_home,
+           strlen(canonical_home) + 1U);
+    publication_identity_from_stat(
+        &captured.home_identity, &pinned_home);
+    rc = 0;
+done:
+    /* Preserve the capture failure's errno across descriptor retirement;
+     * promote the first close failure only when capture otherwise succeeded. */
+    saved_errno = errno;
+    if (ssh_fd >= 0 && close(ssh_fd) != 0 && rc == 0) {
+        saved_errno = errno;
+        set_system_error(
+            ERR_FILE_IO,
+            "Failed to close SSH directory after alias capture");
+        rc = -1;
+    }
+    if (home_fd >= 0 && close(home_fd) != 0 && rc == 0) {
+        saved_errno = errno;
+        set_system_error(
+            ERR_FILE_IO,
+            "Failed to close HOME after SSH alias capture");
+        rc = -1;
+    }
+    if (rc == 0) {
+        *obligation = captured;
+    } else {
+        memset(obligation, 0, sizeof(*obligation));
+        errno = saved_errno;
+    }
+    return rc;
+}
+
+static int ssh_recheck_open_alias_obligation(
+    const char *home, const ssh_config_directory_t *directory,
+    const config_retirement_ssh_alias_obligation_t *obligation) {
+    char canonical_home[MAX_PATH_LEN];
+    struct stat pinned_home;
+    struct stat named_home;
+    struct stat pinned_ssh;
+    struct stat named_ssh;
+
+    if (!obligation ||
+        realpath(home, canonical_home) == NULL ||
+        strcmp(canonical_home, obligation->home_path) != 0) {
+        errno = EAGAIN;
+        set_system_error(
+            ERR_FILE_IO,
+            "HOME namespace does not match SSH alias obligation");
+        return -1;
+    }
+    if (fstat(directory->home_fd, &pinned_home) != 0 ||
+        stat(obligation->home_path, &named_home) != 0) {
+        set_system_error(
+            ERR_FILE_IO,
+            "Failed to inspect HOME for SSH alias obligation");
+        return -1;
+    }
+    if (!ssh_directory_publication_matches(
+            &obligation->home_identity, &pinned_home) ||
+        !same_ssh_config_directory(&pinned_home, &named_home)) {
+        errno = EAGAIN;
+        set_system_error(
+            ERR_FILE_IO,
+            "HOME generation does not match SSH alias obligation");
+        return -1;
+    }
+    if (!obligation->ssh_directory_identity.present) {
+        if (fstatat(directory->home_fd, ".ssh", &named_ssh,
+                    AT_SYMLINK_NOFOLLOW) == 0 ||
+            errno != ENOENT) {
+            errno = EAGAIN;
+            set_system_error(
+                ERR_FILE_IO,
+                "SSH directory appeared after alias obligation capture");
+            return -1;
+        }
+        return 0;
+    }
+    if (fstat(directory->dir_fd, &pinned_ssh) != 0 ||
+        fstatat(directory->home_fd, ".ssh", &named_ssh,
+                AT_SYMLINK_NOFOLLOW) != 0) {
+        set_system_error(
+            ERR_FILE_IO,
+            "Failed to inspect SSH directory for alias obligation");
+        return -1;
+    }
+    if (!ssh_config_directory_is_safe(&pinned_ssh) ||
+        !ssh_directory_publication_matches(
+            &obligation->ssh_directory_identity, &pinned_ssh) ||
+        !same_ssh_config_directory(&pinned_ssh, &named_ssh)) {
+        errno = EAGAIN;
+        set_system_error(
+            ERR_FILE_IO,
+            "SSH directory generation does not match alias obligation");
+        return -1;
+    }
+    return 0;
+}
+
+int ssh_revalidate_host_alias_obligation(
+    const config_retirement_ssh_alias_obligation_t *obligation) {
+    config_retirement_ssh_alias_obligation_t observed;
+
+    if (!ssh_alias_obligation_is_valid(obligation)) {
+        set_error(ERR_INVALID_ARGS,
+                  "Invalid SSH alias retirement obligation");
+        return -1;
+    }
+    if (ssh_capture_host_alias_obligation(
+            obligation->ssh_host_alias, &observed) != 0) {
+        return -1;
+    }
+    if (strcmp(observed.home_path, obligation->home_path) != 0 ||
+        !ssh_directory_publication_equal_stable(
+            &observed.home_identity, &obligation->home_identity) ||
+        !ssh_directory_publication_equal_stable(
+            &observed.ssh_directory_identity,
+            &obligation->ssh_directory_identity)) {
+        errno = EAGAIN;
+        set_system_error(
+            ERR_FILE_IO,
+            "SSH alias retirement namespace no longer matches obligation");
+        return -1;
+    }
+    return 0;
 }
 
 static bool ssh_config_next_line(const char *buf, size_t len, size_t offset,
@@ -5774,6 +6332,7 @@ static int ssh_config_recheck_public_unchanged(
     struct stat current_directory;
     int current_dir_fd = -1;
     int rc = -1;
+    int saved_errno;
 
     if (recheck_ssh_home_directory(home, directory) != 0) return -1;
     current_dir_fd = openat(directory->home_fd, ".ssh",
@@ -5803,13 +6362,95 @@ static int ssh_config_recheck_public_unchanged(
     rc = 0;
 
 done:
+    /* Preserve the transaction failure's errno across lock/descriptor
+     * retirement; promote cleanup only after an otherwise successful result. */
+    saved_errno = errno;
     if (close(current_dir_fd) != 0 && rc == 0) {
+        saved_errno = errno;
         set_system_error(ERR_FILE_IO,
                          "Cannot close final public SSH config directory "
                          "verification descriptor: %s",
                          directory->path);
+        rc = -1;
+    }
+    if (rc != 0) errno = saved_errno;
+    return rc;
+}
+
+/* Rebind a config-absent no-op to the currently public ~/.ssh directory after
+ * its durability sync. A callback may replace the public directory during
+ * fsync; checking only the retained dir_fd would then settle the wrong
+ * namespace. */
+static int ssh_config_recheck_public_absent(
+    const char *home, const ssh_config_directory_t *directory) {
+    struct stat current_directory;
+    struct stat unexpected;
+    int current_dir_fd = -1;
+    int rc = -1;
+    int saved_errno;
+
+    if (recheck_ssh_home_directory(home, directory) != 0) return -1;
+    current_dir_fd = openat(directory->home_fd, ".ssh",
+                            O_RDONLY | O_CLOEXEC | O_DIRECTORY | O_NOFOLLOW);
+    if (current_dir_fd < 0) {
+        set_system_error(
+            ERR_FILE_IO,
+            "Cannot reopen public SSH directory for absent-config proof");
         return -1;
     }
+    if (fstat(current_dir_fd, &current_directory) != 0 ||
+        !ssh_config_directory_is_safe(&current_directory) ||
+        !same_ssh_config_directory(
+            &directory->dir_identity, &current_directory)) {
+        errno = EAGAIN;
+        set_system_error(
+            ERR_FILE_IO,
+            "SSH directory changed during absent-config verification");
+        goto done;
+    }
+    if (fstatat(current_dir_fd, "config", &unexpected,
+                AT_SYMLINK_NOFOLLOW) == 0) {
+        errno = EAGAIN;
+        set_system_error(
+            ERR_FILE_IO,
+            "SSH config appeared after its absent state was synchronized");
+        goto done;
+    }
+    if (errno != ENOENT) {
+        set_system_error(
+            ERR_FILE_IO,
+            "Failed to reprove absent SSH config after directory sync");
+        goto done;
+    }
+    if (recheck_ssh_config_directory(home, directory) != 0) {
+        goto done;
+    }
+    if (fstatat(current_dir_fd, "config", &unexpected,
+                AT_SYMLINK_NOFOLLOW) == 0) {
+        errno = EAGAIN;
+        set_system_error(
+            ERR_FILE_IO,
+            "SSH config appeared while finalizing its absent state");
+        goto done;
+    }
+    if (errno != ENOENT) {
+        set_system_error(
+            ERR_FILE_IO,
+            "Failed final absent SSH config verification");
+        goto done;
+    }
+    rc = 0;
+
+done:
+    saved_errno = errno;
+    if (close(current_dir_fd) != 0 && rc == 0) {
+        saved_errno = errno;
+        set_system_error(
+            ERR_FILE_IO,
+            "Cannot close absent-config verification descriptor");
+        rc = -1;
+    }
+    if (rc != 0) errno = saved_errno;
     return rc;
 }
 
@@ -6092,7 +6733,9 @@ static int ssh_write_config_atomic_at(
     const char *display_path, const char *content, size_t content_len,
     bool config_existed, const struct stat *config_identity,
     int pinned_config_fd, const char *original_content,
-    size_t original_len, ssh_config_publication_state_t *publication) {
+    size_t original_len,
+    const config_retirement_ssh_alias_obligation_t *obligation,
+    ssh_config_publication_state_t *publication) {
     static const char random_chars[] =
         "abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789";
     char suffix[17];
@@ -6105,6 +6748,7 @@ static int ssh_write_config_atomic_at(
     int dir_fd = directory->dir_fd;
     const char *dir_path = directory->path;
     int fd = -1;
+    int saved_errno;
     bool have_temp_identity = false;
     bool temp_registered = false;
     bool renamed = false;
@@ -6248,12 +6892,30 @@ static int ssh_write_config_atomic_at(
             "replacement durability is uncertain");
         return -1;
     }
+    if (obligation) {
+        if (ssh_recheck_open_alias_obligation(
+                home, directory, obligation) != 0) {
+            return -1;
+        }
+    } else if (recheck_ssh_config_directory(home, directory) != 0) {
+        return -1;
+    }
+    if (fstatat(dir_fd, "config", &installed,
+                AT_SYMLINK_NOFOLLOW) != 0 ||
+        !same_installed_ssh_config(&temp_identity, &installed)) {
+        set_error(
+            ERR_FILE_IO,
+            "SSH config was synchronized but its final installed generation "
+            "changed; publication remains uncertain");
+        return -1;
+    }
     if (publication) {
         *publication = SSH_CONFIG_PUBLICATION_COMMITTED;
     }
     return 0;
 
 fail:
+    saved_errno = errno;
     if (fd >= 0) close(fd);
     /* AR-13 L12: the initial fstat of the temp may have failed (have_temp_identity
      * false), but the O_EXCL entry we created microseconds ago inside the
@@ -6272,6 +6934,7 @@ fail:
         (void)unlinkat(dir_fd, temp_name, 0);
     }
     if (temp_registered) signals_scratch_unregister(temp_path);
+    errno = saved_errno;
     return -1;
 }
 
@@ -6280,13 +6943,19 @@ fail:
  * "Host <alias>" stanza routing git traffic to the removed account's key, since
  * nothing ever deleted a managed block. No-op if the config or the block is
  * absent. Returns 0 on success (including no-op), -1 on I/O failure. */
-int ssh_remove_host_alias(const char *alias) {
+static int ssh_remove_host_alias_result_internal(
+    const char *alias,
+    const config_retirement_ssh_alias_obligation_t *obligation,
+    ssh_config_publication_state_t *publication) {
     char ssh_config_path[MAX_PATH_LEN];
     char *buf = NULL;
     char *filtered = NULL;
     const char *home = getenv("HOME");
     struct stat config_identity;
-    ssh_config_directory_t directory;
+    ssh_config_directory_t directory = {
+        .home_fd = -1,
+        .dir_fd = -1
+    };
     size_t buf_len = 0;
     size_t filtered_len = 0;
     size_t removed = 0;
@@ -6294,9 +6963,15 @@ int ssh_remove_host_alias(const char *alias) {
     int config_lock_fd = -1;
     int pinned_config_fd = -1;
     int rc = -1;
+    int saved_errno;
 
+    if (publication) {
+        *publication = SSH_CONFIG_PUBLICATION_PREINSTALL_FAILED;
+    }
     if (!alias || !*alias) {
-        return 0;
+        set_error(ERR_INVALID_ARGS,
+                  "SSH host alias removal requires a non-empty alias");
+        return -1;
     }
     if (!home || !*home) {
         set_error(ERR_INVALID_PATH, "HOME not set");
@@ -6307,8 +6982,29 @@ int ssh_remove_host_alias(const char *alias) {
         return -1;
     }
     if (open_ssh_config_directory(home, false, &directory) != 0) {
-        if (directory.absent) return 0;
+        if (directory.absent) {
+            if (obligation) {
+                errno = EAGAIN;
+                set_system_error(
+                    ERR_FILE_IO,
+                    "Required SSH directory is absent for alias obligation");
+                return -1;
+            }
+            if (prove_absent_ssh_config_directory_durable(
+                    home, NULL, publication) != 0) {
+                return -1;
+            }
+            if (publication) {
+                *publication = SSH_CONFIG_PUBLICATION_UNCHANGED;
+            }
+            return 0;
+        }
         return -1;
+    }
+    if (obligation &&
+        ssh_recheck_open_alias_obligation(
+            home, &directory, obligation) != 0) {
+        goto done;
     }
     /* Serialize the complete read/transform/publish transaction.  Locking only
      * the final rename still lets two gitswitch processes read the same base
@@ -6323,6 +7019,11 @@ int ssh_remove_host_alias(const char *alias) {
                          "Failed to lock SSH config transaction");
         goto done;
     }
+    if (obligation &&
+        ssh_recheck_open_alias_obligation(
+            home, &directory, obligation) != 0) {
+        goto done;
+    }
     if ((size_t)snprintf(ssh_config_path, sizeof(ssh_config_path), "%s/config",
                          directory.path) >= sizeof(ssh_config_path)) {
         set_error(ERR_INVALID_PATH, "SSH config path too long");
@@ -6334,6 +7035,34 @@ int ssh_remove_host_alias(const char *alias) {
         goto done;
     }
     if (!config_existed) {
+        if (publication) {
+            *publication =
+                SSH_CONFIG_PUBLICATION_DURABILITY_UNCERTAIN;
+        }
+        if (g_ssh_dirsync(directory.dir_fd) != 0) {
+            set_system_error(
+                ERR_FILE_IO,
+                "SSH config is absent but its directory sync failed; "
+                "alias-removal durability remains uncertain");
+            goto done;
+        }
+        if (obligation &&
+            ssh_recheck_open_alias_obligation(
+                home, &directory, obligation) != 0) {
+            goto done;
+        }
+        if (ssh_config_recheck_public_absent(
+                home, &directory) != 0) {
+            goto done;
+        }
+        if (obligation &&
+            ssh_recheck_open_alias_obligation(
+                home, &directory, obligation) != 0) {
+            goto done;
+        }
+        if (publication) {
+            *publication = SSH_CONFIG_PUBLICATION_UNCHANGED;
+        }
         rc = 0;
         goto done;
     }
@@ -6348,10 +7077,34 @@ int ssh_remove_host_alias(const char *alias) {
          * cache-visible yet not durable. Re-prove durability with the same
          * directory sync the write path performs before reporting the no-op
          * committed, rather than converting that uncertainty into success. */
+        if (publication) {
+            *publication =
+                SSH_CONFIG_PUBLICATION_DURABILITY_UNCERTAIN;
+        }
         if (g_ssh_dirsync(directory.dir_fd) != 0) {
-            set_system_error(ERR_FILE_IO,
-                             "Failed to durably commit SSH config directory");
+            set_system_error(
+                ERR_FILE_IO,
+                "SSH host alias is already absent but the config directory "
+                "sync failed; alias-removal durability remains uncertain");
             goto done; /* rc remains -1 */
+        }
+        if (obligation &&
+            ssh_recheck_open_alias_obligation(
+                home, &directory, obligation) != 0) {
+            goto done;
+        }
+        if (ssh_config_recheck_public_unchanged(
+                home, &directory, ssh_config_path,
+                &config_identity, pinned_config_fd, buf, buf_len) != 0) {
+            goto done;
+        }
+        if (obligation &&
+            ssh_recheck_open_alias_obligation(
+                home, &directory, obligation) != 0) {
+            goto done;
+        }
+        if (publication) {
+            *publication = SSH_CONFIG_PUBLICATION_UNCHANGED;
         }
         rc = 0;
         goto done;
@@ -6360,32 +7113,81 @@ int ssh_remove_host_alias(const char *alias) {
     if (ssh_write_config_atomic_at(home, &directory,
                                    ssh_config_path, filtered, filtered_len,
                                    config_existed, &config_identity,
-                                   pinned_config_fd, buf, buf_len, NULL) != 0) {
+                                   pinned_config_fd, buf, buf_len,
+                                   obligation, publication) != 0) {
         goto done;
     }
     log_info("Removed %zu SSH host alias block%s: %s", removed,
              removed == 1U ? "" : "s", alias);
     rc = 0;
 done:
+    saved_errno = errno;
     free(buf);
     free(filtered);
     if (pinned_config_fd >= 0 && close(pinned_config_fd) != 0 && rc == 0) {
+        saved_errno = errno;
         set_system_error(ERR_FILE_IO,
                          "Failed to close pinned SSH config");
         rc = -1;
     }
     if (config_lock_fd >= 0) unlock_private_file(config_lock_fd);
     if (directory.dir_fd >= 0 && close(directory.dir_fd) != 0 && rc == 0) {
+        saved_errno = errno;
         set_system_error(ERR_FILE_IO,
                          "Failed to close pinned SSH config directory");
         rc = -1;
     }
     if (directory.home_fd >= 0 && close(directory.home_fd) != 0 && rc == 0) {
+        saved_errno = errno;
         set_system_error(ERR_FILE_IO,
                          "Failed to close pinned SSH config HOME");
         rc = -1;
     }
+    if (rc != 0) errno = saved_errno;
     return rc;
+}
+
+int ssh_remove_host_alias_obligation_result(
+    const config_retirement_ssh_alias_obligation_t *obligation,
+    ssh_config_publication_state_t *publication) {
+    const char *home = getenv("HOME");
+
+    if (publication) {
+        *publication = SSH_CONFIG_PUBLICATION_PREINSTALL_FAILED;
+    }
+    if (!ssh_alias_obligation_is_valid(obligation)) {
+        set_error(ERR_INVALID_ARGS,
+                  "Invalid SSH alias retirement obligation");
+        return -1;
+    }
+    if (!home || !*home) {
+        set_error(ERR_INVALID_PATH, "HOME not set");
+        return -1;
+    }
+    if (!obligation->ssh_directory_identity.present) {
+        if (prove_absent_ssh_config_directory_durable(
+                home, obligation, publication) != 0) {
+            return -1;
+        }
+        if (publication) {
+            *publication = SSH_CONFIG_PUBLICATION_UNCHANGED;
+        }
+        return 0;
+    }
+    return ssh_remove_host_alias_result_internal(
+        obligation->ssh_host_alias, obligation, publication);
+}
+
+int ssh_remove_host_alias_result(
+    const char *alias,
+    ssh_config_publication_state_t *publication) {
+    return ssh_remove_host_alias_result_internal(
+        alias, NULL, publication);
+}
+
+int ssh_remove_host_alias(const char *alias) {
+    if (!alias || !*alias) return 0;
+    return ssh_remove_host_alias_result(alias, NULL);
 }
 
 int ssh_configure_host_alias_result(
@@ -6569,15 +7371,20 @@ int ssh_configure_host_alias_result(
              * uncertainty into success — re-prove the directory entry's
              * durability now, mirroring unlink_ssh_runtime_entry's
              * sync-the-observed-state principle. */
+            if (publication) {
+                *publication =
+                    SSH_CONFIG_PUBLICATION_DURABILITY_UNCERTAIN;
+            }
             if (g_ssh_dirsync(directory.dir_fd) != 0) {
-                if (publication) {
-                    *publication =
-                        SSH_CONFIG_PUBLICATION_DURABILITY_UNCERTAIN;
-                }
                 set_system_error(
                     ERR_FILE_IO,
                     "SSH config is already current but its directory sync "
                     "failed; publication durability remains uncertain");
+                goto done;
+            }
+            if (ssh_config_recheck_public_unchanged(
+                    home, &directory, ssh_config_path, &config_identity,
+                    pinned_config_fd, buf, buf_len) != 0) {
                 goto done;
             }
             log_debug(
@@ -6615,7 +7422,7 @@ int ssh_configure_host_alias_result(
                                    ssh_config_path, newbuf, newbuf_len,
                                    config_existed, &config_identity,
                                    pinned_config_fd, buf, buf_len,
-                                   publication) != 0) {
+                                   NULL, publication) != 0) {
         goto done;
     }
 

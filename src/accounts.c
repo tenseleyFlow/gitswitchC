@@ -116,9 +116,14 @@ typedef struct {
     config_retirement_owner_t owners[MAX_ACCOUNTS];
     size_t owner_count;
     pending_retirement_phase_t phase;
-    /* No target had a durable publication: nothing to retire, so no Git
-     * transaction or guard exists and publish/finalize are no-ops. */
-    bool vacuous;
+    /* Git and marker ownership are independent: an alias-only REMOVE has a
+     * durable guard but no Git transaction, while a truly empty retirement
+     * owns neither. */
+    bool truly_vacuous;
+    bool git_vacuous;
+    bool guarded;
+    bool has_ssh_alias_obligation;
+    config_retirement_ssh_alias_obligation_t ssh_alias_obligation;
 } pending_retirement_t;
 
 /* CLI removal cannot retire an exclusive ~/.ssh/config alias until the
@@ -450,6 +455,7 @@ static int check_gpg_key_local_state(
 static int pending_retirement_prepare(
     const gitswitch_ctx_t *ctx, config_retirement_kind_t kind,
     const account_t *const targets[], size_t target_count,
+    const config_retirement_ssh_alias_obligation_t *ssh_alias_obligation,
     pending_retirement_t *retirement);
 static int pending_retirement_cancel_unpublished(
     pending_retirement_t *retirement);
@@ -4006,6 +4012,10 @@ int accounts_remove_finalize(
     accounts_transaction_token_t token;
     char alias[MAX_NAME_LEN];
     bool alias_exclusive;
+    accounts_retirement_save_outcome_t settlement_outcome;
+    ssh_config_publication_state_t alias_publication =
+        SSH_CONFIG_PUBLICATION_UNCHANGED;
+    int alias_rc = 0;
 
     if (!g_pending_remove.active || !ctx || g_pending_remove.ctx != ctx ||
         outcome < ACCOUNTS_RETIREMENT_SAVE_DURABLE ||
@@ -4028,17 +4038,28 @@ int accounts_remove_finalize(
     }
     error_accumulator_init(&failures);
     g_transaction_owner.phase = ACCOUNTS_TRANSACTION_FINALIZING;
-
-    if ((g_pending_remove.retirement.git ||
-         g_pending_remove.retirement.vacuous) &&
-        pending_retirement_finalize(
-            ctx, &g_pending_remove.retirement, outcome) != 0) {
-        (void)error_accumulator_add_last(
-            &failures, "outer Git retirement finalization");
-    }
+    settlement_outcome = outcome;
 
     if (outcome != ACCOUNTS_RETIREMENT_SAVE_PREINSTALL_FAILED) {
-        if (alias[0] != '\0' && !alias_exclusive) {
+        if (g_pending_remove.retirement.has_ssh_alias_obligation &&
+            g_pending_remove.retirement.ssh_alias_obligation.present) {
+            alias_rc = ssh_remove_host_alias_obligation_result(
+                &g_pending_remove.retirement.ssh_alias_obligation,
+                &alias_publication);
+            if (alias_rc != 0) {
+                /* Preserve the publication error before finalization touches
+                 * the shared error context. Settlement remains a separate
+                 * decision derived from the structured state below. */
+                (void)error_accumulator_add_last(
+                    &failures, "bound SSH alias retirement");
+            }
+            if (outcome == ACCOUNTS_RETIREMENT_SAVE_DURABLE &&
+                alias_publication != SSH_CONFIG_PUBLICATION_COMMITTED &&
+                alias_publication != SSH_CONFIG_PUBLICATION_UNCHANGED) {
+                settlement_outcome =
+                    ACCOUNTS_RETIREMENT_SAVE_UNCERTAIN;
+            }
+        } else if (alias[0] != '\0' && !alias_exclusive) {
             log_warning(
                 "Retaining shared ~/.ssh/config host-alias block for '%s'; another account still claims the same alias",
                 alias);
@@ -4051,6 +4072,13 @@ int accounts_remove_finalize(
                 "Could not remove ~/.ssh/config host-alias block for '%s': %s",
                 alias, get_last_error()->message);
         }
+    }
+
+    if (g_pending_remove.retirement.phase != PENDING_RETIREMENT_NONE &&
+        pending_retirement_finalize(
+            ctx, &g_pending_remove.retirement, settlement_outcome) != 0) {
+        (void)error_accumulator_add_last(
+            &failures, "outer retirement finalization");
     }
 
     /* A pre-install outcome deliberately leaves the durable account/alias
@@ -4155,7 +4183,7 @@ static int accounts_collect_retiring_owner_publications(
     const publication_ledger_t *ledger,
     const config_retirement_owner_t *owner,
     const publication_record_t *records[PUBLICATION_LEDGER_MAX_RECORDS],
-    size_t *record_count) {
+    size_t *record_count, bool allow_zero) {
     size_t count = 0U;
     bool saw_id = false;
 
@@ -4166,13 +4194,16 @@ static int accounts_collect_retiring_owner_publications(
         return -1;
     }
     *record_count = 0U;
-    if (!ledger->present || ledger->version != PUBLICATION_LEDGER_VERSION) {
+    if ((ledger->present &&
+         ledger->version != PUBLICATION_LEDGER_VERSION) ||
+        (!ledger->present && !allow_zero)) {
         errno = ESTALE;
         set_error(
             ERR_GIT_CONFIG_FAILED,
             "Incomplete removal has no canonical publication tombstone ledger");
         return -1;
     }
+    if (!ledger->present) return 0;
     for (size_t i = 0U; i < ledger->count; i++) {
         const publication_record_t *record = &ledger->records[i];
 
@@ -4209,7 +4240,7 @@ static int accounts_collect_retiring_owner_publications(
         }
         records[count++] = record;
     }
-    if (!saw_id || count == 0U) {
+    if ((!saw_id || count == 0U) && !allow_zero) {
         errno = ESTALE;
         set_error(
             ERR_GIT_CONFIG_FAILED,
@@ -4218,6 +4249,33 @@ static int accounts_collect_retiring_owner_publications(
         return -1;
     }
     *record_count = count;
+    return 0;
+}
+
+static int accounts_require_no_live_alias_claimant(
+    const gitswitch_ctx_t *ctx,
+    const config_retirement_ssh_alias_obligation_t *obligation) {
+    if (!ctx || !obligation || !obligation->known) {
+        errno = ESTALE;
+        set_error(
+            ERR_GIT_CONFIG_FAILED,
+            "Incomplete v1 REMOVE marker has unknown SSH alias state; rerun with the original account configuration or resolve the retirement marker manually");
+        return -1;
+    }
+    if (!obligation->present) return 0;
+    for (size_t i = 0U; i < ctx->account_count; i++) {
+        if (ctx->accounts[i].ssh_host_alias[0] != '\0' &&
+            string_ascii_case_equal(
+                ctx->accounts[i].ssh_host_alias,
+                obligation->ssh_host_alias)) {
+            errno = ESTALE;
+            set_error(
+                ERR_GIT_CONFIG_FAILED,
+                "Cannot recover incomplete removal because live account ID %u claims SSH alias '%s'",
+                ctx->accounts[i].id, obligation->ssh_host_alias);
+            return -1;
+        }
+    }
     return 0;
 }
 
@@ -4232,6 +4290,44 @@ static int accounts_serialize_recovery_ledger(
     }
     if (publication_ledger_serialize(
             ledger, serialized, serialized_length) != 0) {
+        return -1;
+    }
+    return 0;
+}
+
+static int accounts_revalidate_recovery_ledger(
+    const char *config_path, const unsigned char *expected,
+    size_t expected_length, publication_ledger_t *observed,
+    unsigned char **serialized, size_t *serialized_length,
+    const char *changed_message) {
+    if (!config_path || (!expected && expected_length != 0U) || !observed ||
+        !serialized || !serialized_length) {
+        errno = EINVAL;
+        set_error(ERR_INVALID_ARGS,
+                  "Invalid retirement-ledger revalidation state");
+        return -1;
+    }
+    publication_ledger_clear(observed);
+    publication_ledger_init(observed);
+    if (*serialized) {
+        secure_zero_memory(*serialized, *serialized_length);
+        free(*serialized);
+        *serialized = NULL;
+        *serialized_length = 0U;
+    }
+    if (config_load_publication_ledger(config_path, observed) != 0 ||
+        accounts_serialize_recovery_ledger(
+            observed, serialized, serialized_length) != 0) {
+        return -1;
+    }
+    if (expected_length != *serialized_length ||
+        (expected_length != 0U &&
+         memcmp(expected, *serialized, expected_length) != 0)) {
+        errno = ESTALE;
+        set_error(
+            ERR_GIT_CONFIG_FAILED, "%s",
+            changed_message ? changed_message
+                            : "Retirement publication tombstones changed");
         return -1;
     }
     return 0;
@@ -4255,6 +4351,11 @@ int accounts_remove_recover_incomplete(gitswitch_ctx_t *ctx,
     error_accumulator_t failures;
     int result = -1;
     bool matching_absent_owner = false;
+    bool settlement_completed = false;
+    bool alias_error_after_install = false;
+    bool terminal_failure_accumulated = false;
+    ssh_config_publication_state_t alias_publication =
+        SSH_CONFIG_PUBLICATION_UNCHANGED;
 
     memset(&recovery, 0, sizeof(recovery));
     memset(records, 0, sizeof(records));
@@ -4282,6 +4383,16 @@ int accounts_remove_recover_incomplete(gitswitch_ctx_t *ctx,
         result = 0;
         goto done;
     }
+    if (recovery.marker_version < 2U ||
+        !recovery.ssh_alias_obligation.known) {
+        errno = ESTALE;
+        set_error(
+            ERR_GIT_CONFIG_FAILED,
+            "Cannot recover incomplete v1 REMOVE marker for account ID %u because its SSH alias obligation is unknown; restore the original account and retry removal, or resolve the marker manually",
+            requested_id);
+        matching_absent_owner = true;
+        goto done;
+    }
 
     for (size_t i = 0U; i < ctx->account_count; i++) {
         const account_t *account = &ctx->accounts[i];
@@ -4305,17 +4416,25 @@ int accounts_remove_recover_incomplete(gitswitch_ctx_t *ctx,
     }
     matching_absent_owner = true;
 
-    if (config_retirement_guard_adopt(
+    if (config_revalidate_loaded_source(ctx) != 0 ||
+        accounts_require_no_live_alias_claimant(
+            ctx, &recovery.ssh_alias_obligation) != 0 ||
+        config_retirement_guard_adopt_with_ssh_alias_obligation(
             ctx->config.config_path, CONFIG_RETIREMENT_REMOVE,
-            recovery.owners, recovery.owner_count, &guard) != 0 ||
+            recovery.owners, recovery.owner_count,
+            &recovery.ssh_alias_obligation, &guard) != 0 ||
         config_revalidate_loaded_source(ctx) != 0 ||
         config_load_publication_ledger(
             ctx->config.config_path, &ledger) != 0 ||
         accounts_collect_retiring_owner_publications(
             &ledger, &recovery.owners[0],
-            records, &record_count) != 0 ||
+            records, &record_count,
+            recovery.ssh_alias_obligation.present) != 0 ||
         accounts_serialize_recovery_ledger(
-            &ledger, &ledger_bytes, &ledger_length) != 0 ||
+            &ledger, &ledger_bytes, &ledger_length) != 0) {
+        goto done;
+    }
+    if (record_count != 0U &&
         git_retirement_recovery_begin(
             records, record_count, &git_recovery) != 0) {
         goto done;
@@ -4325,27 +4444,91 @@ int accounts_remove_recover_incomplete(gitswitch_ctx_t *ctx,
      * byte-stable while the canonical Git destination locks remain held.
      * Exact equality prevents a same-owner record replacement from being
      * laundered through the earlier clean-destination proof. */
-    if (config_revalidate_loaded_source(ctx) != 0 ||
-        config_load_publication_ledger(
-            ctx->config.config_path, &revalidated_ledger) != 0 ||
-        accounts_serialize_recovery_ledger(
+    if (accounts_revalidate_recovery_ledger(
+            ctx->config.config_path, ledger_bytes, ledger_length,
             &revalidated_ledger, &revalidated_bytes,
-            &revalidated_length) != 0 ||
-        ledger_length != revalidated_length ||
-        memcmp(ledger_bytes, revalidated_bytes, ledger_length) != 0) {
-        if (get_last_error()->code == ERR_SUCCESS) {
-            errno = ESTALE;
-            set_error(
-                ERR_GIT_CONFIG_FAILED,
-                "Retirement publication tombstones changed during incomplete-remove recovery");
+            &revalidated_length,
+            "Retirement publication tombstones changed during incomplete-remove recovery") !=
+        0) {
+        goto done;
+    }
+    if (recovery.ssh_alias_obligation.present) {
+        int alias_rc;
+
+        REMOVE_TEST_CHECKPOINT(5);
+        /* Immediate authorization barrier for the irreversible alias
+         * mutation. The owned-marker check uses the already-held lifecycle
+         * lock; it neither probes token-free state nor reacquires that lock. */
+        if (config_revalidate_loaded_source(ctx) != 0 ||
+            accounts_require_no_live_alias_claimant(
+                ctx, &recovery.ssh_alias_obligation) != 0 ||
+            config_retirement_guard_revalidate(guard) != 0 ||
+            accounts_revalidate_recovery_ledger(
+                ctx->config.config_path, ledger_bytes, ledger_length,
+                &revalidated_ledger, &revalidated_bytes,
+                &revalidated_length,
+                "Retirement publication tombstones changed before SSH alias recovery") !=
+                0 ||
+            (git_recovery &&
+             git_retirement_recovery_verify(git_recovery) != 0) ||
+            ssh_revalidate_host_alias_obligation(
+                &recovery.ssh_alias_obligation) != 0) {
+            goto done;
         }
+        alias_rc = ssh_remove_host_alias_obligation_result(
+            &recovery.ssh_alias_obligation, &alias_publication);
+        if (alias_rc != 0) {
+            (void)error_accumulator_add_last(
+                &failures, "bound SSH alias recovery");
+            alias_error_after_install = true;
+        }
+        if (alias_publication != SSH_CONFIG_PUBLICATION_COMMITTED &&
+            alias_publication != SSH_CONFIG_PUBLICATION_UNCHANGED) {
+            if (alias_rc == 0) {
+                errno = EAGAIN;
+                set_error(
+                    ERR_FILE_IO,
+                    "SSH alias recovery did not reach a settled publication state");
+            } else {
+                terminal_failure_accumulated = true;
+            }
+            goto done;
+        }
+    }
+    /* end() is the final Git proof and lock release. The durable blocker must
+     * remain active until it succeeds; its failure is independent of an
+     * already-settled SSH publication diagnostic. */
+    if (git_recovery &&
+        git_retirement_recovery_end(&git_recovery) != 0) {
+        (void)error_accumulator_add_last(
+            &failures, "Git retirement recovery final proof and release");
+        terminal_failure_accumulated = true;
         goto done;
     }
-    if (git_retirement_recovery_verify(git_recovery) != 0 ||
-        config_retirement_guard_clear(&guard) != 0) {
+
+    /* Re-prove every remaining authority after Git lock release and
+     * immediately before completing the exact durable marker. */
+    if (config_revalidate_loaded_source(ctx) != 0 ||
+        accounts_require_no_live_alias_claimant(
+            ctx, &recovery.ssh_alias_obligation) != 0 ||
+        config_retirement_guard_revalidate(guard) != 0 ||
+        accounts_revalidate_recovery_ledger(
+            ctx->config.config_path, ledger_bytes, ledger_length,
+            &revalidated_ledger, &revalidated_bytes,
+            &revalidated_length,
+            "Retirement publication tombstones changed before incomplete-remove completion") !=
+            0 ||
+        (recovery.ssh_alias_obligation.present &&
+         ssh_revalidate_host_alias_obligation(
+             &recovery.ssh_alias_obligation) != 0)) {
         goto done;
     }
-    if (git_retirement_recovery_end(&git_recovery) != 0) {
+    if (config_retirement_guard_clear(&guard) != 0) {
+        goto done;
+    }
+    settlement_completed = true;
+    if (alias_error_after_install) {
+        result = -1;
         goto done;
     }
     clear_error();
@@ -4353,7 +4536,8 @@ int accounts_remove_recover_incomplete(gitswitch_ctx_t *ctx,
     result = 1;
 
 done:
-    if (result < 0) {
+    if (result < 0 && !settlement_completed &&
+        !terminal_failure_accumulated) {
         error_context_t primary = *get_last_error();
         int primary_errno = errno ? errno : EIO;
 
@@ -4408,6 +4592,8 @@ int accounts_remove(gitswitch_ctx_t *ctx, const char *identifier) {
     bool was_current;
     bool was_active;
     bool removed_alias_exclusive;
+    bool bound_alias_exclusive;
+    config_retirement_ssh_alias_obligation_t ssh_alias_obligation;
     int ssh_rc;
     int gpg_rc;
     int runtime_lock_fd;
@@ -4418,6 +4604,7 @@ int accounts_remove(gitswitch_ctx_t *ctx, const char *identifier) {
     bool outer_retirement_published = false;
 
     error_accumulator_init(&retirement_errors);
+    memset(&ssh_alias_obligation, 0, sizeof(ssh_alias_obligation));
     if (accounts_transaction_begin(ctx, ACCOUNTS_TRANSACTION_REMOVE,
                                    &token) != 0) {
         return -1;
@@ -4525,6 +4712,15 @@ int accounts_remove(gitswitch_ctx_t *ctx, const char *identifier) {
     safe_strncpy(removed_alias, account->ssh_host_alias, sizeof(removed_alias));
     removed_alias_exclusive = account_alias_exclusively_owned(
         ctx, account->id, removed_alias);
+    bound_alias_exclusive =
+        account_has_managed_alias(account) && removed_alias_exclusive;
+    ssh_alias_obligation.known = true;
+    if (ctx->config.defer_signal_cleanup && bound_alias_exclusive) {
+        if (ssh_capture_host_alias_obligation(
+                removed_alias, &ssh_alias_obligation) != 0) {
+            goto remove_done;
+        }
+    }
     account_id = account->id;
     had_current = (ctx->current_account != NULL);
     if (had_current) {
@@ -4552,6 +4748,7 @@ int accounts_remove(gitswitch_ctx_t *ctx, const char *identifier) {
         retirement_targets[0] = account;
         if (pending_retirement_prepare(
                 ctx, CONFIG_RETIREMENT_REMOVE, retirement_targets, 1U,
+                &ssh_alias_obligation,
                 &retirement) != 0) {
             goto remove_done;
         }
@@ -5230,6 +5427,7 @@ static int pending_retirement_publish_failure(
 static int pending_retirement_prepare(
     const gitswitch_ctx_t *ctx, config_retirement_kind_t kind,
     const account_t *const targets[], size_t target_count,
+    const config_retirement_ssh_alias_obligation_t *ssh_alias_obligation,
     pending_retirement_t *retirement) {
     publication_ledger_t ledger;
     const account_t *account_refs[PUBLICATION_LEDGER_MAX_RECORDS];
@@ -5274,12 +5472,15 @@ static int pending_retirement_prepare(
         for (size_t j = 0U; j < ledger.count; j++) {
             if (ledger.records[j].account_id == account->id) id_records++;
         }
-        /* AR-12 H1: an account with no ledger records at all — never
-         * successfully switched, or loaded from a pre-ledger config — has
-         * nothing durable to retire. Its retirement leg is vacuously
-         * satisfied; runtime teardown and model removal proceed without
-         * demanding a switch-first round trip. */
-        if (id_records == 0U) continue;
+        /* A REMOVE alias obligation is independently durable. It needs the
+         * exact owner in the marker even when that owner never published Git
+         * state and therefore has no ledger record. */
+        if (id_records == 0U &&
+            !(kind == CONFIG_RETIREMENT_REMOVE &&
+              ssh_alias_obligation && ssh_alias_obligation->known &&
+              ssh_alias_obligation->present)) {
+            continue;
+        }
         if (!account->incarnation_persisted ||
             !account_incarnation_is_valid(account->incarnation)) {
             errno = ESTALE;
@@ -5336,22 +5537,38 @@ static int pending_retirement_prepare(
         }
     }
     if (item_count == 0U) {
-        /* Every target was vacuous: no Git transaction or guard is needed
-         * because no canonical destination will be touched. */
-        retirement->vacuous = true;
-        retirement->phase = PENDING_RETIREMENT_PREPARED;
-        result = 0;
+        retirement->git_vacuous = true;
+        if (!(kind == CONFIG_RETIREMENT_REMOVE &&
+              ssh_alias_obligation && ssh_alias_obligation->known &&
+              ssh_alias_obligation->present)) {
+            /* No canonical Git destination and no SSH namespace obligation. */
+            retirement->truly_vacuous = true;
+            retirement->phase = PENDING_RETIREMENT_PREPARED;
+            result = 0;
+            goto done;
+        }
+    }
+    if (kind == CONFIG_RETIREMENT_REMOVE && ssh_alias_obligation) {
+        retirement->ssh_alias_obligation = *ssh_alias_obligation;
+        retirement->has_ssh_alias_obligation = true;
+    }
+    if ((kind == CONFIG_RETIREMENT_REMOVE && ssh_alias_obligation
+             ? config_retirement_guard_install_or_adopt_with_ssh_alias_obligation(
+                   ctx->config.config_path, kind, retirement->owners,
+                   retirement->owner_count, ssh_alias_obligation,
+                   &retirement->guard)
+             : config_retirement_guard_install_or_adopt(
+                   ctx->config.config_path, kind, retirement->owners,
+                   retirement->owner_count, &retirement->guard)) != 0) {
         goto done;
     }
-    if (config_retirement_guard_install_or_adopt(
-            ctx->config.config_path, kind, retirement->owners,
-            retirement->owner_count, &retirement->guard) != 0) {
-        goto done;
-    }
-    if (git_retirement_transaction_prepare(
-            account_refs, publication_refs, item_count,
-            &retirement->git) != 0) {
-        goto done;
+    retirement->guarded = true;
+    if (item_count != 0U) {
+        if (git_retirement_transaction_prepare(
+                account_refs, publication_refs, item_count,
+                &retirement->git) != 0) {
+            goto done;
+        }
     }
     retirement->phase = PENDING_RETIREMENT_PREPARED;
     result = 0;
@@ -5377,8 +5594,9 @@ static int pending_retirement_cancel_unpublished(
     bool git_clean = true;
 
     if (!retirement ||
-        (!retirement->vacuous &&
-         (!retirement->git || !retirement->guard))) {
+        (!retirement->truly_vacuous &&
+         (!retirement->guarded || !retirement->guard ||
+          (!retirement->git_vacuous && !retirement->git)))) {
         errno = EINVAL;
         set_error(ERR_INVALID_ARGS,
                   "Invalid unpublished Git retirement cancellation");
@@ -5390,13 +5608,14 @@ static int pending_retirement_cancel_unpublished(
                   "Only a prepared Git retirement can be cancelled");
         return -1;
     }
-    if (retirement->vacuous) {
+    if (retirement->truly_vacuous) {
         secure_zero_memory(retirement, sizeof(*retirement));
         return 0;
     }
     error_accumulator_init(&failures);
     created = config_retirement_guard_was_created(retirement->guard);
-    if (git_retirement_transaction_commit(&retirement->git) != 0) {
+    if (retirement->git &&
+        git_retirement_transaction_commit(&retirement->git) != 0) {
         (void)error_accumulator_add_last(
             &failures, "unpublished Git retirement cleanup");
         git_clean = false;
@@ -5422,8 +5641,9 @@ static int pending_retirement_publish(pending_retirement_t *retirement,
                                       size_t *cleared) {
     if (cleared) *cleared = 0U;
     if (!retirement ||
-        (!retirement->vacuous &&
-         (!retirement->git || !retirement->guard))) {
+        (!retirement->truly_vacuous &&
+         (!retirement->guarded || !retirement->guard ||
+          (!retirement->git_vacuous && !retirement->git)))) {
         errno = EINVAL;
         set_error(ERR_INVALID_ARGS,
                   "Invalid prepared outer Git retirement");
@@ -5435,11 +5655,12 @@ static int pending_retirement_publish(pending_retirement_t *retirement,
                   "Only a prepared Git retirement can be published");
         return -1;
     }
-    if (retirement->vacuous) {
+    if (retirement->truly_vacuous) {
         retirement->phase = PENDING_RETIREMENT_PUBLISHED;
         return 0;
     }
-    if (git_retirement_transaction_publish(retirement->git, cleared) != 0) {
+    if (retirement->git &&
+        git_retirement_transaction_publish(retirement->git, cleared) != 0) {
         return pending_retirement_publish_failure(
             retirement, "Git retirement publication");
     }
@@ -5459,8 +5680,9 @@ static int pending_retirement_finalize(
     size_t destination_count = 0U;
 
     if (!ctx || !retirement ||
-        (!retirement->vacuous &&
-         (!retirement->git || !retirement->guard ||
+        (!retirement->truly_vacuous &&
+         (!retirement->guarded || !retirement->guard ||
+          (!retirement->git_vacuous && !retirement->git) ||
           retirement->owner_count == 0U)) ||
         retirement->owner_count > MAX_ACCOUNTS ||
         outcome < ACCOUNTS_RETIREMENT_SAVE_DURABLE ||
@@ -5476,7 +5698,7 @@ static int pending_retirement_finalize(
                   "Only a published Git retirement can be finalized");
         return -1;
     }
-    if (retirement->vacuous) {
+    if (retirement->truly_vacuous) {
         /* No destination was touched and no guard exists; every save
          * outcome settles to the same empty state. */
         secure_zero_memory(retirement, sizeof(*retirement));
@@ -5485,7 +5707,8 @@ static int pending_retirement_finalize(
     error_accumulator_init(&failures);
     created = config_retirement_guard_was_created(retirement->guard);
 
-    if (outcome == ACCOUNTS_RETIREMENT_SAVE_PREINSTALL_FAILED) {
+    if (outcome == ACCOUNTS_RETIREMENT_SAVE_PREINSTALL_FAILED &&
+        retirement->git) {
         if (git_retirement_transaction_abort(retirement->git) != 0) {
             (void)error_accumulator_add_last(
                 &failures, "exact Git retirement rollback");
@@ -5599,7 +5822,8 @@ static int pending_retirement_finalize(
      * retained exact bytes; commit re-proves those destinations after the
      * ledger refresh. Durable and uncertain outcomes still consume their
      * held locks here before the cross-process blocker can be cleared. */
-    if (git_retirement_transaction_commit(&retirement->git) != 0) {
+    if (retirement->git &&
+        git_retirement_transaction_commit(&retirement->git) != 0) {
         (void)error_accumulator_add_last(
             &failures, "Git retirement transaction cleanup");
         settlement_ok = false;
@@ -5735,6 +5959,7 @@ int accounts_reset_retirement_prepare(
     memset(&g_pending_reset, 0, sizeof(g_pending_reset));
     if (pending_retirement_prepare(
             ctx, CONFIG_RETIREMENT_RESET, targets, target_count,
+            NULL,
             &g_pending_reset.retirement) != 0) {
         memset(&g_pending_reset, 0, sizeof(g_pending_reset));
         return -1;
