@@ -8,6 +8,9 @@
 #include "gitswitch.h"
 #include "scratch_registry_test.h"
 #include "ssh_manager.h"
+#define GITSWITCH_INTERNAL_API
+#include "ssh_manager_internal.h"
+#undef GITSWITCH_INTERNAL_API
 #include "utils.h"
 
 #include <dirent.h>
@@ -191,6 +194,32 @@ static void check_unchanged(const char *path, const void *expected,
     CHECK(before->st_ino == after.st_ino);
     CHECK(same_mtime(before, &after));
     free(actual);
+}
+
+static void check_alias_conflict_rejected_before_publication(
+    const char *config, const char *original, size_t original_len,
+    const account_t *account) {
+    struct stat before;
+    ssh_config_publication_state_t publication =
+        SSH_CONFIG_PUBLICATION_COMMITTED;
+
+    CHECK_EQ_INT(stat(config, &before), 0);
+    CHECK_EQ_INT(ssh_preflight_host_alias_config(account), -1);
+    check_unchanged(config, original, original_len, &before);
+
+    CHECK_EQ_INT(ssh_configure_host_alias_result(account, &publication), -1);
+    CHECK_EQ_INT(publication, SSH_CONFIG_PUBLICATION_PREINSTALL_FAILED);
+    check_unchanged(config, original, original_len, &before);
+}
+
+static void check_alias_config_permitted_without_mutation(
+    const char *config, const char *original, size_t original_len,
+    const account_t *account) {
+    struct stat before;
+
+    CHECK_EQ_INT(stat(config, &before), 0);
+    CHECK_EQ_INT(ssh_preflight_host_alias_config(account), 0);
+    check_unchanged(config, original, original_len, &before);
 }
 
 static size_t count_text(const char *haystack, const char *needle) {
@@ -836,6 +865,437 @@ TEST(exact_marker_parser_preserves_incidental_substrings) {
     CHECK_EQ_INT(stat(config, &before), 0);
     CHECK_EQ_INT(ssh_remove_host_alias(TEST_ALIAS), 0);
     check_unchanged(config, original, sizeof(original) - 1U, &before);
+}
+
+TEST(earlier_unmanaged_catchall_is_rejected_before_alias_publication) {
+    static const char original[] =
+        "Host *\n"
+        "  HostName catchall.example.test\n"
+        "  IdentityFile \"/preserved/catchall-key\"\n"
+        "Host preserved\n"
+        "  User alice\n";
+    char home[96], config[MAX_PATH_LEN], key[MAX_PATH_LEN];
+    account_t account;
+
+    CHECK_EQ_INT(setup_home(home, config), 0);
+    CHECK_EQ_INT(write_bytes(config, original, sizeof(original) - 1U), 0);
+    snprintf(key, sizeof(key), "%s/id", home);
+    make_account(&account, key);
+
+    check_alias_conflict_rejected_before_publication(
+        config, original, sizeof(original) - 1U, &account);
+}
+
+TEST(earlier_unmanaged_wildcard_match_is_rejected_before_alias_publication) {
+    static const char original[] =
+        "Host github-*\n"
+        "  HostName wildcard.example.test\n"
+        "  IdentityFile \"/preserved/wildcard-key\"\n"
+        "Host preserved\n"
+        "  User alice\n";
+    char home[96], config[MAX_PATH_LEN], key[MAX_PATH_LEN];
+    account_t account;
+
+    CHECK_EQ_INT(setup_home(home, config), 0);
+    CHECK_EQ_INT(write_bytes(config, original, sizeof(original) - 1U), 0);
+    snprintf(key, sizeof(key), "%s/id", home);
+    make_account(&account, key);
+
+    check_alias_conflict_rejected_before_publication(
+        config, original, sizeof(original) - 1U, &account);
+}
+
+TEST(earlier_unmanaged_second_whitespace_pattern_is_rejected_before_publication) {
+    static const char original[] =
+        "Host preserved github-*\n"
+        "  HostName wildcard.example.test\n"
+        "  IdentityFile \"/preserved/wildcard-key\"\n";
+    char home[96], config[MAX_PATH_LEN], key[MAX_PATH_LEN];
+    account_t account;
+
+    CHECK_EQ_INT(setup_home(home, config), 0);
+    CHECK_EQ_INT(write_bytes(config, original, sizeof(original) - 1U), 0);
+    snprintf(key, sizeof(key), "%s/id", home);
+    make_account(&account, key);
+
+    check_alias_conflict_rejected_before_publication(
+        config, original, sizeof(original) - 1U, &account);
+}
+
+TEST(earlier_managed_wildcard_overlap_is_rejected_before_alias_publication) {
+    static const char original[] =
+        "# >>> gitswitch github-* >>>\n"
+        "Host github-*\n"
+        "  HostName wildcard.example.test\n"
+        "  IdentityFile \"/preserved/managed-wildcard-key\"\n"
+        "  IdentitiesOnly yes\n"
+        "# <<< gitswitch github-* <<<\n"
+        "Host preserved\n"
+        "  User alice\n";
+    char home[96], config[MAX_PATH_LEN], key[MAX_PATH_LEN];
+    account_t account;
+
+    CHECK_EQ_INT(setup_home(home, config), 0);
+    CHECK_EQ_INT(write_bytes(config, original, sizeof(original) - 1U), 0);
+    snprintf(key, sizeof(key), "%s/id", home);
+    make_account(&account, key);
+
+    check_alias_conflict_rejected_before_publication(
+        config, original, sizeof(original) - 1U, &account);
+}
+
+TEST(later_managed_wildcard_identity_accumulation_is_rejected_before_publication) {
+    static const char original[] =
+        BEGIN_MARK "\n"
+        "Host " TEST_ALIAS "\n"
+        "  HostName github.com\n"
+        "  IdentityFile \"/preserved/intended-key\"\n"
+        "  IdentitiesOnly yes\n"
+        END_MARK "\n"
+        "# >>> gitswitch github-* >>>\n"
+        "Host github-*\n"
+        "  HostName wildcard.example.test\n"
+        "  IdentityFile \"/preserved/foreign-key\"\n"
+        "  IdentitiesOnly yes\n"
+        "# <<< gitswitch github-* <<<\n";
+    char home[96], config[MAX_PATH_LEN], key[MAX_PATH_LEN];
+    account_t account;
+
+    CHECK_EQ_INT(setup_home(home, config), 0);
+    CHECK_EQ_INT(write_bytes(config, original, sizeof(original) - 1U), 0);
+    snprintf(key, sizeof(key), "%s/id", home);
+    make_account(&account, key);
+
+    check_alias_conflict_rejected_before_publication(
+        config, original, sizeof(original) - 1U, &account);
+}
+
+TEST(negated_unmanaged_wildcard_exception_does_not_conflict) {
+    static const char original[] =
+        "Host * !" TEST_ALIAS "\n"
+        "  HostName excluded.example.test\n"
+        "  IdentityFile \"/preserved/excluded-key\"\n";
+    char home[96], config[MAX_PATH_LEN], key[MAX_PATH_LEN];
+    account_t account;
+
+    CHECK_EQ_INT(setup_home(home, config), 0);
+    CHECK_EQ_INT(write_bytes(config, original, sizeof(original) - 1U), 0);
+    snprintf(key, sizeof(key), "%s/id", home);
+    make_account(&account, key);
+
+    check_alias_config_permitted_without_mutation(
+        config, original, sizeof(original) - 1U, &account);
+}
+
+TEST(escaped_leading_bang_is_literal_and_wildcard_still_conflicts) {
+    static const char original[] =
+        "Host \\!" TEST_ALIAS " *\n"
+        "  HostName escaped-bang.example.test\n"
+        "  IdentityFile \"/preserved/escaped-bang-key\"\n";
+    char home[96], config[MAX_PATH_LEN], key[MAX_PATH_LEN];
+    account_t account;
+
+    CHECK_EQ_INT(setup_home(home, config), 0);
+    CHECK_EQ_INT(write_bytes(config, original, sizeof(original) - 1U), 0);
+    snprintf(key, sizeof(key), "%s/id", home);
+    make_account(&account, key);
+
+    check_alias_conflict_rejected_before_publication(
+        config, original, sizeof(original) - 1U, &account);
+}
+
+TEST(comma_separated_text_is_one_nonmatching_pattern) {
+    static const char original[] =
+        "Host preserved," TEST_ALIAS "\n"
+        "  HostName comma-literal.example.test\n"
+        "  IdentityFile \"/preserved/comma-key\"\n";
+    char home[96], config[MAX_PATH_LEN], key[MAX_PATH_LEN];
+    account_t account;
+
+    CHECK_EQ_INT(setup_home(home, config), 0);
+    CHECK_EQ_INT(write_bytes(config, original, sizeof(original) - 1U), 0);
+    snprintf(key, sizeof(key), "%s/id", home);
+    make_account(&account, key);
+
+    check_alias_config_permitted_without_mutation(
+        config, original, sizeof(original) - 1U, &account);
+}
+
+TEST(similar_exact_alias_does_not_conflict) {
+    static const char original[] =
+        "Host " TEST_ALIAS "-old\n"
+        "  HostName old.example.test\n"
+        "  IdentityFile \"/preserved/old-key\"\n";
+    char home[96], config[MAX_PATH_LEN], key[MAX_PATH_LEN];
+    account_t account;
+
+    CHECK_EQ_INT(setup_home(home, config), 0);
+    CHECK_EQ_INT(write_bytes(config, original, sizeof(original) - 1U), 0);
+    snprintf(key, sizeof(key), "%s/id", home);
+    make_account(&account, key);
+
+    check_alias_config_permitted_without_mutation(
+        config, original, sizeof(original) - 1U, &account);
+}
+
+TEST(wildcard_target_pattern_conflicting_with_exact_host_is_rejected) {
+    static const char original[] =
+        "Host github-work\n"
+        "  HostName exact.example.test\n"
+        "  IdentityFile \"/preserved/exact-key\"\n";
+    char home[96], config[MAX_PATH_LEN], key[MAX_PATH_LEN];
+    account_t account;
+
+    CHECK_EQ_INT(setup_home(home, config), 0);
+    CHECK_EQ_INT(write_bytes(config, original, sizeof(original) - 1U), 0);
+    snprintf(key, sizeof(key), "%s/id", home);
+    make_account(&account, key);
+    snprintf(account.ssh_host_alias, sizeof(account.ssh_host_alias),
+             "github-*");
+
+    check_alias_conflict_rejected_before_publication(
+        config, original, sizeof(original) - 1U, &account);
+}
+
+TEST(question_target_pattern_conflicting_with_exact_host_is_rejected) {
+    static const char original[] =
+        "Host github-work\n"
+        "  HostName exact.example.test\n"
+        "  IdentityFile \"/preserved/exact-key\"\n";
+    char home[96], config[MAX_PATH_LEN], key[MAX_PATH_LEN];
+    account_t account;
+
+    CHECK_EQ_INT(setup_home(home, config), 0);
+    CHECK_EQ_INT(write_bytes(config, original, sizeof(original) - 1U), 0);
+    snprintf(key, sizeof(key), "%s/id", home);
+    make_account(&account, key);
+    snprintf(account.ssh_host_alias, sizeof(account.ssh_host_alias),
+             "git?ub-work");
+
+    check_alias_conflict_rejected_before_publication(
+        config, original, sizeof(original) - 1U, &account);
+}
+
+TEST(case_insensitive_indented_host_equals_directive_is_rejected) {
+    static const char original[] =
+        "  hOsT=github-*\n"
+        "  HostName syntax.example.test\n"
+        "  IdentityFile \"/preserved/syntax-key\"\n";
+    char home[96], config[MAX_PATH_LEN], key[MAX_PATH_LEN];
+    account_t account;
+
+    CHECK_EQ_INT(setup_home(home, config), 0);
+    CHECK_EQ_INT(write_bytes(config, original, sizeof(original) - 1U), 0);
+    snprintf(key, sizeof(key), "%s/id", home);
+    make_account(&account, key);
+
+    check_alias_conflict_rejected_before_publication(
+        config, original, sizeof(original) - 1U, &account);
+}
+
+TEST(bare_carriage_return_host_whitespace_is_rejected) {
+    static const char original[] =
+        " \rHost\rgithub-*\n"
+        "  HostName carriage-return.example.test\n"
+        "  IdentityFile \"/preserved/carriage-return-key\"\n";
+    char home[96], config[MAX_PATH_LEN], key[MAX_PATH_LEN];
+    account_t account;
+
+    CHECK_EQ_INT(setup_home(home, config), 0);
+    CHECK_EQ_INT(write_bytes(config, original, sizeof(original) - 1U), 0);
+    snprintf(key, sizeof(key), "%s/id", home);
+    make_account(&account, key);
+
+    check_alias_conflict_rejected_before_publication(
+        config, original, sizeof(original) - 1U, &account);
+}
+
+TEST(host_patterns_remain_case_sensitive) {
+    static const char original[] =
+        "Host GITHUB-*\n"
+        "  HostName case.example.test\n"
+        "  IdentityFile \"/preserved/case-key\"\n";
+    char home[96], config[MAX_PATH_LEN], key[MAX_PATH_LEN];
+    account_t account;
+
+    CHECK_EQ_INT(setup_home(home, config), 0);
+    CHECK_EQ_INT(write_bytes(config, original, sizeof(original) - 1U), 0);
+    snprintf(key, sizeof(key), "%s/id", home);
+    make_account(&account, key);
+
+    check_alias_config_permitted_without_mutation(
+        config, original, sizeof(original) - 1U, &account);
+}
+
+TEST(matching_host_with_proxy_command_is_permitted) {
+    static const char original[] =
+        "Host github-*\n"
+        "  ProxyCommand false\n";
+    char home[96], config[MAX_PATH_LEN], key[MAX_PATH_LEN];
+    account_t account;
+
+    CHECK_EQ_INT(setup_home(home, config), 0);
+    CHECK_EQ_INT(write_bytes(config, original, sizeof(original) - 1U), 0);
+    snprintf(key, sizeof(key), "%s/id", home);
+    make_account(&account, key);
+
+    check_alias_config_permitted_without_mutation(
+        config, original, sizeof(original) - 1U, &account);
+}
+
+TEST(matching_host_with_harmless_options_is_permitted) {
+    static const char original[] =
+        "Host *\n"
+        "  ServerAliveInterval 30\n"
+        "  Compression yes\n";
+    char home[96], config[MAX_PATH_LEN], key[MAX_PATH_LEN];
+    account_t account;
+
+    CHECK_EQ_INT(setup_home(home, config), 0);
+    CHECK_EQ_INT(write_bytes(config, original, sizeof(original) - 1U), 0);
+    snprintf(key, sizeof(key), "%s/id", home);
+    make_account(&account, key);
+
+    check_alias_config_permitted_without_mutation(
+        config, original, sizeof(original) - 1U, &account);
+}
+
+TEST(matching_host_with_certificate_file_is_rejected) {
+    static const char original[] =
+        "Host github-*\n"
+        "  CertificateFile \"/preserved/foreign-cert.pub\"\n";
+    char home[96], config[MAX_PATH_LEN], key[MAX_PATH_LEN];
+    account_t account;
+
+    CHECK_EQ_INT(setup_home(home, config), 0);
+    CHECK_EQ_INT(write_bytes(config, original, sizeof(original) - 1U), 0);
+    snprintf(key, sizeof(key), "%s/id", home);
+    make_account(&account, key);
+
+    check_alias_conflict_rejected_before_publication(
+        config, original, sizeof(original) - 1U, &account);
+}
+
+TEST(matching_host_with_hostname_only_is_rejected) {
+    static const char original[] =
+        "Host github-*\n"
+        "  HostName foreign.example.test\n";
+    char home[96], config[MAX_PATH_LEN], key[MAX_PATH_LEN];
+    account_t account;
+
+    CHECK_EQ_INT(setup_home(home, config), 0);
+    CHECK_EQ_INT(write_bytes(config, original, sizeof(original) - 1U), 0);
+    snprintf(key, sizeof(key), "%s/id", home);
+    make_account(&account, key);
+
+    check_alias_conflict_rejected_before_publication(
+        config, original, sizeof(original) - 1U, &account);
+}
+
+TEST(matching_host_with_identity_file_only_is_rejected) {
+    static const char original[] =
+        "Host github-*\n"
+        "  IdentityFile \"/preserved/foreign-key\"\n";
+    char home[96], config[MAX_PATH_LEN], key[MAX_PATH_LEN];
+    account_t account;
+
+    CHECK_EQ_INT(setup_home(home, config), 0);
+    CHECK_EQ_INT(write_bytes(config, original, sizeof(original) - 1U), 0);
+    snprintf(key, sizeof(key), "%s/id", home);
+    make_account(&account, key);
+
+    check_alias_conflict_rejected_before_publication(
+        config, original, sizeof(original) - 1U, &account);
+}
+
+TEST(matching_host_with_identities_only_is_rejected) {
+    static const char original[] =
+        "Host github-*\n"
+        "  IdentitiesOnly no\n";
+    char home[96], config[MAX_PATH_LEN], key[MAX_PATH_LEN];
+    account_t account;
+
+    CHECK_EQ_INT(setup_home(home, config), 0);
+    CHECK_EQ_INT(write_bytes(config, original, sizeof(original) - 1U), 0);
+    snprintf(key, sizeof(key), "%s/id", home);
+    make_account(&account, key);
+
+    check_alias_conflict_rejected_before_publication(
+        config, original, sizeof(original) - 1U, &account);
+}
+
+TEST(overlong_host_pattern_fails_closed_before_publication) {
+    char original[MAX_NAME_LEN * 8U + 64U];
+    char pattern[MAX_NAME_LEN * 8U + 1U];
+    char home[96], config[MAX_PATH_LEN], key[MAX_PATH_LEN];
+    account_t account;
+    int needed;
+
+    memset(pattern, 'a', sizeof(pattern) - 1U);
+    pattern[sizeof(pattern) - 1U] = '\0';
+    needed = snprintf(original, sizeof(original),
+                      "Host %s\n  ProxyCommand false\n", pattern);
+    CHECK(needed > 0 && (size_t)needed < sizeof(original));
+    CHECK_EQ_INT(setup_home(home, config), 0);
+    CHECK_EQ_INT(write_bytes(config, original,
+                             needed > 0 ? (size_t)needed : 0U), 0);
+    snprintf(key, sizeof(key), "%s/id", home);
+    make_account(&account, key);
+
+    check_alias_conflict_rejected_before_publication(
+        config, original, needed > 0 ? (size_t)needed : 0U, &account);
+}
+
+TEST(include_directive_fails_closed_before_alias_publication) {
+    static const char original[] =
+        "Include /preserved/external-ssh-config\n"
+        "Host preserved\n"
+        "  User alice\n";
+    char home[96], config[MAX_PATH_LEN], key[MAX_PATH_LEN];
+    account_t account;
+
+    CHECK_EQ_INT(setup_home(home, config), 0);
+    CHECK_EQ_INT(write_bytes(config, original, sizeof(original) - 1U), 0);
+    snprintf(key, sizeof(key), "%s/id", home);
+    make_account(&account, key);
+
+    check_alias_conflict_rejected_before_publication(
+        config, original, sizeof(original) - 1U, &account);
+}
+
+TEST(match_directive_fails_closed_before_alias_publication) {
+    static const char original[] =
+        "Match host " TEST_ALIAS "\n"
+        "  HostName match.example.test\n"
+        "  IdentityFile \"/preserved/match-key\"\n";
+    char home[96], config[MAX_PATH_LEN], key[MAX_PATH_LEN];
+    account_t account;
+
+    CHECK_EQ_INT(setup_home(home, config), 0);
+    CHECK_EQ_INT(write_bytes(config, original, sizeof(original) - 1U), 0);
+    snprintf(key, sizeof(key), "%s/id", home);
+    make_account(&account, key);
+
+    check_alias_conflict_rejected_before_publication(
+        config, original, sizeof(original) - 1U, &account);
+}
+
+TEST(global_routing_options_fail_closed_before_alias_publication) {
+    static const char original[] =
+        "HostName global.example.test\n"
+        "IdentityFile \"/preserved/global-key\"\n"
+        "Host preserved\n"
+        "  User alice\n";
+    char home[96], config[MAX_PATH_LEN], key[MAX_PATH_LEN];
+    account_t account;
+
+    CHECK_EQ_INT(setup_home(home, config), 0);
+    CHECK_EQ_INT(write_bytes(config, original, sizeof(original) - 1U), 0);
+    snprintf(key, sizeof(key), "%s/id", home);
+    make_account(&account, key);
+
+    check_alias_conflict_rejected_before_publication(
+        config, original, sizeof(original) - 1U, &account);
 }
 
 TEST(malformed_nested_and_mismatched_blocks_fail_closed) {
@@ -2391,6 +2851,30 @@ TEST_MAIN_BEGIN()
     RUN_TEST(openssh_percent_and_environment_expansions_are_safe);
     RUN_TEST(embedded_nul_at_every_region_fails_without_mutation);
     RUN_TEST(exact_marker_parser_preserves_incidental_substrings);
+    RUN_TEST(earlier_unmanaged_catchall_is_rejected_before_alias_publication);
+    RUN_TEST(earlier_unmanaged_wildcard_match_is_rejected_before_alias_publication);
+    RUN_TEST(earlier_unmanaged_second_whitespace_pattern_is_rejected_before_publication);
+    RUN_TEST(earlier_managed_wildcard_overlap_is_rejected_before_alias_publication);
+    RUN_TEST(later_managed_wildcard_identity_accumulation_is_rejected_before_publication);
+    RUN_TEST(negated_unmanaged_wildcard_exception_does_not_conflict);
+    RUN_TEST(escaped_leading_bang_is_literal_and_wildcard_still_conflicts);
+    RUN_TEST(comma_separated_text_is_one_nonmatching_pattern);
+    RUN_TEST(similar_exact_alias_does_not_conflict);
+    RUN_TEST(wildcard_target_pattern_conflicting_with_exact_host_is_rejected);
+    RUN_TEST(question_target_pattern_conflicting_with_exact_host_is_rejected);
+    RUN_TEST(case_insensitive_indented_host_equals_directive_is_rejected);
+    RUN_TEST(bare_carriage_return_host_whitespace_is_rejected);
+    RUN_TEST(host_patterns_remain_case_sensitive);
+    RUN_TEST(matching_host_with_proxy_command_is_permitted);
+    RUN_TEST(matching_host_with_harmless_options_is_permitted);
+    RUN_TEST(matching_host_with_certificate_file_is_rejected);
+    RUN_TEST(matching_host_with_hostname_only_is_rejected);
+    RUN_TEST(matching_host_with_identity_file_only_is_rejected);
+    RUN_TEST(matching_host_with_identities_only_is_rejected);
+    RUN_TEST(overlong_host_pattern_fails_closed_before_publication);
+    RUN_TEST(include_directive_fails_closed_before_alias_publication);
+    RUN_TEST(match_directive_fails_closed_before_alias_publication);
+    RUN_TEST(global_routing_options_fail_closed_before_alias_publication);
     RUN_TEST(malformed_nested_and_mismatched_blocks_fail_closed);
     RUN_TEST(valid_duplicates_collapse_to_one_then_remove_to_zero);
     RUN_TEST(crlf_duplicates_collapse_and_preserve_unrelated_bytes);

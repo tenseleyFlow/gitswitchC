@@ -4943,6 +4943,394 @@ static bool ssh_config_line_prefix(const char *buf,
     return true;
 }
 
+static bool ssh_config_ascii_case_equal(const char *left, size_t left_len,
+                                        const char *right) {
+    size_t right_len = strlen(right);
+
+    if (left_len != right_len) return false;
+    for (size_t i = 0; i < left_len; i++) {
+        unsigned char a = (unsigned char)left[i];
+        unsigned char b = (unsigned char)right[i];
+
+        if (a >= (unsigned char)'A' && a <= (unsigned char)'Z') {
+            a = (unsigned char)(a - (unsigned char)'A' +
+                                (unsigned char)'a');
+        }
+        if (b >= (unsigned char)'A' && b <= (unsigned char)'Z') {
+            b = (unsigned char)(b - (unsigned char)'A' +
+                                (unsigned char)'a');
+        }
+        if (a != b) return false;
+    }
+    return true;
+}
+
+static bool ssh_config_argument_space(char c) {
+    return c == ' ' || c == '\t' || c == '\r';
+}
+
+/* Split an ssh_config directive without interpreting its arguments. OpenSSH
+ * accepts either whitespace or '=' between a keyword and its first argument;
+ * spaces, tabs, and a bare carriage return are argument whitespace, while
+ * keyword case is insignificant. */
+static bool ssh_config_parse_directive(
+    const char *buf, const ssh_config_line_t *line,
+    const char **keyword, size_t *keyword_len,
+    const char **arguments, size_t *arguments_len) {
+    size_t offset = 0;
+    size_t keyword_start;
+
+    while (offset < line->text_len &&
+           ssh_config_argument_space(buf[line->start + offset])) {
+        offset++;
+    }
+    if (offset == line->text_len || buf[line->start + offset] == '#') {
+        return false;
+    }
+    keyword_start = offset;
+    while (offset < line->text_len &&
+           !ssh_config_argument_space(buf[line->start + offset]) &&
+           buf[line->start + offset] != '=') {
+        offset++;
+    }
+    if (offset == keyword_start) return false;
+
+    *keyword = buf + line->start + keyword_start;
+    *keyword_len = offset - keyword_start;
+    while (offset < line->text_len &&
+           ssh_config_argument_space(buf[line->start + offset])) {
+        offset++;
+    }
+    if (offset < line->text_len && buf[line->start + offset] == '=') {
+        offset++;
+        while (offset < line->text_len &&
+               ssh_config_argument_space(buf[line->start + offset])) {
+            offset++;
+        }
+    }
+    *arguments = buf + line->start + offset;
+    *arguments_len = line->text_len - offset;
+    return true;
+}
+
+/* OpenSSH Host patterns use '*' and '?' and retain byte case. The managed
+ * alias grammar excludes escapes and character classes, so a bounded rolling
+ * DP exactly decides whether one existing Host pattern selects the literal
+ * alias gitswitch will hand to ssh. */
+static bool ssh_config_host_pattern_matches(const char *pattern,
+                                            size_t pattern_len,
+                                            const char *alias) {
+    bool previous[MAX_NAME_LEN] = {false};
+    bool current[MAX_NAME_LEN] = {false};
+    size_t alias_len = strlen(alias);
+
+    if (alias_len >= MAX_NAME_LEN) return false;
+    previous[0] = true;
+    for (size_t i = 0; i < pattern_len; i++) {
+        unsigned char pattern_byte = (unsigned char)pattern[i];
+
+        memset(current, 0, (alias_len + 1U) * sizeof(current[0]));
+        if (pattern_byte == (unsigned char)'*') {
+            current[0] = previous[0];
+            for (size_t j = 1; j <= alias_len; j++) {
+                current[j] = previous[j] || current[j - 1U];
+            }
+        } else {
+            for (size_t j = 1; j <= alias_len; j++) {
+                unsigned char alias_byte = (unsigned char)alias[j - 1U];
+
+                current[j] =
+                    previous[j - 1U] &&
+                    (pattern_byte == (unsigned char)'?' ||
+                     pattern_byte == alias_byte);
+            }
+        }
+        memcpy(previous, current,
+               (alias_len + 1U) * sizeof(previous[0]));
+    }
+    return previous[alias_len];
+}
+
+static bool ssh_config_pattern_has_wildcard(const char *pattern,
+                                            size_t pattern_len) {
+    return memchr(pattern, '*', pattern_len) != NULL ||
+           memchr(pattern, '?', pattern_len) != NULL;
+}
+
+static bool ssh_config_pattern_bytes_overlap(unsigned char left,
+                                             unsigned char right) {
+    if (left == (unsigned char)'*' || left == (unsigned char)'?' ||
+        right == (unsigned char)'*' || right == (unsigned char)'?') {
+        return true;
+    }
+    return left == right;
+}
+
+/* Decide non-empty intersection of two OpenSSH '*'/'?' pattern languages.
+ * Each pattern is a tiny NFA: '*' has an epsilon transition to its successor
+ * and a consuming self-loop; '?' and literals consume one byte. Reachability
+ * in the product NFA proves whether a concrete hostname can select both
+ * blocks. Inputs above the persisted alias bound are conservatively treated as
+ * overlapping so an adversarial config cannot turn the proof into unbounded
+ * work. */
+static int ssh_config_host_patterns_intersect(const char *left,
+                                              size_t left_len,
+                                              const char *right,
+                                              size_t right_len,
+                                              bool *intersects_out) {
+    size_t columns;
+    size_t state_count;
+    bool *visited;
+    size_t *queue;
+    size_t head = 0;
+    size_t tail = 0;
+    bool intersects = false;
+
+    *intersects_out = false;
+    if (left_len >= MAX_NAME_LEN || right_len >= MAX_NAME_LEN) {
+        *intersects_out = true;
+        return 0;
+    }
+    columns = right_len + 1U;
+    state_count = (left_len + 1U) * columns;
+    visited = calloc(state_count, sizeof(*visited));
+    queue = malloc(state_count * sizeof(*queue));
+    if (!visited || !queue) {
+        free(visited);
+        free(queue);
+        set_error(ERR_MEMORY_ALLOCATION,
+                  "Out of memory proving SSH Host pattern precedence");
+        return -1;
+    }
+
+#define SSH_CONFIG_ENQUEUE(_left, _right)                                  \
+    do {                                                                    \
+        size_t state_ = (_left) * columns + (_right);                       \
+        if (!visited[state_]) {                                             \
+            visited[state_] = true;                                         \
+            queue[tail++] = state_;                                         \
+        }                                                                   \
+    } while (0)
+
+    SSH_CONFIG_ENQUEUE(0U, 0U);
+    while (head < tail) {
+        size_t state = queue[head++];
+        size_t left_offset = state / columns;
+        size_t right_offset = state % columns;
+
+        if (left_offset == left_len && right_offset == right_len) {
+            intersects = true;
+            break;
+        }
+        if (left_offset < left_len && left[left_offset] == '*') {
+            SSH_CONFIG_ENQUEUE(left_offset + 1U, right_offset);
+        }
+        if (right_offset < right_len && right[right_offset] == '*') {
+            SSH_CONFIG_ENQUEUE(left_offset, right_offset + 1U);
+        }
+        if (left_offset < left_len && right_offset < right_len &&
+            ssh_config_pattern_bytes_overlap(
+                (unsigned char)left[left_offset],
+                (unsigned char)right[right_offset])) {
+            size_t next_left =
+                left[left_offset] == '*' ? left_offset : left_offset + 1U;
+            size_t next_right =
+                right[right_offset] == '*' ? right_offset : right_offset + 1U;
+
+            SSH_CONFIG_ENQUEUE(next_left, next_right);
+        }
+    }
+
+#undef SSH_CONFIG_ENQUEUE
+    free(visited);
+    free(queue);
+    *intersects_out = intersects;
+    return 0;
+}
+
+/* Decode the whitespace-separated pattern-list on one Host directive. Quotes
+ * and backslash protect the following bytes exactly as they do in OpenSSH's
+ * argument splitter. A Host line selects the alias when any positive pattern
+ * matches and no negated pattern matches. For a wildcard managed alias, the
+ * question is whether the two pattern languages can select any same hostname.
+ * Exact containment under an arbitrary list of negated glob languages is
+ * intentionally not approximated as safe: only an identical negative pattern
+ * or '*' proves that the complete managed language is excluded. */
+static int ssh_config_host_directive_matches(
+    const char *arguments, size_t arguments_len, const char *alias,
+    bool *matches) {
+    char pattern[MAX_NAME_LEN];
+    size_t offset = 0;
+    bool positive_match = false;
+    bool negative_match = false;
+    bool alias_is_pattern =
+        ssh_config_pattern_has_wildcard(alias, strlen(alias));
+
+    *matches = false;
+
+    while (offset < arguments_len) {
+        size_t written = 0;
+        char quote = '\0';
+        bool escaped = false;
+        bool first_byte_escaped = false;
+        bool negated;
+
+        while (offset < arguments_len &&
+               ssh_config_argument_space(arguments[offset])) {
+            offset++;
+        }
+        if (offset == arguments_len || arguments[offset] == '#') break;
+
+        while (offset < arguments_len) {
+            char c = arguments[offset++];
+
+            if (escaped) {
+                if (written + 1U >= sizeof(pattern)) {
+                    set_error(ERR_FILE_IO,
+                              "SSH Host pattern is too long to validate");
+                    return -1;
+                }
+                if (written == 0U) first_byte_escaped = true;
+                pattern[written++] = c;
+                escaped = false;
+                continue;
+            }
+            if (c == '\\') {
+                escaped = true;
+                continue;
+            }
+            if (quote != '\0') {
+                if (c == quote) {
+                    quote = '\0';
+                } else {
+                    if (written + 1U >= sizeof(pattern)) {
+                        set_error(ERR_FILE_IO,
+                                  "SSH Host pattern is too long to validate");
+                        return -1;
+                    }
+                    pattern[written++] = c;
+                }
+                continue;
+            }
+            if (c == '"' || c == '\'') {
+                quote = c;
+                continue;
+            }
+            if (ssh_config_argument_space(c)) break;
+            if (c == '#') {
+                offset = arguments_len;
+                break;
+            }
+            if (written + 1U >= sizeof(pattern)) {
+                set_error(ERR_FILE_IO,
+                          "SSH Host pattern is too long to validate");
+                return -1;
+            }
+            pattern[written++] = c;
+        }
+        if (escaped || quote != '\0') {
+            set_error(ERR_FILE_IO,
+                      "Malformed quoting in SSH Host pattern list");
+            return -1;
+        }
+        if (written == 0U) continue;
+        pattern[written] = '\0';
+        negated = !first_byte_escaped && pattern[0] == '!' && written > 1U;
+        if (alias_is_pattern) {
+            const char *candidate = pattern + (negated ? 1U : 0U);
+            size_t candidate_len = written - (negated ? 1U : 0U);
+            bool intersects;
+
+            if (negated) {
+                if ((candidate_len == 1U && candidate[0] == '*') ||
+                    (candidate_len == strlen(alias) &&
+                     memcmp(candidate, alias, candidate_len) == 0)) {
+                    negative_match = true;
+                }
+            } else {
+                if (ssh_config_host_patterns_intersect(
+                        candidate, candidate_len, alias, strlen(alias),
+                        &intersects) != 0) {
+                    return -1;
+                }
+                if (intersects) positive_match = true;
+            }
+        } else if (ssh_config_host_pattern_matches(
+                       pattern + (negated ? 1U : 0U),
+                       written - (negated ? 1U : 0U), alias)) {
+            if (negated) negative_match = true;
+            else positive_match = true;
+        }
+    }
+    *matches = positive_match && !negative_match;
+    return 0;
+}
+
+/* The generated block is appended. An earlier matching Host section can
+ * preempt HostName/IdentitiesOnly or add IdentityFile/CertificateFile
+ * credential material, defeating the managed account boundary. Target-owned
+ * blocks have already been filtered out before this check. Other transport
+ * policy such as ProxyCommand, ProxyJump, User, or Port remains intentionally
+ * user-controlled and does not contaminate the selected credential set. */
+static int ssh_config_reject_prior_alias_routing(
+    const char *buf, size_t len, const char *alias) {
+    size_t scan = 0;
+    bool matching_host = true;
+
+    while (scan < len) {
+        ssh_config_line_t line;
+        const char *keyword;
+        const char *arguments;
+        size_t keyword_len;
+        size_t arguments_len;
+
+        (void)ssh_config_next_line(buf, len, scan, &line);
+        scan = line.end;
+        if (!ssh_config_parse_directive(
+                buf, &line, &keyword, &keyword_len,
+                &arguments, &arguments_len)) {
+            continue;
+        }
+        if (ssh_config_ascii_case_equal(keyword, keyword_len, "host")) {
+            if (ssh_config_host_directive_matches(
+                    arguments, arguments_len, alias, &matching_host) != 0) {
+                return -1;
+            }
+            continue;
+        }
+        if (ssh_config_ascii_case_equal(keyword, keyword_len, "match")) {
+            set_error(ERR_FILE_IO,
+                      "Cannot prove managed SSH alias '%s' precedence across "
+                      "an existing Match directive",
+                      alias);
+            return -1;
+        }
+        if (ssh_config_ascii_case_equal(keyword, keyword_len, "include")) {
+            if (!matching_host) continue;
+            set_error(ERR_FILE_IO,
+                      "Cannot prove managed SSH alias '%s' precedence across "
+                      "an active Include directive",
+                      alias);
+            return -1;
+        }
+        if (matching_host &&
+            (ssh_config_ascii_case_equal(keyword, keyword_len, "hostname") ||
+             ssh_config_ascii_case_equal(keyword, keyword_len,
+                                         "identityfile") ||
+             ssh_config_ascii_case_equal(keyword, keyword_len,
+                                         "identitiesonly") ||
+             ssh_config_ascii_case_equal(keyword, keyword_len,
+                                         "certificatefile"))) {
+            set_error(ERR_FILE_IO,
+                      "Earlier SSH Host pattern conflicts with managed alias "
+                      "'%s' through option '%.*s'",
+                      alias, (int)keyword_len, keyword);
+            return -1;
+        }
+    }
+    return 0;
+}
+
 static ssh_config_marker_t ssh_config_parse_marker(
     const char *buf, const ssh_config_line_t *line,
     char alias[MAX_NAME_LEN]) {
@@ -5667,6 +6055,10 @@ int ssh_preflight_host_alias_config(const account_t *account) {
                                   &filtered, &filtered_len, &removed) != 0) {
         goto done;
     }
+    if (ssh_config_reject_prior_alias_routing(
+            filtered, filtered_len, account->ssh_host_alias) != 0) {
+        goto done;
+    }
     rc = 0;
 
 done:
@@ -6102,6 +6494,10 @@ int ssh_configure_host_alias_result(
     }
     if (ssh_filter_managed_blocks(buf, buf_len, account->ssh_host_alias,
                                   &filtered, &filtered_len, &removed) != 0) {
+        goto done;
+    }
+    if (ssh_config_reject_prior_alias_routing(
+            filtered, filtered_len, account->ssh_host_alias) != 0) {
         goto done;
     }
 
