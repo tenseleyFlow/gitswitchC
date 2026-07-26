@@ -1719,7 +1719,11 @@ TEST(targeted_reset_never_reaps_embedded_nul_pid_prefix) {
 
 /* A syntactically valid sidecar can be stale while another agent owns the
  * managed socket. Identity-refusing the bystander PID is not proof the socket
- * is dead: preserve the reachable runtime and leave both processes alive. */
+ * is dead: preserve the reachable runtime and leave both processes alive.
+ * The real bystander also drives both size-delimited Linux proc parsers:
+ * sidecar creation reads /proc/PID/stat and reset reads /proc/PID/status.
+ * Keep this case in the strict ASan lane so neither parser can regress to a
+ * NUL-oriented strto* call on read_proc_file()'s unterminated bytes. */
 TEST(targeted_reset_preserves_live_socket_when_sidecar_pid_is_bystander) {
     char agent_dir[128], sock[192], current[192], pidfile[192];
     pid_t agent_pid = -1;

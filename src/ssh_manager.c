@@ -805,6 +805,9 @@ static ssh_process_outcome_t inspection_failure_outcome(pid_t pid) {
                                         : SSH_PROCESS_INDETERMINATE;
 }
 
+static int parse_bounded_decimal_u64(const char *text, size_t length,
+                                     uint64_t *value_out);
+
 #ifdef __linux__
 static int read_proc_file(const char *path, char **data_out,
                           size_t *size_out) {
@@ -1459,8 +1462,7 @@ static int parse_linux_effective_uid(const char *status, size_t status_size,
         size_t line_size = 0;
         const char *line = status + offset;
         const char *cursor;
-        char *end;
-        uintmax_t value = 0;
+        uint64_t value = 0;
 
         while (offset + line_size < status_size &&
                status[offset + line_size] != '\n') {
@@ -1473,6 +1475,8 @@ static int parse_linux_effective_uid(const char *status, size_t status_size,
         }
         cursor = line + sizeof(prefix) - 1U;
         for (int field = 0; field < 2; field++) {
+            const char *field_start;
+
             while (cursor < line + line_size &&
                    isspace((unsigned char)*cursor)) {
                 cursor++;
@@ -1481,17 +1485,19 @@ static int parse_linux_effective_uid(const char *status, size_t status_size,
                 errno = EINVAL;
                 return -1;
             }
-            errno = 0;
-            value = strtoumax(cursor, &end, 10);
-            if (errno != 0 || end == cursor || end > line + line_size ||
-                (end < line + line_size &&
-                 !isspace((unsigned char)*end))) {
+            field_start = cursor;
+            while (cursor < line + line_size &&
+                   !isspace((unsigned char)*cursor)) {
+                cursor++;
+            }
+            if (parse_bounded_decimal_u64(
+                    field_start, (size_t)(cursor - field_start),
+                    &value) != 0) {
                 errno = EINVAL;
                 return -1;
             }
-            cursor = end;
         }
-        if ((uintmax_t)(uid_t)value != value) {
+        if ((uint64_t)(uid_t)value != value) {
             errno = EOVERFLOW;
             return -1;
         }
@@ -1810,8 +1816,8 @@ static int capture_linux_process_generation(
     size_t stat_size = 0;
     size_t compact_used = 0;
     char *cursor;
-    char *end;
-    unsigned long long start;
+    const char *start_end;
+    uint64_t start;
     int rc = -1;
 
     if (pid <= 1 || !generation) {
@@ -1865,10 +1871,13 @@ static int capture_linux_process_generation(
             goto out;
         }
     }
-    errno = 0;
-    start = strtoull(cursor, &end, 10);
-    if (errno != 0 || end == cursor ||
-        (end < stat_data + stat_size && *end != ' ' && *end != '\n') ||
+    start_end = cursor;
+    while (start_end < stat_data + stat_size &&
+           *start_end != ' ' && *start_end != '\n') {
+        start_end++;
+    }
+    if (parse_bounded_decimal_u64(
+            cursor, (size_t)(start_end - cursor), &start) != 0 ||
         start == 0) {
         errno = EINVAL;
         goto out;
