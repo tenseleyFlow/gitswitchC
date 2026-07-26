@@ -543,10 +543,11 @@ TEST(input_error_is_distinct_from_eof) {
 #ifdef HAVE_READLINE
 /* AR-14 L40: both standard streams are a PTY, so prompt_line must enter GNU
  * readline rather than its redirected-stdio fallback. Readline's input
- * callback performs a real read(2) from the result pipe's write-only endpoint,
- * deterministically producing EBADF without relying on platform-specific PTY
- * hangup behavior. The parent drains the PTY while Readline restores termios:
- * FreeBSD may otherwise wait for unread slave output during TCSADRAIN. */
+ * callback performs a real read(2) from a dedicated O_WRONLY /dev/null
+ * descriptor, deterministically producing EBADF without relying on pipe
+ * directionality or platform-specific PTY hangup behavior. The parent drains
+ * the PTY while Readline restores termios: FreeBSD may otherwise wait for
+ * unread slave output during TCSADRAIN. */
 TEST(readline_pty_input_error_is_distinct_from_eof) {
     typedef struct {
         int result;
@@ -609,7 +610,8 @@ TEST(readline_pty_input_error_is_distinct_from_eof) {
         rl_catch_signals = 0;
         rl_catch_sigwinch = 0;
         if (rl_initialize() != 0) _exit(3);
-        g_readline_fault_fd = result_pipe[1];
+        g_readline_fault_fd = open("/dev/null", O_WRONLY);
+        if (g_readline_fault_fd < 0) _exit(3);
         g_readline_fault_calls = 0;
         g_readline_fault_errno = 0;
         rl_getc_function = readline_pty_error_getc;
@@ -619,6 +621,7 @@ TEST(readline_pty_input_error_is_distinct_from_eof) {
         observed.buffer_empty = buffer[0] == '\0';
         observed.callback_calls = g_readline_fault_calls;
         observed.callback_errno = g_readline_fault_errno;
+        if (close(g_readline_fault_fd) != 0) _exit(3);
         g_readline_fault_fd = -1;
 
         while (written < sizeof(observed)) {
@@ -636,6 +639,8 @@ TEST(readline_pty_input_error_is_distinct_from_eof) {
 
     close(result_pipe[1]);
     result_pipe[1] = -1;
+    close(slave);
+    slave = -1;
     bool reaped =
         reap_readline_child_within(child, master, 3000, &status);
     child = -1;
