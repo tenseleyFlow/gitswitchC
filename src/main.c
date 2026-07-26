@@ -1098,15 +1098,6 @@ int main(int argc, char *argv[]) {
     }
     free(option_argv);
 
-    /* AR-06 F62: --global and --local are contradictory. Silently letting
-     * --global win hid a user's mistake and could write the wrong scope; fail
-     * with a clear message instead. */
-    if (force_global && force_local) {
-        fprintf(stderr, "gitswitch: --global and --local are mutually exclusive\n");
-        error_cleanup();
-        return EXIT_FAILURE;
-    }
-
     /* Help/version remain unconditional informational exits. Every executable
      * command form, including the legacy init alias, is otherwise checked here
      * before display/config initialization can cause observable work. */
@@ -1168,6 +1159,17 @@ int main(int argc, char *argv[]) {
         int rc = print_usage(argv[0]);
         error_cleanup();
         return rc == 0 ? EXIT_SUCCESS : EXIT_FAILURE;
+    }
+
+    /* AR-06 F62 / AR-14 L7: --global and --local are contradictory for an
+     * executable command, but help and version are unconditional
+     * informational actions. Validate the command scope only after both
+     * informational dispatches so their status does not depend on unrelated
+     * command options. */
+    if (force_global && force_local) {
+        fprintf(stderr, "gitswitch: --global and --local are mutually exclusive\n");
+        error_cleanup();
+        return EXIT_FAILURE;
     }
 
     if (legacy_agent_info) {
@@ -2149,6 +2151,16 @@ cleanup:
         }
     }
     command_failure_publish_and_display(&mutation);
+
+    /* AR-14 L8: display helpers and ordinary printf paths may leave a write
+     * failure latched until the final stdio flush. Promote that latent failure
+     * only when the command has no primary failure of its own. Informational
+     * and shell-snippet paths return through their dedicated finishers above;
+     * names-only output is already checked in its handler, making this
+     * successful recheck harmless. */
+    if (exit_code == EXIT_SUCCESS && finish_stdout_output() != 0) {
+        exit_code = EXIT_FAILURE;
+    }
 
     /* Cleanup error handling */
     error_cleanup();

@@ -161,8 +161,9 @@ static size_t read_capture(const char *path, char *buffer,
     return used;
 }
 
-static cli_result_t invoke_cli(const cli_fixture_t *fixture, int argc,
-                               char **argv) {
+static cli_result_t invoke_cli_with_stdout(const cli_fixture_t *fixture,
+                                           int argc, char **argv,
+                                           bool stdout_unwritable) {
     cli_result_t result;
     int stdout_fd = -1;
     int stderr_fd = -1;
@@ -194,6 +195,10 @@ static cli_result_t invoke_cli(const cli_fixture_t *fixture, int argc,
     (void)gitswitch_test_set_switch_rollback_publish_hook(publish_hook);
 
     stdout_fd = open(fixture->stdout_path, O_WRONLY | O_CREAT | O_TRUNC, 0600);
+    if (stdout_unwritable && stdout_fd >= 0) {
+        close(stdout_fd);
+        stdout_fd = open("/dev/null", O_RDONLY);
+    }
     stderr_fd = open(fixture->stderr_path, O_WRONLY | O_CREAT | O_TRUNC, 0600);
     if (stdout_fd < 0 || stderr_fd < 0) goto restore_fds;
     if (fflush(NULL) != 0) goto restore_fds;
@@ -271,6 +276,11 @@ restore_fds:
     return result;
 }
 
+static cli_result_t invoke_cli(const cli_fixture_t *fixture, int argc,
+                               char **argv) {
+    return invoke_cli_with_stdout(fixture, argc, argv, false);
+}
+
 static void check_clean_return(const cli_result_t *result,
                                int expected_allocations) {
     CHECK_EQ_INT(result->allocation_delta, expected_allocations);
@@ -322,30 +332,53 @@ TEST(every_safe_short_option_parses_before_help_dispatch) {
     check_clean_return(&result, 0);
 }
 
-TEST(scope_options_are_individually_valid_and_jointly_rejected) {
+TEST(informational_options_ignore_scope_conflicts_but_commands_reject_them) {
     cli_fixture_t fixture;
     char program[] = "gitswitch";
-    char global[] = "-g";
-    char local[] = "-l";
-    char version[] = "-v";
+    char global[] = "--global";
+    char local[] = "--local";
+    char version[] = "--version";
+    char help[] = "--help";
+    char status[] = "status";
     char *global_argv[] = { program, global, version, NULL };
     char *local_argv[] = { program, local, version, NULL };
-    char *conflict_argv[] = { program, global, local, version, NULL };
+    char *version_conflict_argv[] = {
+        program, global, local, version, NULL
+    };
+    char *help_conflict_argv[] = { program, local, global, help, NULL };
+    char *command_conflict_argv[] = {
+        program, global, local, status, NULL
+    };
     cli_result_t global_result;
     cli_result_t local_result;
-    cli_result_t conflict_result;
+    cli_result_t version_conflict_result;
+    cli_result_t help_conflict_result;
+    cli_result_t command_conflict_result;
 
     CHECK_EQ_INT(fixture_setup(&fixture), 0);
     global_result = invoke_cli(&fixture, 3, global_argv);
     local_result = invoke_cli(&fixture, 3, local_argv);
-    conflict_result = invoke_cli(&fixture, 4, conflict_argv);
+    version_conflict_result = invoke_cli(&fixture, 4, version_conflict_argv);
+    help_conflict_result = invoke_cli(&fixture, 4, help_conflict_argv);
+    command_conflict_result = invoke_cli(&fixture, 4, command_conflict_argv);
     CHECK_EQ_INT(global_result.status, EXIT_SUCCESS);
     check_clean_return(&global_result, 0);
     CHECK_EQ_INT(local_result.status, EXIT_SUCCESS);
     check_clean_return(&local_result, 0);
-    CHECK_EQ_INT(conflict_result.status, EXIT_FAILURE);
-    CHECK(strstr(conflict_result.stderr_text, "mutually exclusive") != NULL);
-    check_clean_return(&conflict_result, 0);
+    CHECK_EQ_INT(version_conflict_result.status, EXIT_SUCCESS);
+    CHECK(strstr(version_conflict_result.stdout_text, "gitswitch") != NULL);
+    CHECK(strstr(version_conflict_result.stderr_text,
+                 "mutually exclusive") == NULL);
+    check_clean_return(&version_conflict_result, 0);
+    CHECK_EQ_INT(help_conflict_result.status, EXIT_SUCCESS);
+    CHECK(strstr(help_conflict_result.stdout_text, "Usage: gitswitch") != NULL);
+    CHECK(strstr(help_conflict_result.stderr_text,
+                 "mutually exclusive") == NULL);
+    check_clean_return(&help_conflict_result, 0);
+    CHECK_EQ_INT(command_conflict_result.status, EXIT_FAILURE);
+    CHECK(strstr(command_conflict_result.stderr_text,
+                 "mutually exclusive") != NULL);
+    check_clean_return(&command_conflict_result, 0);
 }
 
 TEST(unknown_and_malformed_options_fail_before_context_allocation) {
@@ -547,6 +580,18 @@ TEST(no_command_uses_private_read_only_fixture_and_releases_context) {
     check_clean_return(&result, 1);
 }
 
+TEST(successful_ordinary_command_fails_on_final_stdout_error) {
+    cli_fixture_t fixture;
+    char program[] = "gitswitch";
+    char *argv[] = { program, NULL };
+    cli_result_t result;
+
+    CHECK_EQ_INT(fixture_setup(&fixture), 0);
+    result = invoke_cli_with_stdout(&fixture, 1, argv, true);
+    CHECK_EQ_INT(result.status, EXIT_FAILURE);
+    check_clean_return(&result, 1);
+}
+
 TEST(empty_configuration_read_only_commands_release_each_parent_context) {
     static const char *const commands[] = {
         "list", "ls", "status"
@@ -602,7 +647,8 @@ int main(void) {
     }
     RUN_TEST(informational_options_return_normally_across_repeated_entries);
     RUN_TEST(every_safe_short_option_parses_before_help_dispatch);
-    RUN_TEST(scope_options_are_individually_valid_and_jointly_rejected);
+    RUN_TEST(
+        informational_options_ignore_scope_conflicts_but_commands_reject_them);
     RUN_TEST(unknown_and_malformed_options_fail_before_context_allocation);
     RUN_TEST(each_command_family_rejects_invalid_arity_before_context_allocation);
     RUN_TEST(internal_probes_reject_operands_and_mutual_exclusion);
@@ -611,6 +657,7 @@ int main(void) {
     RUN_TEST(init_accepts_supported_shells_and_rejects_an_unknown_shell);
     RUN_TEST(legacy_init_alias_uses_the_private_shell_environment);
     RUN_TEST(no_command_uses_private_read_only_fixture_and_releases_context);
+    RUN_TEST(successful_ordinary_command_fails_on_final_stdout_error);
     RUN_TEST(empty_configuration_read_only_commands_release_each_parent_context);
     restore_environment(saved_env, sizeof(saved_env) / sizeof(saved_env[0]));
     result = ts_test_finish();
