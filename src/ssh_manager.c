@@ -224,6 +224,7 @@ static int inspect_process_image_real(pid_t pid, ssh_process_image_t *image);
 static int ssh_process_signal_real(pid_t pid, int signal_number);
 static int ssh_pidfd_open_real(pid_t pid);
 static int ssh_pidfd_signal_real(int pidfd, int signal_number);
+static int ssh_pidfd_poll_real(int pidfd, int timeout_ms, short *revents);
 static int sync_ssh_runtime_dir(int dir_fd, const char *operation);
 static int unlink_ssh_runtime_entry(int dir_fd, const char *name,
                                     bool missing_ok,
@@ -259,7 +260,8 @@ static ssh_reap_test_ops_t g_reap_ops = {
     .image = inspect_process_image_real,
     .signal = ssh_process_signal_real,
     .pidfd_open = ssh_pidfd_open_real,
-    .pidfd_signal = ssh_pidfd_signal_real
+    .pidfd_signal = ssh_pidfd_signal_real,
+    .pidfd_poll = ssh_pidfd_poll_real
 };
 static ssh_pid_commit_hook_fn g_pid_commit_hook;
 static ssh_pid_commit_hook_fn g_pid_postrename_hook;
@@ -355,6 +357,9 @@ ssh_reap_test_ops_t ssh_manager_set_reap_test_ops(
     g_reap_ops.pidfd_signal = ops && ops->pidfd_signal
                                   ? ops->pidfd_signal
                                   : ssh_pidfd_signal_real;
+    g_reap_ops.pidfd_poll = ops && ops->pidfd_poll
+                                ? ops->pidfd_poll
+                                : ssh_pidfd_poll_real;
     return previous;
 }
 
@@ -2184,32 +2189,34 @@ static int64_t monotonic_milliseconds(void) {
     return (int64_t)now.tv_sec * 1000 + now.tv_nsec / 1000000;
 }
 
+static ssh_process_outcome_t classify_pidfd_poll_revents(short revents) {
+    if ((revents & (POLLERR | POLLNVAL)) != 0) {
+        return SSH_PROCESS_INDETERMINATE;
+    }
+    return (revents & (POLLIN | POLLHUP)) != 0
+               ? SSH_PROCESS_GONE
+               : SSH_PROCESS_INDETERMINATE;
+}
+
 static ssh_process_outcome_t wait_pidfd_gone(int pidfd, int total_ms) {
     int64_t started = monotonic_milliseconds();
     int64_t deadline;
-    struct pollfd pfd;
 
     if (total_ms < 0 || started < 0 || started > INT64_MAX - total_ms) {
         return SSH_PROCESS_INDETERMINATE;
     }
     deadline = started + total_ms;
-    memset(&pfd, 0, sizeof(pfd));
-    pfd.fd = pidfd;
-    pfd.events = POLLIN;
     for (;;) {
         int64_t now = monotonic_milliseconds();
         int timeout;
         int rc;
+        short revents = 0;
+
         if (now < 0) return SSH_PROCESS_INDETERMINATE;
         if (now >= deadline) return SSH_PROCESS_OWNED;
         timeout = (int)(deadline - now);
-        rc = poll(&pfd, 1, timeout);
-        if (rc > 0) {
-            if ((pfd.revents & (POLLIN | POLLHUP | POLLERR)) != 0) {
-                return SSH_PROCESS_GONE;
-            }
-            return SSH_PROCESS_INDETERMINATE;
-        }
+        rc = g_reap_ops.pidfd_poll(pidfd, timeout, &revents);
+        if (rc > 0) return classify_pidfd_poll_revents(revents);
         if (rc == 0) return SSH_PROCESS_OWNED;
         if (errno != EINTR) return SSH_PROCESS_INDETERMINATE;
     }
@@ -2255,6 +2262,22 @@ static int ssh_pidfd_signal_real(int pidfd, int signal_number) {
 #endif
 }
 
+static int ssh_pidfd_poll_real(int pidfd, int timeout_ms, short *revents) {
+    struct pollfd descriptor;
+    int rc;
+
+    if (!revents) {
+        errno = EINVAL;
+        return -1;
+    }
+    descriptor.fd = pidfd;
+    descriptor.events = POLLIN;
+    descriptor.revents = 0;
+    rc = poll(&descriptor, 1, timeout_ms);
+    *revents = descriptor.revents;
+    return rc;
+}
+
 static ssh_process_outcome_t verify_expected_process_generation(
     const ssh_agent_record_t *record) {
     ssh_process_generation_t observed;
@@ -2270,19 +2293,13 @@ static ssh_process_outcome_t verify_expected_process_generation(
 }
 
 static ssh_process_outcome_t probe_pidfd_liveness(int pidfd) {
-    struct pollfd alive_check = {.fd = pidfd, .events = POLLIN};
-
     for (int attempts = 0;; attempts++) {
         int rc;
+        short revents = 0;
 
-        alive_check.revents = 0;
-        rc = poll(&alive_check, 1, 0);
+        rc = g_reap_ops.pidfd_poll(pidfd, 0, &revents);
         if (rc == 0) break;
-        if (rc > 0) {
-            return (alive_check.revents & (POLLIN | POLLHUP)) != 0
-                       ? SSH_PROCESS_GONE
-                       : SSH_PROCESS_INDETERMINATE;
-        }
+        if (rc > 0) return classify_pidfd_poll_revents(revents);
         if (errno == EINTR && attempts < 16) continue;
         return SSH_PROCESS_INDETERMINATE;
     }

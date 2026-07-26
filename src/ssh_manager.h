@@ -105,6 +105,8 @@ typedef int (*ssh_process_image_fn)(pid_t pid, ssh_process_image_t *image);
 typedef int (*ssh_process_signal_fn)(pid_t pid, int signal_number);
 typedef int (*ssh_pidfd_open_fn)(pid_t pid);
 typedef int (*ssh_pidfd_signal_fn)(int pidfd, int signal_number);
+typedef int (*ssh_pidfd_poll_fn)(int pidfd, int timeout_ms,
+                                 short *revents);
 typedef struct {
     ssh_process_identity_fn identity;
     ssh_process_generation_fn generation;
@@ -112,6 +114,7 @@ typedef struct {
     ssh_process_signal_fn signal;
     ssh_pidfd_open_fn pidfd_open;
     ssh_pidfd_signal_fn pidfd_signal;
+    ssh_pidfd_poll_fn pidfd_poll;
 } ssh_reap_test_ops_t;
 typedef int (*ssh_pid_commit_hook_fn)(int dir_fd, const char *temp_name);
 typedef int (*ssh_namespace_commit_hook_fn)(int dir_fd);

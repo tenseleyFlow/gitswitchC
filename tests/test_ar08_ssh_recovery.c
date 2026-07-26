@@ -30,6 +30,7 @@
 #include <errno.h>
 #include <fcntl.h>
 #include <inttypes.h>
+#include <poll.h>
 #include <signal.h>
 #include <stdint.h>
 #include <stdio.h>
@@ -1133,15 +1134,31 @@ static int pidfd_open_pipe(pid_t pid) {
     return fds[0];
 }
 
-static int pidfd_open_pollerr(pid_t pid) {
-    int fds[2];
+static short g_pidfd_poll_failure_revents;
 
-    if (pid != TEST_PID || pipe(fds) != 0) return -1;
-    if (close(fds[0]) != 0) {
-        close(fds[1]);
+static int pidfd_poll_failure(int pidfd, int timeout_ms, short *revents) {
+    (void)timeout_ms;
+    if (pidfd < 0 || !revents) {
+        errno = EINVAL;
         return -1;
     }
-    return fds[1];
+    *revents = g_pidfd_poll_failure_revents;
+    return 1;
+}
+
+static int pidfd_pollerr_after_term(int pidfd, int timeout_ms,
+                                    short *revents) {
+    (void)timeout_ms;
+    if (pidfd < 0 || !revents) {
+        errno = EINVAL;
+        return -1;
+    }
+    if (g_term_calls == 0) {
+        *revents = 0;
+        return 0;
+    }
+    *revents = POLLERR;
+    return 1;
 }
 
 static int pidfd_open_flips_numeric_generation(pid_t pid) {
@@ -1880,7 +1897,8 @@ TEST(live_pidfd_rejects_contradictory_numeric_identity_gone) {
     close(fixture.dir_fd);
 }
 
-TEST(pidfd_pollerr_is_indeterminate_and_retains_retry_tuple) {
+static void exercise_pidfd_poll_failure_retains_retry_tuple(
+    const char *fixture_stem, short failure_revents) {
     ssh_fixture_t fixture;
     artifact_snapshot_t sidecar_before = {0};
     artifact_snapshot_t socket_before = {0};
@@ -1888,12 +1906,66 @@ TEST(pidfd_pollerr_is_indeterminate_and_retains_retry_tuple) {
         .identity = identity_owned,
         .generation = generation_from_fixture,
         .signal = record_generation_signal,
-        .pidfd_open = pidfd_open_pollerr,
-        .pidfd_signal = record_generation_pidfd_signal
+        .pidfd_open = pidfd_open_pipe,
+        .pidfd_signal = record_generation_pidfd_signal,
+        .pidfd_poll = pidfd_poll_failure
     };
     ssh_reap_test_ops_t previous;
 
-    CHECK_EQ_INT(make_fixture(&fixture, "gsar14pidfdpollerr"), 0);
+    CHECK_EQ_INT(make_fixture(&fixture, fixture_stem), 0);
+    if (fixture.dir_fd < 0) return;
+    CHECK_EQ_INT(publish_sidecar(&fixture, TEST_PID), 0);
+    CHECK_EQ_INT(bind_stale_socket(fixture.socket), 0);
+    CHECK_EQ_INT(capture_artifact_snapshot(fixture.sidecar,
+                                           &sidecar_before), 0);
+    CHECK_EQ_INT(capture_artifact_snapshot(fixture.socket,
+                                           &socket_before), 0);
+
+    reset_generation_harness();
+    g_pidfd_poll_failure_revents = failure_revents;
+    previous = ssh_manager_set_reap_test_ops(&ops);
+    CHECK_EQ_INT(ssh_manager_reset("work"), -1);
+    ssh_manager_set_reap_test_ops(&previous);
+
+    CHECK_EQ_INT(g_generation_calls, 1);
+    CHECK_EQ_INT(g_presence_calls, 0);
+    CHECK_EQ_INT(g_term_calls, 0);
+    CHECK_EQ_INT(g_kill_calls, 0);
+    CHECK(artifact_matches_snapshot(fixture.sidecar, &sidecar_before));
+    CHECK(artifact_matches_snapshot(fixture.socket, &socket_before));
+    if (g_pidfd_keepalive >= 0) {
+        CHECK_EQ_INT(close(g_pidfd_keepalive), 0);
+        g_pidfd_keepalive = -1;
+    }
+    cleanup_retained_fixture(&fixture);
+    close(fixture.dir_fd);
+}
+
+TEST(pidfd_pollerr_dominates_hup_and_retains_retry_tuple) {
+    exercise_pidfd_poll_failure_retains_retry_tuple(
+        "gsar14pidfdpollerr", POLLERR | POLLHUP);
+}
+
+TEST(pidfd_pollnval_dominates_hup_and_retains_retry_tuple) {
+    exercise_pidfd_poll_failure_retains_retry_tuple(
+        "gsar14pidfdpollnval", POLLNVAL | POLLHUP);
+}
+
+TEST(pidfd_pollerr_after_term_retains_retry_tuple) {
+    ssh_fixture_t fixture;
+    artifact_snapshot_t sidecar_before = {0};
+    artifact_snapshot_t socket_before = {0};
+    ssh_reap_test_ops_t ops = {
+        .identity = identity_owned,
+        .generation = generation_from_fixture,
+        .signal = record_generation_signal,
+        .pidfd_open = pidfd_open_pipe,
+        .pidfd_signal = record_generation_pidfd_signal,
+        .pidfd_poll = pidfd_pollerr_after_term
+    };
+    ssh_reap_test_ops_t previous;
+
+    CHECK_EQ_INT(make_fixture(&fixture, "gsar14pidfdwaitpollerr"), 0);
     if (fixture.dir_fd < 0) return;
     CHECK_EQ_INT(publish_sidecar(&fixture, TEST_PID), 0);
     CHECK_EQ_INT(bind_stale_socket(fixture.socket), 0);
@@ -1907,12 +1979,16 @@ TEST(pidfd_pollerr_is_indeterminate_and_retains_retry_tuple) {
     CHECK_EQ_INT(ssh_manager_reset("work"), -1);
     ssh_manager_set_reap_test_ops(&previous);
 
-    CHECK_EQ_INT(g_generation_calls, 1);
-    CHECK_EQ_INT(g_presence_calls, 0);
-    CHECK_EQ_INT(g_term_calls, 0);
+    CHECK_EQ_INT(g_generation_calls, 3);
+    CHECK_EQ_INT(g_presence_calls, 6);
+    CHECK_EQ_INT(g_term_calls, 1);
     CHECK_EQ_INT(g_kill_calls, 0);
     CHECK(artifact_matches_snapshot(fixture.sidecar, &sidecar_before));
     CHECK(artifact_matches_snapshot(fixture.socket, &socket_before));
+    if (g_pidfd_keepalive >= 0) {
+        CHECK_EQ_INT(close(g_pidfd_keepalive), 0);
+        g_pidfd_keepalive = -1;
+    }
     cleanup_retained_fixture(&fixture);
     close(fixture.dir_fd);
 }
@@ -3286,7 +3362,11 @@ TEST(runtime_root_provenance_prevents_cross_root_reap) {
         CHECK_EQ_INT(publish_sidecar_for_process(&first, pid), 0);
         CHECK_EQ_INT(setenv("XDG_RUNTIME_DIR", first.xdg, 1), 0);
         CHECK_EQ_INT(ssh_manager_reset("work"), 0);
+#ifdef __linux__
         CHECK_EQ_INT(wait_process_absent(pid), 0);
+#else
+        CHECK_EQ_INT(kill(pid, 0), 0);
+#endif
         CHECK(!path_exists(first.sidecar));
         CHECK(!path_exists(first.socket));
     }
@@ -3724,7 +3804,9 @@ TEST(runner_failure_indeterminate_reap_publishes_retry_tuple) {
     CHECK(path_exists(fixture.sidecar));
     CHECK(path_exists(current));
     make_runner_socket_stale();
+    ssh_manager_set_reap_fn(reap_gone);
     CHECK_EQ_INT(ssh_manager_reset("work"), 0);
+    ssh_manager_set_reap_fn(previous_reap);
     CHECK(!path_exists(fixture.socket));
     CHECK(!path_exists(fixture.sidecar));
     CHECK(!path_exists(current));
@@ -4198,7 +4280,9 @@ TEST_MAIN_BEGIN()
     RUN_TEST(pidfd_death_during_numeric_inspection_discards_replacement_result);
     RUN_TEST(live_pidfd_rejects_contradictory_numeric_generation_gone);
     RUN_TEST(live_pidfd_rejects_contradictory_numeric_identity_gone);
-    RUN_TEST(pidfd_pollerr_is_indeterminate_and_retains_retry_tuple);
+    RUN_TEST(pidfd_pollerr_dominates_hup_and_retains_retry_tuple);
+    RUN_TEST(pidfd_pollnval_dominates_hup_and_retains_retry_tuple);
+    RUN_TEST(pidfd_pollerr_after_term_retains_retry_tuple);
     RUN_TEST(pidfd_escalation_never_returns_to_numeric_process_inspection);
     RUN_TEST(targeted_reset_retains_exact_tuple_when_pidfd_is_unsupported);
     RUN_TEST(reset_all_retains_exact_tuple_when_pidfd_is_unsupported);
