@@ -1,6 +1,6 @@
 /* AR-07 T14: trusted persisted SSH command and truthful Git status. */
 #ifdef __linux__
-#define _POSIX_C_SOURCE 200809L
+#define _XOPEN_SOURCE 700
 #endif
 
 #include "test.h"
@@ -126,6 +126,7 @@ static int restore_trusted_gpg(void) {
  * run the already-provisioned GnuPG binary from a private trusted fixture.
  * This preserves the real process and only changes its executable pathname. */
 static int activate_trusted_gpg_copy(const char *source_path) {
+    char canonical_source[MAX_PATH_LEN];
     char destination[MAX_PATH_LEN];
     char resolved[MAX_PATH_LEN];
     struct stat source_stat;
@@ -155,6 +156,9 @@ static int activate_trusted_gpg_copy(const char *source_path) {
         errno = ENOEXEC;
         return -1;
     }
+    /* copy_file() deliberately rejects a symlink source. Resolve the
+     * package-manager link as data, then copy without executing it. */
+    if (!realpath(source_path, canonical_source)) return -1;
     if (path) {
         saved_path = strdup(path);
         if (!saved_path) return -1;
@@ -163,7 +167,7 @@ static int activate_trusted_gpg_copy(const char *source_path) {
                             "gsw-ar11-gpg-bin") ||
         safe_snprintf(destination, sizeof(destination), "%s/gpg",
                       trusted_gpg_dir) != 0 ||
-        copy_file(source_path, destination) != 0 ||
+        copy_file(canonical_source, destination) != 0 ||
         chmod(destination, 0700) != 0) {
         free(saved_path);
         remove_trusted_gpg_fixture();
