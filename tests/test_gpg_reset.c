@@ -308,6 +308,8 @@ static int touch(const char *path) {
 static int g_reset_sync_calls;
 static bool g_fail_reset_sync;
 static int g_reset_sync_errno = EIO;
+static bool g_inject_late_reset_sync_residue;
+static char g_late_reset_sync_residue[128];
 
 #if !defined(__FreeBSD__)
 static int identity_unlink_for_test(int dir_fd, const char *name,
@@ -331,6 +333,14 @@ static int record_reset_sync(int base_fd) {
     struct stat st;
     g_reset_sync_calls++;
     if (fstat(base_fd, &st) != 0 || !S_ISDIR(st.st_mode)) return -1;
+    if (g_inject_late_reset_sync_residue) {
+        g_inject_late_reset_sync_residue = false;
+        if (g_late_reset_sync_residue[0] == '\0' ||
+            symlinkat("late-sync-residue", base_fd,
+                      g_late_reset_sync_residue) != 0) {
+            return -1;
+        }
+    }
     if (g_fail_reset_sync) {
         errno = g_reset_sync_errno;
         return -1;
@@ -1438,6 +1448,42 @@ TEST(full_reset_sync_failure_is_retryable) {
     gpg_manager_set_sync_base_fn(old_sync);
 }
 
+/* AR-14 L25: the authoritative full-reset scan must happen after the final
+ * potentially blocking durability barrier. A same-UID writer represented by
+ * this sync seam lands a valid recovery entry while that barrier is active.
+ * The pre-fix order scanned first and returned success with the late entry. */
+TEST(full_reset_rechecks_after_final_sync) {
+    char xdg[128], base[256], residue[416];
+    struct stat st;
+    gpg_sync_base_fn old_sync;
+
+    CHECK_EQ_INT(make_xdg(xdg, sizeof(xdg)), 0);
+    snprintf(base, sizeof(base), "%s/gitswitch-gpg", xdg);
+    CHECK_EQ_INT(mkdir(base, 0700), 0);
+    snprintf(g_late_reset_sync_residue,
+             sizeof(g_late_reset_sync_residue),
+             ".gitswitch-gpg-rollback.%ld.abcdef0123456789",
+             (long)getpid());
+    snprintf(residue, sizeof(residue), "%s/%s", base,
+             g_late_reset_sync_residue);
+
+    g_reset_sync_calls = 0;
+    g_fail_reset_sync = false;
+    g_inject_late_reset_sync_residue = true;
+    old_sync = gpg_manager_set_sync_base_fn(record_reset_sync);
+    CHECK_EQ_INT(gpg_manager_reset(NULL), -1);
+    CHECK_EQ_INT(g_reset_sync_calls, 1);
+    CHECK_EQ_INT(lstat(residue, &st), 0);
+    CHECK(S_ISLNK(st.st_mode));
+
+    /* With the one-shot writer disabled, the next reset safely plans and
+     * retires the exact late residue before its post-sync final scan. */
+    CHECK_EQ_INT(gpg_manager_reset(NULL), 0);
+    CHECK(lstat(residue, &st) != 0 && errno == ENOENT);
+    gpg_manager_set_sync_base_fn(old_sync);
+    g_late_reset_sync_residue[0] = '\0';
+}
+
 TEST(targeted_reset_restores_current_replaced_after_capture) {
     char xdg[128], base[256], work[320], other[320], marker[384];
     char current[320], target[MAX_PATH_LEN];
@@ -1745,6 +1791,7 @@ TEST_MAIN_BEGIN()
     RUN_TEST(drop_current_sync_failure_is_retryable);
     RUN_TEST(targeted_reset_sync_failure_is_retryable);
     RUN_TEST(full_reset_sync_failure_is_retryable);
+    RUN_TEST(full_reset_rechecks_after_final_sync);
     RUN_TEST(targeted_reset_restores_current_replaced_after_capture);
     RUN_TEST(create_isolated_home_reprobes_exact_base_fd_each_time);
     RUN_TEST(repeated_home_getters_probe_fallback_warning_path_once);

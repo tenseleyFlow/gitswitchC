@@ -6541,6 +6541,21 @@ int gpg_manager_reset(const char *account) {
         }
     }
 reset_finalize:
+    /* Every reset — including an otherwise byte-for-byte retry after an
+     * earlier fsync failure — repairs the durability boundary of
+     * home/current namespace changes before releasing the manager lock. For
+     * a full reset this barrier must precede the authoritative emptiness
+     * scan: a same-UID writer can create new residue while a blocking sync is
+     * in progress, and no later blocking namespace operation may make that
+     * successful scan stale. */
+    if (g_sync_base(base_fd) != 0) {
+        set_system_error(
+            ERR_FILE_IO,
+            "GPG reset changed the namespace but the base directory is not durable; retry reset");
+        gpg_record_reset_failure(&failures, &failed,
+                                 "GPG base directory synchronization");
+    }
+
     if (!account && !failed) {
         if (g_reset_final_hook && g_reset_final_hook(base_fd) != 0) {
             set_error(ERR_FILE_IO, "GPG reset final-verification hook failed");
@@ -6553,16 +6568,6 @@ reset_finalize:
         }
     }
 
-    /* Every successful reset — including an otherwise byte-for-byte retry
-     * after an earlier fsync failure — repairs the durability boundary of
-     * home/current namespace changes before releasing the manager lock. */
-    if (g_sync_base(base_fd) != 0) {
-        set_system_error(
-            ERR_FILE_IO,
-            "GPG reset changed the namespace but the base directory is not durable; retry reset");
-        gpg_record_reset_failure(&failures, &failed,
-                                 "GPG base directory synchronization");
-    }
     gpg_reset_all_plan_destroy(&plan);
     unlock_gpg_dir(base_fd, lock_fd);
     if (failed) {
