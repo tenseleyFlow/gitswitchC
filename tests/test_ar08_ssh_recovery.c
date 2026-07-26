@@ -1023,6 +1023,7 @@ static bool g_replace_generation_after_term;
 static bool g_die_during_generation;
 static int g_pidfd_keepalive = -1;
 static bool g_pidfd_open_saw_generation;
+static int g_protocol_identity_calls;
 
 static ssh_process_generation_t replacement_generation(void) {
     ssh_process_generation_t generation = g_test_generation;
@@ -1153,6 +1154,7 @@ static void reset_generation_harness(void) {
     g_replace_generation_after_term = false;
     g_die_during_generation = false;
     g_pidfd_open_saw_generation = false;
+    g_protocol_identity_calls = 0;
     if (g_pidfd_keepalive >= 0) {
         close(g_pidfd_keepalive);
         g_pidfd_keepalive = -1;
@@ -1165,6 +1167,28 @@ static ssh_process_outcome_t identity_indeterminate(
     (void)record;
     (void)socket_arg;
     (void)runtime_dir_fd;
+    return SSH_PROCESS_INDETERMINATE;
+}
+
+static ssh_process_outcome_t identity_indeterminate_once_then_owned(
+    const ssh_agent_record_t *record, const char *socket_arg,
+    int runtime_dir_fd) {
+    (void)record;
+    (void)socket_arg;
+    (void)runtime_dir_fd;
+    g_protocol_identity_calls++;
+    return g_protocol_identity_calls == 1
+               ? SSH_PROCESS_INDETERMINATE
+               : SSH_PROCESS_OWNED;
+}
+
+static ssh_process_outcome_t identity_always_indeterminate_counted(
+    const ssh_agent_record_t *record, const char *socket_arg,
+    int runtime_dir_fd) {
+    (void)record;
+    (void)socket_arg;
+    (void)runtime_dir_fd;
+    g_protocol_identity_calls++;
     return SSH_PROCESS_INDETERMINATE;
 }
 
@@ -2147,7 +2171,9 @@ static int publish_protocol_sidecar(
 static void exercise_recorded_protocol_retirement(
     const char *stem, ssh_process_generation_kind_t kind,
     test_agent_mode_t mode, bool reset_all, bool expect_success,
-    const unsigned char *expected_trace, size_t expected_trace_size) {
+    const unsigned char *expected_trace, size_t expected_trace_size,
+    ssh_process_identity_fn identity, int expected_identity_calls,
+    const char *expected_error) {
     ssh_fixture_t fixture;
     test_agent_server_t server = {.pid = -1, .trace_fd = -1};
     artifact_snapshot_t socket_before = {0};
@@ -2155,7 +2181,7 @@ static void exercise_recorded_protocol_retirement(
     artifact_snapshot_t current_before = {0};
     ssh_agent_record_t record;
     ssh_reap_test_ops_t ops = {
-        .identity = identity_owned,
+        .identity = identity ? identity : identity_owned,
         .generation = generation_from_fixture,
         .signal = signal_must_not_run,
         .pidfd_open = pidfd_unavailable,
@@ -2186,6 +2212,7 @@ static void exercise_recorded_protocol_retirement(
     reset_generation_harness();
     g_observed_generation = record.generation;
     previous = ssh_manager_set_reap_test_ops(&ops);
+    clear_error();
     reset_rc = ssh_manager_reset(reset_all ? NULL : "work");
     ssh_manager_set_reap_test_ops(&previous);
     trace_size = collect_test_agent_trace(
@@ -2199,7 +2226,13 @@ static void exercise_recorded_protocol_retirement(
     CHECK_EQ_INT(g_signal_calls, 0);
     CHECK_EQ_INT(g_term_calls, 0);
     CHECK_EQ_INT(g_kill_calls, 0);
+    if (expected_identity_calls >= 0) {
+        CHECK_EQ_INT(g_protocol_identity_calls, expected_identity_calls);
+    }
     CHECK_EQ_INT(kill(server.pid, 0), 0);
+    if (expected_error) {
+        CHECK(strstr(get_last_error()->message, expected_error) != NULL);
+    }
     if (expect_success) {
         CHECK(!entry_exists(fixture.socket));
         CHECK(!entry_exists(fixture.sidecar));
@@ -2230,8 +2263,27 @@ TEST(recorded_darwin_and_freebsd_endpoints_clear_then_verify_without_signals) {
         exercise_recorded_protocol_retirement(
             i == 0 ? "gsar14darwinprotocol" : "gsar14freebsdprotocol",
             kinds[i], TEST_AGENT_CLEAR_EMPTY, i != 0, true,
-            expected, sizeof(expected));
+            expected, sizeof(expected), NULL, -1, NULL);
     }
+}
+
+TEST(recorded_endpoint_retries_indeterminate_identity_once_then_retires) {
+    static const unsigned char expected[] = {
+        TEST_AGENT_REMOVE_ALL_IDENTITIES,
+        TEST_AGENT_REQUEST_IDENTITIES
+    };
+    exercise_recorded_protocol_retirement(
+        "gsar14identityretry", SSH_PROCESS_GENERATION_DARWIN,
+        TEST_AGENT_CLEAR_EMPTY, false, true, expected, sizeof(expected),
+        identity_indeterminate_once_then_owned, 3, NULL);
+}
+
+TEST(recorded_endpoint_indeterminate_identity_retains_exact_tuple_and_cause) {
+    exercise_recorded_protocol_retirement(
+        "gsar14identityindeterminate", SSH_PROCESS_GENERATION_DARWIN,
+        TEST_AGENT_CLEAR_EMPTY, false, false, NULL, 0,
+        identity_always_indeterminate_counted, 2,
+        "process identity outcome INDETERMINATE");
 }
 
 TEST(recorded_endpoint_remove_failure_retains_exact_tuple) {
@@ -2240,7 +2292,8 @@ TEST(recorded_endpoint_remove_failure_retains_exact_tuple) {
     };
     exercise_recorded_protocol_retirement(
         "gsar14removefail", SSH_PROCESS_GENERATION_DARWIN,
-        TEST_AGENT_CLEAR_FAILURE, false, false, expected, sizeof(expected));
+        TEST_AGENT_CLEAR_FAILURE, false, false, expected, sizeof(expected),
+        NULL, -1, NULL);
 }
 
 TEST(recorded_endpoint_nonempty_verification_retains_exact_tuple) {
@@ -2250,7 +2303,8 @@ TEST(recorded_endpoint_nonempty_verification_retains_exact_tuple) {
     };
     exercise_recorded_protocol_retirement(
         "gsar14verifyfull", SSH_PROCESS_GENERATION_FREEBSD,
-        TEST_AGENT_CLEAR_NONEMPTY, false, false, expected, sizeof(expected));
+        TEST_AGENT_CLEAR_NONEMPTY, false, false, expected, sizeof(expected),
+        NULL, -1, NULL);
 }
 
 static void configure_owned_protocol_agent(
@@ -2428,7 +2482,7 @@ TEST(stop_owned_bsd_endpoint_cleanup_failure_preserves_observable_retry_state) {
 TEST(linux_pidfd_unavailable_never_uses_agent_protocol) {
     exercise_recorded_protocol_retirement(
         "gsar14linuxnoprotocol", SSH_PROCESS_GENERATION_LINUX,
-        TEST_AGENT_CLEAR_EMPTY, false, false, NULL, 0);
+        TEST_AGENT_CLEAR_EMPTY, false, false, NULL, 0, NULL, -1, NULL);
 }
 
 TEST(pidfd_open_esrch_cleans_exact_tuple_without_numeric_termination) {
@@ -4101,6 +4155,8 @@ TEST_MAIN_BEGIN()
     RUN_TEST(sidecarless_oversized_protocol_frame_retains_exact_artifacts);
     RUN_TEST(sidecarless_protocol_timeout_retains_exact_artifacts);
     RUN_TEST(recorded_darwin_and_freebsd_endpoints_clear_then_verify_without_signals);
+    RUN_TEST(recorded_endpoint_retries_indeterminate_identity_once_then_retires);
+    RUN_TEST(recorded_endpoint_indeterminate_identity_retains_exact_tuple_and_cause);
     RUN_TEST(recorded_endpoint_remove_failure_retains_exact_tuple);
     RUN_TEST(recorded_endpoint_nonempty_verification_retains_exact_tuple);
     RUN_TEST(stop_owned_bsd_endpoint_clears_then_detaches_without_signals);

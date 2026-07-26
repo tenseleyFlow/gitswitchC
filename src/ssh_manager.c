@@ -1134,9 +1134,12 @@ static int open_socket_peer(const char *socket_arg, int runtime_dir_fd,
         struct ucred credential;
         socklen_t credential_size = sizeof(credential);
         if (getsockopt(fd, SOL_SOCKET, SO_PEERCRED, &credential,
-                       &credential_size) != 0 ||
-            credential_size != sizeof(credential) ||
+                       &credential_size) != 0) {
+            goto out;
+        }
+        if (credential_size != sizeof(credential) ||
             credential.pid <= 1) {
+            errno = EPROTO;
             goto out;
         }
         connection->peer_pid = credential.pid;
@@ -1149,10 +1152,13 @@ static int open_socket_peer(const char *socket_arg, int runtime_dir_fd,
 
         memset(&credential, 0, sizeof(credential));
         if (getsockopt(fd, SOL_LOCAL, LOCAL_PEERCRED, &credential,
-                       &credential_size) != 0 ||
-            credential_size != sizeof(credential) ||
+                       &credential_size) != 0) {
+            goto out;
+        }
+        if (credential_size != sizeof(credential) ||
             credential.cr_version != XUCRED_VERSION ||
             credential.cr_pid <= 1) {
+            errno = EPROTO;
             goto out;
         }
         connection->peer_pid = credential.cr_pid;
@@ -1170,8 +1176,11 @@ static int open_socket_peer(const char *socket_arg, int runtime_dir_fd,
         (void)effective_gid;
 #ifdef LOCAL_PEERPID
         if (getsockopt(fd, SOL_LOCAL, LOCAL_PEERPID, &process_id,
-                       &process_id_size) != 0 ||
-            process_id_size != sizeof(process_id) || process_id <= 1) {
+                       &process_id_size) != 0) {
+            goto out;
+        }
+        if (process_id_size != sizeof(process_id) || process_id <= 1) {
+            errno = EPROTO;
             goto out;
         }
         connection->peer_pid = process_id;
@@ -4875,19 +4884,27 @@ static int cleanup_stopped_agent_runtime(ssh_config_t *ssh_config) {
     {
         ssh_process_outcome_t reap_outcome = g_ssh_reap(
             &recorded, ssh_config->agent_socket_path, dir_fd);
+        bool retirement_attempted = false;
+
         if (!ssh_reap_allows_cleanup(reap_outcome) &&
-            reap_outcome == SSH_PROCESS_INDETERMINATE &&
-            socket_present &&
-            retire_recorded_agent_endpoint(
-                dir_fd, runtime_dir, socket_name,
-                ssh_config->agent_socket_path, pid_name,
-                &socket_pin, &pid_pin, &recorded) == 0) {
-            recorded_endpoint_retired = true;
-        } else if (!ssh_reap_allows_cleanup(reap_outcome)) {
-            set_error(ERR_SSH_AGENT_FAILED,
-                      "SSH agent PID %ld reap outcome %s; retained for retry",
-                      (long)recorded.pid,
-                      ssh_process_outcome_name(reap_outcome));
+            reap_outcome == SSH_PROCESS_INDETERMINATE && socket_present) {
+            retirement_attempted = true;
+            if (retire_recorded_agent_endpoint(
+                    dir_fd, runtime_dir, socket_name,
+                    ssh_config->agent_socket_path, pid_name,
+                    &socket_pin, &pid_pin, &recorded) == 0) {
+                recorded_endpoint_retired = true;
+            }
+        }
+        if (!ssh_reap_allows_cleanup(reap_outcome) &&
+            !recorded_endpoint_retired) {
+            if (!retirement_attempted) {
+                set_error(
+                    ERR_SSH_AGENT_FAILED,
+                    "SSH agent PID %ld reap outcome %s; retained for retry",
+                    (long)recorded.pid,
+                    ssh_process_outcome_name(reap_outcome));
+            }
             goto done;
         }
         ssh_config->key_already_loaded = false;
@@ -10178,6 +10195,17 @@ static int prove_malformed_pid_socket_dead_at(
     return 0;
 }
 
+static ssh_process_outcome_t prove_recorded_agent_identity(
+    const ssh_agent_record_t *record, const char *socket_path, int dir_fd) {
+    ssh_process_outcome_t outcome =
+        g_reap_ops.identity(record, socket_path, dir_fd);
+
+    if (outcome == SSH_PROCESS_INDETERMINATE) {
+        outcome = g_reap_ops.identity(record, socket_path, dir_fd);
+    }
+    return outcome;
+}
+
 static int retire_recorded_agent_endpoint(
     int dir_fd, const char *socket_dir, const char *socket_name,
     const char *socket_path, const char *pid_name,
@@ -10185,6 +10213,7 @@ static int retire_recorded_agent_endpoint(
     const ssh_runtime_pin_t *pid_pin,
     const ssh_agent_record_t *record) {
     ssh_agent_connection_t connection;
+    ssh_process_outcome_t process_outcome;
     uint32_t identity_count;
     int64_t deadline;
     int rc = -1;
@@ -10209,17 +10238,48 @@ static int retire_recorded_agent_endpoint(
                   socket_path);
         return -1;
     }
-    if (open_socket_peer(socket_path, dir_fd, &connection) != 0 ||
-        connection.peer_pid != record->image.socket_peer_pid ||
+    if (open_socket_peer(socket_path, dir_fd, &connection) != 0) {
+        set_system_error(
+            ERR_SSH_AGENT_FAILED,
+            "Recorded SSH endpoint connection could not be authenticated; "
+            "retained for retry: %s",
+            socket_path);
+        goto out;
+    }
+    if (connection.peer_pid != record->image.socket_peer_pid ||
         connection.peer_uid != record->image.socket_peer_uid ||
-        connection.peer_uid != getuid() ||
-        verify_expected_process_generation(record) != SSH_PROCESS_OWNED ||
-        g_reap_ops.identity(record, socket_path, dir_fd) !=
-            SSH_PROCESS_OWNED ||
-        ssh_agent_deadline(&deadline) != 0) {
+        connection.peer_uid != getuid()) {
         set_error(ERR_SSH_AGENT_FAILED,
-                  "Recorded SSH endpoint could not be re-proved; retained for retry: %s",
+                  "Recorded SSH endpoint socket peer mismatch; retained for "
+                  "retry: %s",
                   socket_path);
+        goto out;
+    }
+    process_outcome = verify_expected_process_generation(record);
+    if (process_outcome != SSH_PROCESS_OWNED) {
+        set_error(
+            ERR_SSH_AGENT_FAILED,
+            "Recorded SSH endpoint process generation outcome %s; retained "
+            "for retry: %s",
+            ssh_process_outcome_name(process_outcome), socket_path);
+        goto out;
+    }
+    process_outcome =
+        prove_recorded_agent_identity(record, socket_path, dir_fd);
+    if (process_outcome != SSH_PROCESS_OWNED) {
+        set_error(
+            ERR_SSH_AGENT_FAILED,
+            "Recorded SSH endpoint process identity outcome %s; retained "
+            "for retry: %s",
+            ssh_process_outcome_name(process_outcome), socket_path);
+        goto out;
+    }
+    if (ssh_agent_deadline(&deadline) != 0) {
+        set_system_error(
+            ERR_SSH_AGENT_FAILED,
+            "Recorded SSH endpoint protocol deadline could not be established; "
+            "retained for retry: %s",
+            socket_path);
         goto out;
     }
 
@@ -10231,15 +10291,38 @@ static int retire_recorded_agent_endpoint(
             dir_fd, socket_name, socket_path, socket_pin) != 0 ||
         verify_ssh_runtime_pin_at(
             dir_fd, pid_name, NULL, pid_pin) != 0 ||
-        !pinned_pid_sidecar_matches_record(pid_pin, record) ||
-        connection.peer_pid != record->image.socket_peer_pid ||
-        connection.peer_uid != record->image.socket_peer_uid ||
-        verify_expected_process_generation(record) != SSH_PROCESS_OWNED ||
-        g_reap_ops.identity(record, socket_path, dir_fd) !=
-            SSH_PROCESS_OWNED) {
+        !pinned_pid_sidecar_matches_record(pid_pin, record)) {
         set_error(ERR_SSH_AGENT_FAILED,
-                  "Recorded SSH endpoint changed before key retirement; "
+                  "Recorded SSH endpoint namespace changed before key "
+                  "retirement; "
                   "retained for retry: %s", socket_path);
+        goto out;
+    }
+    if (connection.peer_pid != record->image.socket_peer_pid ||
+        connection.peer_uid != record->image.socket_peer_uid) {
+        set_error(ERR_SSH_AGENT_FAILED,
+                  "Recorded SSH endpoint socket peer changed before key "
+                  "retirement; retained for retry: %s",
+                  socket_path);
+        goto out;
+    }
+    process_outcome = verify_expected_process_generation(record);
+    if (process_outcome != SSH_PROCESS_OWNED) {
+        set_error(
+            ERR_SSH_AGENT_FAILED,
+            "Recorded SSH endpoint process generation changed before key "
+            "retirement (%s); retained for retry: %s",
+            ssh_process_outcome_name(process_outcome), socket_path);
+        goto out;
+    }
+    process_outcome =
+        prove_recorded_agent_identity(record, socket_path, dir_fd);
+    if (process_outcome != SSH_PROCESS_OWNED) {
+        set_error(
+            ERR_SSH_AGENT_FAILED,
+            "Recorded SSH endpoint process identity changed before key "
+            "retirement (%s); retained for retry: %s",
+            ssh_process_outcome_name(process_outcome), socket_path);
         goto out;
     }
     if (ssh_agent_remove_all_identities(connection.fd, deadline) != 0) {
@@ -11905,6 +11988,8 @@ int ssh_manager_reset(const char *account) {
         can_remove_runtime = false;
     } else if (pid_rc == SSH_PID_SIDECAR_VALID) {
         ssh_process_outcome_t reap_outcome;
+        bool retirement_attempted = false;
+
         if (verify_socket_dir_namespace(dir_fd, socket_dir) != 0) {
             failed = true;
             can_remove_runtime = false;
@@ -11919,13 +12004,17 @@ int ssh_manager_reset(const char *account) {
         }
         if (!ssh_reap_allows_cleanup(reap_outcome) &&
             reap_outcome == SSH_PROCESS_INDETERMINATE &&
-            socket_present &&
-            retire_recorded_agent_endpoint(
-                dir_fd, socket_dir, sock_name, sock_path, pid_name,
-                &socket_pin, &pid_pin, &record) == 0) {
-            recorded_endpoint_retired = true;
-        } else if (!ssh_reap_allows_cleanup(reap_outcome)) {
-            if (can_remove_runtime) {
+            socket_present && can_remove_runtime) {
+            retirement_attempted = true;
+            if (retire_recorded_agent_endpoint(
+                    dir_fd, socket_dir, sock_name, sock_path, pid_name,
+                    &socket_pin, &pid_pin, &record) == 0) {
+                recorded_endpoint_retired = true;
+            }
+        }
+        if (!ssh_reap_allows_cleanup(reap_outcome) &&
+            !recorded_endpoint_retired) {
+            if (can_remove_runtime && !retirement_attempted) {
                 set_error(ERR_SSH_AGENT_FAILED,
                           "SSH agent PID %ld reap outcome %s; retained for retry",
                           (long)record.pid,
@@ -12261,6 +12350,7 @@ static int kill_orphaned_gitswitch_agents(int dir_fd, const char *socket_dir,
         ssh_process_outcome_t reap_outcome = g_ssh_reap(
             &record, sock_full, dir_fd);
         bool recorded_endpoint_retired = false;
+        bool retirement_attempted = false;
         ssh_runtime_pin_t socket_pin;
         bool socket_pin_held = false;
         ssh_runtime_pin_init(&socket_pin);
@@ -12274,6 +12364,7 @@ static int kill_orphaned_gitswitch_agents(int dir_fd, const char *socket_dir,
             pin_ssh_runtime_entry_at(
                 dir_fd, sock_name, sock_full, &socket_pin) == 0) {
             socket_pin_held = true;
+            retirement_attempted = true;
             if (retire_recorded_agent_endpoint(
                     dir_fd, socket_dir, sock_name, sock_full, name,
                     &socket_pin, &pid_pin, &record) == 0) {
@@ -12282,10 +12373,13 @@ static int kill_orphaned_gitswitch_agents(int dir_fd, const char *socket_dir,
         }
         if (!ssh_reap_allows_cleanup(reap_outcome) &&
             !recorded_endpoint_retired) {
-            set_error(ERR_SSH_AGENT_FAILED,
-                      "SSH agent PID %ld reap outcome %s; retained for retry",
-                      (long)record.pid,
-                      ssh_process_outcome_name(reap_outcome));
+            if (!retirement_attempted) {
+                set_error(
+                    ERR_SSH_AGENT_FAILED,
+                    "SSH agent PID %ld reap outcome %s; retained for retry",
+                    (long)record.pid,
+                    ssh_process_outcome_name(reap_outcome));
+            }
             failed = true;
             if (release_ssh_runtime_pin(dir_fd, &socket_pin) != 0) {
                 failed = true;
