@@ -35,6 +35,7 @@ static int g_runner_calls;
 static int g_agent_spawn_calls;
 static pid_t g_post_spawn_agent_pid = -1;
 static int g_fake_agent_listener = -1;
+static int g_fake_agent_pidfd_write = -1;
 static ssh_process_image_t g_fake_agent_image;
 
 static int test_write_exact(int fd, const void *buf, size_t len) {
@@ -646,10 +647,39 @@ static int fake_agent_signal(pid_t pid, int signal_number) {
     return -1;
 }
 
-static int fake_agent_pidfd_unavailable(pid_t pid) {
-    (void)pid;
-    errno = ENOSYS;
-    return -1;
+static int fake_agent_pidfd_open(pid_t pid) {
+    int pipe_fds[2];
+
+    if (pid != (pid_t)1073741824 || pipe(pipe_fds) != 0) {
+        if (pid != (pid_t)1073741824) errno = ESRCH;
+        return -1;
+    }
+    if (g_fake_agent_pidfd_write >= 0) {
+        close(g_fake_agent_pidfd_write);
+    }
+    g_fake_agent_pidfd_write = pipe_fds[1];
+    return pipe_fds[0];
+}
+
+static int fake_agent_pidfd_signal(int pidfd, int signal_number) {
+    if (pidfd < 0) {
+        errno = EBADF;
+        return -1;
+    }
+    if (signal_number == 0) return 0;
+    if (signal_number != SIGTERM && signal_number != SIGKILL) {
+        errno = EINVAL;
+        return -1;
+    }
+    if (g_fake_agent_listener >= 0) {
+        close(g_fake_agent_listener);
+        g_fake_agent_listener = -1;
+    }
+    if (g_fake_agent_pidfd_write >= 0) {
+        close(g_fake_agent_pidfd_write);
+        g_fake_agent_pidfd_write = -1;
+    }
+    return 0;
 }
 
 static bool entry_exists(const char *path) {
@@ -1049,7 +1079,8 @@ TEST(post_spawn_runner_failure_reaps_runtime_and_allows_retry) {
         .generation = capture_fake_agent_generation,
         .image = capture_fake_agent_image,
         .signal = fake_agent_signal,
-        .pidfd_open = fake_agent_pidfd_unavailable,
+        .pidfd_open = fake_agent_pidfd_open,
+        .pidfd_signal = fake_agent_pidfd_signal,
     };
     bool pid_gone;
 
@@ -1161,7 +1192,8 @@ TEST(fresh_agent_environment_failure_reaps_and_restores_partial_mutation) {
         .generation = capture_fake_agent_generation,
         .image = capture_fake_agent_image,
         .signal = fake_agent_signal,
-        .pidfd_open = fake_agent_pidfd_unavailable,
+        .pidfd_open = fake_agent_pidfd_open,
+        .pidfd_signal = fake_agent_pidfd_signal,
     };
     ssh_setenv_fn previous_setenv;
 
@@ -1573,10 +1605,10 @@ TEST(reset_all_aggregates_failures_and_continues) {
     CHECK_EQ_INT(ssh_manager_reset(NULL), 0);
 }
 
-/* HIGH regression: the absence of a sidecar does not prove an agent is dead.
- * A real reachable listener must survive targeted reset together with the
- * stable link, and the nonzero result preserves CLI retry metadata. */
-TEST(targeted_reset_preserves_live_agent_when_sidecar_is_missing) {
+/* A sidecar-less endpoint can be detached only after the exact pinned,
+ * same-user listener answers a read-only SSH-agent identities request. The
+ * process is deliberately not signaled and can outlive the namespace. */
+TEST(targeted_reset_detaches_live_agent_when_sidecar_is_missing) {
     char agent_dir[128], sock[192], current[192], pidfile[192];
     pid_t pid = -1;
     int start_rc;
@@ -1596,13 +1628,37 @@ TEST(targeted_reset_preserves_live_agent_when_sidecar_is_missing) {
     snprintf(pidfile, sizeof(pidfile), "%s/ssh-agent.work.pid", agent_dir);
     CHECK(!entry_exists(pidfile));
 
-    CHECK_EQ_INT(ssh_manager_reset("work"), -1); /* pre-fix: 0 */
+    CHECK_EQ_INT(ssh_manager_reset("work"), 0);
     CHECK_EQ_INT(kill(pid, 0), 0);
-    CHECK(entry_exists(sock));
-    CHECK(entry_exists(current));
-    CHECK(strstr(get_last_error()->message, "no safely matched PID") != NULL);
+    CHECK(!entry_exists(sock));
+    CHECK(!entry_exists(current));
 
     stop_real_agent(pid, sock, current);
+}
+
+TEST(targeted_reset_retains_sidecarless_non_agent_listener) {
+    char agent_dir[128], sock[192], current[192];
+    int listener;
+
+    CHECK_EQ_INT(setup_runtime(agent_dir, sizeof(agent_dir)), 0);
+    REQUIRE_UNIX_SOCKET_BIND(agent_dir);
+    snprintf(sock, sizeof(sock), "%s/ssh-agent.work.sock", agent_dir);
+    snprintf(current, sizeof(current), "%s/current.sock", agent_dir);
+    listener = listen_socket(sock);
+    CHECK(listener >= 0);
+    if (listener < 0) return;
+    CHECK_EQ_INT(symlink(sock, current), 0);
+
+    CHECK_EQ_INT(ssh_manager_reset("work"), -1);
+    CHECK(entry_exists(sock));
+    CHECK(entry_exists(current));
+    CHECK(strstr(get_last_error()->message,
+                 "same-user SSH agent endpoint") != NULL);
+
+    CHECK_EQ_INT(close(listener), 0);
+    CHECK_EQ_INT(ssh_manager_reset("work"), 0);
+    CHECK(!entry_exists(sock));
+    CHECK(!entry_exists(current));
 }
 
 /* A numeric prefix followed by an embedded NUL is malformed bytes, not a PID
@@ -1717,9 +1773,9 @@ TEST(targeted_reset_preserves_live_socket_when_sidecar_pid_is_bystander) {
     CHECK(!entry_exists(pidfile));
 }
 
-/* The all-account path must make the same fail-closed classification instead
- * of treating a listening, sidecar-less agent as a stale socket. */
-TEST(reset_all_preserves_live_agent_when_sidecar_is_missing) {
+/* Reset-all applies the same read-only protocol proof and namespace-only
+ * detachment without claiming that the process was killed. */
+TEST(reset_all_detaches_live_agent_when_sidecar_is_missing) {
     char agent_dir[128], sock[192], current[192], pidfile[192];
     pid_t pid = -1;
     int start_rc;
@@ -1739,27 +1795,24 @@ TEST(reset_all_preserves_live_agent_when_sidecar_is_missing) {
     snprintf(pidfile, sizeof(pidfile), "%s/ssh-agent.personal.pid", agent_dir);
     CHECK(!entry_exists(pidfile));
 
-    CHECK_EQ_INT(ssh_manager_reset(NULL), -1); /* pre-fix: 0 */
+    CHECK_EQ_INT(ssh_manager_reset(NULL), 0);
     CHECK_EQ_INT(kill(pid, 0), 0);
-    CHECK(entry_exists(sock));
-    CHECK(entry_exists(current));
-    CHECK(strstr(get_last_error()->message, "no PID sidecar") != NULL);
+    CHECK(!entry_exists(sock));
+    CHECK(!entry_exists(current));
 
     stop_real_agent(pid, sock, current);
 }
 
 #ifdef __APPLE__
-/* Darwin's KERN_PROCARGS2 payload includes the environment after argv. The
- * identity check must size that payload from KERN_ARGMAX and still parse only
- * the kernel-reported argc entries; a >4 KiB environment used to truncate the
- * fixed buffer and make a managed agent permanently unreapable. */
-TEST(darwin_reset_reaps_managed_agent_with_large_environment) {
+/* Without pidfd signaling, Darwin retires an exact native v2 endpoint by
+ * clearing identities and detaching its managed namespace. The process may
+ * remain alive, which is intentionally distinct from claiming it was reaped. */
+TEST(darwin_reset_retires_managed_agent_endpoint_without_process_claim) {
     char agent_dir[128], sock[192], current[192], pidfile[192];
     char *large_environment;
     char *saved_environment = NULL;
     const char *old_environment;
     bool had_environment;
-    struct timespec delay = {.tv_sec = 0, .tv_nsec = 10000000L};
     pid_t pid = -1;
     int start_rc;
 
@@ -1807,27 +1860,19 @@ TEST(darwin_reset_reaps_managed_agent_with_large_environment) {
                  0);
 
     CHECK_EQ_INT(ssh_manager_reset("work"), 0);
-    for (int i = 0; i < 50 && kill(pid, 0) == 0; i++) {
-        nanosleep(&delay, NULL);
-    }
-    CHECK(kill(pid, 0) != 0 && errno == ESRCH);
+    CHECK_EQ_INT(kill(pid, 0), 0);
     CHECK(!entry_exists(pidfile));
     CHECK(!entry_exists(sock));
     CHECK(!entry_exists(current));
 
-    if (kill(pid, 0) == 0) {
-        stop_real_agent(pid, sock, current);
-    }
+    stop_real_agent(pid, sock, current);
 }
 
-/* Deterministic companion to the real-agent case above. Apple may omit the
- * environment of its restricted system ssh-agent from KERN_PROCARGS2, so run
- * an unrestricted copy of this test binary as an ssh-agent-shaped daemon.
- * Its 16 KiB environment makes the old 4096-byte retrieval fail every time. */
-TEST(darwin_kern_procargs_reaps_unrestricted_large_environment_agent) {
+/* Exact process metadata is not enough: a same-shape listener that does not
+ * implement the SSH-agent protocol must be retained without signaling. */
+TEST(darwin_reset_retains_non_agent_listener_with_valid_process_record) {
     char agent_dir[128], helper[192], sock[192], current[192];
     char pidfile[192];
-    struct timespec delay = {.tv_sec = 0, .tv_nsec = 10000000L};
     pid_t pid = -1;
 
     CHECK_EQ_INT(setup_runtime(agent_dir, sizeof(agent_dir)), 0);
@@ -1848,16 +1893,17 @@ TEST(darwin_kern_procargs_reaps_unrestricted_large_environment_agent) {
                                     pid, true, helper),
                  0);
 
-    CHECK_EQ_INT(ssh_manager_reset("work"), 0);
-    for (int i = 0; i < 50 && kill(pid, 0) == 0; i++) {
-        nanosleep(&delay, NULL);
-    }
-    CHECK(kill(pid, 0) != 0 && errno == ESRCH);
-    CHECK(!entry_exists(pidfile));
-    CHECK(!entry_exists(sock));
-    CHECK(!entry_exists(current));
+    CHECK_EQ_INT(ssh_manager_reset("work"), -1);
+    CHECK_EQ_INT(kill(pid, 0), 0);
+    CHECK(entry_exists(pidfile));
+    CHECK(entry_exists(sock));
+    CHECK(entry_exists(current));
 
-    if (kill(pid, 0) == 0) (void)kill(pid, SIGKILL);
+    (void)kill(pid, SIGKILL);
+    (void)waitpid(pid, NULL, 0);
+    (void)unlink(pidfile);
+    (void)unlink(sock);
+    (void)unlink(current);
     (void)unlink(helper);
 }
 #endif
@@ -1892,14 +1938,16 @@ int main(int argc, char **argv) {
     RUN_TEST(reset_reports_socket_unlink_failure_and_retains_current);
     RUN_TEST(reset_reports_stable_link_cleanup_failure);
     RUN_TEST(reset_all_aggregates_failures_and_continues);
-    RUN_TEST(targeted_reset_preserves_live_agent_when_sidecar_is_missing);
+    RUN_TEST(targeted_reset_detaches_live_agent_when_sidecar_is_missing);
+    RUN_TEST(targeted_reset_retains_sidecarless_non_agent_listener);
     RUN_TEST(targeted_reset_never_reaps_embedded_nul_pid_prefix);
     RUN_TEST(targeted_reset_preserves_live_socket_when_sidecar_pid_is_bystander);
-    RUN_TEST(reset_all_preserves_live_agent_when_sidecar_is_missing);
+    RUN_TEST(reset_all_detaches_live_agent_when_sidecar_is_missing);
 #ifdef __APPLE__
-    RUN_TEST(darwin_reset_reaps_managed_agent_with_large_environment);
-    RUN_TEST(darwin_kern_procargs_reaps_unrestricted_large_environment_agent);
+    RUN_TEST(darwin_reset_retires_managed_agent_endpoint_without_process_claim);
+    RUN_TEST(darwin_reset_retains_non_agent_listener_with_valid_process_record);
 #endif
     if (g_fake_agent_listener >= 0) close(g_fake_agent_listener);
+    if (g_fake_agent_pidfd_write >= 0) close(g_fake_agent_pidfd_write);
     return ts_test_finish();
 }

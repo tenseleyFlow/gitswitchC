@@ -244,6 +244,7 @@ static int g_retire_replace_on_call;
 static bool g_retire_replacement_captured;
 static struct stat g_retire_replacement_identity;
 static int g_reset_dirsync_calls;
+static int g_stop_dirsync_calls;
 static ssh_metadata_test_stage_t g_metadata_mismatch_stage;
 static int g_metadata_mismatch_calls;
 
@@ -291,6 +292,294 @@ static int bind_live_socket(const char *path) {
         return -1;
     }
     return fd;
+}
+
+enum {
+    TEST_AGENT_REQUEST_IDENTITIES = 11,
+    TEST_AGENT_IDENTITIES_ANSWER = 12,
+    TEST_AGENT_REMOVE_ALL_IDENTITIES = 19,
+    TEST_AGENT_REMOVE_ALL_RSA_IDENTITIES = 9,
+    TEST_AGENT_FAILURE = 5,
+    TEST_AGENT_SUCCESS = 6
+};
+
+typedef enum {
+    TEST_AGENT_IDENTITIES_ONE = 0,
+    TEST_AGENT_WRONG_TYPE,
+    TEST_AGENT_MALFORMED_IDENTITIES,
+    TEST_AGENT_TRUNCATED,
+    TEST_AGENT_OVERSIZED,
+    TEST_AGENT_TIMEOUT,
+    TEST_AGENT_CLEAR_EMPTY,
+    TEST_AGENT_CLEAR_FAILURE,
+    TEST_AGENT_CLEAR_NONEMPTY
+} test_agent_mode_t;
+
+typedef struct {
+    pid_t pid;
+    int trace_fd;
+} test_agent_server_t;
+
+static void test_agent_write_u32(unsigned char *bytes, uint32_t value) {
+    bytes[0] = (unsigned char)(value >> 24);
+    bytes[1] = (unsigned char)(value >> 16);
+    bytes[2] = (unsigned char)(value >> 8);
+    bytes[3] = (unsigned char)value;
+}
+
+static int test_agent_read_exact(int fd, void *buffer, size_t size) {
+    unsigned char *cursor = buffer;
+    size_t offset = 0;
+
+    while (offset < size) {
+        ssize_t n = read(fd, cursor + offset, size - offset);
+        if (n > 0) {
+            offset += (size_t)n;
+            continue;
+        }
+        if (n < 0 && errno == EINTR) continue;
+        return -1;
+    }
+    return 0;
+}
+
+static int test_agent_write_exact(int fd, const void *buffer, size_t size) {
+    const unsigned char *cursor = buffer;
+    size_t offset = 0;
+
+    while (offset < size) {
+        ssize_t n = write(fd, cursor + offset, size - offset);
+        if (n > 0) {
+            offset += (size_t)n;
+            continue;
+        }
+        if (n < 0 && errno == EINTR) continue;
+        return -1;
+    }
+    return 0;
+}
+
+static int test_agent_read_request(int fd, unsigned char *type) {
+    unsigned char frame[5];
+
+    if (!type || test_agent_read_exact(fd, frame, sizeof(frame)) != 0 ||
+        frame[0] != 0 || frame[1] != 0 || frame[2] != 0 ||
+        frame[3] != 1) {
+        return -1;
+    }
+    *type = frame[4];
+    return 0;
+}
+
+static int test_agent_write_message(int fd, const unsigned char *payload,
+                                    size_t payload_size) {
+    unsigned char header[4];
+
+    if (!payload || payload_size > UINT32_MAX) return -1;
+    test_agent_write_u32(header, (uint32_t)payload_size);
+    return test_agent_write_exact(fd, header, sizeof(header)) == 0 &&
+                   test_agent_write_exact(fd, payload, payload_size) == 0
+               ? 0
+               : -1;
+}
+
+static int test_agent_write_identities(int fd, bool nonempty) {
+    static const unsigned char empty[] = {
+        TEST_AGENT_IDENTITIES_ANSWER, 0, 0, 0, 0
+    };
+    static const unsigned char one[] = {
+        TEST_AGENT_IDENTITIES_ANSWER, 0, 0, 0, 1,
+        0, 0, 0, 3, 'k', 'e', 'y',
+        0, 0, 0, 5, 'p', 'r', 'o', 'x', 'y'
+    };
+
+    return nonempty
+               ? test_agent_write_message(fd, one, sizeof(one))
+               : test_agent_write_message(fd, empty, sizeof(empty));
+}
+
+static void test_agent_serve_connection(int fd, int trace_fd,
+                                        test_agent_mode_t mode) {
+    unsigned char type;
+
+    if (test_agent_read_request(fd, &type) != 0) return;
+    if (test_agent_write_exact(trace_fd, &type, sizeof(type)) != 0) return;
+
+    switch (mode) {
+        case TEST_AGENT_IDENTITIES_ONE:
+            if (type == TEST_AGENT_REQUEST_IDENTITIES) {
+                (void)test_agent_write_identities(fd, true);
+            }
+            return;
+        case TEST_AGENT_WRONG_TYPE: {
+            static const unsigned char failure[] = {TEST_AGENT_FAILURE};
+            (void)test_agent_write_message(fd, failure, sizeof(failure));
+            return;
+        }
+        case TEST_AGENT_MALFORMED_IDENTITIES: {
+            static const unsigned char malformed[] = {
+                TEST_AGENT_IDENTITIES_ANSWER, 0, 0, 0, 1
+            };
+            (void)test_agent_write_message(
+                fd, malformed, sizeof(malformed));
+            return;
+        }
+        case TEST_AGENT_TRUNCATED: {
+            unsigned char partial[5];
+            test_agent_write_u32(partial, 5);
+            partial[4] = TEST_AGENT_IDENTITIES_ANSWER;
+            (void)test_agent_write_exact(fd, partial, sizeof(partial));
+            return;
+        }
+        case TEST_AGENT_OVERSIZED: {
+            unsigned char header[4];
+            test_agent_write_u32(header, (256U * 1024U) + 1U);
+            (void)test_agent_write_exact(fd, header, sizeof(header));
+            return;
+        }
+        case TEST_AGENT_TIMEOUT:
+            for (;;) pause();
+        case TEST_AGENT_CLEAR_FAILURE: {
+            static const unsigned char failure[] = {TEST_AGENT_FAILURE};
+            (void)test_agent_write_message(fd, failure, sizeof(failure));
+            return;
+        }
+        case TEST_AGENT_CLEAR_EMPTY:
+        case TEST_AGENT_CLEAR_NONEMPTY: {
+            static const unsigned char success[] = {TEST_AGENT_SUCCESS};
+            if (type != TEST_AGENT_REMOVE_ALL_IDENTITIES ||
+                test_agent_write_message(fd, success, sizeof(success)) != 0 ||
+                test_agent_read_request(fd, &type) != 0 ||
+                test_agent_write_exact(trace_fd, &type,
+                                       sizeof(type)) != 0 ||
+                type != TEST_AGENT_REQUEST_IDENTITIES) {
+                return;
+            }
+            (void)test_agent_write_identities(
+                fd, mode == TEST_AGENT_CLEAR_NONEMPTY);
+            return;
+        }
+        default:
+            return;
+    }
+}
+
+static void test_agent_server_main(const char *path, test_agent_mode_t mode,
+                                   int ready_fd, int trace_fd) {
+    struct sockaddr_un address;
+    char ready = 'E';
+    int listener;
+
+    listener = socket(AF_UNIX, SOCK_STREAM, 0);
+    if (listener < 0 || strlen(path) >= sizeof(address.sun_path)) {
+        (void)test_agent_write_exact(ready_fd, &ready, sizeof(ready));
+        _exit(2);
+    }
+    memset(&address, 0, sizeof(address));
+    address.sun_family = AF_UNIX;
+    memcpy(address.sun_path, path, strlen(path) + 1U);
+    if (bind(listener, (struct sockaddr *)(void *)&address,
+             sizeof(address)) != 0 ||
+        chmod(path, 0600) != 0 || listen(listener, 8) != 0) {
+        (void)test_agent_write_exact(ready_fd, &ready, sizeof(ready));
+        close(listener);
+        _exit(2);
+    }
+    ready = 'R';
+    if (test_agent_write_exact(ready_fd, &ready, sizeof(ready)) != 0) {
+        close(listener);
+        _exit(2);
+    }
+    close(ready_fd);
+
+    for (;;) {
+        int connection = accept(listener, NULL, NULL);
+        if (connection < 0) {
+            if (errno == EINTR) continue;
+            _exit(2);
+        }
+        test_agent_serve_connection(connection, trace_fd, mode);
+        close(connection);
+    }
+}
+
+static int start_test_agent_server(const char *path, test_agent_mode_t mode,
+                                   test_agent_server_t *server) {
+    int ready_pipe[2];
+    int trace_pipe[2];
+    char ready = '\0';
+    pid_t child;
+    int flags;
+
+    if (!path || !server || pipe(ready_pipe) != 0) return -1;
+    if (pipe(trace_pipe) != 0) {
+        close(ready_pipe[0]);
+        close(ready_pipe[1]);
+        return -1;
+    }
+    child = fork();
+    if (child < 0) {
+        close(ready_pipe[0]);
+        close(ready_pipe[1]);
+        close(trace_pipe[0]);
+        close(trace_pipe[1]);
+        return -1;
+    }
+    if (child == 0) {
+        close(ready_pipe[0]);
+        close(trace_pipe[0]);
+        test_agent_server_main(path, mode, ready_pipe[1], trace_pipe[1]);
+        _exit(2);
+    }
+    close(ready_pipe[1]);
+    close(trace_pipe[1]);
+    if (test_agent_read_exact(ready_pipe[0], &ready, sizeof(ready)) != 0 ||
+        close(ready_pipe[0]) != 0 || ready != 'R') {
+        (void)kill(child, SIGKILL);
+        (void)waitpid(child, NULL, 0);
+        close(trace_pipe[0]);
+        return -1;
+    }
+    flags = fcntl(trace_pipe[0], F_GETFL, 0);
+    if (flags < 0 ||
+        fcntl(trace_pipe[0], F_SETFL, flags | O_NONBLOCK) != 0) {
+        (void)kill(child, SIGKILL);
+        (void)waitpid(child, NULL, 0);
+        close(trace_pipe[0]);
+        return -1;
+    }
+    server->pid = child;
+    server->trace_fd = trace_pipe[0];
+    return 0;
+}
+
+static size_t collect_test_agent_trace(test_agent_server_t *server,
+                                       unsigned char *trace,
+                                       size_t trace_size) {
+    size_t used = 0;
+
+    if (!server || !trace) return 0;
+    while (used < trace_size) {
+        ssize_t n = read(server->trace_fd, trace + used, trace_size - used);
+        if (n > 0) {
+            used += (size_t)n;
+            continue;
+        }
+        if (n < 0 && errno == EINTR) continue;
+        break;
+    }
+    return used;
+}
+
+static void stop_test_agent_server(test_agent_server_t *server) {
+    if (!server) return;
+    if (server->pid > 1) {
+        (void)kill(server->pid, SIGKILL);
+        (void)waitpid(server->pid, NULL, 0);
+    }
+    if (server->trace_fd >= 0) close(server->trace_fd);
+    server->pid = -1;
+    server->trace_fd = -1;
 }
 
 static int write_sidecar_bytes(const ssh_fixture_t *fixture,
@@ -547,6 +836,15 @@ static int replace_reset_retirement_entry(int dir_fd, const char *name) {
 static int fail_third_reset_dirsync(int dir_fd) {
     g_reset_dirsync_calls++;
     if (g_reset_dirsync_calls == 3) {
+        errno = EIO;
+        return -1;
+    }
+    return fsync(dir_fd);
+}
+
+static int fail_first_stop_dirsync(int dir_fd) {
+    g_stop_dirsync_calls++;
+    if (g_stop_dirsync_calls == 1) {
         errno = EIO;
         return -1;
     }
@@ -1649,6 +1947,435 @@ TEST(targeted_reset_retains_exact_tuple_when_pidfd_is_unsupported) {
 
 TEST(reset_all_retains_exact_tuple_when_pidfd_is_unsupported) {
     exercise_unsupported_pidfd_retains_exact_tuple(true);
+}
+
+static void exercise_sidecarless_protocol_detach(bool reset_all) {
+    ssh_fixture_t fixture;
+    test_agent_server_t server = {.pid = -1, .trace_fd = -1};
+    artifact_snapshot_t sibling_before = {0};
+    unsigned char trace[8];
+    char sibling[256];
+    size_t trace_size;
+
+    CHECK_EQ_INT(make_fixture(
+                     &fixture,
+                     reset_all ? "gsar14sidecarlessall"
+                               : "gsar14sidecarlessone"), 0);
+    if (fixture.dir_fd < 0) return;
+    CHECK_EQ_INT(start_test_agent_server(
+                     fixture.socket, TEST_AGENT_IDENTITIES_ONE, &server), 0);
+    if (server.pid <= 1) {
+        close(fixture.dir_fd);
+        return;
+    }
+    CHECK_EQ_INT(symlink(fixture.socket, fixture.current), 0);
+    if (!reset_all) {
+        CHECK(snprintf(sibling, sizeof(sibling),
+                       "%s/unrelated-artifact", fixture.runtime) > 0);
+        CHECK_EQ_INT(write_string_to_file(sibling, "keep\n", 0600), 0);
+        CHECK_EQ_INT(capture_artifact_snapshot(
+                         sibling, &sibling_before), 0);
+    }
+
+    CHECK_EQ_INT(ssh_manager_reset(reset_all ? NULL : "work"), 0);
+    trace_size = collect_test_agent_trace(
+        &server, trace, sizeof(trace));
+
+    CHECK_EQ_INT((int)trace_size, 1);
+    CHECK(trace_size < 1U || trace[0] == TEST_AGENT_REQUEST_IDENTITIES);
+    CHECK(trace_size < 1U ||
+          (trace[0] != TEST_AGENT_REMOVE_ALL_IDENTITIES &&
+           trace[0] != TEST_AGENT_REMOVE_ALL_RSA_IDENTITIES));
+    CHECK_EQ_INT(kill(server.pid, 0), 0);
+    CHECK(!entry_exists(fixture.socket));
+    CHECK(!entry_exists(fixture.sidecar));
+    CHECK(!entry_exists(fixture.current));
+    if (!reset_all) {
+        CHECK(artifact_matches_snapshot(sibling, &sibling_before));
+    }
+
+    stop_test_agent_server(&server);
+    close(fixture.dir_fd);
+    ts_rm_rf(fixture.xdg);
+}
+
+TEST(sidecarless_targeted_requests_identities_only_and_detaches_namespace) {
+    exercise_sidecarless_protocol_detach(false);
+}
+
+TEST(sidecarless_reset_all_requests_identities_only_and_detaches_namespace) {
+    exercise_sidecarless_protocol_detach(true);
+}
+
+static void exercise_sidecarless_protocol_failure(
+    const char *stem, test_agent_mode_t mode, bool reset_all) {
+    ssh_fixture_t fixture;
+    test_agent_server_t server = {.pid = -1, .trace_fd = -1};
+    artifact_snapshot_t socket_before = {0};
+    artifact_snapshot_t current_before = {0};
+    unsigned char trace[8];
+    size_t trace_size;
+
+    CHECK_EQ_INT(make_fixture(&fixture, stem), 0);
+    if (fixture.dir_fd < 0) return;
+    CHECK_EQ_INT(start_test_agent_server(fixture.socket, mode, &server), 0);
+    if (server.pid <= 1) {
+        close(fixture.dir_fd);
+        return;
+    }
+    CHECK_EQ_INT(symlink(fixture.socket, fixture.current), 0);
+    CHECK_EQ_INT(capture_artifact_snapshot(
+                     fixture.socket, &socket_before), 0);
+    CHECK_EQ_INT(capture_artifact_snapshot(
+                     fixture.current, &current_before), 0);
+
+    CHECK_EQ_INT(ssh_manager_reset(reset_all ? NULL : "work"), -1);
+    trace_size = collect_test_agent_trace(
+        &server, trace, sizeof(trace));
+
+    CHECK_EQ_INT((int)trace_size, 1);
+    CHECK(trace_size < 1U || trace[0] == TEST_AGENT_REQUEST_IDENTITIES);
+    CHECK_EQ_INT(kill(server.pid, 0), 0);
+    CHECK(artifact_matches_snapshot(fixture.socket, &socket_before));
+    CHECK(artifact_matches_snapshot(fixture.current, &current_before));
+    CHECK(!entry_exists(fixture.sidecar));
+
+    stop_test_agent_server(&server);
+    cleanup_retained_fixture(&fixture);
+    close(fixture.dir_fd);
+    ts_rm_rf(fixture.xdg);
+}
+
+TEST(sidecarless_wrong_protocol_type_retains_exact_artifacts) {
+    exercise_sidecarless_protocol_failure(
+        "gsar14agentwrong", TEST_AGENT_WRONG_TYPE, false);
+}
+
+TEST(sidecarless_malformed_identity_answer_retains_exact_artifacts) {
+    exercise_sidecarless_protocol_failure(
+        "gsar14agentmalformed", TEST_AGENT_MALFORMED_IDENTITIES, false);
+}
+
+TEST(sidecarless_truncated_protocol_frame_retains_exact_artifacts) {
+    exercise_sidecarless_protocol_failure(
+        "gsar14agenttruncated", TEST_AGENT_TRUNCATED, false);
+}
+
+TEST(sidecarless_oversized_protocol_frame_retains_exact_artifacts) {
+    exercise_sidecarless_protocol_failure(
+        "gsar14agentoversized", TEST_AGENT_OVERSIZED, true);
+}
+
+TEST(sidecarless_protocol_timeout_retains_exact_artifacts) {
+    exercise_sidecarless_protocol_failure(
+        "gsar14agenttimeout", TEST_AGENT_TIMEOUT, true);
+}
+
+static int publish_protocol_sidecar(
+    const ssh_fixture_t *fixture, pid_t peer_pid,
+    ssh_process_generation_kind_t kind, ssh_agent_record_t *published) {
+    ssh_agent_record_t record = {
+        .pid = TEST_PID,
+        .generation = g_test_generation
+    };
+
+    record.generation.kind = kind;
+    if (complete_synthetic_record_image(&record) != 0) return -1;
+    record.image.socket_peer_pid = peer_pid;
+    record.image.socket_peer_uid = geteuid();
+    if (ssh_manager_test_write_pid_sidecar(
+            fixture->dir_fd, "ssh-agent.work.pid", &record) != 0) {
+        return -1;
+    }
+    if (published) *published = record;
+    return 0;
+}
+
+static void exercise_recorded_protocol_retirement(
+    const char *stem, ssh_process_generation_kind_t kind,
+    test_agent_mode_t mode, bool reset_all, bool expect_success,
+    const unsigned char *expected_trace, size_t expected_trace_size) {
+    ssh_fixture_t fixture;
+    test_agent_server_t server = {.pid = -1, .trace_fd = -1};
+    artifact_snapshot_t socket_before = {0};
+    artifact_snapshot_t sidecar_before = {0};
+    artifact_snapshot_t current_before = {0};
+    ssh_agent_record_t record;
+    ssh_reap_test_ops_t ops = {
+        .identity = identity_owned,
+        .generation = generation_from_fixture,
+        .signal = signal_must_not_run,
+        .pidfd_open = pidfd_unavailable,
+        .pidfd_signal = pidfd_signal_unused
+    };
+    ssh_reap_test_ops_t previous;
+    unsigned char trace[8];
+    size_t trace_size;
+    int reset_rc;
+
+    CHECK_EQ_INT(make_fixture(&fixture, stem), 0);
+    if (fixture.dir_fd < 0) return;
+    CHECK_EQ_INT(start_test_agent_server(fixture.socket, mode, &server), 0);
+    if (server.pid <= 1) {
+        close(fixture.dir_fd);
+        return;
+    }
+    CHECK_EQ_INT(publish_protocol_sidecar(
+                     &fixture, server.pid, kind, &record), 0);
+    CHECK_EQ_INT(symlink(fixture.socket, fixture.current), 0);
+    CHECK_EQ_INT(capture_artifact_snapshot(
+                     fixture.socket, &socket_before), 0);
+    CHECK_EQ_INT(capture_artifact_snapshot(
+                     fixture.sidecar, &sidecar_before), 0);
+    CHECK_EQ_INT(capture_artifact_snapshot(
+                     fixture.current, &current_before), 0);
+
+    reset_generation_harness();
+    g_observed_generation = record.generation;
+    previous = ssh_manager_set_reap_test_ops(&ops);
+    reset_rc = ssh_manager_reset(reset_all ? NULL : "work");
+    ssh_manager_set_reap_test_ops(&previous);
+    trace_size = collect_test_agent_trace(
+        &server, trace, sizeof(trace));
+
+    CHECK_EQ_INT(reset_rc, expect_success ? 0 : -1);
+    CHECK_EQ_INT((int)trace_size, (int)expected_trace_size);
+    CHECK(trace_size != expected_trace_size ||
+          expected_trace_size == 0U ||
+          memcmp(trace, expected_trace, expected_trace_size) == 0);
+    CHECK_EQ_INT(g_signal_calls, 0);
+    CHECK_EQ_INT(g_term_calls, 0);
+    CHECK_EQ_INT(g_kill_calls, 0);
+    CHECK_EQ_INT(kill(server.pid, 0), 0);
+    if (expect_success) {
+        CHECK(!entry_exists(fixture.socket));
+        CHECK(!entry_exists(fixture.sidecar));
+        CHECK(!entry_exists(fixture.current));
+    } else {
+        CHECK(artifact_matches_snapshot(fixture.socket, &socket_before));
+        CHECK(artifact_matches_snapshot(fixture.sidecar, &sidecar_before));
+        CHECK(artifact_matches_snapshot(fixture.current, &current_before));
+    }
+
+    stop_test_agent_server(&server);
+    if (!expect_success) cleanup_retained_fixture(&fixture);
+    close(fixture.dir_fd);
+    ts_rm_rf(fixture.xdg);
+}
+
+TEST(recorded_darwin_and_freebsd_endpoints_clear_then_verify_without_signals) {
+    static const unsigned char expected[] = {
+        TEST_AGENT_REMOVE_ALL_IDENTITIES,
+        TEST_AGENT_REQUEST_IDENTITIES
+    };
+    static const ssh_process_generation_kind_t kinds[] = {
+        SSH_PROCESS_GENERATION_DARWIN,
+        SSH_PROCESS_GENERATION_FREEBSD
+    };
+
+    for (size_t i = 0; i < sizeof(kinds) / sizeof(kinds[0]); i++) {
+        exercise_recorded_protocol_retirement(
+            i == 0 ? "gsar14darwinprotocol" : "gsar14freebsdprotocol",
+            kinds[i], TEST_AGENT_CLEAR_EMPTY, i != 0, true,
+            expected, sizeof(expected));
+    }
+}
+
+TEST(recorded_endpoint_remove_failure_retains_exact_tuple) {
+    static const unsigned char expected[] = {
+        TEST_AGENT_REMOVE_ALL_IDENTITIES
+    };
+    exercise_recorded_protocol_retirement(
+        "gsar14removefail", SSH_PROCESS_GENERATION_DARWIN,
+        TEST_AGENT_CLEAR_FAILURE, false, false, expected, sizeof(expected));
+}
+
+TEST(recorded_endpoint_nonempty_verification_retains_exact_tuple) {
+    static const unsigned char expected[] = {
+        TEST_AGENT_REMOVE_ALL_IDENTITIES,
+        TEST_AGENT_REQUEST_IDENTITIES
+    };
+    exercise_recorded_protocol_retirement(
+        "gsar14verifyfull", SSH_PROCESS_GENERATION_FREEBSD,
+        TEST_AGENT_CLEAR_NONEMPTY, false, false, expected, sizeof(expected));
+}
+
+static void configure_owned_protocol_agent(
+    const ssh_fixture_t *fixture, const ssh_agent_record_t *record,
+    ssh_config_t *config) {
+    memset(config, 0, sizeof(*config));
+    config->mode = SSH_AGENT_ISOLATED;
+    config->agent_pid = record->pid;
+    config->agent_generation = record->generation;
+    config->agent_image = record->image;
+    config->agent_owned = true;
+    config->key_already_loaded = true;
+    config->reused_existing_agent = true;
+    CHECK_EQ_INT(safe_strncpy(
+                     config->agent_socket_path, fixture->socket,
+                     sizeof(config->agent_socket_path)), 0);
+    CHECK_EQ_INT(safe_strncpy(
+                     config->agent_socket_arg, fixture->socket,
+                     sizeof(config->agent_socket_arg)), 0);
+}
+
+TEST(stop_owned_bsd_endpoint_clears_then_detaches_without_signals) {
+    static const unsigned char expected[] = {
+        TEST_AGENT_REMOVE_ALL_IDENTITIES,
+        TEST_AGENT_REQUEST_IDENTITIES
+    };
+    ssh_fixture_t fixture;
+    test_agent_server_t server = {.pid = -1, .trace_fd = -1};
+    ssh_agent_record_t record;
+    ssh_config_t config;
+    ssh_reap_test_ops_t ops = {
+        .identity = identity_owned,
+        .generation = generation_from_fixture,
+        .signal = signal_must_not_run,
+        .pidfd_open = pidfd_unavailable,
+        .pidfd_signal = pidfd_signal_unused
+    };
+    ssh_reap_test_ops_t previous;
+    unsigned char trace[8];
+    size_t trace_size;
+
+    CHECK_EQ_INT(make_fixture(&fixture, "gsar14stopbsd"), 0);
+    if (fixture.dir_fd < 0) return;
+    CHECK_EQ_INT(start_test_agent_server(
+                     fixture.socket, TEST_AGENT_CLEAR_EMPTY, &server), 0);
+    if (server.pid <= 1) {
+        close(fixture.dir_fd);
+        return;
+    }
+    CHECK_EQ_INT(publish_protocol_sidecar(
+                     &fixture, server.pid,
+                     SSH_PROCESS_GENERATION_DARWIN, &record), 0);
+    configure_owned_protocol_agent(&fixture, &record, &config);
+    CHECK_EQ_INT(setenv("SSH_AUTH_SOCK", fixture.socket, 1), 0);
+    CHECK_EQ_INT(setenv("SSH_AGENT_PID", "1073741824", 1), 0);
+
+    reset_generation_harness();
+    g_observed_generation = record.generation;
+    previous = ssh_manager_set_reap_test_ops(&ops);
+    CHECK_EQ_INT(ssh_stop_agent(&config), 0);
+    ssh_manager_set_reap_test_ops(&previous);
+    trace_size = collect_test_agent_trace(
+        &server, trace, sizeof(trace));
+
+    CHECK_EQ_INT((int)trace_size, (int)sizeof(expected));
+    CHECK(trace_size != sizeof(expected) ||
+          memcmp(trace, expected, sizeof(expected)) == 0);
+    CHECK_EQ_INT(g_signal_calls, 0);
+    CHECK_EQ_INT(g_term_calls, 0);
+    CHECK_EQ_INT(g_kill_calls, 0);
+    CHECK_EQ_INT(kill(server.pid, 0), 0);
+    CHECK(!entry_exists(fixture.socket));
+    CHECK(!entry_exists(fixture.sidecar));
+    CHECK(!config.agent_owned);
+    CHECK_EQ_INT(config.agent_pid, -1);
+    CHECK_EQ_INT((int)config.agent_generation.kind,
+                 SSH_PROCESS_GENERATION_NONE);
+    CHECK(!config.agent_image.valid);
+    CHECK(!config.key_already_loaded);
+    CHECK(!config.reused_existing_agent);
+    CHECK(config.agent_socket_path[0] == '\0');
+    CHECK(config.agent_socket_arg[0] == '\0');
+    CHECK(getenv("SSH_AUTH_SOCK") == NULL);
+    CHECK(getenv("SSH_AGENT_PID") == NULL);
+
+    stop_test_agent_server(&server);
+    close(fixture.dir_fd);
+    ts_rm_rf(fixture.xdg);
+}
+
+TEST(stop_owned_bsd_endpoint_cleanup_failure_preserves_observable_retry_state) {
+    static const unsigned char expected[] = {
+        TEST_AGENT_REMOVE_ALL_IDENTITIES,
+        TEST_AGENT_REQUEST_IDENTITIES
+    };
+    ssh_fixture_t fixture;
+    test_agent_server_t server = {.pid = -1, .trace_fd = -1};
+    artifact_snapshot_t socket_before = {0};
+    artifact_snapshot_t current_before = {0};
+    ssh_agent_record_t record;
+    ssh_config_t config;
+    ssh_reap_test_ops_t ops = {
+        .identity = identity_owned,
+        .generation = generation_from_fixture,
+        .signal = signal_must_not_run,
+        .pidfd_open = pidfd_unavailable,
+        .pidfd_signal = pidfd_signal_unused
+    };
+    ssh_reap_test_ops_t previous_reap;
+    ssh_dirsync_fn previous_dirsync;
+    unsigned char trace[8];
+    size_t trace_size;
+
+    CHECK_EQ_INT(make_fixture(&fixture, "gsar14stopbsdfail"), 0);
+    if (fixture.dir_fd < 0) return;
+    CHECK_EQ_INT(start_test_agent_server(
+                     fixture.socket, TEST_AGENT_CLEAR_EMPTY, &server), 0);
+    if (server.pid <= 1) {
+        close(fixture.dir_fd);
+        return;
+    }
+    CHECK_EQ_INT(publish_protocol_sidecar(
+                     &fixture, server.pid,
+                     SSH_PROCESS_GENERATION_FREEBSD, &record), 0);
+    CHECK_EQ_INT(symlink(fixture.socket, fixture.current), 0);
+    CHECK_EQ_INT(capture_artifact_snapshot(
+                     fixture.socket, &socket_before), 0);
+    CHECK_EQ_INT(capture_artifact_snapshot(
+                     fixture.current, &current_before), 0);
+    configure_owned_protocol_agent(&fixture, &record, &config);
+    CHECK_EQ_INT(setenv("SSH_AUTH_SOCK", fixture.socket, 1), 0);
+    CHECK_EQ_INT(setenv("SSH_AGENT_PID", "1073741824", 1), 0);
+
+    reset_generation_harness();
+    g_observed_generation = record.generation;
+    g_stop_dirsync_calls = 0;
+    previous_reap = ssh_manager_set_reap_test_ops(&ops);
+    previous_dirsync = ssh_manager_set_dirsync_fn(fail_first_stop_dirsync);
+    CHECK_EQ_INT(ssh_stop_agent(&config), -1);
+    ssh_manager_set_dirsync_fn(previous_dirsync);
+    ssh_manager_set_reap_test_ops(&previous_reap);
+    trace_size = collect_test_agent_trace(
+        &server, trace, sizeof(trace));
+
+    CHECK_EQ_INT((int)trace_size, (int)sizeof(expected));
+    CHECK(trace_size != sizeof(expected) ||
+          memcmp(trace, expected, sizeof(expected)) == 0);
+    CHECK_EQ_INT(g_stop_dirsync_calls, 1);
+    CHECK_EQ_INT(g_signal_calls, 0);
+    CHECK_EQ_INT(g_term_calls, 0);
+    CHECK_EQ_INT(g_kill_calls, 0);
+    CHECK_EQ_INT(kill(server.pid, 0), 0);
+    CHECK(!entry_exists(fixture.sidecar));
+    CHECK(artifact_matches_snapshot(fixture.socket, &socket_before));
+    CHECK(artifact_matches_snapshot(fixture.current, &current_before));
+    CHECK(config.agent_owned);
+    CHECK_EQ_INT(config.agent_pid, record.pid);
+    CHECK(config.agent_generation.kind == record.generation.kind);
+    CHECK(config.agent_image.valid);
+    CHECK(!config.key_already_loaded);
+    CHECK(config.reused_existing_agent);
+    CHECK_STR_EQ(config.agent_socket_path, fixture.socket);
+    CHECK_STR_EQ(config.agent_socket_arg, fixture.socket);
+    CHECK_STR_EQ(getenv("SSH_AUTH_SOCK"), fixture.socket);
+    CHECK_STR_EQ(getenv("SSH_AGENT_PID"), "1073741824");
+
+    (void)unsetenv("SSH_AUTH_SOCK");
+    (void)unsetenv("SSH_AGENT_PID");
+    stop_test_agent_server(&server);
+    cleanup_retained_fixture(&fixture);
+    close(fixture.dir_fd);
+    ts_rm_rf(fixture.xdg);
+}
+
+TEST(linux_pidfd_unavailable_never_uses_agent_protocol) {
+    exercise_recorded_protocol_retirement(
+        "gsar14linuxnoprotocol", SSH_PROCESS_GENERATION_LINUX,
+        TEST_AGENT_CLEAR_EMPTY, false, false, NULL, 0);
 }
 
 TEST(pidfd_open_esrch_cleans_exact_tuple_without_numeric_termination) {
@@ -3239,6 +3966,19 @@ TEST_MAIN_BEGIN()
     RUN_TEST(pidfd_escalation_never_returns_to_numeric_process_inspection);
     RUN_TEST(targeted_reset_retains_exact_tuple_when_pidfd_is_unsupported);
     RUN_TEST(reset_all_retains_exact_tuple_when_pidfd_is_unsupported);
+    RUN_TEST(sidecarless_targeted_requests_identities_only_and_detaches_namespace);
+    RUN_TEST(sidecarless_reset_all_requests_identities_only_and_detaches_namespace);
+    RUN_TEST(sidecarless_wrong_protocol_type_retains_exact_artifacts);
+    RUN_TEST(sidecarless_malformed_identity_answer_retains_exact_artifacts);
+    RUN_TEST(sidecarless_truncated_protocol_frame_retains_exact_artifacts);
+    RUN_TEST(sidecarless_oversized_protocol_frame_retains_exact_artifacts);
+    RUN_TEST(sidecarless_protocol_timeout_retains_exact_artifacts);
+    RUN_TEST(recorded_darwin_and_freebsd_endpoints_clear_then_verify_without_signals);
+    RUN_TEST(recorded_endpoint_remove_failure_retains_exact_tuple);
+    RUN_TEST(recorded_endpoint_nonempty_verification_retains_exact_tuple);
+    RUN_TEST(stop_owned_bsd_endpoint_clears_then_detaches_without_signals);
+    RUN_TEST(stop_owned_bsd_endpoint_cleanup_failure_preserves_observable_retry_state);
+    RUN_TEST(linux_pidfd_unavailable_never_uses_agent_protocol);
     RUN_TEST(pidfd_open_esrch_cleans_exact_tuple_without_numeric_termination);
     RUN_TEST(generation_inspection_error_never_terminates_or_consumes_tuple);
     RUN_TEST(legacy_live_sidecar_is_retained_without_reap);

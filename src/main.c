@@ -82,7 +82,7 @@ static int print_usage(const char *prog_name) {
     print_supported_shells(stdout, "|");
     printf(")\n");
     printf("  resume               Restore saved SSH/GPG state, or reconcile an incomplete switch\n");
-    printf("  reset [account]      Kill agents and delete isolated GPG/SSH state (all, or one)\n");
+    printf("  reset [account]      Retire isolated GPG/SSH state (all, or one)\n");
     printf("  switch <account>     Switch to specified account\n");
     printf("  <account>            Switch to specified account\n");
     printf("\nOptions:\n");
@@ -1245,7 +1245,8 @@ int main(int argc, char *argv[]) {
      * config read-modify-writers (add/edit/remove, a bare-account switch that
      * updates active_account): `resume` mutates only boot-volatile SSH/GPG
      * runtime state (it deliberately leaves Git configuration untouched), and
-     * `reset` kills agents and retargets/deletes runtime symlinks. Both must be
+     * `reset` safely retires agents and retargets/deletes runtime symlinks.
+     * Both must be
      * serialized against a concurrent switch or the final runtime can belong
      * to a different account than the switch's persisted Git identity
      * (AR-02 #1: tmux-restore shells running resume while another shell
@@ -2281,7 +2282,8 @@ static command_result_t handle_remove_command(gitswitch_ctx_t *ctx,
         return result;
     }
 
-    /* AR-06 F07: accounts_remove tears down the SSH/GPG runtime (kills agents,
+    /* AR-06 F07: accounts_remove tears down the SSH/GPG runtime (safely
+     * terminates agents where provable or detaches proved SSH endpoints, and
      * deletes the isolated GPG home with its exported secret-key copy) with no
      * dry_run check of its own — the exact destructive-preview hole AR-05 H1
      * closed for `reset` only. Gate here, before the confirmation prompt, the
@@ -2294,7 +2296,7 @@ static command_result_t handle_remove_command(gitswitch_ctx_t *ctx,
             return result;
         }
         display_info("DRY RUN MODE - No actual changes will be made");
-        printf("Would kill the SSH/GPG agents and delete the isolated GPG home for\n"
+        printf("Would retire the SSH/GPG agent state and delete the isolated GPG home for\n"
                "'%s' (removing its on-disk secret-key copy), then remove the account\n"
                "from %s.\n", acct->name, ctx->config.config_path);
         display_success("DRY RUN complete - no changes were made");
@@ -3474,8 +3476,10 @@ static int handle_resume_command(gitswitch_ctx_t *ctx) {
     return EXIT_SUCCESS;
 }
 
-/* Tear down isolated SSH/GPG state: kill the per-account agents and delete
- * (unlink) the isolated GPG homes holding the exported secret-key copies. On
+/* Tear down isolated SSH/GPG state: terminate per-account agents when safely
+ * provable, or clear/detach eligible SSH endpoints while warning that their
+ * process and preexisting connections may remain. Delete (unlink) the
+ * isolated GPG homes holding the exported secret-key copies. On
  * the default memory-backed storage that destroys the bytes; on the
  * GITSWITCH_ALLOW_TMP_GPG non-tmpfs opt-in path they may remain forensically
  * recoverable after deletion (AR-02 #26). With an account argument, only that
@@ -3527,10 +3531,10 @@ static command_result_t handle_reset_command(gitswitch_ctx_t *ctx,
     if (ctx->config.dry_run) {
         display_info("DRY RUN MODE - No actual changes will be made");
         if (target) {
-            printf("Would kill the SSH/GPG agents and delete the isolated GPG home for\n"
+            printf("Would retire the SSH/GPG agent state and delete the isolated GPG home for\n"
                    "'%s', removing its on-disk secret-key copy.\n", target);
         } else {
-            printf("Would kill ALL gitswitch SSH/GPG agents and delete ALL isolated GPG\n"
+            printf("Would retire ALL gitswitch SSH/GPG agent state and delete ALL isolated GPG\n"
                    "homes, removing every on-disk secret-key copy.\n");
         }
         if ((!target || (active_account &&
@@ -3557,13 +3561,13 @@ static command_result_t handle_reset_command(gitswitch_ctx_t *ctx,
         if (target) {
             prompt_length = snprintf(
                 confirmation_prompt, sizeof(confirmation_prompt),
-                "This kills the SSH/GPG agents and deletes the isolated GPG home for\n"
+                "This retires the SSH/GPG agent state and deletes the isolated GPG home for\n"
                 "'%s', removing its on-disk secret-key copy.\n"
                 "Type 'yes' to continue: ", target);
         } else {
             prompt_length = snprintf(
                 confirmation_prompt, sizeof(confirmation_prompt),
-                "This kills ALL gitswitch SSH/GPG agents and deletes ALL isolated GPG\n"
+                "This retires ALL gitswitch SSH/GPG agent state and deletes ALL isolated GPG\n"
                 "homes, removing every on-disk secret-key copy.\n"
                 "Type 'yes' to continue: ");
         }
@@ -3603,10 +3607,10 @@ static command_result_t handle_reset_command(gitswitch_ctx_t *ctx,
             return result;
         }
     } else if (target) {
-        printf("This kills the SSH/GPG agents and deletes the isolated GPG home for\n"
+        printf("This retires the SSH/GPG agent state and deletes the isolated GPG home for\n"
                "'%s', removing its on-disk secret-key copy.\n", target);
     } else {
-        printf("This kills ALL gitswitch SSH/GPG agents and deletes ALL isolated GPG\n"
+        printf("This retires ALL gitswitch SSH/GPG agent state and deletes ALL isolated GPG\n"
                "homes, removing every on-disk secret-key copy.\n");
     }
 
