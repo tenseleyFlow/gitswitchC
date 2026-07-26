@@ -439,16 +439,28 @@ static void test_agent_serve_connection(int fd, int trace_fd,
         }
         case TEST_AGENT_TIMEOUT:
             for (;;) pause();
-        case TEST_AGENT_CLEAR_FAILURE: {
-            static const unsigned char failure[] = {TEST_AGENT_FAILURE};
-            (void)test_agent_write_message(fd, failure, sizeof(failure));
-            return;
-        }
+        case TEST_AGENT_CLEAR_FAILURE:
         case TEST_AGENT_CLEAR_EMPTY:
         case TEST_AGENT_CLEAR_NONEMPTY: {
+            static const unsigned char failure[] = {TEST_AGENT_FAILURE};
             static const unsigned char success[] = {TEST_AGENT_SUCCESS};
-            if (type != TEST_AGENT_REMOVE_ALL_IDENTITIES ||
-                test_agent_write_message(fd, success, sizeof(success)) != 0 ||
+
+            if (type == TEST_AGENT_REQUEST_IDENTITIES) {
+                if (test_agent_write_identities(fd, true) != 0 ||
+                    test_agent_read_request(fd, &type) != 0 ||
+                    test_agent_write_exact(trace_fd, &type,
+                                           sizeof(type)) != 0) {
+                    return;
+                }
+            }
+            if (type != TEST_AGENT_REMOVE_ALL_IDENTITIES) return;
+            if (mode == TEST_AGENT_CLEAR_FAILURE) {
+                (void)test_agent_write_message(
+                    fd, failure, sizeof(failure));
+                return;
+            }
+            if (test_agent_write_message(
+                    fd, success, sizeof(success)) != 0 ||
                 test_agent_read_request(fd, &type) != 0 ||
                 test_agent_write_exact(trace_fd, &type,
                                        sizeof(type)) != 0 ||
@@ -2171,6 +2183,7 @@ static int publish_protocol_sidecar(
 static void exercise_recorded_protocol_retirement(
     const char *stem, ssh_process_generation_kind_t kind,
     test_agent_mode_t mode, bool reset_all, bool expect_success,
+    bool peer_mismatch,
     const unsigned char *expected_trace, size_t expected_trace_size,
     ssh_process_identity_fn identity, int expected_identity_calls,
     const char *expected_error) {
@@ -2200,7 +2213,8 @@ static void exercise_recorded_protocol_retirement(
         return;
     }
     CHECK_EQ_INT(publish_protocol_sidecar(
-                     &fixture, server.pid, kind, &record), 0);
+                     &fixture, peer_mismatch ? server.pid + 1 : server.pid,
+                     kind, &record), 0);
     CHECK_EQ_INT(symlink(fixture.socket, fixture.current), 0);
     CHECK_EQ_INT(capture_artifact_snapshot(
                      fixture.socket, &socket_before), 0);
@@ -2250,7 +2264,12 @@ static void exercise_recorded_protocol_retirement(
 }
 
 TEST(recorded_darwin_and_freebsd_endpoints_clear_then_verify_without_signals) {
-    static const unsigned char expected[] = {
+    static const unsigned char darwin_expected[] = {
+        TEST_AGENT_REQUEST_IDENTITIES,
+        TEST_AGENT_REMOVE_ALL_IDENTITIES,
+        TEST_AGENT_REQUEST_IDENTITIES
+    };
+    static const unsigned char freebsd_expected[] = {
         TEST_AGENT_REMOVE_ALL_IDENTITIES,
         TEST_AGENT_REQUEST_IDENTITIES
     };
@@ -2263,37 +2282,47 @@ TEST(recorded_darwin_and_freebsd_endpoints_clear_then_verify_without_signals) {
         exercise_recorded_protocol_retirement(
             i == 0 ? "gsar14darwinprotocol" : "gsar14freebsdprotocol",
             kinds[i], TEST_AGENT_CLEAR_EMPTY, i != 0, true,
-            expected, sizeof(expected), NULL, -1, NULL);
+            false,
+            i == 0 ? darwin_expected : freebsd_expected,
+            i == 0 ? sizeof(darwin_expected) : sizeof(freebsd_expected),
+            NULL, -1, NULL);
     }
 }
 
 TEST(recorded_endpoint_retries_indeterminate_identity_once_then_retires) {
     static const unsigned char expected[] = {
+        TEST_AGENT_REQUEST_IDENTITIES,
         TEST_AGENT_REMOVE_ALL_IDENTITIES,
         TEST_AGENT_REQUEST_IDENTITIES
     };
     exercise_recorded_protocol_retirement(
         "gsar14identityretry", SSH_PROCESS_GENERATION_DARWIN,
-        TEST_AGENT_CLEAR_EMPTY, false, true, expected, sizeof(expected),
+        TEST_AGENT_CLEAR_EMPTY, false, true, false,
+        expected, sizeof(expected),
         identity_indeterminate_once_then_owned, 3, NULL);
 }
 
 TEST(recorded_endpoint_indeterminate_identity_retains_exact_tuple_and_cause) {
+    static const unsigned char expected[] = {
+        TEST_AGENT_REQUEST_IDENTITIES
+    };
     exercise_recorded_protocol_retirement(
         "gsar14identityindeterminate", SSH_PROCESS_GENERATION_DARWIN,
-        TEST_AGENT_CLEAR_EMPTY, false, false, NULL, 0,
+        TEST_AGENT_CLEAR_EMPTY, false, false, false,
+        expected, sizeof(expected),
         identity_always_indeterminate_counted, 2,
         "process identity outcome INDETERMINATE");
 }
 
 TEST(recorded_endpoint_remove_failure_retains_exact_tuple) {
     static const unsigned char expected[] = {
+        TEST_AGENT_REQUEST_IDENTITIES,
         TEST_AGENT_REMOVE_ALL_IDENTITIES
     };
     exercise_recorded_protocol_retirement(
         "gsar14removefail", SSH_PROCESS_GENERATION_DARWIN,
-        TEST_AGENT_CLEAR_FAILURE, false, false, expected, sizeof(expected),
-        NULL, -1, NULL);
+        TEST_AGENT_CLEAR_FAILURE, false, false, false,
+        expected, sizeof(expected), NULL, -1, NULL);
 }
 
 TEST(recorded_endpoint_nonempty_verification_retains_exact_tuple) {
@@ -2303,8 +2332,32 @@ TEST(recorded_endpoint_nonempty_verification_retains_exact_tuple) {
     };
     exercise_recorded_protocol_retirement(
         "gsar14verifyfull", SSH_PROCESS_GENERATION_FREEBSD,
-        TEST_AGENT_CLEAR_NONEMPTY, false, false, expected, sizeof(expected),
-        NULL, -1, NULL);
+        TEST_AGENT_CLEAR_NONEMPTY, false, false, false,
+        expected, sizeof(expected), NULL, -1, NULL);
+}
+
+TEST(recorded_darwin_preflight_failure_retains_exact_tuple_without_remove) {
+    static const unsigned char expected[] = {
+        TEST_AGENT_REQUEST_IDENTITIES
+    };
+
+    exercise_recorded_protocol_retirement(
+        "gsar14preflightfail", SSH_PROCESS_GENERATION_DARWIN,
+        TEST_AGENT_WRONG_TYPE, false, false, false,
+        expected, sizeof(expected), NULL, 0,
+        "preflight could not be authenticated");
+}
+
+TEST(recorded_darwin_preflight_peer_mismatch_retains_exact_tuple_without_remove) {
+    static const unsigned char expected[] = {
+        TEST_AGENT_REQUEST_IDENTITIES
+    };
+
+    exercise_recorded_protocol_retirement(
+        "gsar14preflightpeer", SSH_PROCESS_GENERATION_DARWIN,
+        TEST_AGENT_CLEAR_EMPTY, false, false, true,
+        expected, sizeof(expected), NULL, 0,
+        "socket peer mismatch");
 }
 
 static void configure_owned_protocol_agent(
@@ -2328,6 +2381,7 @@ static void configure_owned_protocol_agent(
 
 TEST(stop_owned_bsd_endpoint_clears_then_detaches_without_signals) {
     static const unsigned char expected[] = {
+        TEST_AGENT_REQUEST_IDENTITIES,
         TEST_AGENT_REMOVE_ALL_IDENTITIES,
         TEST_AGENT_REQUEST_IDENTITIES
     };
@@ -2482,7 +2536,8 @@ TEST(stop_owned_bsd_endpoint_cleanup_failure_preserves_observable_retry_state) {
 TEST(linux_pidfd_unavailable_never_uses_agent_protocol) {
     exercise_recorded_protocol_retirement(
         "gsar14linuxnoprotocol", SSH_PROCESS_GENERATION_LINUX,
-        TEST_AGENT_CLEAR_EMPTY, false, false, NULL, 0, NULL, -1, NULL);
+        TEST_AGENT_CLEAR_EMPTY, false, false, false,
+        NULL, 0, NULL, -1, NULL);
 }
 
 TEST(pidfd_open_esrch_cleans_exact_tuple_without_numeric_termination) {
@@ -4159,6 +4214,8 @@ TEST_MAIN_BEGIN()
     RUN_TEST(recorded_endpoint_indeterminate_identity_retains_exact_tuple_and_cause);
     RUN_TEST(recorded_endpoint_remove_failure_retains_exact_tuple);
     RUN_TEST(recorded_endpoint_nonempty_verification_retains_exact_tuple);
+    RUN_TEST(recorded_darwin_preflight_failure_retains_exact_tuple_without_remove);
+    RUN_TEST(recorded_darwin_preflight_peer_mismatch_retains_exact_tuple_without_remove);
     RUN_TEST(stop_owned_bsd_endpoint_clears_then_detaches_without_signals);
     RUN_TEST(stop_owned_bsd_endpoint_cleanup_failure_preserves_observable_retry_state);
     RUN_TEST(linux_pidfd_unavailable_never_uses_agent_protocol);

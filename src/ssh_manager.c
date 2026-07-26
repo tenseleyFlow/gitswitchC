@@ -937,6 +937,10 @@ typedef struct {
     uid_t peer_uid;
 } ssh_agent_connection_t;
 
+static int ssh_agent_request_identities(int fd, int64_t deadline,
+                                        uint32_t *identity_count);
+static int ssh_agent_deadline(int64_t *deadline);
+
 static int wait_for_socket_connection(int fd, int timeout_ms) {
     int64_t started;
     int64_t deadline;
@@ -1002,6 +1006,82 @@ static int wait_for_socket_connection(int fd, int timeout_ms) {
         }
         if (errno != EINTR) return -1;
     }
+}
+
+static int capture_socket_peer_credentials(int fd, pid_t *peer_pid,
+                                           uid_t *peer_uid) {
+    if (fd < 0 || !peer_pid || !peer_uid) {
+        errno = EINVAL;
+        return -1;
+    }
+#ifdef __linux__
+    {
+        struct ucred credential;
+        socklen_t credential_size = sizeof(credential);
+
+        if (getsockopt(fd, SOL_SOCKET, SO_PEERCRED, &credential,
+                       &credential_size) != 0) {
+            return -1;
+        }
+        if (credential_size != sizeof(credential) ||
+            credential.pid <= 1) {
+            errno = EPROTO;
+            return -1;
+        }
+        *peer_pid = credential.pid;
+        *peer_uid = credential.uid;
+    }
+#elif defined(__FreeBSD__)
+    {
+        struct xucred credential;
+        socklen_t credential_size = sizeof(credential);
+
+        memset(&credential, 0, sizeof(credential));
+        if (getsockopt(fd, SOL_LOCAL, LOCAL_PEERCRED, &credential,
+                       &credential_size) != 0) {
+            return -1;
+        }
+        if (credential_size != sizeof(credential) ||
+            credential.cr_version != XUCRED_VERSION ||
+            credential.cr_pid <= 1) {
+            errno = EPROTO;
+            return -1;
+        }
+        *peer_pid = credential.cr_pid;
+        *peer_uid = credential.cr_uid;
+    }
+#elif defined(__APPLE__)
+    {
+        uid_t effective_uid;
+        gid_t effective_gid;
+#ifdef LOCAL_PEERPID
+        pid_t process_id = -1;
+        socklen_t process_id_size = sizeof(process_id);
+#endif
+
+        if (getpeereid(fd, &effective_uid, &effective_gid) != 0) return -1;
+        (void)effective_gid;
+#ifdef LOCAL_PEERPID
+        if (getsockopt(fd, SOL_LOCAL, LOCAL_PEERPID, &process_id,
+                       &process_id_size) != 0) {
+            return -1;
+        }
+        if (process_id_size != sizeof(process_id) || process_id <= 1) {
+            errno = EPROTO;
+            return -1;
+        }
+        *peer_pid = process_id;
+        *peer_uid = effective_uid;
+#else
+        errno = ENOTSUP;
+        return -1;
+#endif
+    }
+#else
+    errno = ENOTSUP;
+    return -1;
+#endif
+    return 0;
 }
 
 static int open_socket_peer(const char *socket_arg, int runtime_dir_fd,
@@ -1129,71 +1209,10 @@ static int open_socket_peer(const char *socket_arg, int runtime_dir_fd,
             goto out;
         }
     }
-#ifdef __linux__
-    {
-        struct ucred credential;
-        socklen_t credential_size = sizeof(credential);
-        if (getsockopt(fd, SOL_SOCKET, SO_PEERCRED, &credential,
-                       &credential_size) != 0) {
-            goto out;
-        }
-        if (credential_size != sizeof(credential) ||
-            credential.pid <= 1) {
-            errno = EPROTO;
-            goto out;
-        }
-        connection->peer_pid = credential.pid;
-        connection->peer_uid = credential.uid;
-    }
-#elif defined(__FreeBSD__)
-    {
-        struct xucred credential;
-        socklen_t credential_size = sizeof(credential);
-
-        memset(&credential, 0, sizeof(credential));
-        if (getsockopt(fd, SOL_LOCAL, LOCAL_PEERCRED, &credential,
-                       &credential_size) != 0) {
-            goto out;
-        }
-        if (credential_size != sizeof(credential) ||
-            credential.cr_version != XUCRED_VERSION ||
-            credential.cr_pid <= 1) {
-            errno = EPROTO;
-            goto out;
-        }
-        connection->peer_pid = credential.cr_pid;
-        connection->peer_uid = credential.cr_uid;
-    }
-#elif defined(__APPLE__)
-    {
-        uid_t effective_uid;
-        gid_t effective_gid;
-#ifdef LOCAL_PEERPID
-        pid_t process_id = -1;
-        socklen_t process_id_size = sizeof(process_id);
-#endif
-        if (getpeereid(fd, &effective_uid, &effective_gid) != 0) goto out;
-        (void)effective_gid;
-#ifdef LOCAL_PEERPID
-        if (getsockopt(fd, SOL_LOCAL, LOCAL_PEERPID, &process_id,
-                       &process_id_size) != 0) {
-            goto out;
-        }
-        if (process_id_size != sizeof(process_id) || process_id <= 1) {
-            errno = EPROTO;
-            goto out;
-        }
-        connection->peer_pid = process_id;
-        connection->peer_uid = effective_uid;
-#else
-        errno = ENOTSUP;
+    if (capture_socket_peer_credentials(
+            fd, &connection->peer_pid, &connection->peer_uid) != 0) {
         goto out;
-#endif
     }
-#else
-    errno = ENOTSUP;
-    goto out;
-#endif
     connection->fd = fd;
     fd = -1;
     rc = 0;
@@ -1209,6 +1228,10 @@ out:
 static int inspect_socket_peer(const char *socket_arg, int runtime_dir_fd,
                                pid_t *peer_pid, uid_t *peer_uid) {
     ssh_agent_connection_t connection;
+#ifdef __APPLE__
+    uint32_t identity_count;
+    int64_t deadline;
+#endif
     int rc;
 
     if (!peer_pid || !peer_uid) {
@@ -1217,6 +1240,19 @@ static int inspect_socket_peer(const char *socket_arg, int runtime_dir_fd,
     }
     rc = open_socket_peer(socket_arg, runtime_dir_fd, &connection);
     if (rc != 0) return -1;
+#ifdef __APPLE__
+    if (ssh_agent_deadline(&deadline) != 0 ||
+        ssh_agent_request_identities(
+            connection.fd, deadline, &identity_count) != 0 ||
+        capture_socket_peer_credentials(
+            connection.fd, &connection.peer_pid,
+            &connection.peer_uid) != 0) {
+        int saved_errno = errno;
+        close(connection.fd);
+        errno = saved_errno;
+        return -1;
+    }
+#endif
     *peer_pid = connection.peer_pid;
     *peer_uid = connection.peer_uid;
     if (close(connection.fd) != 0) return -1;
@@ -10215,6 +10251,7 @@ static int retire_recorded_agent_endpoint(
     ssh_agent_connection_t connection;
     ssh_process_outcome_t process_outcome;
     uint32_t identity_count;
+    int64_t preflight_deadline;
     int64_t deadline;
     int rc = -1;
 
@@ -10245,6 +10282,22 @@ static int retire_recorded_agent_endpoint(
             "retained for retry: %s",
             socket_path);
         goto out;
+    }
+    if (record->generation.kind == SSH_PROCESS_GENERATION_DARWIN) {
+        if (ssh_agent_deadline(&preflight_deadline) != 0 ||
+            ssh_agent_request_identities(
+                connection.fd, preflight_deadline,
+                &identity_count) != 0 ||
+            capture_socket_peer_credentials(
+                connection.fd, &connection.peer_pid,
+                &connection.peer_uid) != 0) {
+            set_system_error(
+                ERR_SSH_AGENT_FAILED,
+                "Recorded Darwin SSH endpoint preflight could not be "
+                "authenticated; retained for retry: %s",
+                socket_path);
+            goto out;
+        }
     }
     if (connection.peer_pid != record->image.socket_peer_pid ||
         connection.peer_uid != record->image.socket_peer_uid ||
