@@ -104,6 +104,50 @@ static int setup_empty_runtime_dir(void) {
     return setenv("XDG_RUNTIME_DIR", g_xdg, 1);
 }
 
+static int capture_accounts_switch_output(gitswitch_ctx_t *ctx,
+                                          const char *account_name,
+                                          char *output,
+                                          size_t output_size,
+                                          int *switch_result) {
+    FILE *capture;
+    int saved_stdout;
+    int restore_result;
+    size_t length;
+
+    if (!ctx || !account_name || !output || output_size == 0U ||
+        !switch_result) {
+        return -1;
+    }
+    capture = tmpfile();
+    if (!capture) return -1;
+    saved_stdout = dup(STDOUT_FILENO);
+    if (saved_stdout < 0 || fflush(stdout) != 0) {
+        if (saved_stdout >= 0) close(saved_stdout);
+        fclose(capture);
+        return -1;
+    }
+    if (dup2(fileno(capture), STDOUT_FILENO) != STDOUT_FILENO) {
+        close(saved_stdout);
+        fclose(capture);
+        return -1;
+    }
+
+    *switch_result = accounts_switch(ctx, account_name);
+    if (fflush(stdout) != 0) {
+        (void)dup2(saved_stdout, STDOUT_FILENO);
+        close(saved_stdout);
+        fclose(capture);
+        return -1;
+    }
+    restore_result = dup2(saved_stdout, STDOUT_FILENO);
+    close(saved_stdout);
+    rewind(capture);
+    length = fread(output, 1, output_size - 1U, capture);
+    output[length] = '\0';
+    fclose(capture);
+    return restore_result == STDOUT_FILENO ? 0 : -1;
+}
+
 /* Runtime locks are process-scoped on some supported kernels, so a fresh
  * child is the authoritative probe that a failed preparation did not retain
  * the cross-manager lock. */
@@ -381,6 +425,7 @@ static int g_deadlined_nonprobe_commands;
 static int64_t g_ssh_probe_deadline;
 static bool g_fail_ssh_probe;
 static bool g_timeout_ssh_probe;
+static bool g_spawn_fail_ssh_probe;
 static char g_ssh_probe_target[MAX_NAME_LEN + sizeof("git@")];
 static char g_ssh_probe_hostname[sizeof("HostName=") + MAX_NAME_LEN];
 static gitswitch_ctx_t *g_probe_expected_ctx;
@@ -992,13 +1037,18 @@ static int ssh_git_runner(const char *const argv[], const run_opts_t *opts,
             ssh_probe_observes_committed_switch();
         if (result) {
             memset(result, 0, sizeof(*result));
-            result->spawned = true;
+            result->spawned = !g_spawn_fail_ssh_probe;
             result->exit_code =
-                (g_fail_ssh_probe || g_timeout_ssh_probe) ? 255 : 1;
+                g_spawn_fail_ssh_probe
+                    ? -1
+                    : (g_fail_ssh_probe || g_timeout_ssh_probe) ? 255 : 1;
             result->timed_out = g_timeout_ssh_probe;
         }
         if (opts && opts->out && opts->out_size > 0) {
-            if (g_fail_ssh_probe || g_timeout_ssh_probe) {
+            if (g_fail_ssh_probe) {
+                snprintf(opts->out, opts->out_size,
+                         "git@github.com: Permission denied (publickey).");
+            } else if (g_timeout_ssh_probe || g_spawn_fail_ssh_probe) {
                 opts->out[0] = '\0';
             } else {
                 snprintf(opts->out, opts->out_size,
@@ -1007,13 +1057,18 @@ static int ssh_git_runner(const char *const argv[], const run_opts_t *opts,
             }
             if (result) result->out_len = strlen(opts->out);
         }
-        if (g_fail_ssh_probe || g_timeout_ssh_probe) {
+        if (g_fail_ssh_probe || g_timeout_ssh_probe ||
+            g_spawn_fail_ssh_probe) {
             g_probe_failure_pending_observation = true;
-            errno = g_timeout_ssh_probe ? ETIMEDOUT : EIO;
+            errno = g_timeout_ssh_probe
+                        ? ETIMEDOUT
+                        : g_spawn_fail_ssh_probe ? ENOENT : EACCES;
             set_system_error(ERR_SYSTEM_COMMAND_FAILED,
                              g_timeout_ssh_probe
                                  ? "Injected SSH connection probe timeout"
-                                 : "Injected SSH connection probe failure");
+                                 : g_spawn_fail_ssh_probe
+                                       ? "Injected SSH probe spawn failure"
+                                       : "Injected SSH authentication failure");
             return -1;
         }
         return 0;
@@ -1319,6 +1374,7 @@ static void seed_previous_git_identity(void) {
     g_ssh_probe_deadline = -1;
     g_fail_ssh_probe = false;
     g_timeout_ssh_probe = false;
+    g_spawn_fail_ssh_probe = false;
     g_ssh_probe_target[0] = '\0';
     g_ssh_probe_hostname[0] = '\0';
     g_probe_expected_ctx = NULL;
@@ -2462,6 +2518,7 @@ TEST(prepared_verbose_fresh_switch_runs_one_default_probe) {
 TEST(failed_postcommit_probe_preserves_switch_and_diagnostic) {
     static const char original[] = "Host personal\n  User old\n";
     char home[600], saved_home[4096], config_path[700], after[4096];
+    char output[4096];
     gitswitch_ctx_t ctx;
     command_runner_fn previous_runner;
     const error_context_t *observed_error;
@@ -2485,11 +2542,17 @@ TEST(failed_postcommit_probe_preserves_switch_and_diagnostic) {
     clear_error();
     errno = 0;
     previous_runner = run_set_runner(ssh_git_runner);
-    rc = accounts_switch(&ctx, "testacct");
+    CHECK_EQ_INT(capture_accounts_switch_output(
+                     &ctx, "testacct", output, sizeof(output), &rc),
+                 0);
     observed_error = get_last_error();
     observed_errno = errno;
 
     CHECK_EQ_INT(rc, 0);
+    CHECK(strstr(output,
+                 "SSH connection could not be verified (github.com-tgt)") !=
+          NULL);
+    CHECK(strstr(output, "unreachable") == NULL);
     CHECK_EQ_INT(g_ssh_connection_probes, 1);
     CHECK_EQ_INT(g_ssh_alias_probes, 1);
     CHECK_EQ_INT(g_ssh_default_probes, 0);
@@ -2531,6 +2594,52 @@ TEST(failed_postcommit_probe_preserves_switch_and_diagnostic) {
     CHECK_EQ_INT(accounts_session_cleanup(), 0);
     run_set_runner(previous_runner);
     CHECK_EQ_INT(setenv("HOME", saved_home, 1), 0);
+}
+
+TEST(postcommit_probe_failure_messages_are_cause_neutral) {
+    static const char original[] = "Host personal\n  User old\n";
+    static const char *const causes[] = {
+        "timeout",
+        "authentication",
+        "spawn",
+    };
+    size_t i;
+
+    if (!ssh_probe_fixture_available()) {
+        TS_SKIP("openssh", "SSH command fixture prerequisites unavailable");
+    }
+    for (i = 0U; i < sizeof(causes) / sizeof(causes[0]); i++) {
+        char home[600], saved_home[4096], config_path[700], output[4096];
+        gitswitch_ctx_t ctx;
+        command_runner_fn previous_runner;
+        int rc;
+
+        CHECK_EQ_INT(setup_empty_runtime_dir(), 0);
+        CHECK_EQ_INT(setup_alias_config_file(
+                         home, sizeof(home), saved_home, sizeof(saved_home),
+                         config_path, sizeof(config_path), original), 0);
+        ctx = make_ctx();
+        CHECK_EQ_INT(enable_switch_target_ssh(&ctx, "github.com-tgt"), 0);
+        seed_previous_git_identity();
+        g_timeout_ssh_probe = strcmp(causes[i], "timeout") == 0;
+        g_fail_ssh_probe = strcmp(causes[i], "authentication") == 0;
+        g_spawn_fail_ssh_probe = strcmp(causes[i], "spawn") == 0;
+        previous_runner = run_set_runner(ssh_git_runner);
+
+        CHECK_EQ_INT(capture_accounts_switch_output(
+                         &ctx, "testacct", output, sizeof(output), &rc),
+                     0);
+        CHECK_EQ_INT(rc, 0);
+        CHECK(strstr(
+                  output,
+                  "SSH connection could not be verified (github.com-tgt)") !=
+              NULL);
+        CHECK(strstr(output, "unreachable") == NULL);
+
+        CHECK_EQ_INT(accounts_session_cleanup(), 0);
+        run_set_runner(previous_runner);
+        CHECK_EQ_INT(setenv("HOME", saved_home, 1), 0);
+    }
 }
 
 /* Each existing policy exclusion gets an independent full-switch witness.
@@ -5889,6 +5998,7 @@ TEST_MAIN_BEGIN()
     RUN_TEST(fresh_alias_switch_runs_one_postcommit_probe);
     RUN_TEST(prepared_verbose_fresh_switch_runs_one_default_probe);
     RUN_TEST(failed_postcommit_probe_preserves_switch_and_diagnostic);
+    RUN_TEST(postcommit_probe_failure_messages_are_cause_neutral);
     RUN_TEST(postcommit_probe_policy_skip_matrix);
     RUN_TEST(reused_agent_skips_postcommit_probe);
     RUN_TEST(pending_postcommit_signal_skips_ssh_probe);

@@ -254,6 +254,29 @@ TEST(deadline_timeout_rejects_otherwise_valid_authentication) {
     run_set_runner(previous);
 }
 
+TEST(timeout_authentication_and_spawn_failures_share_failure_result) {
+    static const char greeting[] =
+        "Hi intended-user! You've successfully authenticated, but GitHub "
+        "does not provide shell access.";
+    account_t account;
+    command_runner_fn previous;
+
+    make_account(&account, false);
+    previous = run_set_runner(connection_runner);
+
+    CHECK_EQ_INT(scripted_deadline_probe(&account, "git@github.com",
+                                         INT64_C(42), greeting, 1, true),
+                 -1);
+    CHECK_EQ_INT(scripted_probe(
+                     &account,
+                     "git@github.com: Permission denied (publickey).",
+                     255, 0, true, false),
+                 -1);
+    CHECK_EQ_INT(scripted_probe(&account, "", -1, 0, false, false), -1);
+
+    run_set_runner(previous);
+}
+
 TEST(deadline_probe_rejects_negative_deadline_without_running_ssh) {
     account_t account;
     command_runner_fn previous;
@@ -696,6 +719,7 @@ TEST_MAIN_BEGIN()
     RUN_TEST(deadline_probe_propagates_exact_absolute_deadline);
     RUN_TEST(public_probe_remains_unbounded);
     RUN_TEST(deadline_timeout_rejects_otherwise_valid_authentication);
+    RUN_TEST(timeout_authentication_and_spawn_failures_share_failure_result);
     RUN_TEST(deadline_probe_rejects_negative_deadline_without_running_ssh);
     RUN_TEST(direct_probe_offers_only_the_intended_account_key);
     RUN_TEST(managed_alias_probe_pins_git_user_destination_and_config);

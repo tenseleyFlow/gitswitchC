@@ -1080,7 +1080,7 @@ static void finish_switch_success(gitswitch_ctx_t *ctx, account_t *account,
                 printf("  [OK] SSH connection verified (%s)\n",
                        account->ssh_host_alias);
             } else {
-                printf("  [--] SSH connection test skipped (%s unreachable)\n",
+                printf("  [--] SSH connection could not be verified (%s)\n",
                        account->ssh_host_alias);
             }
         } else if (ctx->config.verbose &&
