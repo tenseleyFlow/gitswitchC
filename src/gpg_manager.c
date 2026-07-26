@@ -2007,7 +2007,7 @@ static void gpg_encode_generation_bytes(const unsigned char bytes[33],
     size_t input = 0U;
     size_t output = 0U;
 
-    while (input < 33U) {
+    while (input + 2U < 33U) {
         uint32_t value = ((uint32_t)bytes[input] << 16U) |
                          ((uint32_t)bytes[input + 1U] << 8U) |
                          bytes[input + 2U];
