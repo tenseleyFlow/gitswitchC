@@ -77,6 +77,8 @@ static bool toml_bool_object_value(const bool *object, bool *value);
 static bool toml_canonical_integer(const char *value, int *parsed);
 static bool toml_canonical_boolean(const char *value, bool *parsed);
 static bool toml_same_file(const struct stat *left, const struct stat *right);
+static bool toml_same_file_generation(const struct stat *left,
+                                      const struct stat *right);
 static bool toml_temp_identity_is_private(const struct stat *identity);
 static toml_document_init_hook_fn g_document_init_hook;
 static toml_writer_test_hook_fn g_writer_test_hook;
@@ -172,7 +174,7 @@ void toml_init_document(toml_document_t *doc) {
 /* Parse TOML from file with comprehensive security validation */
 int toml_parse_file(const char *file_path, toml_document_t *doc) {
     FILE *file = NULL;
-    struct stat path_stat, file_stat;
+    struct stat path_stat, file_stat, path_after, file_after;
     char *buffer = NULL;
     size_t file_size = 0;
     size_t bytes_read;
@@ -279,11 +281,58 @@ int toml_parse_file(const char *file_path, toml_document_t *doc) {
     if (!buffer) {
         goto cleanup;
     }
+
+    if (g_metadata_test_hook) {
+        (void)g_metadata_test_hook(TOML_METADATA_TEST_FILE_BEFORE_READ);
+    }
     
     /* Read file content */
+    errno = 0;
     bytes_read = fread(buffer, 1, file_size, file);
     if (bytes_read != file_size) {
-        set_system_error(ERR_FILE_IO, "Failed to read complete config file: %s", file_path);
+        if (ferror(file)) {
+            if (errno == 0) errno = EIO;
+            set_system_error(ERR_FILE_IO,
+                             "Failed to read complete config file: %s",
+                             file_path);
+        } else {
+            errno = ESTALE;
+            set_system_error(ERR_FILE_IO,
+                             "Configuration file shrank while being read: %s",
+                             file_path);
+        }
+        goto cleanup;
+    }
+    if (fgetc(file) != EOF) {
+        errno = ESTALE;
+        set_system_error(ERR_FILE_IO,
+                         "Configuration file grew while being read: %s",
+                         file_path);
+        goto cleanup;
+    }
+    if (ferror(file)) {
+        set_system_error(ERR_FILE_IO,
+                         "Failed to verify end of config file: %s",
+                         file_path);
+        goto cleanup;
+    }
+
+    if (g_metadata_test_hook) {
+        (void)g_metadata_test_hook(TOML_METADATA_TEST_FILE_AFTER_READ);
+    }
+    if (fstat(fileno(file), &file_after) != 0 ||
+        lstat(file_path, &path_after) != 0) {
+        set_system_error(ERR_FILE_IO,
+                         "Failed to revalidate config file after read: %s",
+                         file_path);
+        goto cleanup;
+    }
+    if (!toml_same_file_generation(&file_stat, &file_after) ||
+        !toml_same_file_generation(&file_after, &path_after)) {
+        errno = ESTALE;
+        set_system_error(ERR_FILE_IO,
+                         "Configuration file changed while being read: %s",
+                         file_path);
         goto cleanup;
     }
     
@@ -2751,6 +2800,27 @@ cleanup:
 static bool toml_same_file(const struct stat *left, const struct stat *right) {
     return left && right && left->st_dev == right->st_dev &&
            left->st_ino == right->st_ino;
+}
+
+static bool toml_same_file_generation(const struct stat *left,
+                                      const struct stat *right) {
+    if (!toml_same_file(left, right) || left->st_mode != right->st_mode ||
+        left->st_uid != right->st_uid || left->st_gid != right->st_gid ||
+        left->st_nlink != right->st_nlink ||
+        left->st_size != right->st_size) {
+        return false;
+    }
+#if defined(__APPLE__) || defined(__FreeBSD__)
+    return left->st_mtimespec.tv_sec == right->st_mtimespec.tv_sec &&
+           left->st_mtimespec.tv_nsec == right->st_mtimespec.tv_nsec &&
+           left->st_ctimespec.tv_sec == right->st_ctimespec.tv_sec &&
+           left->st_ctimespec.tv_nsec == right->st_ctimespec.tv_nsec;
+#else
+    return left->st_mtim.tv_sec == right->st_mtim.tv_sec &&
+           left->st_mtim.tv_nsec == right->st_mtim.tv_nsec &&
+           left->st_ctim.tv_sec == right->st_ctim.tv_sec &&
+           left->st_ctim.tv_nsec == right->st_ctim.tv_nsec;
+#endif
 }
 
 static bool toml_named_directory_matches(const char *dir_path,
