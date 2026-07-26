@@ -393,6 +393,18 @@ static bool fk_touch(const char *path) {
     return true;
 }
 
+static bool fk_write_executable_stub(const char *path) {
+    static const char body[] = "#!/bin/sh\nexit 0\n";
+    FILE *file = fopen(path, "w");
+    int write_result;
+    int close_result;
+
+    if (!file) return false;
+    write_result = fputs(body, file);
+    close_result = fclose(file);
+    return write_result >= 0 && close_result == 0 && chmod(path, 0700) == 0;
+}
+
 TEST(git_configure_ssh_rejects_single_quote_in_keypath) {
     char dir[64];
     char quote_path[512], dquote_path[512], newline_path[512], ok_path[512];
@@ -2446,7 +2458,7 @@ TEST(retire_leaves_foreign_ssh_command_in_place) {
 }
 
 TEST(published_ssh_retirement_uses_saved_command_after_program_removal) {
-    char root[MAX_PATH_LEN] = "/tmp/gsw-retire-published-ssh-XXXXXX";
+    char root[MAX_PATH_LEN] = "";
     char program[MAX_PATH_LEN];
     char command[GIT_CONFIG_VALUE_MAX];
     char *saved_path = NULL;
@@ -2455,31 +2467,53 @@ TEST(published_ssh_retirement_uses_saved_command_after_program_removal) {
     publication_record_t publication;
     command_runner_fn previous;
     size_t cleared = 99;
+    bool root_created = false;
+    bool path_changed = false;
+    int result;
 
     if (path_before) {
         saved_path = strdup(path_before);
         CHECK(saved_path != NULL);
-        if (!saved_path) return;
+        if (!saved_path) goto cleanup;
     }
-    CHECK(ts_mkdtemp(root) != NULL);
-    CHECK_EQ_INT(safe_snprintf(program, sizeof(program), "%s/ssh", root), 0);
-    CHECK(fk_touch(program));
-    CHECK_EQ_INT(chmod(program, 0700), 0);
-    CHECK_EQ_INT(safe_snprintf(
-                     command, sizeof(command),
-                     "'%s' -i '/historical/key' -F '/dev/null' "
-                     "-o IdentitiesOnly=yes",
-                     program), 0);
+    if (!ts_mkdtemp_trusted(root, sizeof(root),
+                            "gsw-retire-published-ssh")) {
+        CHECK(false);
+        goto cleanup;
+    }
+    root_created = true;
+    result = safe_snprintf(program, sizeof(program), "%s/ssh", root);
+    CHECK_EQ_INT(result, 0);
+    if (result != 0) goto cleanup;
+    if (!fk_write_executable_stub(program)) {
+        CHECK(false);
+        goto cleanup;
+    }
+    result = setenv("PATH", root, 1);
+    CHECK_EQ_INT(result, 0);
+    if (result != 0) goto cleanup;
+    path_changed = true;
 
     git_ops_test_reset_caches();
     fk_reset();
-    retire_fill_account(&acct, "/edited/account/key");
+    retire_fill_account(&acct, "/historical/key");
+    result = git_expected_ssh_command(&acct, command, sizeof(command));
+    CHECK_EQ_INT(result, 0);
+    if (result != 0) goto cleanup;
     retire_fill_ssh_publication(&publication, &acct, command, program);
+    result = safe_strncpy(acct.ssh_key_path, "/edited/account/key",
+                          sizeof(acct.ssh_key_path));
+    CHECK_EQ_INT(result, 0);
+    if (result != 0) goto cleanup;
     acct.gpg_enabled = false;
     acct.gpg_signing_enabled = false;
     acct.gpg_key_id[0] = '\0';
-    CHECK_EQ_INT(unlink(program), 0);
-    CHECK_EQ_INT(setenv("PATH", "/definitely/not/present", 1), 0);
+    result = unlink(program);
+    CHECK_EQ_INT(result, 0);
+    if (result != 0) goto cleanup;
+    result = setenv("PATH", "/definitely/not/present", 1);
+    CHECK_EQ_INT(result, 0);
+    if (result != 0) goto cleanup;
     fk_seed("--global", GIT_CONFIG_CORE_SSHCOMMAND, command);
 
     previous = run_set_runner(fake_git_runner);
@@ -2502,48 +2536,90 @@ TEST(published_ssh_retirement_uses_saved_command_after_program_removal) {
     CHECK_EQ_INT((int)cleared, 0);
     CHECK(fk_find("--global", GIT_CONFIG_CORE_SSHCOMMAND) >= 0);
 
-    if (saved_path) CHECK_EQ_INT(setenv("PATH", saved_path, 1), 0);
-    else CHECK_EQ_INT(unsetenv("PATH"), 0);
+cleanup:
+    if (path_changed) {
+        result = saved_path ? setenv("PATH", saved_path, 1)
+                            : unsetenv("PATH");
+        CHECK_EQ_INT(result, 0);
+    }
     free(saved_path);
-    ts_rm_rf(root);
+    git_ops_test_reset_caches();
+    if (root_created) ts_rm_rf(root);
 }
 
 TEST(published_ssh_retirement_ignores_current_global_override) {
-    char program_root[MAX_PATH_LEN] = "/tmp/gsw-retire-ssh-program-XXXXXX";
+    char program_root[MAX_PATH_LEN] = "";
     char program[MAX_PATH_LEN];
     char command[GIT_CONFIG_VALUE_MAX];
     char foreign_config[MAX_PATH_LEN];
+    char *saved_path = NULL;
+    const char *path_before = getenv("PATH");
     account_t acct;
     publication_record_t publication;
     command_runner_fn previous;
     size_t cleared = 99;
     int fd = -1;
+    int result;
+    bool root_created = false;
+    bool path_changed = false;
+    bool global_config_changed = false;
 
-    CHECK(ts_mkdtemp(program_root) != NULL);
-    CHECK_EQ_INT(safe_snprintf(program, sizeof(program), "%s/ssh",
-                               program_root), 0);
-    CHECK(fk_touch(program));
-    CHECK_EQ_INT(chmod(program, 0700), 0);
-    CHECK_EQ_INT(safe_snprintf(command, sizeof(command),
-                               "'%s' -i '/historical/key'", program), 0);
+    if (path_before) {
+        saved_path = strdup(path_before);
+        CHECK(saved_path != NULL);
+        if (!saved_path) goto cleanup;
+    }
+    if (!ts_mkdtemp_trusted(program_root, sizeof(program_root),
+                            "gsw-retire-ssh-program")) {
+        CHECK(false);
+        goto cleanup;
+    }
+    root_created = true;
+    result = safe_snprintf(program, sizeof(program), "%s/ssh", program_root);
+    CHECK_EQ_INT(result, 0);
+    if (result != 0) goto cleanup;
+    if (!fk_write_executable_stub(program)) {
+        CHECK(false);
+        goto cleanup;
+    }
+    result = setenv("PATH", program_root, 1);
+    CHECK_EQ_INT(result, 0);
+    if (result != 0) goto cleanup;
+    path_changed = true;
 
     git_ops_test_reset_caches();
     fk_reset();
-    retire_fill_account(&acct, "/current/key");
+    retire_fill_account(&acct, "/historical/key");
+    result = git_expected_ssh_command(&acct, command, sizeof(command));
+    CHECK_EQ_INT(result, 0);
+    if (result != 0) goto cleanup;
     retire_fill_ssh_publication(&publication, &acct, command, program);
+    result = safe_strncpy(acct.ssh_key_path, "/current/key",
+                          sizeof(acct.ssh_key_path));
+    CHECK_EQ_INT(result, 0);
+    if (result != 0) goto cleanup;
     acct.gpg_enabled = false;
     acct.gpg_signing_enabled = false;
     acct.gpg_key_id[0] = '\0';
-    CHECK_EQ_INT(safe_snprintf(foreign_config, sizeof(foreign_config),
-                               "%s/foreign-config-XXXXXX",
-                               retire_global_root), 0);
+    result = safe_snprintf(foreign_config, sizeof(foreign_config),
+                           "%s/foreign-config-XXXXXX",
+                           retire_global_root);
+    CHECK_EQ_INT(result, 0);
+    if (result != 0) goto cleanup;
     fd = mkstemp(foreign_config);
     CHECK(fd >= 0);
     if (fd < 0) goto cleanup;
-    CHECK_EQ_INT(close(fd), 0);
+    result = close(fd);
+    CHECK_EQ_INT(result, 0);
+    if (result != 0) goto cleanup;
     fd = -1;
-    CHECK_EQ_INT(chmod(foreign_config, 0600), 0);
-    CHECK_EQ_INT(setenv("GIT_CONFIG_GLOBAL", foreign_config, 1), 0);
+    result = chmod(foreign_config, 0600);
+    CHECK_EQ_INT(result, 0);
+    if (result != 0) goto cleanup;
+    result = setenv("GIT_CONFIG_GLOBAL", foreign_config, 1);
+    CHECK_EQ_INT(result, 0);
+    if (result != 0) goto cleanup;
+    global_config_changed = true;
     git_ops_test_reset_caches();
     fk_seed("--global", GIT_CONFIG_CORE_SSHCOMMAND, command);
 
@@ -2559,9 +2635,17 @@ TEST(published_ssh_retirement_ignores_current_global_override) {
 
 cleanup:
     if (fd >= 0) CHECK_EQ_INT(close(fd), 0);
-    CHECK_EQ_INT(setenv("GIT_CONFIG_GLOBAL", retire_global_config, 1), 0);
+    if (global_config_changed) {
+        CHECK_EQ_INT(setenv("GIT_CONFIG_GLOBAL", retire_global_config, 1), 0);
+    }
+    if (path_changed) {
+        result = saved_path ? setenv("PATH", saved_path, 1)
+                            : unsetenv("PATH");
+        CHECK_EQ_INT(result, 0);
+    }
+    free(saved_path);
     git_ops_test_reset_caches();
-    ts_rm_rf(program_root);
+    if (root_created) ts_rm_rf(program_root);
 }
 
 TEST(signing_key_identity_requires_exact_canonical_fingerprint) {
