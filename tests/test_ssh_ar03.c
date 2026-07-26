@@ -59,6 +59,7 @@ static char g_xdg[64]; /* short: socket paths must fit sun_path (~108) */
 static int  g_agent_start_attempts;   /* execs of ssh-agent */
 static bool g_agent_argv_had_dash_s;  /* H1: -s present in the spawn argv */
 static char g_first_probe[32];        /* L18: first ssh-add/ssh-keygen exec */
+#if defined(__linux__)
 static ssh_process_image_t g_l29_image;
 static int g_l29_denied_errno;
 static ssh_process_generation_t g_l29_observed_generation;
@@ -108,6 +109,7 @@ static int l29_wrong_generation(
     *generation = g_l29_observed_generation;
     return 0;
 }
+#endif
 
 /* Find "-a <path>" wherever it sits in argv: the H1 fix inserts -s ahead of
  * it, so fakes must not assume a fixed position (and pre-fix argv still
@@ -179,6 +181,7 @@ static int make_xdg_agent_dir(char *dir_out, size_t size) {
     return mkdir(dir_out, 0700);
 }
 
+#if defined(__linux__)
 static int write_live_agent_record(const char *dir, const char *name,
                                    pid_t pid) {
     ssh_agent_record_t record = {.pid = pid};
@@ -195,6 +198,7 @@ static int write_live_agent_record(const char *dir, const char *name,
     if (close(dir_fd) != 0) rc = -1;
     return rc;
 }
+#endif
 
 static int make_account(account_t *a, const char *key_basename) {
     static const char private_prefix[] =
