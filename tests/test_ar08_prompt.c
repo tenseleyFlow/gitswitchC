@@ -15,6 +15,7 @@
 
 #include <signal.h>
 #include <sys/wait.h>
+#include <time.h>
 
 #ifdef HAVE_READLINE
 #include <readline/readline.h>
@@ -27,17 +28,65 @@ typedef struct {
 
 #ifdef HAVE_READLINE
 static int g_readline_fault_fd = -1;
+static int g_readline_fault_calls;
+static int g_readline_fault_errno;
 
 static int readline_pty_error_getc(FILE *stream) {
     unsigned char byte;
     ssize_t count;
 
     (void)stream;
+    g_readline_fault_calls++;
     do {
         count = read(g_readline_fault_fd, &byte, 1);
     } while (count < 0 && errno == EINTR);
     if (count == 1) return byte;
-    return EOF;
+    g_readline_fault_errno = count < 0 ? errno : 0;
+    return count == 0 ? EOF : READERR;
+}
+
+static void drain_readline_master(int master) {
+    char discarded[256];
+
+    for (int reads = 0; reads < 16; reads++) {
+        ssize_t count = read(master, discarded, sizeof(discarded));
+
+        if (count > 0) continue;
+        if (count < 0 && errno == EINTR) {
+            reads--;
+            continue;
+        }
+        break;
+    }
+}
+
+static bool reap_readline_child_within(pid_t child, int master,
+                                       int timeout_ms, int *status_out) {
+    const struct timespec pause = {.tv_sec = 0, .tv_nsec = 10000000L};
+    int flags = fcntl(master, F_GETFL);
+
+    if (flags < 0 || fcntl(master, F_SETFL, flags | O_NONBLOCK) != 0) {
+        (void)kill(child, SIGKILL);
+        while (waitpid(child, NULL, 0) < 0 && errno == EINTR) {}
+        return false;
+    }
+
+    for (int elapsed = 0; elapsed <= timeout_ms; elapsed += 10) {
+        int status = 0;
+        pid_t waited = waitpid(child, &status, WNOHANG);
+
+        drain_readline_master(master);
+        if (waited == child) {
+            if (status_out) *status_out = status;
+            return true;
+        }
+        if (waited < 0 && errno != EINTR) break;
+        (void)nanosleep(&pause, NULL);
+    }
+
+    (void)kill(child, SIGKILL);
+    while (waitpid(child, NULL, 0) < 0 && errno == EINTR) {}
+    return false;
 }
 #endif
 
@@ -494,9 +543,10 @@ TEST(input_error_is_distinct_from_eof) {
 #ifdef HAVE_READLINE
 /* AR-14 L40: both standard streams are a PTY, so prompt_line must enter GNU
  * readline rather than its redirected-stdio fallback. Readline's input
- * callback performs a real read(2) from a write-only descriptor for that same
- * PTY, deterministically producing EBADF without relying on platform-specific
- * PTY-hangup EOF/EIO behavior. */
+ * callback performs a real read(2) from the result pipe's write-only endpoint,
+ * deterministically producing EBADF without relying on platform-specific PTY
+ * hangup behavior. The parent drains the PTY while Readline restores termios:
+ * FreeBSD may otherwise wait for unread slave output during TCSADRAIN. */
 TEST(readline_pty_input_error_is_distinct_from_eof) {
     typedef struct {
         int result;
@@ -504,6 +554,8 @@ TEST(readline_pty_input_error_is_distinct_from_eof) {
         int buffer_empty;
         int stdin_is_tty;
         int stdout_is_tty;
+        int callback_calls;
+        int callback_errno;
     } readline_error_result_t;
 
     readline_error_result_t observed = {0};
@@ -548,16 +600,25 @@ TEST(readline_pty_input_error_is_distinct_from_eof) {
         clearerr(stdout);
         observed.stdin_is_tty = isatty(STDIN_FILENO);
         observed.stdout_is_tty = isatty(STDOUT_FILENO);
-        g_readline_fault_fd = open(slave_name, O_WRONLY | O_NOCTTY);
-        if (g_readline_fault_fd < 0) _exit(3);
+        if (setenv("TERM", "dumb", 1) != 0 ||
+            setenv("INPUTRC", "/dev/null", 1) != 0) {
+            _exit(3);
+        }
+        rl_instream = stdin;
+        rl_outstream = stdout;
+        rl_catch_signals = 0;
+        rl_catch_sigwinch = 0;
+        if (rl_initialize() != 0) _exit(3);
+        g_readline_fault_fd = result_pipe[1];
+        g_readline_fault_calls = 0;
+        g_readline_fault_errno = 0;
         rl_getc_function = readline_pty_error_getc;
-        alarm(3);
         errno = 0;
         observed.result = prompt_line("", buffer, sizeof(buffer), false);
         observed.saved_errno = errno;
         observed.buffer_empty = buffer[0] == '\0';
-        alarm(0);
-        close(g_readline_fault_fd);
+        observed.callback_calls = g_readline_fault_calls;
+        observed.callback_errno = g_readline_fault_errno;
         g_readline_fault_fd = -1;
 
         while (written < sizeof(observed)) {
@@ -575,6 +636,9 @@ TEST(readline_pty_input_error_is_distinct_from_eof) {
 
     close(result_pipe[1]);
     result_pipe[1] = -1;
+    bool reaped =
+        reap_readline_child_within(child, master, 3000, &status);
+    child = -1;
     while (result_used < sizeof(observed)) {
         ssize_t count = read(
             result_pipe[0], (char *)&observed + result_used,
@@ -584,14 +648,17 @@ TEST(readline_pty_input_error_is_distinct_from_eof) {
         if (count <= 0) break;
         result_used += (size_t)count;
     }
-    CHECK_EQ_INT(waitpid(child, &status, 0), child);
-    child = -1;
-    CHECK(WIFEXITED(status));
-    if (WIFEXITED(status)) CHECK_EQ_INT(WEXITSTATUS(status), 0);
+    CHECK(reaped);
+    if (reaped) {
+        CHECK(WIFEXITED(status));
+        if (WIFEXITED(status)) CHECK_EQ_INT(WEXITSTATUS(status), 0);
+    }
     CHECK(result_used == sizeof(observed));
     if (result_used == sizeof(observed)) {
         CHECK(observed.stdin_is_tty);
         CHECK(observed.stdout_is_tty);
+        CHECK(observed.callback_calls > 0);
+        CHECK_EQ_INT(observed.callback_errno, EBADF);
         CHECK_EQ_INT(observed.result, PROMPT_LINE_ERROR);
         CHECK_EQ_INT(observed.saved_errno, EBADF);
         CHECK(observed.buffer_empty);
