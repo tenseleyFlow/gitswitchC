@@ -861,6 +861,76 @@ TEST(config_lock_rejects_symlink_fifo_and_unsafe_mode) {
     restore_home_env(saved_home);
 }
 
+TEST(config_lock_startup_cleans_only_proven_resume_hint_temp_residue) {
+    char home[128], saved_home[512], dotconfig[256], config_dir[512];
+    char stale[640], symlink_decoy[640], mode_decoy[640];
+    char unmatched_decoy[640], linked_decoy[640], linked_peer[640];
+    char victim[640], text[64];
+    struct stat st;
+    gitswitch_ctx_t ctx;
+    int token = -1;
+
+    save_home_env(saved_home, sizeof(saved_home));
+    CHECK_EQ_INT(make_scratch_dir(home, sizeof(home)), 0);
+    snprintf(dotconfig, sizeof(dotconfig), "%s/.config", home);
+    snprintf(config_dir, sizeof(config_dir), "%s/gitswitch", dotconfig);
+    snprintf(stale, sizeof(stale),
+             "%s/.resume-hint.tmp.aB3xY9", config_dir);
+    snprintf(symlink_decoy, sizeof(symlink_decoy),
+             "%s/.resume-hint.tmp.Sym123", config_dir);
+    snprintf(mode_decoy, sizeof(mode_decoy),
+             "%s/.resume-hint.tmp.Mode12", config_dir);
+    snprintf(unmatched_decoy, sizeof(unmatched_decoy),
+             "%s/.resume-hint.tmp.aB3xY-", config_dir);
+    snprintf(linked_decoy, sizeof(linked_decoy),
+             "%s/.resume-hint.tmp.Link12", config_dir);
+    snprintf(linked_peer, sizeof(linked_peer),
+             "%s/link-peer", config_dir);
+    snprintf(victim, sizeof(victim), "%s/victim", home);
+
+    CHECK_EQ_INT(mkdir(dotconfig, 0700), 0);
+    CHECK_EQ_INT(mkdir(config_dir, 0700), 0);
+    CHECK_EQ_INT(write_config(stale, "stale\n", 6U), 0);
+    CHECK_EQ_INT(write_config(victim, "victim\n", 7U), 0);
+    CHECK_EQ_INT(symlink(victim, symlink_decoy), 0);
+    CHECK_EQ_INT(write_config(mode_decoy, "mode\n", 5U), 0);
+    CHECK_EQ_INT(chmod(mode_decoy, 0644), 0);
+    CHECK_EQ_INT(write_config(unmatched_decoy, "unmatched\n", 10U), 0);
+    CHECK_EQ_INT(write_config(linked_decoy, "linked\n", 7U), 0);
+    CHECK_EQ_INT(link(linked_decoy, linked_peer), 0);
+    CHECK_EQ_INT(setenv("HOME", home, 1), 0);
+
+    /* This is the real mutating CLI ordering: acquire the config write lock,
+     * then initialize/load configuration while retaining that lock. */
+    token = config_write_lock();
+    CHECK(token >= 0);
+    if (token >= 0) {
+        memset(&ctx, 0, sizeof(ctx));
+        CHECK_EQ_INT(config_init(&ctx), 0);
+        config_write_unlock(token);
+        token = -1;
+    }
+
+    errno = 0;
+    CHECK(lstat(stale, &st) != 0 && errno == ENOENT);
+    CHECK_EQ_INT(lstat(symlink_decoy, &st), 0);
+    CHECK(S_ISLNK(st.st_mode));
+    CHECK_EQ_INT(lstat(mode_decoy, &st), 0);
+    CHECK(S_ISREG(st.st_mode));
+    CHECK_EQ_INT((long)(st.st_mode & 0777), 0644);
+    CHECK_EQ_INT(lstat(unmatched_decoy, &st), 0);
+    CHECK(S_ISREG(st.st_mode));
+    CHECK_EQ_INT(lstat(linked_decoy, &st), 0);
+    CHECK(S_ISREG(st.st_mode));
+    CHECK_EQ_INT((long)st.st_nlink, 2);
+    CHECK(slurp(victim, text, sizeof(text)) > 0);
+    CHECK_STR_EQ(text, "victim\n");
+
+    if (token >= 0) config_write_unlock(token);
+    restore_home_env(saved_home);
+    ts_rm_rf(home);
+}
+
 static int config_lock_child_contended(void) {
     pid_t pid = fork();
     int status = 0;
@@ -2649,6 +2719,7 @@ TEST_MAIN_BEGIN()
     RUN_TEST(config_init_secures_real_or_absent_final_directory);
     RUN_TEST(config_get_path_uses_home_or_passwd_without_filesystem_mutation);
     RUN_TEST(config_lock_rejects_symlink_fifo_and_unsafe_mode);
+    RUN_TEST(config_lock_startup_cleans_only_proven_resume_hint_temp_residue);
     RUN_TEST(config_lock_release_preserves_reused_fd_and_retires_context);
     RUN_TEST(config_lock_survives_post_acquisition_namespace_replacement);
     RUN_TEST(config_init_preserves_symlinked_parent_policy);

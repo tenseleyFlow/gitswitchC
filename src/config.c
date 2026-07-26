@@ -7584,6 +7584,181 @@ void config_switch_guard_abandon(
     *guard = NULL;
 }
 
+#define CONFIG_RESUME_HINT_TEMP_PREFIX ".resume-hint.tmp."
+#define CONFIG_RESUME_HINT_TEMP_SUFFIX_LENGTH 6U
+#define CONFIG_RESUME_HINT_TEMP_SCAN_MAX_ENTRIES 4096U
+#define CONFIG_RESUME_HINT_TEMP_SCAN_MAX_CANDIDATES 64U
+
+static bool config_resume_hint_temp_name_is_exact(const char *name) {
+    static const char prefix[] = CONFIG_RESUME_HINT_TEMP_PREFIX;
+    size_t prefix_length = sizeof(prefix) - 1U;
+
+    if (!name ||
+        strlen(name) != prefix_length +
+                            CONFIG_RESUME_HINT_TEMP_SUFFIX_LENGTH ||
+        memcmp(name, prefix, prefix_length) != 0) {
+        return false;
+    }
+    for (size_t i = 0U; i < CONFIG_RESUME_HINT_TEMP_SUFFIX_LENGTH; i++) {
+        unsigned char c = (unsigned char)name[prefix_length + i];
+
+        if (!((c >= (unsigned char)'0' && c <= (unsigned char)'9') ||
+              (c >= (unsigned char)'A' && c <= (unsigned char)'Z') ||
+              (c >= (unsigned char)'a' && c <= (unsigned char)'z'))) {
+            return false;
+        }
+    }
+    return true;
+}
+
+static int config_cleanup_resume_hint_temp_candidate_at(
+    int directory_fd, const char *name, bool *removed) {
+    struct stat named_before;
+    struct stat opened;
+    struct stat descriptor_after;
+    struct stat named_after;
+    int fd = -1;
+    int failure_errno = ESTALE;
+
+    *removed = false;
+    errno = 0;
+    if (fstatat(directory_fd, name, &named_before,
+                AT_SYMLINK_NOFOLLOW) != 0) {
+        failure_errno = errno ? errno : ESTALE;
+        goto candidate_fail;
+    }
+    /* Recognized but unsafe leaves are decoys, not cleanup authority. Keep
+     * symlinks, foreign ownership, non-regular nodes, non-0600 modes, and
+     * multiply-linked files untouched. */
+    if (!config_metadata_file_is_safe(&named_before, true)) return 0;
+
+    fd = openat(directory_fd, name,
+                O_RDONLY | O_CLOEXEC | O_NOFOLLOW | O_NONBLOCK);
+    if (fd < 0 || fstat(fd, &opened) != 0) {
+        failure_errno = errno ? errno : ESTALE;
+        goto candidate_fail;
+    }
+    if (!config_metadata_file_is_safe(&opened, true) ||
+        !config_metadata_snapshot_same(&named_before, &opened) ||
+        fstatat(directory_fd, name, &named_after,
+                AT_SYMLINK_NOFOLLOW) != 0 ||
+        fstat(fd, &descriptor_after) != 0 ||
+        !config_metadata_file_is_safe(&named_after, true) ||
+        !config_metadata_file_is_safe(&descriptor_after, true) ||
+        !config_metadata_snapshot_same(&opened, &named_after) ||
+        !config_metadata_snapshot_same(&opened, &descriptor_after)) {
+        failure_errno = errno ? errno : ESTALE;
+        goto candidate_fail;
+    }
+    if (unlinkat(directory_fd, name, 0) != 0) {
+        failure_errno = errno ? errno : ESTALE;
+        goto candidate_fail;
+    }
+    errno = 0;
+    if (fstatat(directory_fd, name, &named_after,
+                AT_SYMLINK_NOFOLLOW) == 0 ||
+        errno != ENOENT) {
+        failure_errno = errno ? errno : ESTALE;
+        goto candidate_fail;
+    }
+    if (close(fd) != 0) {
+        fd = -1;
+        failure_errno = errno ? errno : EIO;
+        goto candidate_fail;
+    }
+    fd = -1;
+    *removed = true;
+    return 0;
+
+candidate_fail:
+    if (fd >= 0) close(fd);
+    errno = failure_errno;
+    set_system_error(
+        ERR_CONFIG_WRITE_FAILED,
+        "Cannot safely clean stale resume-hint temporary file: %s", name);
+    return -1;
+}
+
+/* Called only after the cooperating config write lock has been acquired and
+ * before that lock is returned to its caller. Therefore no live cooperating
+ * writer can own one of these mkstemp names: a same-process CLI startup also
+ * reaches this boundary before config_init and before its first state temp is
+ * created. The scan is completed before deletion, so an incomplete or
+ * over-limit enumeration leaves every candidate untouched. */
+static int config_cleanup_stale_resume_hint_temps_at(int directory_fd) {
+    static const char prefix[] = CONFIG_RESUME_HINT_TEMP_PREFIX;
+    char candidates[CONFIG_RESUME_HINT_TEMP_SCAN_MAX_CANDIDATES]
+                   [sizeof(prefix) + CONFIG_RESUME_HINT_TEMP_SUFFIX_LENGTH];
+    DIR *stream = NULL;
+    struct dirent *entry;
+    size_t entry_count = 0U;
+    size_t candidate_count = 0U;
+    bool removed_any = false;
+    int scan_fd;
+    int scan_errno;
+    int close_result;
+
+    scan_fd = openat(directory_fd, ".",
+                     O_RDONLY | O_CLOEXEC | O_DIRECTORY | O_NOFOLLOW);
+    if (scan_fd < 0) goto scan_fail;
+    stream = fdopendir(scan_fd);
+    if (!stream) {
+        scan_errno = errno ? errno : EIO;
+        close(scan_fd);
+        errno = scan_errno;
+        goto scan_fail;
+    }
+    errno = 0;
+    while ((entry = readdir(stream)) != NULL) {
+        entry_count++;
+        if (entry_count > CONFIG_RESUME_HINT_TEMP_SCAN_MAX_ENTRIES) {
+            scan_errno = E2BIG;
+            goto scan_done;
+        }
+        if (!config_resume_hint_temp_name_is_exact(entry->d_name)) continue;
+        if (candidate_count >=
+            CONFIG_RESUME_HINT_TEMP_SCAN_MAX_CANDIDATES) {
+            scan_errno = E2BIG;
+            goto scan_done;
+        }
+        memcpy(candidates[candidate_count], entry->d_name,
+               sizeof(candidates[candidate_count]));
+        candidate_count++;
+    }
+    scan_errno = errno;
+
+scan_done:
+    close_result = closedir(stream);
+    stream = NULL;
+    if (scan_errno != 0 || close_result != 0) {
+        errno = scan_errno != 0 ? scan_errno : (errno ? errno : EIO);
+        goto scan_fail;
+    }
+
+    for (size_t i = 0U; i < candidate_count; i++) {
+        bool removed = false;
+
+        if (config_cleanup_resume_hint_temp_candidate_at(
+                directory_fd, candidates[i], &removed) != 0) {
+            return -1;
+        }
+        removed_any = removed_any || removed;
+    }
+    if (removed_any && fsync(directory_fd) != 0) {
+        set_system_error(
+            ERR_CONFIG_WRITE_FAILED,
+            "Cannot durably clean stale resume-hint temporary files");
+        return -1;
+    }
+    return 0;
+
+scan_fail:
+    set_system_error(
+        ERR_CONFIG_WRITE_FAILED,
+        "Cannot completely scan stale resume-hint temporary files");
+    return -1;
+}
+
 static int config_write_lock_directory(const char *dir) {
     char lockpath[MAX_PATH_LEN];
     struct stat dir_identity;
@@ -7629,8 +7804,20 @@ static int config_write_lock_directory(const char *dir) {
     }
 
     token_fd = try_lock_private_file_at(dir_fd, ".config.lock");
+    if (token_fd < 0) {
+        close(dir_fd);
+        return -1;
+    }
+
+    if (config_cleanup_stale_resume_hint_temps_at(dir_fd) != 0) {
+        int saved_errno = errno ? errno : EIO;
+
+        close(dir_fd);
+        unlock_private_file(token_fd);
+        errno = saved_errno;
+        return -1;
+    }
     close(dir_fd);
-    if (token_fd < 0) return -1;
 
     /* The helper pins and locks the original namespace. The public path must
      * still select that validated directory before the caller mutates state;
