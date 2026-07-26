@@ -83,7 +83,8 @@ typedef enum {
     RETIREMENT_GUARD_CLEAR_AFTER_DIR_SYNC,
     RETIREMENT_GUARD_PAIR_AFTER_MARKER_READ,
     RETIREMENT_GUARD_INSTALL_BEFORE_DIR_SYNC,
-    RETIREMENT_GUARD_READ_AFTER_CLOSE
+    RETIREMENT_GUARD_READ_AFTER_CLOSE,
+    RETIREMENT_GUARD_PAIR_AFTER_COMPLETION_READ
 } retirement_guard_clear_test_stage_t;
 typedef int (*retirement_guard_clear_test_hook_fn)(
     retirement_guard_clear_test_stage_t stage, int directory_fd,
@@ -128,7 +129,8 @@ enum {
     RETIREMENT_GUARD_CLEAR_AFTER_DIR_SYNC,
     RETIREMENT_GUARD_PAIR_AFTER_MARKER_READ,
     RETIREMENT_GUARD_INSTALL_BEFORE_DIR_SYNC,
-    RETIREMENT_GUARD_READ_AFTER_CLOSE
+    RETIREMENT_GUARD_READ_AFTER_CLOSE,
+    RETIREMENT_GUARD_PAIR_AFTER_COMPLETION_READ
 };
 #define RETIREMENT_GUARD_CLEAR_TEST_CHECKPOINT(stage, fd, name)             \
     ((void)(stage), (void)(fd), (void)(name), 0)
@@ -138,7 +140,8 @@ enum {
 typedef enum {
     SWITCH_GUARD_INSTALL_BEFORE_INITIAL_FSTAT = 0,
     SWITCH_GUARD_INSTALL_AFTER_STAGE_SYNC,
-    SWITCH_GUARD_CLEAR_AFTER_UNLINK
+    SWITCH_GUARD_CLEAR_AFTER_UNLINK,
+    SWITCH_GUARD_SNAPSHOT_AFTER_MARKER_READ
 } switch_guard_test_stage_t;
 typedef int (*switch_guard_test_hook_fn)(
     switch_guard_test_stage_t stage, int directory_fd);
@@ -173,7 +176,8 @@ static int config_switch_guard_test_checkpoint(
 enum {
     SWITCH_GUARD_INSTALL_BEFORE_INITIAL_FSTAT = 0,
     SWITCH_GUARD_INSTALL_AFTER_STAGE_SYNC,
-    SWITCH_GUARD_CLEAR_AFTER_UNLINK
+    SWITCH_GUARD_CLEAR_AFTER_UNLINK,
+    SWITCH_GUARD_SNAPSHOT_AFTER_MARKER_READ
 };
 #define SWITCH_GUARD_TEST_CHECKPOINT(stage, fd) \
     ((void)(stage), (void)(fd), 0)
@@ -3329,8 +3333,10 @@ static int config_retirement_guard_stage_state_at(
 
 static int config_retirement_guard_name_stable_at(
     int directory_fd, const char *name, bool absent,
-    const struct stat *expected) {
+    struct stat *expected, const unsigned char *expected_data,
+    size_t expected_length) {
     struct stat named;
+    struct stat reproved;
 
     errno = 0;
     if (fstatat(directory_fd, name, &named, AT_SYMLINK_NOFOLLOW) != 0) {
@@ -3338,12 +3344,23 @@ static int config_retirement_guard_name_stable_at(
         errno = errno ? errno : ESTALE;
         return -1;
     }
-    if (absent || !expected ||
-        !config_metadata_file_is_safe(&named, true) ||
-        !config_metadata_snapshot_same(expected, &named)) {
+    if (absent || !expected || !expected_data || expected_length == 0U ||
+        !config_metadata_file_is_safe(&named, true)) {
         errno = ESTALE;
         return -1;
     }
+    if (config_metadata_snapshot_same(expected, &named)) {
+        *expected = named;
+        return 0;
+    }
+    if (!config_metadata_ctime_only_change(expected, &named) ||
+        config_reprove_published_file_at(
+            directory_fd, name, expected, expected_data, expected_length,
+            &reproved) != 0) {
+        errno = errno ? errno : ESTALE;
+        return -1;
+    }
+    *expected = reproved;
     return 0;
 }
 
@@ -3379,12 +3396,17 @@ static int config_retirement_guard_pair_read_at(
             &pair->completion_absent, &pair->completion_data,
             &pair->completion_length, &pair->completion_identity,
             &pair->completion_model) != 0 ||
+        RETIREMENT_GUARD_CLEAR_TEST_CHECKPOINT(
+            RETIREMENT_GUARD_PAIR_AFTER_COMPLETION_READ,
+            directory_fd, CONFIG_RETIREMENT_COMPLETE_NAME) != 0 ||
         config_retirement_guard_name_stable_at(
             directory_fd, CONFIG_RETIREMENT_GUARD_NAME,
-            pair->marker_absent, &pair->marker_identity) != 0 ||
+            pair->marker_absent, &pair->marker_identity,
+            pair->marker_data, pair->marker_length) != 0 ||
         config_retirement_guard_name_stable_at(
             directory_fd, CONFIG_RETIREMENT_COMPLETE_NAME,
-            pair->completion_absent, &pair->completion_identity) != 0 ||
+            pair->completion_absent, &pair->completion_identity,
+            pair->completion_data, pair->completion_length) != 0 ||
         config_retirement_guard_stage_state_at(
             directory_fd, &stage_after_present, &stage_after) != 0) {
         goto pair_fail;
@@ -3548,7 +3570,8 @@ static int config_retirement_guard_reconcile_exact_stage_at(
             observed, &revalidated) ||
         config_retirement_guard_name_stable_at(
             directory_fd, CONFIG_RETIREMENT_STAGE_NAME,
-            false, &stage_identity) != 0 ||
+            false, &stage_identity, observed->marker_data,
+            observed->marker_length) != 0 ||
         !config_named_directory_matches(
             directory, directory_identity)) {
         saved_errno = errno ? errno : ESTALE;
@@ -4175,7 +4198,8 @@ int config_retirement_guard_recovery_probe(
                 &pair, &stage_pair) ||
             config_retirement_guard_name_stable_at(
                 directory_fd, CONFIG_RETIREMENT_STAGE_NAME,
-                false, &stage_identity) != 0 ||
+                false, &stage_identity, pair.marker_data,
+                pair.marker_length) != 0 ||
             !config_named_directory_matches(
                 directory, &directory_identity)) {
             if (errno == 0) errno = ESTALE;
@@ -6236,8 +6260,10 @@ preintent_fail:
 
 static int config_switch_guard_name_stable_at(
     int directory_fd, const char *name, bool absent,
-    const struct stat *expected) {
+    struct stat *expected, const unsigned char *expected_data,
+    size_t expected_length) {
     struct stat named;
+    struct stat reproved;
 
     errno = 0;
     if (fstatat(
@@ -6249,12 +6275,23 @@ static int config_switch_guard_name_stable_at(
                     : (errno ? errno : EIO);
         return -1;
     }
-    if (absent || !expected ||
-        !config_metadata_file_is_safe(&named, true) ||
-        !config_metadata_snapshot_same(expected, &named)) {
+    if (absent || !expected || !expected_data || expected_length == 0U ||
+        !config_metadata_file_is_safe(&named, true)) {
         errno = ESTALE;
         return -1;
     }
+    if (config_metadata_snapshot_same(expected, &named)) {
+        *expected = named;
+        return 0;
+    }
+    if (!config_metadata_ctime_only_change(expected, &named) ||
+        config_reprove_published_file_at(
+            directory_fd, name, expected, expected_data, expected_length,
+            &reproved) != 0) {
+        errno = errno ? errno : ESTALE;
+        return -1;
+    }
+    *expected = reproved;
     return 0;
 }
 
@@ -6432,10 +6469,14 @@ static int config_switch_guard_snapshot_read_at(
             &snapshot->marker_data, &snapshot->marker_length,
             &snapshot->marker_identity,
             &snapshot->marker_model) != 0 ||
+        SWITCH_GUARD_TEST_CHECKPOINT(
+            SWITCH_GUARD_SNAPSHOT_AFTER_MARKER_READ,
+            directory_fd) != 0 ||
         config_switch_guard_name_stable_at(
             directory_fd, CONFIG_SWITCH_GUARD_NAME,
             snapshot->marker_absent,
-            &snapshot->marker_identity) != 0 ||
+            &snapshot->marker_identity, snapshot->marker_data,
+            snapshot->marker_length) != 0 ||
         config_switch_guard_stage_state_at(
             directory_fd, &stage_after_present,
             &stage_after) != 0) {
@@ -6969,7 +7010,7 @@ static int config_switch_guard_cleanup_owned_stage_at(
     if (fsync(directory_fd) != 0 ||
         config_switch_guard_name_stable_at(
             directory_fd, CONFIG_SWITCH_STAGE_NAME,
-            true, NULL) != 0 ||
+            true, NULL, NULL, 0U) != 0 ||
         verify_private_lock_file_at(
             lock_fd, directory_fd,
             CONFIG_SWITCH_LOCK_NAME) != 0 ||
@@ -7540,7 +7581,8 @@ int config_switch_guard_probe(
             snapshot.marker_model.destination_count) != 0 ||
         config_switch_guard_name_stable_at(
             directory_fd, CONFIG_SWITCH_GUARD_NAME, false,
-            &snapshot.marker_identity) != 0 ||
+            &snapshot.marker_identity, snapshot.marker_data,
+            snapshot.marker_length) != 0 ||
         !config_named_directory_matches(
             directory, &directory_identity)) {
         if (errno == 0) errno = ESTALE;

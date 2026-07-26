@@ -40,7 +40,8 @@ gitswitch_test_set_switch_rollback_publish_hook(
 typedef enum {
     SWITCH_GUARD_INSTALL_BEFORE_INITIAL_FSTAT = 0,
     SWITCH_GUARD_INSTALL_AFTER_STAGE_SYNC,
-    SWITCH_GUARD_CLEAR_AFTER_UNLINK
+    SWITCH_GUARD_CLEAR_AFTER_UNLINK,
+    SWITCH_GUARD_SNAPSHOT_AFTER_MARKER_READ
 } switch_guard_test_stage_t;
 typedef int (*switch_guard_test_hook_fn)(
     switch_guard_test_stage_t stage, int directory_fd);
@@ -94,6 +95,12 @@ typedef struct {
     h1_saved_env_t environment[6];
 } h1_guard_case_t;
 
+typedef enum {
+    SWITCH_MARKER_MUTATION_NONE = 0,
+    SWITCH_MARKER_MUTATION_CTIME_ONLY,
+    SWITCH_MARKER_MUTATION_CHANGED_BYTE_RESTORED_MTIME
+} switch_marker_mutation_t;
+
 static runtime_holder_t g_runtime_holder = { -1, -1 };
 static bool g_hook_should_hold_runtime;
 static int g_hook_called;
@@ -127,6 +134,14 @@ static int g_switch_guard_source_drift_rc;
 static char g_switch_guard_source_path[PATH_MAX];
 static struct stat g_switch_guard_source_before_drift;
 static struct stat g_switch_guard_source_after_drift;
+static switch_marker_mutation_t g_switch_marker_mutation;
+static int g_switch_marker_mutation_calls;
+static int g_switch_marker_mutation_rc;
+static char g_switch_marker_mutation_path[PATH_MAX];
+static struct stat g_switch_marker_before_mutation;
+static struct stat g_switch_marker_after_mutation;
+static unsigned char g_switch_marker_original_byte;
+static unsigned char g_switch_marker_mutated_byte;
 static volatile sig_atomic_t g_returning_signal_calls;
 
 typedef enum {
@@ -681,6 +696,110 @@ static int h1_force_ctime_only_drift(
     return -1;
 }
 
+static int h1_change_byte_restore_mtime(
+    const char *path, struct stat *before_out, struct stat *after_out,
+    unsigned char *original_byte, unsigned char *mutated_byte) {
+    struct stat before;
+    struct stat drift_before;
+    struct stat after;
+    struct timespec times[2];
+    unsigned char original;
+    unsigned char mutated;
+    int fd = -1;
+    int failure_errno = EIO;
+
+    if (!path || !before_out || !after_out ||
+        !original_byte || !mutated_byte) {
+        errno = EINVAL;
+        return -1;
+    }
+    fd = open(path, O_RDWR | O_CLOEXEC | O_NOFOLLOW | O_NONBLOCK);
+    if (fd < 0 || fstat(fd, &before) != 0 ||
+        before.st_size <= 0 ||
+        pread(fd, &original, 1, 0) != 1) {
+        failure_errno = errno ? errno : ESTALE;
+        goto mutation_fail;
+    }
+#if defined(__APPLE__)
+    times[0] = before.st_atimespec;
+    times[1] = before.st_mtimespec;
+#else
+    times[0] = before.st_atim;
+    times[1] = before.st_mtim;
+#endif
+    mutated = (unsigned char)(original ^ 1U);
+    if (pwrite(fd, &mutated, 1, 0) != 1 ||
+        futimens(fd, times) != 0 || fsync(fd) != 0) {
+        failure_errno = errno ? errno : EIO;
+        goto mutation_fail;
+    }
+    if (close(fd) != 0) {
+        fd = -1;
+        failure_errno = errno ? errno : EIO;
+        goto mutation_fail;
+    }
+    fd = -1;
+    if (lstat(path, &drift_before) != 0 ||
+        !h1_same_file_state_without_ctime(&before, &drift_before) ||
+        h1_force_ctime_only_drift(
+            path, &drift_before, &after) != 0 ||
+        !h1_same_file_state_without_ctime(&before, &after) ||
+        h1_same_ctime(&before, &after)) {
+        failure_errno = errno ? errno : ESTALE;
+        goto mutation_fail;
+    }
+    *before_out = before;
+    *after_out = after;
+    *original_byte = original;
+    *mutated_byte = mutated;
+    return 0;
+
+mutation_fail:
+    if (fd >= 0) close(fd);
+    errno = failure_errno;
+    return -1;
+}
+
+static int mutate_switch_guard_marker_after_read(
+    switch_guard_test_stage_t stage, int directory_fd) {
+    switch_marker_mutation_t mutation;
+
+    (void)directory_fd;
+    if (stage != SWITCH_GUARD_SNAPSHOT_AFTER_MARKER_READ ||
+        g_switch_marker_mutation == SWITCH_MARKER_MUTATION_NONE) {
+        return 0;
+    }
+    mutation = g_switch_marker_mutation;
+    g_switch_marker_mutation = SWITCH_MARKER_MUTATION_NONE;
+    g_switch_marker_mutation_calls++;
+    if (lstat(
+            g_switch_marker_mutation_path,
+            &g_switch_marker_before_mutation) != 0) {
+        g_switch_marker_mutation_rc = -1;
+        return -1;
+    }
+    if (mutation == SWITCH_MARKER_MUTATION_CTIME_ONLY) {
+        g_switch_marker_mutation_rc = h1_force_ctime_only_drift(
+            g_switch_marker_mutation_path,
+            &g_switch_marker_before_mutation,
+            &g_switch_marker_after_mutation);
+        return g_switch_marker_mutation_rc;
+    }
+    if (mutation ==
+        SWITCH_MARKER_MUTATION_CHANGED_BYTE_RESTORED_MTIME) {
+        g_switch_marker_mutation_rc = h1_change_byte_restore_mtime(
+            g_switch_marker_mutation_path,
+            &g_switch_marker_before_mutation,
+            &g_switch_marker_after_mutation,
+            &g_switch_marker_original_byte,
+            &g_switch_marker_mutated_byte);
+        return g_switch_marker_mutation_rc;
+    }
+    errno = EINVAL;
+    g_switch_marker_mutation_rc = -1;
+    return -1;
+}
+
 static int drift_switch_guard_source_after_stage_sync(
     switch_guard_test_stage_t stage, int directory_fd) {
     (void)directory_fd;
@@ -872,6 +991,17 @@ static void h1_guard_case_end(h1_guard_case_t *guard_case) {
            sizeof(g_switch_guard_source_before_drift));
     memset(&g_switch_guard_source_after_drift, 0,
            sizeof(g_switch_guard_source_after_drift));
+    g_switch_marker_mutation = SWITCH_MARKER_MUTATION_NONE;
+    g_switch_marker_mutation_calls = 0;
+    g_switch_marker_mutation_rc = -1;
+    memset(g_switch_marker_mutation_path, 0,
+           sizeof(g_switch_marker_mutation_path));
+    memset(&g_switch_marker_before_mutation, 0,
+           sizeof(g_switch_marker_before_mutation));
+    memset(&g_switch_marker_after_mutation, 0,
+           sizeof(g_switch_marker_after_mutation));
+    g_switch_marker_original_byte = 0U;
+    g_switch_marker_mutated_byte = 0U;
     if (guard_case->guard) {
         config_switch_guard_abandon(&guard_case->guard);
     }
@@ -3967,6 +4097,155 @@ TEST(parent_guard_probe_recovers_after_source_ctime_drift_and_abandon) {
     ts_rm_rf(fixture.root);
 }
 
+TEST(parent_guard_probe_accepts_ctime_only_drift_after_marker_read) {
+    cli_owner_fixture_t fixture = {0};
+    h1_guard_case_t guard_case = {0};
+    config_switch_guard_recovery_t recovery;
+    bool blocked = false;
+    int begin_result = -1;
+    int fixture_result;
+
+    fixture_result = h1_fixture_setup(&fixture);
+    CHECK_EQ_INT(fixture_result, 0);
+    if (fixture_result == 0) {
+        begin_result = h1_guard_case_begin(&fixture, &guard_case);
+    }
+    CHECK_EQ_INT(begin_result, 0);
+    if (begin_result == 0) {
+        CHECK_EQ_INT(
+            config_switch_guard_install_or_adopt(
+                guard_case.ctx, guard_case.target, GIT_SCOPE_GLOBAL,
+                guard_case.destinations, guard_case.destination_count,
+                &guard_case.guard),
+            0);
+        CHECK(guard_case.guard != NULL);
+        CHECK(config_switch_guard_was_created(guard_case.guard));
+        config_switch_guard_abandon(&guard_case.guard);
+        CHECK(!guard_case.guard);
+
+        CHECK_EQ_INT(
+            safe_strncpy(
+                g_switch_marker_mutation_path, fixture.switch_fence,
+                sizeof(g_switch_marker_mutation_path)),
+            0);
+        g_switch_marker_mutation =
+            SWITCH_MARKER_MUTATION_CTIME_ONLY;
+        g_switch_marker_mutation_calls = 0;
+        g_switch_marker_mutation_rc = -1;
+        (void)gitswitch_test_set_switch_guard_hook(
+            mutate_switch_guard_marker_after_read);
+        memset(&recovery, 0, sizeof(recovery));
+        CHECK_EQ_INT(
+            config_switch_guard_probe(
+                fixture.config, &blocked, &recovery),
+            0);
+        (void)gitswitch_test_set_switch_guard_hook(NULL);
+        CHECK_EQ_INT(g_switch_marker_mutation_calls, 1);
+        CHECK_EQ_INT(g_switch_marker_mutation_rc, 0);
+        CHECK(h1_same_file_state_without_ctime(
+            &g_switch_marker_before_mutation,
+            &g_switch_marker_after_mutation));
+        CHECK(!h1_same_ctime(
+            &g_switch_marker_before_mutation,
+            &g_switch_marker_after_mutation));
+        CHECK(blocked);
+        CHECK(recovery.valid);
+        CHECK_EQ_INT(recovery.target.id, guard_case.target->id);
+        CHECK(strcmp(
+            recovery.target.incarnation,
+            guard_case.target->incarnation) == 0);
+        CHECK_EQ_INT(
+            recovery.effective_scope, GIT_SCOPE_GLOBAL);
+        CHECK_EQ_INT(
+            (int)recovery.destination_count,
+            (int)guard_case.destination_count);
+    }
+    h1_guard_case_end(&guard_case);
+    ts_rm_rf(fixture.root);
+}
+
+TEST(parent_guard_probe_rejects_changed_bytes_after_marker_read) {
+    unsigned char observed[16384] = {0};
+    cli_owner_fixture_t fixture = {0};
+    h1_guard_case_t guard_case = {0};
+    config_switch_guard_recovery_t recovery;
+    struct stat retained = {0};
+    size_t observed_length = 0U;
+    bool blocked = false;
+    int probe_errno = 0;
+    int begin_result = -1;
+    int fixture_result;
+
+    fixture_result = h1_fixture_setup(&fixture);
+    CHECK_EQ_INT(fixture_result, 0);
+    if (fixture_result == 0) {
+        begin_result = h1_guard_case_begin(&fixture, &guard_case);
+    }
+    CHECK_EQ_INT(begin_result, 0);
+    if (begin_result == 0) {
+        CHECK_EQ_INT(
+            config_switch_guard_install_or_adopt(
+                guard_case.ctx, guard_case.target, GIT_SCOPE_GLOBAL,
+                guard_case.destinations, guard_case.destination_count,
+                &guard_case.guard),
+            0);
+        CHECK(guard_case.guard != NULL);
+        CHECK(config_switch_guard_was_created(guard_case.guard));
+        config_switch_guard_abandon(&guard_case.guard);
+        CHECK(!guard_case.guard);
+
+        CHECK_EQ_INT(
+            safe_strncpy(
+                g_switch_marker_mutation_path, fixture.switch_fence,
+                sizeof(g_switch_marker_mutation_path)),
+            0);
+        g_switch_marker_mutation =
+            SWITCH_MARKER_MUTATION_CHANGED_BYTE_RESTORED_MTIME;
+        g_switch_marker_mutation_calls = 0;
+        g_switch_marker_mutation_rc = -1;
+        (void)gitswitch_test_set_switch_guard_hook(
+            mutate_switch_guard_marker_after_read);
+        memset(&recovery, 0, sizeof(recovery));
+        errno = 0;
+        CHECK_EQ_INT(
+            config_switch_guard_probe(
+                fixture.config, &blocked, &recovery),
+            -1);
+        probe_errno = errno;
+        (void)gitswitch_test_set_switch_guard_hook(NULL);
+        CHECK_EQ_INT(probe_errno, ESTALE);
+        CHECK_EQ_INT(g_switch_marker_mutation_calls, 1);
+        CHECK_EQ_INT(g_switch_marker_mutation_rc, 0);
+        CHECK(h1_same_file_state_without_ctime(
+            &g_switch_marker_before_mutation,
+            &g_switch_marker_after_mutation));
+        CHECK(!h1_same_ctime(
+            &g_switch_marker_before_mutation,
+            &g_switch_marker_after_mutation));
+        CHECK(g_switch_marker_original_byte !=
+              g_switch_marker_mutated_byte);
+        CHECK(blocked);
+        CHECK(!recovery.valid);
+
+        observed_length = h1_read_bounded_file(
+            fixture.switch_fence, observed, sizeof(observed),
+            &retained);
+        CHECK_EQ_INT(
+            (long)observed_length,
+            (long)g_switch_marker_after_mutation.st_size);
+        CHECK(observed_length > 0U);
+        if (observed_length > 0U) {
+            CHECK_EQ_INT(
+                observed[0], g_switch_marker_mutated_byte);
+        }
+        CHECK(ts_same_identity(
+            &g_switch_marker_after_mutation, &retained));
+    }
+    h1_guard_case_end(&guard_case);
+    memset(observed, 0, sizeof(observed));
+    ts_rm_rf(fixture.root);
+}
+
 TEST(parent_guard_abandon_then_adopt_reuses_exact_authority) {
     unsigned char marker_before[16384] = {0};
     unsigned char marker_after[sizeof(marker_before)] = {0};
@@ -4146,6 +4425,10 @@ TEST_MAIN_BEGIN()
     RUN_TEST(parent_guard_clear_rejects_same_bytes_on_replacement_inode);
     RUN_TEST(
         parent_guard_probe_recovers_after_source_ctime_drift_and_abandon);
+    RUN_TEST(
+        parent_guard_probe_accepts_ctime_only_drift_after_marker_read);
+    RUN_TEST(
+        parent_guard_probe_rejects_changed_bytes_after_marker_read);
     RUN_TEST(parent_guard_abandon_then_adopt_reuses_exact_authority);
     RUN_TEST(parent_guard_retain_republishes_exact_unlinked_marker);
 TEST_MAIN_END()

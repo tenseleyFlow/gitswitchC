@@ -26,7 +26,8 @@ typedef enum {
     RETIREMENT_GUARD_CLEAR_AFTER_DIR_SYNC,
     RETIREMENT_GUARD_PAIR_AFTER_MARKER_READ,
     RETIREMENT_GUARD_INSTALL_BEFORE_DIR_SYNC,
-    RETIREMENT_GUARD_READ_AFTER_CLOSE
+    RETIREMENT_GUARD_READ_AFTER_CLOSE,
+    RETIREMENT_GUARD_PAIR_AFTER_COMPLETION_READ
 } retirement_guard_clear_test_stage_t;
 typedef int (*retirement_guard_clear_test_hook_fn)(
     retirement_guard_clear_test_stage_t stage, int descriptor,
@@ -254,6 +255,106 @@ static bool guard_mutate_token(
     return true;
 }
 
+static int guard_change_bytes_restore_mtime_at(
+    int directory_fd, const char *name,
+    unsigned char original_out[GUARD_MAX_BYTES],
+    unsigned char mutated[GUARD_MAX_BYTES], size_t *mutated_length,
+    struct stat *before_out, struct stat *after_out) {
+    unsigned char original[GUARD_MAX_BYTES];
+    struct stat before;
+    struct stat drift_before;
+    struct stat after;
+    struct timespec times[2];
+    size_t length;
+    size_t total = 0U;
+    int fd = -1;
+    int failure_errno = EIO;
+
+    if (directory_fd < 0 || !name || !original_out || !mutated ||
+        !mutated_length || !before_out || !after_out) {
+        errno = EINVAL;
+        return -1;
+    }
+    fd = openat(
+        directory_fd, name,
+        O_RDWR | O_CLOEXEC | O_NOFOLLOW | O_NONBLOCK);
+    if (fd < 0 || fstat(fd, &before) != 0 ||
+        before.st_size <= 0 ||
+        (uintmax_t)before.st_size > GUARD_MAX_BYTES) {
+        failure_errno = errno ? errno : ESTALE;
+        goto mutation_fail;
+    }
+    length = (size_t)before.st_size;
+    while (total < length) {
+        ssize_t count = pread(
+            fd, original + total, length - total, (off_t)total);
+
+        if (count > 0) {
+            total += (size_t)count;
+        } else if (count < 0 && errno == EINTR) {
+            continue;
+        } else {
+            failure_errno = errno ? errno : ESTALE;
+            goto mutation_fail;
+        }
+    }
+    if (!guard_mutate_token(original, length, mutated)) {
+        failure_errno = EINVAL;
+        goto mutation_fail;
+    }
+#if defined(__APPLE__)
+    times[0] = before.st_atimespec;
+    times[1] = before.st_mtimespec;
+#else
+    times[0] = before.st_atim;
+    times[1] = before.st_mtim;
+#endif
+    total = 0U;
+    while (total < length) {
+        ssize_t count = pwrite(
+            fd, mutated + total, length - total, (off_t)total);
+
+        if (count > 0) {
+            total += (size_t)count;
+        } else if (count < 0 && errno == EINTR) {
+            continue;
+        } else {
+            failure_errno = errno ? errno : EIO;
+            goto mutation_fail;
+        }
+    }
+    if (futimens(fd, times) != 0 || fsync(fd) != 0) {
+        failure_errno = errno ? errno : EIO;
+        goto mutation_fail;
+    }
+    if (close(fd) != 0) {
+        fd = -1;
+        failure_errno = errno ? errno : EIO;
+        goto mutation_fail;
+    }
+    fd = -1;
+    if (guard_force_ctime_only_drift_at(
+            directory_fd, name, &drift_before, &after) != 0 ||
+        !guard_same_except_ctime(&before, &drift_before) ||
+        !guard_same_except_ctime(&before, &after) ||
+        guard_same_ctime(&before, &after)) {
+        failure_errno = errno ? errno : ESTALE;
+        goto mutation_fail;
+    }
+    *mutated_length = length;
+    memcpy(original_out, original, length);
+    *before_out = before;
+    *after_out = after;
+    memset(original, 0, sizeof(original));
+    return 0;
+
+mutation_fail:
+    if (fd >= 0) close(fd);
+    memset(original, 0, sizeof(original));
+    errno = failure_errno;
+    return -1;
+}
+
 static size_t guard_make_v1_marker(
     const guard_fixture_t *fixture, config_retirement_kind_t kind,
     unsigned char legacy[GUARD_MAX_BYTES]) {
@@ -418,7 +519,8 @@ typedef enum {
     HOOK_REPLACE_CANONICAL,
     HOOK_CTIME_AT_INSTALL_SYNC,
     HOOK_CTIME_AFTER_FRESH_READ,
-    HOOK_REPLACE_AFTER_FRESH_READ
+    HOOK_REPLACE_AFTER_FRESH_READ,
+    HOOK_CHANGED_BYTES_RESTORED_MTIME
 } hook_action_t;
 
 static retirement_guard_clear_test_stage_t hook_stage;
@@ -429,6 +531,7 @@ static bool hook_action_observed;
 static int hook_action_error;
 static struct stat hook_identity_before;
 static struct stat hook_identity_after;
+static unsigned char hook_original[GUARD_MAX_BYTES];
 static unsigned char hook_replacement[GUARD_MAX_BYTES];
 static size_t hook_replacement_length;
 
@@ -437,14 +540,20 @@ static int guard_fault_hook(
     const char *marker_name) {
     if (!hook_armed) return 0;
     if ((hook_action == HOOK_CTIME_AFTER_FRESH_READ ||
-         hook_action == HOOK_REPLACE_AFTER_FRESH_READ) &&
+         hook_action == HOOK_REPLACE_AFTER_FRESH_READ ||
+         (hook_action == HOOK_CHANGED_BYTES_RESTORED_MTIME &&
+          hook_stage !=
+              RETIREMENT_GUARD_PAIR_AFTER_COMPLETION_READ)) &&
         stage == RETIREMENT_GUARD_INSTALL_BEFORE_DIR_SYNC) {
         hook_fresh_publish_seen = true;
         return 0;
     }
     if (stage != hook_stage ||
         ((hook_action == HOOK_CTIME_AFTER_FRESH_READ ||
-          hook_action == HOOK_REPLACE_AFTER_FRESH_READ) &&
+          hook_action == HOOK_REPLACE_AFTER_FRESH_READ ||
+          (hook_action == HOOK_CHANGED_BYTES_RESTORED_MTIME &&
+           hook_stage !=
+               RETIREMENT_GUARD_PAIR_AFTER_COMPLETION_READ)) &&
          !hook_fresh_publish_seen)) {
         return 0;
     }
@@ -482,6 +591,17 @@ static int guard_fault_hook(
                 hook_replacement_length) != 0 ||
             fstatat(descriptor, marker_name, &hook_identity_after,
                     AT_SYMLINK_NOFOLLOW) != 0) {
+            hook_action_error = errno ? errno : EIO;
+            errno = hook_action_error;
+            return -1;
+        }
+        return 0;
+    }
+    if (hook_action == HOOK_CHANGED_BYTES_RESTORED_MTIME) {
+        if (guard_change_bytes_restore_mtime_at(
+                descriptor, marker_name, hook_original, hook_replacement,
+                &hook_replacement_length, &hook_identity_before,
+                &hook_identity_after) != 0) {
             hook_action_error = errno ? errno : EIO;
             errno = hook_action_error;
             return -1;
@@ -537,6 +657,78 @@ TEST(completion_keeps_canonical_generation_and_unblocks) {
     CHECK_EQ_INT(guard_count_retirement_entries(
                      fixture.directory, &unexpected), 3);
     CHECK_EQ_INT(unexpected, 0);
+    guard_fixture_cleanup(&fixture);
+}
+
+TEST(completion_accepts_ctime_only_drift_before_pair_final_reproof) {
+    guard_fixture_t fixture;
+    bool blocked = true;
+
+    CHECK_EQ_INT(guard_fixture_init(&fixture), 0);
+    CHECK_EQ_INT(config_retirement_guard_clear(&fixture.guard), 0);
+    CHECK(fixture.guard == NULL);
+
+    guard_arm_hook(
+        RETIREMENT_GUARD_PAIR_AFTER_COMPLETION_READ,
+        HOOK_CTIME_AT_INSTALL_SYNC);
+    CHECK(guard_probe(&fixture, &blocked));
+    (void)gitswitch_test_set_retirement_guard_clear_hook(NULL);
+    CHECK(!blocked);
+    CHECK(!hook_armed);
+    CHECK(hook_action_observed);
+    CHECK_EQ_INT(hook_action_error, 0);
+    CHECK(guard_same_except_ctime(
+        &hook_identity_before, &hook_identity_after));
+    CHECK(!guard_same_ctime(
+        &hook_identity_before, &hook_identity_after));
+    guard_fixture_cleanup(&fixture);
+}
+
+TEST(completion_rejects_changed_bytes_before_pair_final_reproof) {
+    guard_fixture_t fixture;
+    unsigned char observed[GUARD_MAX_BYTES];
+    struct stat after;
+    size_t observed_length;
+    bool blocked = false;
+    int probe_errno;
+
+    CHECK_EQ_INT(guard_fixture_init(&fixture), 0);
+    CHECK_EQ_INT(config_retirement_guard_clear(&fixture.guard), 0);
+    CHECK(fixture.guard == NULL);
+
+    guard_arm_hook(
+        RETIREMENT_GUARD_PAIR_AFTER_COMPLETION_READ,
+        HOOK_CHANGED_BYTES_RESTORED_MTIME);
+    errno = 0;
+    CHECK_EQ_INT(config_retirement_guard_probe(
+                     fixture.config_path, &blocked), -1);
+    probe_errno = errno;
+    (void)gitswitch_test_set_retirement_guard_clear_hook(NULL);
+    CHECK_EQ_INT(probe_errno, ESTALE);
+    CHECK(blocked);
+    CHECK(!hook_armed);
+    CHECK(hook_action_observed);
+    CHECK_EQ_INT(hook_action_error, 0);
+    CHECK(ts_same_identity(
+        &hook_identity_before, &hook_identity_after));
+    CHECK(guard_same_except_ctime(
+        &hook_identity_before, &hook_identity_after));
+    CHECK(!guard_same_ctime(
+        &hook_identity_before, &hook_identity_after));
+    CHECK(hook_replacement_length > 0U);
+    CHECK(memcmp(
+        hook_original, hook_replacement,
+        hook_replacement_length) != 0);
+
+    observed_length = guard_read_file(
+        fixture.completion_path, observed, sizeof(observed));
+    CHECK_EQ_INT((long)observed_length,
+                 (long)hook_replacement_length);
+    CHECK(memcmp(observed, hook_replacement,
+                 hook_replacement_length) == 0);
+    CHECK_EQ_INT(stat(fixture.completion_path, &after), 0);
+    CHECK(ts_same_identity(&hook_identity_after, &after));
+    memset(observed, 0, sizeof(observed));
     guard_fixture_cleanup(&fixture);
 }
 
@@ -868,6 +1060,86 @@ TEST(fresh_install_accepts_ctime_only_drift_after_reader_close) {
         &hook_identity_before, &hook_identity_after));
 
     fixture.guard = installed;
+    guard_fixture_cleanup(&fixture);
+}
+
+TEST(fresh_install_accepts_ctime_only_drift_before_pair_final_reproof) {
+    guard_fixture_t fixture;
+    config_retirement_guard_t *installed = NULL;
+
+    CHECK_EQ_INT(guard_fixture_init(&fixture), 0);
+    CHECK_EQ_INT(config_retirement_guard_clear(&fixture.guard), 0);
+    CHECK(fixture.guard == NULL);
+
+    guard_arm_hook(
+        RETIREMENT_GUARD_PAIR_AFTER_MARKER_READ,
+        HOOK_CTIME_AFTER_FRESH_READ);
+    CHECK_EQ_INT(config_retirement_guard_install_or_adopt(
+                     fixture.config_path, CONFIG_RETIREMENT_RESET,
+                     &fixture.owner, 1U, &installed), 0);
+    (void)gitswitch_test_set_retirement_guard_clear_hook(NULL);
+    CHECK(installed != NULL);
+    CHECK(config_retirement_guard_was_created(installed));
+    CHECK(!hook_armed);
+    CHECK(hook_fresh_publish_seen);
+    CHECK(hook_action_observed);
+    CHECK_EQ_INT(hook_action_error, 0);
+    CHECK(guard_same_except_ctime(
+        &hook_identity_before, &hook_identity_after));
+    CHECK(!guard_same_ctime(
+        &hook_identity_before, &hook_identity_after));
+
+    fixture.guard = installed;
+    guard_fixture_cleanup(&fixture);
+}
+
+TEST(fresh_install_rejects_changed_bytes_before_pair_final_reproof) {
+    guard_fixture_t fixture;
+    config_retirement_guard_t *installed = NULL;
+    unsigned char observed[GUARD_MAX_BYTES];
+    struct stat after;
+    size_t observed_length;
+    int install_errno;
+
+    CHECK_EQ_INT(guard_fixture_init(&fixture), 0);
+    CHECK_EQ_INT(config_retirement_guard_clear(&fixture.guard), 0);
+    CHECK(fixture.guard == NULL);
+
+    guard_arm_hook(
+        RETIREMENT_GUARD_PAIR_AFTER_MARKER_READ,
+        HOOK_CHANGED_BYTES_RESTORED_MTIME);
+    errno = 0;
+    CHECK_EQ_INT(config_retirement_guard_install_or_adopt(
+                     fixture.config_path, CONFIG_RETIREMENT_RESET,
+                     &fixture.owner, 1U, &installed), -1);
+    install_errno = errno;
+    (void)gitswitch_test_set_retirement_guard_clear_hook(NULL);
+    CHECK(installed == NULL);
+    CHECK_EQ_INT(install_errno, ESTALE);
+    CHECK(!hook_armed);
+    CHECK(hook_fresh_publish_seen);
+    CHECK(hook_action_observed);
+    CHECK_EQ_INT(hook_action_error, 0);
+    CHECK(ts_same_identity(
+        &hook_identity_before, &hook_identity_after));
+    CHECK(guard_same_except_ctime(
+        &hook_identity_before, &hook_identity_after));
+    CHECK(!guard_same_ctime(
+        &hook_identity_before, &hook_identity_after));
+    CHECK(hook_replacement_length > 0U);
+    CHECK(memcmp(
+        hook_original, hook_replacement,
+        hook_replacement_length) != 0);
+
+    observed_length = guard_read_file(
+        fixture.marker_path, observed, sizeof(observed));
+    CHECK_EQ_INT((long)observed_length,
+                 (long)hook_replacement_length);
+    CHECK(memcmp(observed, hook_replacement,
+                 hook_replacement_length) == 0);
+    CHECK_EQ_INT(stat(fixture.marker_path, &after), 0);
+    CHECK(ts_same_identity(&hook_identity_after, &after));
+    memset(observed, 0, sizeof(observed));
     guard_fixture_cleanup(&fixture);
 }
 
@@ -1601,6 +1873,10 @@ TEST(foreign_staged_generation_remains_fail_closed_and_untouched) {
 TEST_MAIN_BEGIN()
     error_init(LOG_LEVEL_ERROR, NULL);
     RUN_TEST(completion_keeps_canonical_generation_and_unblocks);
+    RUN_TEST(
+        completion_accepts_ctime_only_drift_before_pair_final_reproof);
+    RUN_TEST(
+        completion_rejects_changed_bytes_before_pair_final_reproof);
     RUN_TEST(prepublication_sync_failure_stays_blocked_and_converges);
     RUN_TEST(postpublication_sync_failures_are_committed);
     RUN_TEST(mixed_generation_probe_never_unblocks);
@@ -1610,6 +1886,10 @@ TEST_MAIN_BEGIN()
     RUN_TEST(lifecycle_lock_serializes_guard_owners);
     RUN_TEST(unproven_install_is_not_adopted_until_directory_sync_succeeds);
     RUN_TEST(fresh_install_accepts_ctime_only_drift_after_reader_close);
+    RUN_TEST(
+        fresh_install_accepts_ctime_only_drift_before_pair_final_reproof);
+    RUN_TEST(
+        fresh_install_rejects_changed_bytes_before_pair_final_reproof);
     RUN_TEST(fresh_install_rejects_identical_inode_swap_after_reader_close);
     RUN_TEST(exact_adoption_accepts_retained_marker_ctime_only_drift);
     RUN_TEST(abandon_after_failed_clear_never_reopens);
