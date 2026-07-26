@@ -4698,12 +4698,15 @@ TEST(structured_prepare_result_tracks_exact_context_ownership) {
 
 typedef enum {
     ACCOUNT_MUTATION_ID = 0,
+    ACCOUNT_MUTATION_INCARNATION,
+    ACCOUNT_MUTATION_INCARNATION_PERSISTED,
     ACCOUNT_MUTATION_NAME,
     ACCOUNT_MUTATION_EMAIL,
     ACCOUNT_MUTATION_DESCRIPTION,
     ACCOUNT_MUTATION_SCOPE,
     ACCOUNT_MUTATION_SSH_ENABLED,
     ACCOUNT_MUTATION_SSH_KEY_PATH,
+    ACCOUNT_MUTATION_SSH_KEY_SPELLING,
     ACCOUNT_MUTATION_SSH_HOST_ALIAS,
     ACCOUNT_MUTATION_SSH_HOSTNAME,
     ACCOUNT_MUTATION_GPG_ENABLED,
@@ -4717,6 +4720,14 @@ static void mutate_account_field(account_t *account,
     switch (field) {
         case ACCOUNT_MUTATION_ID:
             account->id = 101;
+            break;
+        case ACCOUNT_MUTATION_INCARNATION:
+            account->incarnation[0] =
+                account->incarnation[0] == 'A' ? 'B' : 'A';
+            break;
+        case ACCOUNT_MUTATION_INCARNATION_PERSISTED:
+            account->incarnation_persisted =
+                !account->incarnation_persisted;
             break;
         case ACCOUNT_MUTATION_NAME:
             CHECK_EQ_INT(safe_strncpy(account->name, "changed-name",
@@ -4741,6 +4752,11 @@ static void mutate_account_field(account_t *account,
         case ACCOUNT_MUTATION_SSH_KEY_PATH:
             CHECK_EQ_INT(safe_strncpy(account->ssh_key_path, "~/.ssh/changed",
                                       sizeof(account->ssh_key_path)), 0);
+            break;
+        case ACCOUNT_MUTATION_SSH_KEY_SPELLING:
+            CHECK_EQ_INT(safe_strncpy(account->ssh_key_spelling,
+                                      "~/.ssh/./spelling-only",
+                                      sizeof(account->ssh_key_spelling)), 0);
             break;
         case ACCOUNT_MUTATION_SSH_HOST_ALIAS:
             CHECK_EQ_INT(safe_strncpy(account->ssh_host_alias,
@@ -4779,6 +4795,7 @@ TEST(prepared_commit_rejects_every_frozen_account_field_change) {
     for (int field = 0; field < ACCOUNT_MUTATION_COUNT; field++) {
         gitswitch_ctx_t owner;
         gitswitch_ctx_t contender;
+        account_t before_mutation;
         accounts_switch_commit_state_t state =
             ACCOUNTS_SWITCH_COMMIT_ALIAS_CLEANUP_FAILED;
         int runner_calls;
@@ -4794,8 +4811,25 @@ TEST(prepared_commit_rejects_every_frozen_account_field_change) {
                          ACCOUNTS_SWITCH_PREPARE_PREPARED),
                      0);
         runner_calls = g_fake_runner_calls;
+        before_mutation = owner.accounts[0];
         mutate_account_field(&owner.accounts[0],
                              (account_mutation_field_t)field);
+        if (field == ACCOUNT_MUTATION_INCARNATION) {
+            CHECK(strcmp(owner.accounts[0].incarnation,
+                         before_mutation.incarnation) != 0);
+            CHECK_EQ_INT(owner.accounts[0].incarnation_persisted,
+                         before_mutation.incarnation_persisted);
+        } else if (field == ACCOUNT_MUTATION_INCARNATION_PERSISTED) {
+            CHECK_STR_EQ(owner.accounts[0].incarnation,
+                         before_mutation.incarnation);
+            CHECK(owner.accounts[0].incarnation_persisted !=
+                  before_mutation.incarnation_persisted);
+        } else if (field == ACCOUNT_MUTATION_SSH_KEY_SPELLING) {
+            CHECK_STR_EQ(owner.accounts[0].ssh_key_path,
+                         before_mutation.ssh_key_path);
+            CHECK(strcmp(owner.accounts[0].ssh_key_spelling,
+                         before_mutation.ssh_key_spelling) != 0);
+        }
 
         errno = 0;
         CHECK_EQ_INT(accounts_switch_commit_result(&owner, &state), -1);
