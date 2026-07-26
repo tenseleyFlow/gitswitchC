@@ -7227,6 +7227,9 @@ static int gpg_resolve_secret_key_listing_contract(
     bool signing_usable = false;
     bool have_secret_material = false;
     bool awaiting_primary_fingerprint = false;
+    bool awaiting_subkey_fingerprint = false;
+    bool pending_subkey_secret_usable = false;
+    bool pending_subkey_signing_usable = false;
     bool have_fingerprint = false;
 
     if (!listing || !fingerprint || fingerprint_size == 0) {
@@ -7261,6 +7264,13 @@ static int gpg_resolve_secret_key_listing_contract(
                 fingerprint[0] = '\0';
                 set_error(ERR_GPG_KEY_FAILED,
                           "GPG primary key fingerprint is missing or out of order");
+                return -1;
+            }
+            if (awaiting_subkey_fingerprint &&
+                !(record_len == 3 && memcmp(record, "fpr", 3) == 0)) {
+                fingerprint[0] = '\0';
+                set_error(ERR_GPG_KEY_FAILED,
+                          "GPG subkey fingerprint is missing or out of order");
                 return -1;
             }
             if (record_len == 3 && memcmp(record, "sec", 3) == 0) {
@@ -7307,6 +7317,37 @@ static int gpg_resolve_secret_key_listing_contract(
                 have_fingerprint = true;
                 awaiting_primary_fingerprint = false;
             } else if (record_len == 3 &&
+                       memcmp(record, "fpr", 3) == 0 &&
+                       primary_count == 1 &&
+                       awaiting_subkey_fingerprint) {
+                const char *value;
+                size_t value_len;
+                size_t i;
+
+                if (!gpg_colon_field(line, line_len, 9, &value, &value_len) ||
+                    (value_len != 40 && value_len != 64)) {
+                    fingerprint[0] = '\0';
+                    set_error(
+                        ERR_GPG_KEY_FAILED,
+                        "GPG subkey has no complete canonical fingerprint");
+                    return -1;
+                }
+                for (i = 0; i < value_len; i++) {
+                    if (!isxdigit((unsigned char)value[i])) {
+                        fingerprint[0] = '\0';
+                        set_error(ERR_GPG_KEY_FAILED,
+                                  "GPG subkey fingerprint is malformed");
+                        return -1;
+                    }
+                }
+                have_secret_material =
+                    have_secret_material || pending_subkey_secret_usable;
+                signing_usable =
+                    signing_usable || pending_subkey_signing_usable;
+                pending_subkey_secret_usable = false;
+                pending_subkey_signing_usable = false;
+                awaiting_subkey_fingerprint = false;
+            } else if (record_len == 3 &&
                        memcmp(record, "ssb", 3) == 0 &&
                        primary_count == 1) {
                 bool subkey_secret = gpg_record_has_secret_material(
@@ -7315,12 +7356,11 @@ static int gpg_resolve_secret_key_listing_contract(
                     subkey_secret &&
                     gpg_record_is_currently_usable(line, line_len);
 
-                have_secret_material =
-                    have_secret_material || subkey_secret_usable;
-                if (primary_usable && subkey_secret_usable &&
-                    gpg_record_has_direct_signing(line, line_len)) {
-                    signing_usable = true;
-                }
+                pending_subkey_secret_usable = subkey_secret_usable;
+                pending_subkey_signing_usable =
+                    primary_usable && subkey_secret_usable &&
+                    gpg_record_has_direct_signing(line, line_len);
+                awaiting_subkey_fingerprint = true;
             }
         }
         if (!eol) {
@@ -7344,6 +7384,12 @@ static int gpg_resolve_secret_key_listing_contract(
     if (!have_fingerprint) {
         set_error(ERR_GPG_KEY_FAILED,
                   "GPG primary key has no canonical fingerprint");
+        return -1;
+    }
+    if (awaiting_subkey_fingerprint) {
+        fingerprint[0] = '\0';
+        set_error(ERR_GPG_KEY_FAILED,
+                  "GPG subkey has no canonical fingerprint");
         return -1;
     }
     if (!primary_usable) {

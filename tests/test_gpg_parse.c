@@ -65,6 +65,68 @@ TEST(resolves_current_signing_subkey_to_primary_identity) {
     CHECK_STR_EQ(fingerprint, PRIMARY_FPR);
 }
 
+TEST(requires_each_subkeys_adjacent_canonical_fingerprint) {
+    static const char signing_record[] =
+        "ssb:u:255:22:FEDCBA9876543210:1700000000:::-:::s:::+:::ed25519::\n";
+    const char *missing =
+        PRIMARY_CERT
+        "ssb:u:255:22:FEDCBA9876543210:1700000000:::-:::s:::+:::ed25519::\n";
+    const char *intervening_record =
+        PRIMARY_CERT
+        "ssb:u:255:22:FEDCBA9876543210:1700000000:::-:::s:::+:::ed25519::\n"
+        "uid:u::::::::Signer <s@example.test>::::::::::\n"
+        "fpr:::::::::FEDCBA9876543210FEDCBA9876543210FEDCBA98:\n";
+    const char *short_fingerprint =
+        PRIMARY_CERT
+        "ssb:u:255:22:FEDCBA9876543210:1700000000:::-:::s:::+:::ed25519::\n"
+        "fpr:::::::::FEDCBA9876543210:\n";
+    const char *malformed_fingerprint =
+        PRIMARY_CERT
+        "ssb:u:255:22:FEDCBA9876543210:1700000000:::-:::s:::+:::ed25519::\n"
+        "fpr:::::::::FEDCBA9876543210FEDCBA9876543210FEDCBA9G:\n";
+    const char *primary_signing_does_not_mask_malformed_subkey =
+        PRIMARY_SIGN
+        "ssb:u:255:22:FEDCBA9876543210:1700000000:::-:::s:::+:::ed25519::\n"
+        "uid:u::::::::Signer <s@example.test>::::::::::\n";
+    const char *non_signing_subkey_still_requires_fingerprint =
+        PRIMARY_CERT_STUB
+        "ssb:u:255:22:FEDCBA9876543210:1700000000:::-:::e:::+:::ed25519::\n";
+    char status_interleaved[1024];
+    char fingerprint[GPG_FINGERPRINT_BUFSIZE];
+    const char *const rejected[] = {
+        missing,
+        intervening_record,
+        short_fingerprint,
+        malformed_fingerprint,
+        primary_signing_does_not_mask_malformed_subkey,
+        non_signing_subkey_still_requires_fingerprint
+    };
+
+    for (size_t i = 0; i < sizeof(rejected) / sizeof(rejected[0]); i++) {
+        CHECK_EQ_INT(gpg_manager_resolve_secret_key_listing(
+                         rejected[i], false, fingerprint,
+                         sizeof(fingerprint)), -1);
+        CHECK(fingerprint[0] == '\0');
+    }
+
+    CHECK((size_t)snprintf(
+              status_interleaved, sizeof(status_interleaved),
+              "%s%s[GNUPG:] KEY_CONSIDERED %s 0\n"
+              "fpr:::::::::FEDCBA9876543210FEDCBA9876543210FEDCBA98:\n",
+              PRIMARY_CERT, signing_record, PRIMARY_FPR) <
+          sizeof(status_interleaved));
+    CHECK_EQ_INT(gpg_manager_resolve_secret_key_listing(
+                     status_interleaved, true, fingerprint,
+                     sizeof(fingerprint)), 0);
+    CHECK_STR_EQ(fingerprint, PRIMARY_FPR);
+
+    /* Primary-only signing evidence remains independently sufficient. */
+    CHECK_EQ_INT(gpg_manager_resolve_secret_key_listing(
+                     PRIMARY_SIGN, true, fingerprint,
+                     sizeof(fingerprint)), 0);
+    CHECK_STR_EQ(fingerprint, PRIMARY_FPR);
+}
+
 TEST(supports_empty_secret_validity_with_explicit_material) {
     char fingerprint[GPG_FINGERPRINT_BUFSIZE];
 
@@ -204,6 +266,7 @@ TEST_MAIN_BEGIN()
     error_init(LOG_LEVEL_WARNING, NULL);
     RUN_TEST(resolves_current_primary_signing_key);
     RUN_TEST(resolves_current_signing_subkey_to_primary_identity);
+    RUN_TEST(requires_each_subkeys_adjacent_canonical_fingerprint);
     RUN_TEST(supports_empty_secret_validity_with_explicit_material);
     RUN_TEST(rejects_unusable_records_despite_empty_validity);
     RUN_TEST(rejects_expired_disabled_and_missing_material);

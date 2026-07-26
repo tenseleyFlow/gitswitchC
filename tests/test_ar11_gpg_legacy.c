@@ -57,7 +57,8 @@ typedef enum {
     FIXTURE_GPG20_DISABLED,
     FIXTURE_MODERN_EMPTY,
     FIXTURE_MALFORMED_VERSION,
-    FIXTURE_VERSION_FAILURE
+    FIXTURE_VERSION_FAILURE,
+    FIXTURE_EXECUTABLE_REPLACED
 } fixture_mode_t;
 
 static fixture_mode_t g_fixture_mode;
@@ -135,6 +136,8 @@ static const char *fixture_listing(void) {
             return GPG20_PRIMARY_EXPIRED;
         case FIXTURE_GPG20_DISABLED:
             return GPG20_PRIMARY_DISABLED;
+        case FIXTURE_EXECUTABLE_REPLACED:
+            return GPG20_PRIMARY_SIGN;
         case FIXTURE_MODERN_EMPTY:
         case FIXTURE_MALFORMED_VERSION:
         case FIXTURE_VERSION_FAILURE:
@@ -160,8 +163,26 @@ static int legacy_listing_runner(const char *const argv[],
     CHECK(opts_unsets_environment(opts, "GPG_AGENT_INFO"));
 
     if (argv_contains(argv, "--list-secret-keys")) {
+        int output_rc;
+
         g_listing_calls++;
-        return emit_output(opts, result, fixture_listing());
+        output_rc = emit_output(opts, result, fixture_listing());
+        if (output_rc == 0 &&
+            g_fixture_mode == FIXTURE_EXECUTABLE_REPLACED) {
+            char replacement[MAX_PATH_LEN];
+
+            if (!argv || !argv[0] ||
+                safe_snprintf(replacement, sizeof(replacement),
+                              "%s.replacement", argv[0]) != 0 ||
+                write_string_to_file(
+                    replacement,
+                    "#!/bin/sh\nprintf 'gpg (GnuPG) 2.0.30\\n'\n",
+                    0700) != 0 ||
+                rename(replacement, argv[0]) != 0) {
+                return -1;
+            }
+        }
+        return output_rc;
     }
     if (argv && argv[0] && argv[1] && !argv[2] &&
         strcmp(argv[1], "--version") == 0) {
@@ -306,10 +327,27 @@ TEST(unprovable_legacy_version_contract_fails_closed) {
     CHECK(fingerprint[0] == '\0');
 }
 
+TEST(legacy_contract_rejects_executable_generation_change) {
+    char fingerprint[GPG_FINGERPRINT_BUFSIZE];
+    char diagnostic[256];
+    error_code_t error_code = ERR_SUCCESS;
+
+    CHECK_EQ_INT(run_fixture(
+                     FIXTURE_EXECUTABLE_REPLACED, true, fingerprint,
+                     sizeof(fingerprint), &error_code, diagnostic,
+                     sizeof(diagnostic)), -1);
+    CHECK_EQ_INT(g_listing_calls, 1);
+    CHECK_EQ_INT(g_version_calls, 1);
+    CHECK_EQ_INT(error_code, ERR_GPG_KEY_FAILED);
+    CHECK(strstr(diagnostic, "version") != NULL);
+    CHECK(fingerprint[0] == '\0');
+}
+
 TEST_MAIN_BEGIN()
     error_init(LOG_LEVEL_ERROR, NULL);
     RUN_TEST(genuine_gnupg_2_0_disk_material_resolves_with_version_proof);
     RUN_TEST(empty_material_is_not_a_general_modern_availability_marker);
     RUN_TEST(legacy_stubs_expiry_and_disablement_remain_unusable);
     RUN_TEST(unprovable_legacy_version_contract_fails_closed);
+    RUN_TEST(legacy_contract_rejects_executable_generation_change);
 TEST_MAIN_END()
