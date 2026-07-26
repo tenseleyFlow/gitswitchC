@@ -59,18 +59,48 @@ static char *g_gpg_saved_path;
 static bool g_gpg_saved_path_present;
 static bool g_gpg_command_fixture_active;
 static bool g_host_gpg_available;
+static int g_fake_agent_listener = -1;
+static gitswitch_ctx_t *g_finalizing_observer_ctx;
+static bool g_finalizing_phase_observed;
+
+static void observe_finalizing_switch_phase(void) {
+    accounts_switch_commit_state_t state =
+        ACCOUNTS_SWITCH_COMMIT_COMPLETE;
+    error_context_t saved_error = g_last_error;
+    char expected_phase[32];
+    int saved_errno = errno;
+
+    snprintf(expected_phase, sizeof(expected_phase), "phase %d",
+             ACCOUNTS_TRANSACTION_FINALIZING);
+    if (accounts_switch_commit_result(g_finalizing_observer_ctx, &state) == -1 &&
+        strstr(get_last_error()->message, expected_phase) != NULL) {
+        g_finalizing_phase_observed = true;
+    }
+    g_last_error = saved_error;
+    errno = saved_errno;
+}
+
+static void close_fake_agent_listener(void) {
+    if (g_fake_agent_listener >= 0) {
+        close(g_fake_agent_listener);
+        g_fake_agent_listener = -1;
+    }
+}
 
 /* Create a fresh fake XDG_RUNTIME_DIR holding the pre-switch runtime state of
  * a "previous" account: a current.sock symlink and a GNUPGHOME `current`
  * symlink pointing at a real (empty) home dir. Returns 0 on success. */
 static int setup_runtime_dir(void) {
     char path[512];
+    int cleanup_result;
 
     /* Some SSH rollback cases intentionally leave a restored session active.
      * Later GPG cases may clear it on platforms where gpg is installed, which
      * made the signal tests accidentally depend on the hosted tool matrix.
      * Start every case from a clean process session before changing XDG. */
-    if (accounts_session_cleanup() != 0) return -1;
+    cleanup_result = accounts_session_cleanup();
+    close_fake_agent_listener();
+    if (cleanup_result != 0) return -1;
 
     snprintf(g_xdg, sizeof(g_xdg), "/tmp/gsw_rollback_XXXXXX");
     if (!ts_mkdtemp(g_xdg) ||
@@ -97,7 +127,10 @@ static int setup_runtime_dir(void) {
  * fixture for signal-lifecycle tests: prepare/abort can prove a complete Git
  * rollback without manufacturing an SSH agent solely for restoration. */
 static int setup_empty_runtime_dir(void) {
-    if (accounts_session_cleanup() != 0) return -1;
+    int cleanup_result = accounts_session_cleanup();
+
+    close_fake_agent_listener();
+    if (cleanup_result != 0) return -1;
     snprintf(g_xdg, sizeof(g_xdg), "/tmp/gsw_rollback_empty_XXXXXX");
     if (!ts_mkdtemp(g_xdg) ||
         ts_canonicalize_dir_path(g_xdg, sizeof(g_xdg)) != 0) return -1;
@@ -444,6 +477,9 @@ static bool g_fail_ssh_add;
 static const char *g_retarget_gpg_on_user_name; /* simulate a later XDG writer */
 static FILE *g_log;                 /* when set, every argv is logged here */
 static char g_effective_signingkey_observed[MAX_GPG_FINGERPRINT_LEN];
+
+#define FAKE_AGENT_PID 1073741824
+#define FAKE_AGENT_FP "SHA256:AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA"
 
 static const int switch_guarded_signals[] = {
     SIGINT, SIGTERM, SIGHUP, SIGQUIT
@@ -885,8 +921,24 @@ static int fake_runner(const char *const argv[], const run_opts_t *opts,
 
 /* ---- git+ssh runner for the SSH-restart rollback test (AR-02 #30) -------- */
 
-/* Bind a real (unserved) 0600 unix socket so validate_ssh_agent_socket sees a
- * genuine socket inode. Returns 0 on success. */
+static bool is_ssh_agent_command(const char *path) {
+    const char *base;
+
+    if (!path || !*path) return false;
+    base = strrchr(path, '/');
+    return strcmp(base ? base + 1 : path, "ssh-agent") == 0;
+}
+
+static int certify_agent_launch(const char *path, run_result_t *result) {
+    if (!path || !result ||
+        !run_launch_witness_capture(path, &result->launch_witness)) {
+        return -1;
+    }
+    return 0;
+}
+
+/* Bind and retain a real listening 0600 unix socket so both inode validation
+ * and the kernel-authenticated peer probe see a live fake agent endpoint. */
 static int bind_fake_agent_socket(const char *path) {
     struct sockaddr_un addr;
     int fd = socket(AF_UNIX, SOCK_STREAM, 0);
@@ -897,12 +949,18 @@ static int bind_fake_agent_socket(const char *path) {
     memset(&addr, 0, sizeof(addr));
     addr.sun_family = AF_UNIX;
     strcpy(addr.sun_path, path);
-    if (bind(fd, (struct sockaddr *)&addr, sizeof(addr)) != 0) {
+    close_fake_agent_listener();
+    if (bind(fd, (struct sockaddr *)&addr, sizeof(addr)) != 0 ||
+        listen(fd, 8) != 0) {
         close(fd);
         return -1;
     }
-    close(fd); /* the socket inode persists; nobody needs to accept() */
-    return chmod(path, 0600);
+    if (chmod(path, 0600) != 0) {
+        close(fd);
+        return -1;
+    }
+    g_fake_agent_listener = fd;
+    return 0;
 }
 
 static int bind_fake_agent_socket_for_runner(const char *path,
@@ -931,8 +989,7 @@ static int bind_fake_agent_socket_for_runner(const char *path,
  * The reported agent PID is far above any platform's pid_max so the later
  * teardown's reaper can never find — let alone signal — a real process behind
  * it. */
-#define FAKE_AGENT_PID 1073741824
-#define FAKE_AGENT_FP "SHA256:AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA"
+static ssh_reap_test_ops_t g_previous_reap_ops;
 
 static int capture_rollback_process_generation(
     pid_t pid, ssh_process_generation_t *generation) {
@@ -951,6 +1008,19 @@ static int capture_rollback_process_generation(
         return 0;
     }
     return ssh_manager_test_capture_process_generation(pid, generation);
+}
+
+static int retire_fake_agent_pidfd_open(pid_t pid) {
+    if (pid == (pid_t)FAKE_AGENT_PID) {
+        close_fake_agent_listener();
+        errno = ESRCH;
+        return -1;
+    }
+    if (g_previous_reap_ops.pidfd_open) {
+        return g_previous_reap_ops.pidfd_open(pid);
+    }
+    errno = ENOSYS;
+    return -1;
 }
 
 static bool ssh_probe_observes_committed_switch(void) {
@@ -992,6 +1062,7 @@ static bool ssh_probe_observes_committed_switch(void) {
 
 static int ssh_git_runner(const char *const argv[], const run_opts_t *opts,
                           run_result_t *result) {
+    if (g_finalizing_observer_ctx) observe_finalizing_switch_phase();
     if (g_probe_failure_pending_observation && strcmp(argv[0], "ssh") != 0) {
         g_post_probe_error = *get_last_error();
         g_post_probe_errno = errno;
@@ -1073,7 +1144,7 @@ static int ssh_git_runner(const char *const argv[], const run_opts_t *opts,
         }
         return 0;
     }
-    if (strcmp(argv[0], "ssh-agent") == 0) {
+    if (is_ssh_agent_command(argv[0])) {
         g_ssh_activation_commands++;
         /* Find "-a <path>" wherever it sits: the AR-03 H1 fix passes an
          * explicit -s ahead of it, so the socket is no longer argv[2]. */
@@ -1090,6 +1161,7 @@ static int ssh_git_runner(const char *const argv[], const run_opts_t *opts,
             memset(result, 0, sizeof(*result));
             result->spawned = true;
         }
+        if (certify_agent_launch(argv[0], result) != 0) return -1;
         if (bind_fake_agent_socket_for_runner(sock, opts) != 0) return -1;
         if (opts && opts->out && opts->out_size > 0) {
             snprintf(opts->out, opts->out_size,
@@ -1995,7 +2067,6 @@ TEST(repeated_signals_during_previous_session_cleanup_wait_for_abort) {
     g_fail_list_config = false;
     g_log = NULL;
     previous_runner = run_set_runner(ssh_git_runner);
-    CHECK_EQ_INT(accounts_switch(&ctx, "testacct"), 0);
 
     memset(&ctx.accounts[1], 0, sizeof(ctx.accounts[1]));
     ctx.accounts[1].id = 2;
@@ -2033,6 +2104,7 @@ TEST(repeated_signals_during_previous_session_cleanup_wait_for_abort) {
         if (pid == 0) {
             struct sigaction default_action;
 
+            if (accounts_switch(&ctx, "testacct") != 0) _exit(29);
             memset(&default_action, 0, sizeof(default_action));
             default_action.sa_handler = SIG_DFL;
             sigemptyset(&default_action.sa_mask);
@@ -3214,9 +3286,7 @@ TEST(incomplete_rollback_retry_survives_transient_runtime_lock_contention) {
     char after[4096], detail[sizeof(g_last_error.message)];
     gitswitch_ctx_t ctx;
     command_runner_fn previous_runner;
-    ssh_config_commit_hook_fn previous_hook;
     runtime_lock_holder_t holder = {0, -1};
-    int rc;
 
     CHECK_EQ_INT(setup_runtime_dir(), 0);
     CHECK_EQ_INT(setup_alias_config_file(
@@ -3231,15 +3301,16 @@ TEST(incomplete_rollback_retry_survives_transient_runtime_lock_contention) {
     g_raise_on_user_name = false;
     g_log = NULL;
     previous_runner = run_set_runner(ssh_git_runner);
-    previous_hook = ssh_manager_set_config_commit_hook_fn(
-        replace_git_name_and_fail_alias_commit);
-    rc = accounts_switch(&ctx, "testacct");
+    CHECK_EQ_INT(prepare_switch_expect(
+                     &ctx, "testacct",
+                     ACCOUNTS_SWITCH_PREPARE_PREPARED),
+                 0);
+    safe_strncpy(g_store_name, "Concurrent Name", sizeof(g_store_name));
+    CHECK_EQ_INT(accounts_switch_abort(&ctx, false), -1);
     safe_strncpy(detail, get_last_error()->message, sizeof(detail));
-    ssh_manager_set_config_commit_hook_fn(previous_hook);
 
     /* Integrated switch left an incomplete rollback retained for retry. */
-    CHECK_EQ_INT(rc, -1);
-    CHECK(strstr(detail, "retry ownership retained") != NULL);
+    CHECK(strstr(detail, "retry material retained") != NULL);
     after[0] = '\0';
     CHECK(read_file_to_string(config_path, after, sizeof(after)) >= 0);
     CHECK_STR_EQ(after, original);
@@ -3254,7 +3325,11 @@ TEST(incomplete_rollback_retry_survives_transient_runtime_lock_contention) {
      * owner was stranded in FINALIZING and this returned -1 ("Cannot abort
      * switch transaction from phase 4") forever. */
     safe_strncpy(g_store_name, "testacct", sizeof(g_store_name));
+    g_finalizing_observer_ctx = &ctx;
+    g_finalizing_phase_observed = false;
     CHECK_EQ_INT(accounts_switch_abort(&ctx, false), 0);
+    g_finalizing_observer_ctx = NULL;
+    CHECK(g_finalizing_phase_observed);
     CHECK_STR_EQ(g_store_name, "Previous Name");
     CHECK_EQ_INT(accounts_switch_abort(&ctx, false), -1);
     CHECK(strstr(get_last_error()->message,
@@ -5964,9 +6039,11 @@ TEST(sigint_mid_git_config_rolls_back_then_reraises) {
 TEST_MAIN_BEGIN()
     const ssh_reap_test_ops_t generation_ops = {
         .generation = capture_rollback_process_generation,
+        .pidfd_open = retire_fake_agent_pidfd_open,
     };
     ssh_reap_test_ops_t previous_reap_ops =
         ssh_manager_set_reap_test_ops(&generation_ops);
+    g_previous_reap_ops = previous_reap_ops;
     error_init(LOG_LEVEL_WARNING, NULL);
     RUN_TEST(unpersisted_target_fails_before_switch_mutation);
     RUN_TEST(snapshot_failure_aborts_before_any_git_write);
@@ -6047,5 +6124,6 @@ TEST_MAIN_BEGIN()
     RUN_TEST(incomplete_prepared_abort_retains_signal_ownership_until_retry);
     RUN_TEST(deferred_signal_survives_post_switch_window);
     RUN_TEST(sigint_mid_git_config_rolls_back_then_reraises);
+    close_fake_agent_listener();
     ssh_manager_set_reap_test_ops(&previous_reap_ops);
 TEST_MAIN_END()
