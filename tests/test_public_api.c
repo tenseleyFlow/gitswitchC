@@ -352,8 +352,12 @@ TEST(all_retained_public_apis_compile_and_link) {
 #endif
     REQUIRE_PUBLIC_API(run_uses_default_runner);
     REQUIRE_PUBLIC_API(runtime_lock_test_fail_release_stat);
+    REQUIRE_PUBLIC_API(runtime_state_lock_abandon_inherited);
     REQUIRE_PUBLIC_API(runtime_state_lock_acquire);
     REQUIRE_PUBLIC_API(runtime_state_lock_release);
+#ifdef GITSWITCH_TESTING
+    REQUIRE_PUBLIC_API(runtime_lock_test_descriptors);
+#endif
     REQUIRE_PUBLIC_API(safe_calloc);
     REQUIRE_PUBLIC_API(safe_malloc);
     REQUIRE_PUBLIC_API(safe_memcpy);

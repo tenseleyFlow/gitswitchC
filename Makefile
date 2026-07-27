@@ -403,7 +403,8 @@ INCLUDES = -I$(SRCDIR)
 # SHA256/MD5 strings in ssh_manager.c only parse `ssh-keygen -l` output, so
 # the old -lssl -lcrypto linkage was a phantom dependency that put
 # libssl/libcrypto DT_NEEDED entries in every shipped binary (AR-05 M2).
-LIBS =
+CFLAGS += -pthread
+LIBS = -pthread
 
 # Optional GNU readline: gives terminal-to-terminal add/edit prompts line
 # editing and TAB path completion. Auto-detected; build still works without it

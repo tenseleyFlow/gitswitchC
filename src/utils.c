@@ -16,6 +16,7 @@
 #include <fcntl.h>
 #include <dirent.h>
 #include <poll.h>
+#include <pthread.h>
 #include <errno.h>
 #include <pwd.h>
 #include <termios.h>
@@ -132,6 +133,8 @@ static private_lock_context_t g_private_lock_contexts[PRIVATE_LOCK_CONTEXTS];
 static pid_t g_private_lock_pid;
 static pid_t g_runtime_lock_pid;
 static uint64_t g_private_lock_next_generation;
+static pthread_once_t g_private_lock_atfork_once = PTHREAD_ONCE_INIT;
+static int g_private_lock_atfork_error;
 
 static int dup_cloexec(int fd, int minimum);
 static int private_lock_create_token(int *token_fd, int *guard_fd,
@@ -1266,45 +1269,103 @@ static int private_lock_create_token(int *token_fd, int *guard_fd,
     return 0;
 }
 
-/* flock state is inherited across fork because parent and child initially
- * share the same open descriptions.  The child must discard that inherited
- * bookkeeping before trying to acquire anything: treating it as reentrant
- * ownership would let the child enter while the parent still holds the lock.
- * Identity checks avoid closing an unrelated descriptor if test/application
- * code closed and reused an exposed token before its first post-fork acquire. */
-static void private_lock_prepare_process(void) {
-    pid_t pid = getpid();
+/* The child hook runs before fork() returns to application code, so no
+ * child-side reuse has happened yet. Parent-side code may already have closed
+ * and reused an exposed/stale number, hence each close remains identity-gated.
+ * close()/fstat() are async-signal-safe; the handler performs no allocation,
+ * locking, or namespace operation. */
+static void private_lock_atfork_child(void) {
+    for (size_t i = 0; i < RUNTIME_LOCK_CONTEXTS; i++) {
+        runtime_lock_context_t *ctx = &g_runtime_locks[i];
 
-    if (g_private_lock_pid == 0) {
-        g_private_lock_pid = pid;
-        return;
+        if (!ctx->active) continue;
+        if (private_lock_fd_has_identity(
+                ctx->parent_fd, ctx->parent_dev, ctx->parent_ino)) {
+            close(ctx->parent_fd);
+        }
+        if (private_lock_fd_has_identity(
+                ctx->dir_fd, ctx->dir_dev, ctx->dir_ino)) {
+            close(ctx->dir_fd);
+        }
+        ctx->active = false;
+        ctx->lock_fd = -1;
+        ctx->parent_fd = -1;
+        ctx->dir_fd = -1;
     }
-    if (g_private_lock_pid == pid) return;
-
     for (size_t i = 0; i < PRIVATE_LOCK_CONTEXTS; i++) {
         private_lock_context_t *ctx = &g_private_lock_contexts[i];
-        if (ctx->active &&
-            private_lock_fd_has_identity(ctx->token_fd, ctx->token_dev,
-                                         ctx->token_ino)) {
+
+        if (!ctx->active) continue;
+        if (private_lock_fd_has_identity(
+                ctx->token_fd, ctx->token_dev, ctx->token_ino)) {
             close(ctx->token_fd);
         }
-        if (ctx->active &&
-            private_lock_fd_has_identity(ctx->guard_fd, ctx->guard_dev,
-                                         ctx->guard_ino)) {
+        if (private_lock_fd_has_identity(
+                ctx->guard_fd, ctx->guard_dev, ctx->guard_ino)) {
             close(ctx->guard_fd);
         }
+        ctx->active = false;
+        ctx->token_fd = -1;
+        ctx->guard_fd = -1;
     }
     for (size_t i = 0; i < PRIVATE_LOCK_INODES; i++) {
         private_lock_inode_t *inode = &g_private_lock_inodes[i];
+
         if (inode->active &&
-            private_lock_fd_has_identity(inode->fd, inode->dev, inode->ino)) {
+            private_lock_fd_has_identity(
+                inode->fd, inode->dev, inode->ino)) {
             close(inode->fd);
         }
+        inode->active = false;
+        inode->fd = -1;
+        inode->refs = 0;
     }
+    g_private_lock_next_generation = 0;
+    g_private_lock_pid = getpid();
+    g_runtime_lock_pid = g_private_lock_pid;
+}
+
+static void private_lock_register_atfork(void) {
+    g_private_lock_atfork_error =
+        pthread_atfork(NULL, NULL, private_lock_atfork_child);
+}
+
+static int private_lock_ensure_atfork(void) {
+    int once_error =
+        pthread_once(&g_private_lock_atfork_once,
+                     private_lock_register_atfork);
+
+    if (once_error != 0) {
+        errno = once_error;
+        return -1;
+    }
+    if (g_private_lock_atfork_error != 0) {
+        errno = g_private_lock_atfork_error;
+        return -1;
+    }
+    return 0;
+}
+
+/* flock state is inherited across fork because parent and child initially
+ * share the same open descriptions. The atfork hook normally clears it before
+ * child code can reuse a number. The PID fallback exists for non-fork process
+ * epoch changes and deliberately forgets raw numbers without closing them:
+ * after caller code can run, descriptor identity cannot disambiguate ABA. */
+static int private_lock_prepare_process(void) {
+    pid_t pid = getpid();
+
+    if (private_lock_ensure_atfork() != 0) return -1;
+    if (g_private_lock_pid == 0) {
+        g_private_lock_pid = pid;
+        return 0;
+    }
+    if (g_private_lock_pid == pid) return 0;
+
     memset(g_private_lock_contexts, 0, sizeof(g_private_lock_contexts));
     memset(g_private_lock_inodes, 0, sizeof(g_private_lock_inodes));
     g_private_lock_next_generation = 0;
     g_private_lock_pid = pid;
+    return 0;
 }
 
 static int private_lock_allocate_generation(uint64_t *generation_out) {
@@ -1407,7 +1468,11 @@ static int lock_private_file_at_mode(int dir_fd, const char *name,
         set_error(ERR_INVALID_ARGS, "Invalid private lock file");
         return -1;
     }
-    private_lock_prepare_process();
+    if (private_lock_prepare_process() != 0) {
+        set_system_error(ERR_SYSTEM_CALL,
+                         "Cannot install private-lock fork handler");
+        return -1;
+    }
     for (size_t i = 0; i < PRIVATE_LOCK_CONTEXTS; i++) {
         if (!g_private_lock_contexts[i].active) {
             context_slot = i;
@@ -1547,7 +1612,7 @@ int verify_private_lock_file_at(int token_fd, int dir_fd, const char *name) {
         errno = EINVAL;
         return -1;
     }
-    private_lock_prepare_process();
+    if (private_lock_prepare_process() != 0) return -1;
     if (fstat(token_fd, &token) != 0) {
         errno = ESTALE;
         return -1;
@@ -1640,7 +1705,10 @@ void unlock_private_file(int token_fd) {
     private_lock_context_t *oldest = NULL;
     int saved_errno = errno;
 
-    private_lock_prepare_process();
+    if (private_lock_prepare_process() != 0) {
+        errno = saved_errno;
+        return;
+    }
     if (token_fd < 0) {
         errno = saved_errno;
         return;
@@ -1670,32 +1738,72 @@ void unlock_private_file(int token_fd) {
     errno = saved_errno;
 }
 
-static void runtime_lock_prepare_process(void) {
+#ifdef GITSWITCH_TESTING
+static void runtime_lock_test_append_descriptor(
+    int fd, int *seen, size_t *count) {
+    if (fd < 0 || !count) return;
+    for (size_t i = 0; i < *count; i++) {
+        if (seen[i] == fd) return;
+    }
+    seen[*count] = fd;
+    (*count)++;
+}
+
+size_t runtime_lock_test_descriptors(int *fds, size_t capacity) {
+    int seen[PRIVATE_LOCK_CONTEXTS * 2U + PRIVATE_LOCK_INODES +
+             RUNTIME_LOCK_CONTEXTS * 3U];
+    size_t count = 0U;
+
+    for (size_t i = 0; i < PRIVATE_LOCK_CONTEXTS; i++) {
+        const private_lock_context_t *ctx = &g_private_lock_contexts[i];
+
+        if (!ctx->active) continue;
+        runtime_lock_test_append_descriptor(ctx->token_fd, seen, &count);
+        runtime_lock_test_append_descriptor(ctx->guard_fd, seen, &count);
+    }
+    for (size_t i = 0; i < PRIVATE_LOCK_INODES; i++) {
+        const private_lock_inode_t *inode = &g_private_lock_inodes[i];
+
+        if (inode->active) {
+            runtime_lock_test_append_descriptor(inode->fd, seen, &count);
+        }
+    }
+    for (size_t i = 0; i < RUNTIME_LOCK_CONTEXTS; i++) {
+        const runtime_lock_context_t *ctx = &g_runtime_locks[i];
+
+        if (!ctx->active) continue;
+        runtime_lock_test_append_descriptor(ctx->lock_fd, seen, &count);
+        runtime_lock_test_append_descriptor(ctx->parent_fd, seen, &count);
+        runtime_lock_test_append_descriptor(ctx->dir_fd, seen, &count);
+    }
+    if (fds) {
+        size_t copied = count < capacity ? count : capacity;
+        memcpy(fds, seen, copied * sizeof(*fds));
+    }
+    return count;
+}
+#endif
+
+static int runtime_lock_prepare_process(void) {
     pid_t pid = getpid();
 
-    /* Reset the generic registry first, before opening anything that could
-     * reuse a descriptor number closed explicitly by post-fork caller code. */
-    private_lock_prepare_process();
+    if (private_lock_prepare_process() != 0) return -1;
     if (g_runtime_lock_pid == 0) {
         g_runtime_lock_pid = pid;
-        return;
+        return 0;
     }
-    if (g_runtime_lock_pid == pid) return;
+    if (g_runtime_lock_pid == pid) return 0;
 
-    for (size_t i = 0; i < RUNTIME_LOCK_CONTEXTS; i++) {
-        runtime_lock_context_t *ctx = &g_runtime_locks[i];
-        if (!ctx->active) continue;
-        if (private_lock_fd_has_identity(ctx->dir_fd, ctx->dir_dev,
-                                         ctx->dir_ino)) {
-            close(ctx->dir_fd);
-        }
-        if (private_lock_fd_has_identity(ctx->parent_fd, ctx->parent_dev,
-                                         ctx->parent_ino)) {
-            close(ctx->parent_fd);
-        }
-    }
     memset(g_runtime_locks, 0, sizeof(g_runtime_locks));
     g_runtime_lock_pid = pid;
+    return 0;
+}
+
+void runtime_state_lock_abandon_inherited(void) {
+    /* The atfork child hook already closed and reset inherited descriptors
+     * before child code could reuse their numbers. This explicit API merely
+     * ensures registration and applies the close-free PID fallback. */
+    (void)runtime_lock_prepare_process();
 }
 
 int runtime_state_lock_acquire(void) {
@@ -1709,7 +1817,11 @@ int runtime_state_lock_acquire(void) {
     uint64_t lock_generation = 0;
     int written;
 
-    runtime_lock_prepare_process();
+    if (runtime_lock_prepare_process() != 0) {
+        set_system_error(ERR_SYSTEM_CALL,
+                         "Cannot install runtime-lock fork handler");
+        return -1;
+    }
     parent_fd = open_runtime_parent_impl(runtime_parent,
                                          sizeof(runtime_parent),
                                          &anchor_slot);
@@ -1834,7 +1946,7 @@ int runtime_state_lock_acquire(void) {
 }
 
 void runtime_state_lock_release(int fd) {
-    runtime_lock_prepare_process();
+    if (runtime_lock_prepare_process() != 0) return;
     if (fd >= 0) {
         size_t selected = RUNTIME_LOCK_CONTEXTS;
 

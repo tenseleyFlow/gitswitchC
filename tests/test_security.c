@@ -1514,6 +1514,57 @@ cleanup:
     (void)rmdir(root);
 }
 
+TEST(private_lock_atfork_preserves_prefork_reused_token) {
+    char root[] = "/tmp/gs_private_lock_prefork_XXXXXX";
+    char lock_path[512];
+    int dir_fd = -1;
+    int token = -1;
+    pid_t child = -1;
+    int status = 0;
+
+    if (!ts_mkdtemp(root)) { CHECK(!"mkdtemp failed"); return; }
+    dir_fd = open(root, O_RDONLY | O_DIRECTORY | O_CLOEXEC);
+    CHECK(dir_fd >= 0);
+    if (dir_fd < 0) goto cleanup;
+    token = lock_private_file_at(dir_fd, ".test-lock");
+    CHECK(token >= 0);
+    if (token < 0) goto cleanup;
+    snprintf(lock_path, sizeof(lock_path), "%s/.test-lock", root);
+    CHECK_EQ_INT(close(token), 0);
+    CHECK_EQ_INT(replace_fd_with_lock_path(token, lock_path), token);
+
+    fflush(NULL);
+    child = fork();
+    CHECK(child >= 0);
+    if (child == 0) {
+        if (fcntl(token, F_GETFD) < 0) _exit(2);
+        unlock_private_file(token);
+        _exit(fcntl(token, F_GETFD) >= 0 ? 0 : 3);
+    }
+    if (child > 0) {
+        CHECK_EQ_INT(waitpid(child, &status, 0), child);
+        child = -1;
+        CHECK(WIFEXITED(status) && WEXITSTATUS(status) == 0);
+        /* The stale public number does not weaken the parent's internal
+         * guard/inode authority; normal release still admits a contender. */
+        unlock_private_file(token);
+        CHECK_EQ_INT(private_lock_child_outcome(root, ".test-lock"), 0);
+    }
+
+cleanup:
+    if (child > 0) {
+        (void)kill(child, SIGKILL);
+        (void)waitpid(child, NULL, 0);
+    }
+    if (token >= 0) {
+        unlock_private_file(token);
+        close(token);
+    }
+    if (dir_fd >= 0) close(dir_fd);
+    (void)unlink(lock_path);
+    (void)rmdir(root);
+}
+
 /* runtime_state_lock keeps additional parent/leaf descriptors internally.
  * A post-fork reset must identity-check those numbers too: the child can close
  * and reuse every inherited fd before its first runtime-lock API call. */
@@ -1524,6 +1575,9 @@ TEST(runtime_lock_fork_reset_preserves_reused_descriptor_numbers) {
     const char *old_xdg = getenv("XDG_RUNTIME_DIR");
     bool had_xdg = old_xdg && *old_xdg;
     int parent_lock = -1;
+    int retained[256];
+    int witnesses[256];
+    size_t retained_count = 0U;
     pid_t child = -1;
     int status = 0;
     struct stat token_st;
@@ -1540,29 +1594,65 @@ TEST(runtime_lock_fork_reset_preserves_reused_descriptor_numbers) {
     CHECK_EQ_INT(fstat(parent_lock, &token_st), 0);
     CHECK_EQ_INT(stat(lock_path, &lock_st), 0);
     CHECK(token_st.st_dev != lock_st.st_dev || token_st.st_ino != lock_st.st_ino);
+    retained_count = runtime_lock_test_descriptors(
+        retained, sizeof(retained) / sizeof(retained[0]));
+    CHECK(retained_count > 0U);
+    CHECK(retained_count <= sizeof(retained) / sizeof(retained[0]));
+    for (size_t i = 0U; i < retained_count; i++) witnesses[i] = -1;
+    if (retained_count <= sizeof(retained) / sizeof(retained[0])) {
+        int maximum = -1;
+
+        for (size_t i = 0U; i < retained_count; i++) {
+            struct stat retained_st;
+            struct stat witness_st;
+
+            if (retained[i] > maximum) maximum = retained[i];
+#ifdef F_DUPFD_CLOEXEC
+            witnesses[i] =
+                fcntl(retained[i], F_DUPFD_CLOEXEC, maximum + 1);
+#else
+            witnesses[i] = fcntl(retained[i], F_DUPFD, maximum + 1);
+            if (witnesses[i] >= 0) {
+                int flags = fcntl(witnesses[i], F_GETFD);
+                if (flags < 0 ||
+                    fcntl(witnesses[i], F_SETFD,
+                          flags | FD_CLOEXEC) != 0) {
+                    close(witnesses[i]);
+                    witnesses[i] = -1;
+                }
+            }
+#endif
+            CHECK(witnesses[i] > maximum);
+            CHECK_EQ_INT(fstat(retained[i], &retained_st), 0);
+            CHECK_EQ_INT(fstat(witnesses[i], &witness_st), 0);
+            CHECK(retained_st.st_dev == witness_st.st_dev &&
+                  retained_st.st_ino == witness_st.st_ino);
+            if (witnesses[i] > maximum) maximum = witnesses[i];
+        }
+    }
 
     fflush(NULL);
     child = fork();
     CHECK(child >= 0);
     if (child == 0) {
-        int replacements[256];
-        int count = 0;
-
-        for (int fd = 3; fd <= parent_lock; fd++) close(fd);
-        while (count < (int)(sizeof(replacements) / sizeof(replacements[0])) &&
-               count + 3 < parent_lock) {
-            int fd = open("/dev/null", O_RDONLY | O_CLOEXEC);
-            if (fd < 0) _exit(2);
-            if (fd != count + 3) _exit(3);
-            replacements[count++] = fd;
+        for (size_t i = 0U; i < retained_count; i++) {
+            if (witnesses[i] < 0 ||
+                dup2(witnesses[i], retained[i]) != retained[i]) {
+                _exit(2);
+            }
         }
-        replacements[count] = replace_fd_with_lock_path(parent_lock,
-                                                        lock_path);
-        if (replacements[count] != parent_lock) _exit(4);
-        count++;
         runtime_state_lock_release(parent_lock);
-        for (int i = 0; i < count; i++) {
-            if (fcntl(replacements[i], F_GETFD) < 0) _exit(5);
+        for (size_t i = 0U; i < retained_count; i++) {
+            struct stat replacement_st;
+            struct stat witness_st;
+
+            if (fcntl(retained[i], F_GETFD) < 0 ||
+                fstat(retained[i], &replacement_st) != 0 ||
+                fstat(witnesses[i], &witness_st) != 0 ||
+                replacement_st.st_dev != witness_st.st_dev ||
+                replacement_st.st_ino != witness_st.st_ino) {
+                _exit(3);
+            }
         }
         _exit(0);
     }
@@ -1581,6 +1671,10 @@ cleanup:
         runtime_state_lock_release(parent_lock);
         parent_lock = -1;
         CHECK_EQ_INT(runtime_lock_child_outcome(), 0);
+    }
+    for (size_t i = 0U; i < retained_count &&
+                        i < sizeof(witnesses) / sizeof(witnesses[0]); i++) {
+        if (witnesses[i] >= 0) close(witnesses[i]);
     }
     (void)unlink(lock_path);
     (void)rmdir(lock_dir);
@@ -1959,6 +2053,7 @@ TEST_MAIN_BEGIN()
     RUN_TEST(runtime_lock_release_preserves_reused_nested_token);
     RUN_TEST(runtime_lock_token_is_anonymous_and_lock_path_rebind_survives_release);
     RUN_TEST(private_lock_release_ignores_reused_inherited_token);
+    RUN_TEST(private_lock_atfork_preserves_prefork_reused_token);
     RUN_TEST(runtime_lock_fork_reset_preserves_reused_descriptor_numbers);
     RUN_TEST(find_command_path_skips_world_writable_dir);
     RUN_TEST(find_command_path_rejects_group_writable_components);

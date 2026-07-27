@@ -127,6 +127,10 @@ void unlock_private_file(int token_fd);
  */
 int runtime_state_lock_acquire(void);
 void runtime_state_lock_release(int fd);
+/* After fork(), discard only the child's inherited runtime/private-lock
+ * descriptors and registry copies. This is idempotent, performs no LOCK_UN or
+ * namespace mutation, and is a no-op in the process that acquired the locks. */
+void runtime_state_lock_abandon_inherited(void);
 
 /* Test-only one-shot fault selector for the four release-time namespace
  * probes. Production code leaves this at NONE. The hook exists because the
@@ -315,6 +319,10 @@ void run_test_set_post_fork_pre_publish_hook(
 void run_test_set_fork_failure(int system_errno);
 
 #ifdef GITSWITCH_TESTING
+/* Copy each distinct descriptor number retained by the private/runtime lock
+ * registries. Fork regressions reuse these exact child-side numbers. */
+size_t runtime_lock_test_descriptors(int *fds, size_t capacity);
+
 typedef enum {
     RUN_TEST_EXEC_ACL_NONE = 0,
     RUN_TEST_EXEC_ACL_DIRECTORY,
