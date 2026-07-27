@@ -3456,6 +3456,10 @@ TEST(metadata_mismatches_use_stable_eagain_diagnostics) {
 
 TEST_MAIN_BEGIN()
     error_init(LOG_LEVEL_WARNING, NULL);
+    if (getenv("GITSWITCH_AR08_CONFLICT_RETRY_ONLY")) {
+        RUN_TEST(conflict_retry_never_rebases_onto_unrelated_same_path_generation);
+        return ts_test_finish();
+    }
     RUN_TEST(fork_child_with_empty_git_registry_preserves_unrelated_descriptor);
     if (g_fork_coverage_child) return ts_test_finish();
     RUN_TEST(fork_child_identity_gate_preserves_parent_reused_snapshot_descriptor);

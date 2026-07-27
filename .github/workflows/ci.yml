@@ -237,6 +237,10 @@ jobs:
         # remaining declared capabilities explicit instead of green-skipping
         # them in either build configuration.
         run: brew install dash fish gnupg ksh93 readline
+      - name: AR-14 exact-generation diagnostic preflight
+        run: |
+          /usr/bin/make BUILD_TYPE=debug READLINE=1 WERROR=1 build/bin/test_ar08_git_transaction
+          GITSWITCH_AR08_CONFLICT_RETRY_ONLY=1 ./build/bin/test_ar08_git_transaction
       - name: Build + test (ASan/UBSan, warnings-as-errors)
         run: /usr/bin/make BUILD_TYPE=debug READLINE=1 WERROR=1 test
         env:
