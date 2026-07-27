@@ -36,6 +36,7 @@ static git_metadata_test_stage_t g_metadata_mismatch_stage;
 static int g_metadata_mismatch_calls;
 static git_metadata_test_stage_t g_metadata_trace[2];
 static int g_metadata_trace_count;
+static bool g_fork_coverage_child;
 
 static bool force_git_metadata_mismatch(git_metadata_test_stage_t stage) {
     if (g_metadata_trace_count <
@@ -618,6 +619,14 @@ static bool kill_after_private_finalization_certificate_prepare(
         _exit(87);
     }
     return false;
+}
+
+static bool fail_after_private_finalization_certificate_prepare(
+    git_finalization_test_stage_t stage, int directory_fd,
+    const char *lock_leaf) {
+    (void)directory_fd;
+    return stage == GIT_FINALIZATION_TEST_AFTER_PRIVATE_PREPARE &&
+           finalization_hook_targets_global(lock_leaf);
 }
 
 static bool fail_finalization_release_once(
@@ -2392,6 +2401,278 @@ static int prepare_finalization_transaction(const char *post_name) {
     return 0;
 }
 
+static int install_git_fd_sentinel(int stale_fd, int minimum);
+
+static void fork_coverage_child_return(void) {
+    /* The child must reach normal process exit for gcov to flush, but it must
+     * not run the harness's inherited atexit sweep over the parent's fixture.
+     * Release only the child copies of the tracking allocations and pinned
+     * root descriptors; main observes the flag immediately after the one fork
+     * test returns. */
+    for (int i = 0; i < ts_tmpdir_count; i++) {
+        if (ts_tmpdirs[i].root_fd >= 0) close(ts_tmpdirs[i].root_fd);
+        free(ts_tmpdirs[i].path);
+        memset(&ts_tmpdirs[i], 0, sizeof(ts_tmpdirs[i]));
+        ts_tmpdirs[i].root_fd = -1;
+    }
+    ts_tmpdir_count = 0;
+    g_fork_coverage_child = true;
+}
+
+static bool fd_has_identity(int fd, const struct stat *expected) {
+    struct stat observed;
+
+    return fd >= 0 && expected && fstat(fd, &observed) == 0 &&
+           observed.st_dev == expected->st_dev &&
+           observed.st_ino == expected->st_ino;
+}
+
+static pid_t fork_with_atfork_coverage(void) {
+    /* GCC recognizes direct fork() calls and resets the child's counters
+     * after fork returns. pthread_atfork child handlers run before that reset,
+     * making their genuine execution invisible even when the child exits
+     * normally. An indirect libc fork remains a real pthread_atfork-aware
+     * fork, while the parent waits for the child before either writes gcda. */
+    pid_t (*volatile call_fork)(void) = fork;
+
+    return call_fork();
+}
+
+static int prepare_descriptor_only_retirement(
+    const git_fixture_t *fixture, account_t *account,
+    publication_record_t *publication,
+    git_retirement_transaction_t **transaction) {
+    static const char incarnation[] =
+        "0123456789ABCDEF0123456789ABCDEF"
+        "0123456789ABCDEF0123456789ABCDEF";
+    const account_t *accounts[1];
+    const publication_record_t *publications[1];
+    char config_path[MAX_PATH_LEN];
+    struct stat parent_stat;
+    struct stat config_stat;
+
+    if (!fixture || !account || !publication || !transaction ||
+        safe_snprintf(config_path, sizeof(config_path),
+                      "%s/retirement.gitconfig", fixture->base) != 0 ||
+        write_text_file(config_path, "[fixture]\n\tmarker = keep\n",
+                        0600) != 0 ||
+        stat(fixture->base, &parent_stat) != 0 ||
+        stat(config_path, &config_stat) != 0) {
+        return -1;
+    }
+
+    memset(account, 0, sizeof(*account));
+    account->id = UINT32_C(808);
+    account->incarnation_persisted = true;
+    if (safe_strncpy(account->incarnation, incarnation,
+                     sizeof(account->incarnation)) != 0) {
+        return -1;
+    }
+
+    publication_record_init(publication);
+    publication->account_id = account->id;
+    publication->scope = PUBLICATION_SCOPE_GLOBAL;
+    publication->state = PUBLICATION_STATE_PUBLISHED;
+    publication->capabilities = PUBLICATION_CAP_DESTINATION |
+                                PUBLICATION_CAP_POST_GENERATION;
+    if (safe_strncpy(publication->account_incarnation, incarnation,
+                     sizeof(publication->account_incarnation)) != 0 ||
+        safe_strncpy(publication->config_path, config_path,
+                     sizeof(publication->config_path)) != 0) {
+        return -1;
+    }
+    publication_identity_from_stat(&publication->config_parent,
+                                   &parent_stat);
+    publication_identity_from_stat(&publication->post_config,
+                                   &config_stat);
+    if (publication_record_validate(publication) != 0) return -1;
+
+    accounts[0] = account;
+    publications[0] = publication;
+    return git_retirement_transaction_prepare(
+        accounts, publications, 1U, transaction);
+}
+
+TEST(fork_child_with_empty_git_registry_preserves_unrelated_descriptor) {
+    git_fixture_t fixture;
+    struct stat identity;
+    int unrelated_fd = -1;
+    pid_t child;
+    int status = 0;
+
+    if (!fixture_init(&fixture)) {
+        CHECK(false);
+        fixture_cleanup(&fixture);
+        return;
+    }
+    CHECK_EQ_INT(git_config_snapshot(GIT_SCOPE_GLOBAL), 0);
+    git_config_commit();
+    unrelated_fd = open("/dev/null", O_RDONLY | O_CLOEXEC);
+    CHECK(unrelated_fd >= 0);
+    CHECK(unrelated_fd >= 0 && fstat(unrelated_fd, &identity) == 0);
+    CHECK_EQ_INT(fflush(NULL), 0);
+
+    child = fork_with_atfork_coverage();
+    CHECK(child >= 0);
+    if (child == 0) {
+        CHECK(fd_has_identity(unrelated_fd, &identity));
+        if (unrelated_fd >= 0) close(unrelated_fd);
+        fixture_cleanup(&fixture);
+        fork_coverage_child_return();
+        return;
+    }
+    if (child > 0) {
+        CHECK(waitpid(child, &status, 0) == child);
+        CHECK(WIFEXITED(status));
+        if (WIFEXITED(status)) CHECK_EQ_INT(WEXITSTATUS(status), 0);
+    }
+    if (unrelated_fd >= 0) close(unrelated_fd);
+    fixture_cleanup(&fixture);
+}
+
+TEST(fork_child_identity_gate_preserves_parent_reused_snapshot_descriptor) {
+    git_fixture_t fixture;
+    int inherited[9];
+    size_t inherited_count;
+    int replacement = -1;
+    struct stat replacement_identity;
+    pid_t child;
+    int status = 0;
+
+    if (!fixture_init(&fixture)) {
+        CHECK(false);
+        fixture_cleanup(&fixture);
+        return;
+    }
+    CHECK_EQ_INT(git_config_snapshot(GIT_SCOPE_GLOBAL), 0);
+    inherited_count = git_ops_test_snapshot_descriptors(
+        inherited, sizeof(inherited) / sizeof(inherited[0]));
+    CHECK(inherited_count > 0U);
+    if (inherited_count == 0U) {
+        git_config_commit();
+        fixture_cleanup(&fixture);
+        return;
+    }
+
+    CHECK_EQ_INT(close(inherited[0]), 0);
+    replacement = install_git_fd_sentinel(inherited[0],
+                                           inherited[0] + 1);
+    CHECK(replacement > inherited[0]);
+    CHECK(replacement > inherited[0] &&
+          fstat(inherited[0], &replacement_identity) == 0);
+    CHECK_EQ_INT(fflush(NULL), 0);
+
+    child = fork_with_atfork_coverage();
+    CHECK(child >= 0);
+    if (child == 0) {
+        CHECK(fd_has_identity(inherited[0], &replacement_identity));
+        close(inherited[0]);
+        if (replacement >= 0) close(replacement);
+        fixture_cleanup(&fixture);
+        fork_coverage_child_return();
+        return;
+    }
+    if (child > 0) {
+        CHECK(waitpid(child, &status, 0) == child);
+        CHECK(WIFEXITED(status));
+        if (WIFEXITED(status)) CHECK_EQ_INT(WEXITSTATUS(status), 0);
+    }
+    CHECK(fd_has_identity(inherited[0], &replacement_identity));
+    git_config_commit();
+    close(inherited[0]);
+    if (replacement >= 0) close(replacement);
+    fixture_cleanup(&fixture);
+}
+
+TEST(fork_child_closes_active_snapshot_finalizer_and_retirement_descriptors) {
+    git_fixture_t fixture;
+    account_t retirement_account;
+    publication_record_t retirement_publication;
+    git_retirement_transaction_t *retirement = NULL;
+    git_config_finalization_t *finalization = NULL;
+    int snapshot_fds[9];
+    int finalization_fds[6];
+    int retirement_fds[16];
+    size_t snapshot_count;
+    size_t finalization_count;
+    size_t retirement_count;
+    pid_t child;
+    int status = 0;
+
+    if (!fixture_init(&fixture)) {
+        CHECK(false);
+        fixture_cleanup(&fixture);
+        return;
+    }
+    CHECK_EQ_INT(prepare_descriptor_only_retirement(
+                     &fixture, &retirement_account,
+                     &retirement_publication, &retirement), 0);
+    CHECK(retirement != NULL);
+    CHECK_EQ_INT(git_set("--global", "user.name",
+                         "before-combined-fork-cleanup"), 0);
+    CHECK_EQ_INT(prepare_finalization_transaction(
+                     "combined-fork-cleanup-postimage"), 0);
+    CHECK_EQ_INT(git_config_finalization_begin(&finalization), 0);
+    CHECK(finalization != NULL);
+
+    snapshot_count = git_ops_test_snapshot_descriptors(
+        snapshot_fds, sizeof(snapshot_fds) / sizeof(snapshot_fds[0]));
+    finalization_count = git_ops_test_finalization_descriptors(
+        finalization, finalization_fds,
+        sizeof(finalization_fds) / sizeof(finalization_fds[0]));
+    retirement_count = git_ops_test_retirement_transaction_descriptors(
+        retirement, retirement_fds,
+        sizeof(retirement_fds) / sizeof(retirement_fds[0]));
+    CHECK(snapshot_count > 0U &&
+          snapshot_count <= sizeof(snapshot_fds) / sizeof(snapshot_fds[0]));
+    CHECK(finalization_count > 0U &&
+          finalization_count <=
+              sizeof(finalization_fds) / sizeof(finalization_fds[0]));
+    CHECK(retirement_count > 0U &&
+          retirement_count <=
+              sizeof(retirement_fds) / sizeof(retirement_fds[0]));
+    CHECK_EQ_INT(fflush(NULL), 0);
+
+    child = fork_with_atfork_coverage();
+    CHECK(child >= 0);
+    if (child == 0) {
+        for (size_t i = 0U; i < snapshot_count; i++) {
+            errno = 0;
+            CHECK(fcntl(snapshot_fds[i], F_GETFD) == -1 &&
+                  errno == EBADF);
+        }
+        for (size_t i = 0U; i < finalization_count; i++) {
+            errno = 0;
+            CHECK(fcntl(finalization_fds[i], F_GETFD) == -1 &&
+                  errno == EBADF);
+        }
+        for (size_t i = 0U; i < retirement_count; i++) {
+            errno = 0;
+            CHECK(fcntl(retirement_fds[i], F_GETFD) == -1 &&
+                  errno == EBADF);
+        }
+        errno = 0;
+        CHECK(git_config_finalization_end(&finalization) == -1 &&
+              finalization == NULL && errno == EINVAL);
+        errno = 0;
+        CHECK(git_retirement_transaction_commit(&retirement) == -1 &&
+              retirement == NULL && errno == EINVAL);
+        fixture_cleanup(&fixture);
+        fork_coverage_child_return();
+        return;
+    }
+    if (child > 0) {
+        CHECK(waitpid(child, &status, 0) == child);
+        CHECK(WIFEXITED(status));
+        if (WIFEXITED(status)) CHECK_EQ_INT(WEXITSTATUS(status), 0);
+    }
+
+    CHECK_EQ_INT(git_config_finalization_end(&finalization), 0);
+    git_config_commit();
+    CHECK_EQ_INT(git_retirement_transaction_commit(&retirement), 0);
+    fixture_cleanup(&fixture);
+}
+
 TEST(fork_child_cannot_use_parent_snapshot_and_can_start_fresh) {
     git_fixture_t fixture;
     git_config_finalization_t *finalization = NULL;
@@ -2448,45 +2729,38 @@ TEST(fork_child_cannot_use_parent_snapshot_and_can_start_fresh) {
     fixture_cleanup(&fixture);
 }
 
-static int reopen_snapshot_object(int fd) {
-    struct stat identity;
+static int install_git_fd_sentinel(int stale_fd, int minimum) {
+    int source;
+    int sentinel;
 
-    if (fd < 0 || fstat(fd, &identity) != 0) return -1;
-    if (S_ISDIR(identity.st_mode)) {
-        return openat(
-            fd, ".", O_RDONLY | O_DIRECTORY | O_CLOEXEC | O_NOFOLLOW);
-    }
-#if defined(__linux__)
-    {
-        char proc_path[64];
-
-        if ((size_t)snprintf(
-                proc_path, sizeof(proc_path), "/proc/self/fd/%d", fd) >=
-            sizeof(proc_path)) {
-            errno = ENAMETOOLONG;
-            return -1;
-        }
-        return open(proc_path, O_RDONLY | O_CLOEXEC);
-    }
+    source = open("/dev/null", O_RDONLY | O_CLOEXEC);
+    if (source < 0) return -1;
+#ifdef F_DUPFD_CLOEXEC
+    sentinel = fcntl(source, F_DUPFD_CLOEXEC, minimum);
 #else
-    {
-        int duplicate = fcntl(fd, F_DUPFD, 0);
+    sentinel = fcntl(source, F_DUPFD, minimum);
+    if (sentinel >= 0 &&
+        fcntl(sentinel, F_SETFD, FD_CLOEXEC) != 0) {
+        int saved_errno = errno;
 
-        if (duplicate >= 0 &&
-            fcntl(duplicate, F_SETFD, FD_CLOEXEC) != 0) {
-            int saved_errno = errno;
-
-            close(duplicate);
-            errno = saved_errno;
-            return -1;
-        }
-        return duplicate;
+        close(sentinel);
+        sentinel = -1;
+        errno = saved_errno;
     }
 #endif
+    close(source);
+    if (sentinel < minimum ||
+        dup2(sentinel, stale_fd) != stale_fd) {
+        if (sentinel >= 0) close(sentinel);
+        return -1;
+    }
+    return sentinel;
 }
 
 TEST(fork_child_abandon_preserves_reused_snapshot_descriptors) {
     git_fixture_t fixture;
+    int inherited[9];
+    size_t inherited_count;
     pid_t child;
     int status = 0;
 
@@ -2499,15 +2773,17 @@ TEST(fork_child_abandon_preserves_reused_snapshot_descriptors) {
                          "parent-before-fd-reuse"), 0);
     CHECK_EQ_INT(prepare_finalization_transaction(
                      "parent-postimage-before-fd-reuse"), 0);
+    inherited_count = git_ops_test_snapshot_descriptors(
+        inherited, sizeof(inherited) / sizeof(inherited[0]));
+    CHECK(inherited_count > 0U);
+    CHECK(inherited_count <=
+          sizeof(inherited) / sizeof(inherited[0]));
 
     child = fork();
     CHECK(child >= 0);
     if (child == 0) {
-        int inherited[9];
         int replacements[9];
-        size_t inherited_count =
-            git_ops_test_snapshot_descriptors(
-                inherited, sizeof(inherited) / sizeof(inherited[0]));
+        int minimum = 0;
 
         if (inherited_count == 0U ||
             inherited_count >
@@ -2515,20 +2791,18 @@ TEST(fork_child_abandon_preserves_reused_snapshot_descriptors) {
             _exit(96);
         }
         for (size_t i = 0U; i < inherited_count; i++) {
-            struct stat before;
-            struct stat reopened;
-
-            replacements[i] = reopen_snapshot_object(inherited[i]);
-            if (replacements[i] < 0 ||
-                replacements[i] == inherited[i] ||
-                fstat(inherited[i], &before) != 0 ||
-                fstat(replacements[i], &reopened) != 0 ||
-                before.st_dev != reopened.st_dev ||
-                before.st_ino != reopened.st_ino ||
-                close(inherited[i]) != 0 ||
-                dup2(replacements[i], inherited[i]) != inherited[i]) {
+            if (inherited[i] >= minimum) minimum = inherited[i] + 1;
+        }
+        for (size_t i = 0U; i < inherited_count; i++) {
+            errno = 0;
+            if (fcntl(inherited[i], F_GETFD) != -1 ||
+                errno != EBADF) {
                 _exit(97);
             }
+            replacements[i] =
+                install_git_fd_sentinel(inherited[i], minimum);
+            if (replacements[i] < minimum) _exit(97);
+            minimum = replacements[i] + 1;
         }
         git_config_commit();
         for (size_t i = 0U; i < inherited_count; i++) {
@@ -2674,6 +2948,57 @@ TEST(private_prepublication_sigkill_is_reconciled_exactly) {
     fixture_cleanup(&fixture);
 }
 
+TEST(private_prepare_interruption_cleans_unpublished_certificate) {
+    git_fixture_t fixture;
+    git_config_finalization_t *finalization = NULL;
+    struct stat named;
+
+    if (!fixture_init(&fixture)) {
+        CHECK(false);
+        fixture_cleanup(&fixture);
+        return;
+    }
+    CHECK_EQ_INT(git_set("--global", "user.name",
+                         "before-private-interruption"), 0);
+    CHECK((size_t)snprintf(
+              g_finalization_lock_path,
+              sizeof(g_finalization_lock_path), "%s.lock",
+              fixture.global_config) < sizeof(g_finalization_lock_path));
+    CHECK_EQ_INT(prepare_finalization_transaction(
+                     "private-interruption-postimage"), 0);
+
+    (void)git_ops_test_set_finalization_hook(
+        fail_after_private_finalization_certificate_prepare);
+    clear_error();
+    errno = 0;
+    CHECK_EQ_INT(git_config_finalization_begin(&finalization), -1);
+    CHECK(finalization == NULL);
+    CHECK_EQ_INT(errno, EIO);
+    CHECK_EQ_INT(get_last_error()->code, ERR_GIT_CONFIG_FAILED);
+    CHECK_EQ_INT(get_last_error()->system_errno, EIO);
+    CHECK(strstr(get_last_error()->message,
+                 "Injected private Git finalization-certificate "
+                 "interruption") != NULL);
+    (void)git_ops_test_set_finalization_hook(NULL);
+
+    CHECK_EQ_INT((long)count_finalization_private_aliases(fixture.base), 0);
+    errno = 0;
+    CHECK(lstat(g_finalization_lock_path, &named) != 0 &&
+          errno == ENOENT);
+
+    CHECK_EQ_INT(git_config_finalization_begin(&finalization), 0);
+    CHECK(finalization != NULL);
+    CHECK_EQ_INT(git_config_finalization_end(&finalization), 0);
+    CHECK(finalization == NULL);
+    git_config_commit();
+    CHECK_EQ_INT((long)count_finalization_private_aliases(fixture.base), 0);
+    errno = 0;
+    CHECK(lstat(g_finalization_lock_path, &named) != 0 &&
+          errno == ENOENT);
+
+    fixture_cleanup(&fixture);
+}
+
 TEST(finalization_arena_exhaustion_precedes_private_and_canonical_creation) {
     git_fixture_t fixture;
     git_config_finalization_t *finalization = NULL;
@@ -2772,6 +3097,8 @@ TEST(finalization_release_failure_consumes_handle_and_self_heals) {
 TEST(forked_child_finalization_end_is_descriptor_only) {
     git_fixture_t fixture;
     git_config_finalization_t *finalization = NULL;
+    int inherited[6];
+    size_t inherited_count;
     struct stat before;
     struct stat after;
     char marker_before[1024];
@@ -2794,6 +3121,12 @@ TEST(forked_child_finalization_end_is_descriptor_only) {
                      "forked-finalization-postimage"), 0);
     CHECK_EQ_INT(git_config_finalization_begin(&finalization), 0);
     CHECK(finalization != NULL);
+    inherited_count = git_ops_test_finalization_descriptors(
+        finalization, inherited,
+        sizeof(inherited) / sizeof(inherited[0]));
+    CHECK(inherited_count > 0U);
+    CHECK(inherited_count <=
+          sizeof(inherited) / sizeof(inherited[0]));
     CHECK_EQ_INT(lstat(g_finalization_lock_path, &before), 0);
     CHECK_EQ_INT(read_file(g_finalization_lock_path, marker_before,
                            sizeof(marker_before)), 0);
@@ -2801,13 +3134,9 @@ TEST(forked_child_finalization_end_is_descriptor_only) {
     child = fork();
     CHECK(child >= 0);
     if (child == 0) {
-        int inherited[6];
         int replacements[6];
         struct stat replacement_identity[6];
-        size_t inherited_count =
-            git_ops_test_finalization_descriptors(
-                finalization, inherited,
-                sizeof(inherited) / sizeof(inherited[0]));
+        int minimum = 0;
 
         if (inherited_count == 0U ||
             inherited_count >
@@ -2815,14 +3144,22 @@ TEST(forked_child_finalization_end_is_descriptor_only) {
             _exit(87);
         }
         for (size_t i = 0U; i < inherited_count; i++) {
-            replacements[i] = reopen_snapshot_object(inherited[i]);
-            if (replacements[i] < 0 ||
-                replacements[i] == inherited[i] ||
-                fstat(replacements[i], &replacement_identity[i]) != 0 ||
-                close(inherited[i]) != 0 ||
-                dup2(replacements[i], inherited[i]) != inherited[i]) {
+            if (inherited[i] >= minimum) minimum = inherited[i] + 1;
+        }
+        for (size_t i = 0U; i < inherited_count; i++) {
+            errno = 0;
+            if (fcntl(inherited[i], F_GETFD) != -1 ||
+                errno != EBADF) {
                 _exit(89);
             }
+            replacements[i] =
+                install_git_fd_sentinel(inherited[i], minimum);
+            if (replacements[i] < minimum ||
+                fstat(replacements[i], &replacement_identity[i]) != 0 ||
+                fstat(inherited[i], &replacement_identity[i]) != 0) {
+                _exit(89);
+            }
+            minimum = replacements[i] + 1;
         }
         clear_error();
         errno = 0;
@@ -3105,6 +3442,12 @@ TEST(metadata_mismatches_use_stable_eagain_diagnostics) {
 
 TEST_MAIN_BEGIN()
     error_init(LOG_LEVEL_WARNING, NULL);
+    RUN_TEST(fork_child_with_empty_git_registry_preserves_unrelated_descriptor);
+    if (g_fork_coverage_child) return ts_test_finish();
+    RUN_TEST(fork_child_identity_gate_preserves_parent_reused_snapshot_descriptor);
+    if (g_fork_coverage_child) return ts_test_finish();
+    RUN_TEST(fork_child_closes_active_snapshot_finalizer_and_retirement_descriptors);
+    if (g_fork_coverage_child) return ts_test_finish();
     RUN_TEST(real_git_proves_narrow_ssh_environment_precedence_and_api_rejects_it);
     RUN_TEST(managed_command_scope_overrides_are_rejected_before_snapshot);
     RUN_TEST(late_command_override_is_rejected_at_account_writer_boundary);
@@ -3139,6 +3482,7 @@ TEST_MAIN_BEGIN()
     RUN_TEST(fork_child_abandon_preserves_reused_snapshot_descriptors);
     RUN_TEST(finalization_sigkill_leaves_complete_self_healing_certificate);
     RUN_TEST(private_prepublication_sigkill_is_reconciled_exactly);
+    RUN_TEST(private_prepare_interruption_cleans_unpublished_certificate);
     RUN_TEST(finalization_arena_exhaustion_precedes_private_and_canonical_creation);
     RUN_TEST(finalization_release_failure_consumes_handle_and_self_heals);
     RUN_TEST(forked_child_finalization_end_is_descriptor_only);

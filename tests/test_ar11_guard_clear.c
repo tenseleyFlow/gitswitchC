@@ -540,24 +540,29 @@ TEST(fork_child_abandon_preserves_reused_retirement_guard_directory_fd) {
     guard_fixture_t fixture;
     pid_t child;
     int status = 0;
+    int directory_fd;
 
     CHECK_EQ_INT(guard_fixture_init(&fixture), 0);
+    directory_fd =
+        gitswitch_test_retirement_guard_directory_fd(fixture.guard);
+    CHECK(directory_fd >= 0);
     child = fork();
     CHECK(child >= 0);
     if (child == 0) {
-        int directory_fd =
-            gitswitch_test_retirement_guard_directory_fd(fixture.guard);
-        int sentinel = directory_fd >= 0
-                           ? openat(
-                                 directory_fd, ".",
-                                 O_RDONLY | O_DIRECTORY | O_CLOEXEC |
-                                     O_NOFOLLOW)
-                           : -1;
+        int sentinel;
 
-        if (directory_fd < 0 || sentinel < 0 ||
-            directory_fd == sentinel ||
-            close(directory_fd) != 0 ||
-            dup2(sentinel, directory_fd) != directory_fd) {
+        errno = 0;
+        if (directory_fd < 0 ||
+            fcntl(directory_fd, F_GETFD) != -1 ||
+            errno != EBADF) {
+            _exit(89);
+        }
+        sentinel = open(
+            fixture.directory,
+            O_RDONLY | O_DIRECTORY | O_CLOEXEC | O_NOFOLLOW);
+        if (sentinel < 0 ||
+            (sentinel != directory_fd &&
+             dup2(sentinel, directory_fd) != directory_fd)) {
             _exit(90);
         }
         config_retirement_guard_abandon(&fixture.guard);
@@ -566,7 +571,7 @@ TEST(fork_child_abandon_preserves_reused_retirement_guard_directory_fd) {
             _exit(91);
         }
         close(directory_fd);
-        close(sentinel);
+        if (sentinel != directory_fd) close(sentinel);
         _exit(0);
     }
     if (child > 0) {
@@ -574,6 +579,16 @@ TEST(fork_child_abandon_preserves_reused_retirement_guard_directory_fd) {
         CHECK(WIFEXITED(status));
         if (WIFEXITED(status)) CHECK_EQ_INT(WEXITSTATUS(status), 0);
     }
+    CHECK_EQ_INT(config_retirement_guard_clear(&fixture.guard), 0);
+    CHECK(fixture.guard == NULL);
+    CHECK_EQ_INT(
+        config_retirement_guard_install_or_adopt(
+            fixture.config_path, CONFIG_RETIREMENT_RESET,
+            &fixture.owner, 1U, &fixture.guard),
+        0);
+    CHECK(fixture.guard != NULL);
+    CHECK_EQ_INT(config_retirement_guard_clear(&fixture.guard), 0);
+    CHECK(fixture.guard == NULL);
     guard_fixture_cleanup(&fixture);
 }
 

@@ -41,6 +41,7 @@
 
 #include "utils.h"
 #include "error.h"
+#include "process_fork_internal.h"
 #include "runner_internal.h"
 #define GITSWITCH_SIGNALS_RUNNER_INTERNAL
 #include "signals.h"
@@ -90,6 +91,7 @@ static terminal_echo_state_t g_terminal_echo_state = {
 #define RUNTIME_LOCK_CONTEXTS 8
 #define PRIVATE_LOCK_INODES 64
 #define PRIVATE_LOCK_CONTEXTS 64
+#define PROCESS_FORK_CHILD_CLEANUP_SLOTS 8
 
 typedef struct {
     bool active;
@@ -135,6 +137,8 @@ static pid_t g_runtime_lock_pid;
 static uint64_t g_private_lock_next_generation;
 static pthread_once_t g_private_lock_atfork_once = PTHREAD_ONCE_INIT;
 static int g_private_lock_atfork_error;
+static process_fork_child_cleanup_fn
+    g_process_fork_child_cleanups[PROCESS_FORK_CHILD_CLEANUP_SLOTS];
 
 static int dup_cloexec(int fd, int minimum);
 static int private_lock_create_token(int *token_fd, int *guard_fd,
@@ -1274,7 +1278,7 @@ static int private_lock_create_token(int *token_fd, int *guard_fd,
  * and reused an exposed/stale number, hence each close remains identity-gated.
  * close()/fstat() are async-signal-safe; the handler performs no allocation,
  * locking, or namespace operation. */
-static void private_lock_atfork_child(void) {
+static void process_fork_atfork_child(void) {
     for (size_t i = 0; i < RUNTIME_LOCK_CONTEXTS; i++) {
         runtime_lock_context_t *ctx = &g_runtime_locks[i];
 
@@ -1323,17 +1327,24 @@ static void private_lock_atfork_child(void) {
     g_private_lock_next_generation = 0;
     g_private_lock_pid = getpid();
     g_runtime_lock_pid = g_private_lock_pid;
+
+    for (size_t i = 0; i < PROCESS_FORK_CHILD_CLEANUP_SLOTS; i++) {
+        process_fork_child_cleanup_fn cleanup =
+            g_process_fork_child_cleanups[i];
+
+        if (cleanup) cleanup();
+    }
 }
 
-static void private_lock_register_atfork(void) {
+static void process_fork_register_atfork(void) {
     g_private_lock_atfork_error =
-        pthread_atfork(NULL, NULL, private_lock_atfork_child);
+        pthread_atfork(NULL, NULL, process_fork_atfork_child);
 }
 
 static int private_lock_ensure_atfork(void) {
     int once_error =
         pthread_once(&g_private_lock_atfork_once,
-                     private_lock_register_atfork);
+                     process_fork_register_atfork);
 
     if (once_error != 0) {
         errno = once_error;
@@ -1344,6 +1355,31 @@ static int private_lock_ensure_atfork(void) {
         return -1;
     }
     return 0;
+}
+
+int process_fork_child_cleanup_register(
+    process_fork_child_cleanup_fn cleanup) {
+    if (!cleanup) {
+        errno = EINVAL;
+        return -1;
+    }
+    if (private_lock_ensure_atfork() != 0) return -1;
+
+    for (size_t i = 0; i < PROCESS_FORK_CHILD_CLEANUP_SLOTS; i++) {
+        process_fork_child_cleanup_fn registered =
+            g_process_fork_child_cleanups[i];
+
+        if (registered == cleanup) return 0;
+    }
+    for (size_t i = 0; i < PROCESS_FORK_CHILD_CLEANUP_SLOTS; i++) {
+        if (!g_process_fork_child_cleanups[i]) {
+            g_process_fork_child_cleanups[i] = cleanup;
+            return 0;
+        }
+    }
+
+    errno = ENOSPC;
+    return -1;
 }
 
 /* flock state is inherited across fork because parent and child initially
@@ -2852,6 +2888,79 @@ static bool run_launch_witness_is_well_formed(
                : witness->interpreter_arg[0] == '\0';
 }
 
+#ifdef GITSWITCH_TESTING
+enum { RUN_TEST_LAUNCH_WITNESS_EPOCH_SLOTS = 4 };
+
+typedef struct {
+    char path[MAX_PATH_LEN];
+    unsigned int epoch;
+} run_test_launch_witness_epoch_t;
+
+static run_test_launch_witness_epoch_t
+    g_run_test_launch_witness_epochs[RUN_TEST_LAUNCH_WITNESS_EPOCH_SLOTS];
+
+int run_test_set_launch_witness_epoch(const char *program_path,
+                                      unsigned int epoch) {
+    size_t available = RUN_TEST_LAUNCH_WITNESS_EPOCH_SLOTS;
+
+    if (!program_path || program_path[0] != '/' || epoch == 0U ||
+        epoch >= 1000000000U ||
+        strlen(program_path) >= MAX_PATH_LEN) {
+        errno = EINVAL;
+        return -1;
+    }
+    for (size_t i = 0; i < RUN_TEST_LAUNCH_WITNESS_EPOCH_SLOTS; i++) {
+        if (g_run_test_launch_witness_epochs[i].path[0] == '\0') {
+            if (available == RUN_TEST_LAUNCH_WITNESS_EPOCH_SLOTS) {
+                available = i;
+            }
+            continue;
+        }
+        if (strcmp(g_run_test_launch_witness_epochs[i].path,
+                   program_path) == 0) {
+            g_run_test_launch_witness_epochs[i].epoch = epoch;
+            return 0;
+        }
+    }
+    if (available == RUN_TEST_LAUNCH_WITNESS_EPOCH_SLOTS) {
+        errno = ENOSPC;
+        return -1;
+    }
+    memcpy(g_run_test_launch_witness_epochs[available].path, program_path,
+           strlen(program_path) + 1U);
+    g_run_test_launch_witness_epochs[available].epoch = epoch;
+    return 0;
+}
+
+void run_test_clear_launch_witness_epochs(void) {
+    memset(g_run_test_launch_witness_epochs, 0,
+           sizeof(g_run_test_launch_witness_epochs));
+}
+
+static void run_test_apply_launch_witness_epoch(
+    const char *program_path, struct stat *identity) {
+    unsigned int epoch = 0U;
+
+    if (!program_path || !identity) return;
+    for (size_t i = 0; i < RUN_TEST_LAUNCH_WITNESS_EPOCH_SLOTS; i++) {
+        if (g_run_test_launch_witness_epochs[i].path[0] != '\0' &&
+            strcmp(g_run_test_launch_witness_epochs[i].path,
+                   program_path) == 0) {
+            epoch = g_run_test_launch_witness_epochs[i].epoch;
+            break;
+        }
+    }
+    if (epoch == 0U) return;
+#if defined(__APPLE__)
+    identity->st_ctimespec.tv_nsec =
+        (identity->st_ctimespec.tv_nsec + (long)epoch) % 1000000000L;
+#else
+    identity->st_ctim.tv_nsec =
+        (identity->st_ctim.tv_nsec + (long)epoch) % 1000000000L;
+#endif
+}
+#endif
+
 bool run_launch_witness_matches(
     const run_launch_witness_t *a, const run_launch_witness_t *b) {
     if (!run_launch_witness_is_well_formed(a) ||
@@ -3187,6 +3296,10 @@ static int run_launch_witness_from_opened(
            strlen(resolved_path) + 1U);
     out->is_script = launch->is_script;
     out->valid = true;
+#ifdef GITSWITCH_TESTING
+    run_test_apply_launch_witness_epoch(
+        resolved_path, &out->executable_identity);
+#endif
     return 0;
 }
 

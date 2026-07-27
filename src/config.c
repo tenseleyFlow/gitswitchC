@@ -55,6 +55,7 @@
 #include "display.h"
 #include "signals.h"
 #include "ssh_manager.h"
+#include "process_fork_internal.h"
 
 #define CONFIG_RETIREMENT_SETTLED_SLOTS 4096U
 #define CONFIG_SWITCH_SETTLED_PREFIX ".gitswitch-switch-settled-"
@@ -3576,6 +3577,24 @@ int gitswitch_test_retirement_guard_directory_fd(
  * second-handle loophole and also rejects a fork child that inherited an
  * unfinished parent transaction. */
 static pid_t g_retirement_guard_owner_pid;
+static config_retirement_guard_t *g_active_retirement_guard;
+static config_switch_guard_t *g_active_switch_guard;
+static bool g_config_guard_child_cleanup_registered;
+
+static void config_guard_atfork_child_cleanup(void);
+
+static int config_guard_ensure_child_cleanup(void) {
+    if (g_config_guard_child_cleanup_registered) return 0;
+    if (process_fork_child_cleanup_register(
+            config_guard_atfork_child_cleanup) != 0) {
+        set_system_error(
+            ERR_SYSTEM_CALL,
+            "Cannot register config guard fork-child cleanup");
+        return -1;
+    }
+    g_config_guard_child_cleanup_registered = true;
+    return 0;
+}
 
 static const char *config_retirement_kind_name(
     config_retirement_kind_t kind) {
@@ -5586,6 +5605,9 @@ static void config_retirement_guard_free(
     bool owned_here;
 
     if (!guard) return;
+    if (g_active_retirement_guard == guard) {
+        g_active_retirement_guard = NULL;
+    }
     owned_here = guard->owner_pid == getpid() &&
                  g_retirement_guard_owner_pid == getpid();
     if (owned_here) {
@@ -5727,6 +5749,7 @@ static int config_retirement_guard_make_handle(
         return -1;
     }
     g_retirement_guard_owner_pid = getpid();
+    g_active_retirement_guard = guard;
     *out = guard;
     return 0;
 }
@@ -5772,6 +5795,7 @@ int config_retirement_guard_install_or_adopt_with_ssh_alias_obligation(
             "This process already owns a retirement lifecycle transaction");
         return -1;
     }
+    if (config_guard_ensure_child_cleanup() != 0) return -1;
     memset(canonical, 0, sizeof(canonical));
     memset(&pair, 0, sizeof(pair));
     memset(&revalidated_pair, 0, sizeof(revalidated_pair));
@@ -6193,6 +6217,7 @@ int config_retirement_guard_adopt_with_ssh_alias_obligation(
             "This process already owns a retirement lifecycle transaction");
         return -1;
     }
+    if (config_guard_ensure_child_cleanup() != 0) return -1;
     memset(canonical, 0, sizeof(canonical));
     memset(&pair, 0, sizeof(pair));
     memset(&reconciled_pair, 0, sizeof(reconciled_pair));
@@ -6638,6 +6663,9 @@ static void config_retirement_guard_finish_prepared_commit(
     int directory_fd = guard->directory_fd;
     int lock_fd = guard->lock_fd;
 
+    if (g_active_retirement_guard == guard) {
+        g_active_retirement_guard = NULL;
+    }
     if (g_retirement_guard_owner_pid == getpid()) {
         g_retirement_guard_owner_pid = 0;
     }
@@ -7143,6 +7171,44 @@ int gitswitch_test_switch_guard_directory_fd(
 #endif
 
 static pid_t g_switch_guard_owner_pid;
+
+static void config_guard_atfork_child_close_directory(
+    int *directory_fd, const struct stat *directory_identity) {
+    struct stat opened;
+    int fd;
+
+    if (!directory_fd || !directory_identity) return;
+    fd = *directory_fd;
+    if (fd >= 0 &&
+        fstat(fd, &opened) == 0 &&
+        opened.st_dev == directory_identity->st_dev &&
+        opened.st_ino == directory_identity->st_ino) {
+        (void)close(fd);
+    }
+    *directory_fd = -1;
+}
+
+static void config_guard_atfork_child_cleanup(void) {
+    config_retirement_guard_t *retirement =
+        g_active_retirement_guard;
+    config_switch_guard_t *switch_guard =
+        g_active_switch_guard;
+
+    if (retirement) {
+        config_guard_atfork_child_close_directory(
+            &retirement->directory_fd,
+            &retirement->directory_identity);
+        retirement->lock_fd = -1;
+    }
+    if (switch_guard) {
+        config_guard_atfork_child_close_directory(
+            &switch_guard->directory_fd,
+            &switch_guard->directory_identity);
+        switch_guard->lock_fd = -1;
+    }
+    g_active_retirement_guard = NULL;
+    g_active_switch_guard = NULL;
+}
 
 static int config_switch_guard_stage_write_at(
     int directory_fd, const unsigned char *data, size_t length,
@@ -9673,6 +9739,9 @@ static void config_switch_guard_free(config_switch_guard_t *guard) {
     bool owned_here;
 
     if (!guard) return;
+    if (g_active_switch_guard == guard) {
+        g_active_switch_guard = NULL;
+    }
     owned_here = guard->owner_pid == getpid() &&
                  g_switch_guard_owner_pid == getpid();
     if (owned_here) {
@@ -9778,6 +9847,7 @@ static int config_switch_guard_make_handle(
     memcpy(guard->token, token, sizeof(guard->token));
     guard->created = created;
     g_switch_guard_owner_pid = getpid();
+    g_active_switch_guard = guard;
     *out = guard;
     return 0;
 }
@@ -10075,6 +10145,7 @@ int config_switch_guard_install_or_adopt(
             "This process already owns a switch recovery transaction");
         return -1;
     }
+    if (config_guard_ensure_child_cleanup() != 0) return -1;
     expected = calloc(1U, sizeof(*expected));
     snapshot = calloc(1U, sizeof(*snapshot));
     revalidated = calloc(1U, sizeof(*revalidated));

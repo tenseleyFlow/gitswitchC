@@ -39,6 +39,13 @@ typedef enum {
 typedef void (*run_test_pre_group_release_hook_fn)(pid_t supervisor_pid);
 void run_test_set_pre_group_release_hook(
     run_test_pre_group_release_hook_fn hook);
+/* Overlay a deterministic 1..999999999 generation epoch on successful real
+ * witness captures for one exact canonical executable path. The production
+ * trust walk and descriptor identity checks still run before this test-only
+ * generation is applied. */
+int run_test_set_launch_witness_epoch(const char *program_path,
+                                      unsigned int epoch);
+void run_test_clear_launch_witness_epochs(void);
 #ifdef GITSWITCH_RUNNER_GROUP_TEST_API
 /* One-shot child-supervisor setpgid(2) failure before GROUP_READY. */
 void run_test_set_child_process_group_failure(int system_errno);

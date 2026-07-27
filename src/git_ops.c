@@ -38,6 +38,7 @@
 #undef GITSWITCH_INTERNAL_API
 #include "error.h"
 #include "utils.h"
+#include "process_fork_internal.h"
 #include "runner_internal.h"
 #include "display.h"
 #include "toml_parser.h"
@@ -217,10 +218,55 @@ struct git_config_finalization {
     git_config_finalization_lock_t locks[3];
     size_t count;
     pid_t creator_pid;
+    struct git_config_finalization *fork_registry_prev;
+    struct git_config_finalization *fork_registry_next;
+    bool fork_registry_registered;
 };
 
 static git_config_snapshot_t g_git_snapshot;
+static git_config_finalization_t *g_git_finalization_registry;
 static unsigned int g_git_account_write_depth;
+static void git_fork_child_cleanup(void);
+
+static int git_fork_child_cleanup_ensure_registered(void) {
+    if (process_fork_child_cleanup_register(git_fork_child_cleanup) == 0) {
+        return 0;
+    }
+    set_system_error(
+        ERR_GIT_CONFIG_FAILED,
+        "Cannot register Git post-fork descriptor cleanup");
+    return -1;
+}
+
+static void git_finalization_registry_add(
+    git_config_finalization_t *finalization) {
+    if (!finalization || finalization->fork_registry_registered) return;
+    finalization->fork_registry_prev = NULL;
+    finalization->fork_registry_next = g_git_finalization_registry;
+    if (g_git_finalization_registry) {
+        g_git_finalization_registry->fork_registry_prev = finalization;
+    }
+    g_git_finalization_registry = finalization;
+    finalization->fork_registry_registered = true;
+}
+
+static void git_finalization_registry_remove(
+    git_config_finalization_t *finalization) {
+    if (!finalization || !finalization->fork_registry_registered) return;
+    if (finalization->fork_registry_prev) {
+        finalization->fork_registry_prev->fork_registry_next =
+            finalization->fork_registry_next;
+    } else {
+        g_git_finalization_registry = finalization->fork_registry_next;
+    }
+    if (finalization->fork_registry_next) {
+        finalization->fork_registry_next->fork_registry_prev =
+            finalization->fork_registry_prev;
+    }
+    finalization->fork_registry_prev = NULL;
+    finalization->fork_registry_next = NULL;
+    finalization->fork_registry_registered = false;
+}
 static void git_snapshot_clear(git_config_snapshot_t *snapshot);
 static int git_scope_generation_capture(git_scope_t scope,
                                         git_scope_generation_t *generation);
@@ -7165,20 +7211,32 @@ static int git_finalization_lock_acquire(
     if (git_finalization_reconcile_private_orphans(
             lock->parent_fd, lock->lock_leaf) != 0 ||
         git_finalization_prepare_private_marker(lock) != 0) {
+        error_context_t primary_error = *get_last_error();
+        int primary_errno = errno ? errno : EIO;
+
         (void)git_finalization_cleanup_unpublished_private(lock);
         git_finalization_lock_dispose(lock);
+        g_last_error = primary_error;
+        errno = primary_errno;
         return -1;
     }
     if (g_finalization_test_hook &&
         g_finalization_test_hook(
             GIT_FINALIZATION_TEST_AFTER_PRIVATE_PREPARE,
             lock->parent_fd, lock->lock_leaf)) {
+        error_context_t primary_error;
+        int primary_errno;
+
         errno = EIO;
         set_system_error(
             ERR_GIT_CONFIG_FAILED,
             "Injected private Git finalization-certificate interruption");
+        primary_error = *get_last_error();
+        primary_errno = errno;
         (void)git_finalization_cleanup_unpublished_private(lock);
         git_finalization_lock_dispose(lock);
+        g_last_error = primary_error;
+        errno = primary_errno;
         return -1;
     }
     lock->active = true;
@@ -7324,6 +7382,7 @@ static void git_config_finalization_abandon_mode(
     if (!finalization || !*finalization) return;
     owned = *finalization;
     *finalization = NULL;
+    git_finalization_registry_remove(owned);
     for (size_t i = 0U; i < owned->count; i++) {
         git_finalization_lock_dispose_mode(
             &owned->locks[i], inherited);
@@ -7435,7 +7494,17 @@ int git_config_finalization_begin(
             "Cannot allocate Git transaction finalization state");
         return -1;
     }
+    if (git_fork_child_cleanup_ensure_registered() != 0) {
+        free(owned);
+        return -1;
+    }
+    for (size_t i = 0U;
+         i < sizeof(owned->locks) / sizeof(owned->locks[0]); i++) {
+        owned->locks[i].parent_fd = -1;
+        owned->locks[i].lock_fd = -1;
+    }
     owned->creator_pid = getpid();
+    git_finalization_registry_add(owned);
     for (size_t i = 0;
          i < sizeof(generations) / sizeof(generations[0]); i++) {
         if (generations[i]->valid &&
@@ -7726,6 +7795,7 @@ int git_config_snapshot(git_scope_t scope) {
         set_error(ERR_INVALID_ARGS, "Invalid Git snapshot scope");
         return -1;
     }
+    if (git_fork_child_cleanup_ensure_registered() != 0) return -1;
     if (git_reject_ssh_command_override() != 0) return -1;
     if (git_reject_managed_command_overrides() != 0) return -1;
     git_snapshot_clear(&g_git_snapshot);
@@ -9651,11 +9721,149 @@ struct git_retirement_transaction {
     bool recovery_proof_only;
     bool terminal_release_only;
     bool terminal_settlement_failed;
+    struct git_retirement_transaction *fork_registry_prev;
+    struct git_retirement_transaction *fork_registry_next;
+    bool fork_registry_registered;
 };
 
 struct git_retirement_recovery {
     git_retirement_transaction_t *transaction;
 };
+
+static git_retirement_transaction_t *g_git_retirement_registry;
+
+static void git_retirement_registry_add(
+    git_retirement_transaction_t *transaction) {
+    if (!transaction || transaction->fork_registry_registered) return;
+    transaction->fork_registry_prev = NULL;
+    transaction->fork_registry_next = g_git_retirement_registry;
+    if (g_git_retirement_registry) {
+        g_git_retirement_registry->fork_registry_prev = transaction;
+    }
+    g_git_retirement_registry = transaction;
+    transaction->fork_registry_registered = true;
+}
+
+static void git_retirement_registry_remove(
+    git_retirement_transaction_t *transaction) {
+    if (!transaction || !transaction->fork_registry_registered) return;
+    if (transaction->fork_registry_prev) {
+        transaction->fork_registry_prev->fork_registry_next =
+            transaction->fork_registry_next;
+    } else {
+        g_git_retirement_registry = transaction->fork_registry_next;
+    }
+    if (transaction->fork_registry_next) {
+        transaction->fork_registry_next->fork_registry_prev =
+            transaction->fork_registry_prev;
+    }
+    transaction->fork_registry_prev = NULL;
+    transaction->fork_registry_next = NULL;
+    transaction->fork_registry_registered = false;
+}
+
+static bool git_fork_fd_matches_stat(int fd, const struct stat *expected) {
+    struct stat observed;
+
+    return fd >= 0 && expected && fstat(fd, &observed) == 0 &&
+           observed.st_dev == expected->st_dev &&
+           observed.st_ino == expected->st_ino;
+}
+
+static void git_fork_close_fd_if_matches(
+    int *fd, const struct stat *expected) {
+    int retained;
+
+    if (!fd) return;
+    retained = *fd;
+    if (git_fork_fd_matches_stat(retained, expected)) {
+        (void)close(retained);
+    }
+    *fd = -1;
+}
+
+static void git_fork_cleanup_generation(
+    git_scope_generation_t *generation) {
+    if (!generation) return;
+    if (generation->valid) {
+        git_fork_close_fd_if_matches(
+            &generation->parent_fd, &generation->parent_stat);
+    } else {
+        generation->parent_fd = -1;
+    }
+    if (generation->repository_present) {
+        git_fork_close_fd_if_matches(
+            &generation->repository_fd, &generation->repository_stat);
+    } else {
+        generation->repository_fd = -1;
+    }
+    if (generation->post_config_identity_valid &&
+        generation->post_config_present) {
+        git_fork_close_fd_if_matches(
+            &generation->post_config_fd, &generation->post_config_stat);
+    } else {
+        generation->post_config_fd = -1;
+    }
+}
+
+static void git_fork_cleanup_scope_lock(git_scope_lock_t *lock) {
+    if (!lock) return;
+    git_fork_close_fd_if_matches(&lock->dir_fd, &lock->parent_stat);
+    git_fork_close_fd_if_matches(&lock->lock_fd, &lock->lock_stat);
+    git_fork_close_fd_if_matches(&lock->stage_fd, &lock->stage_stat);
+    git_fork_close_fd_if_matches(&lock->original_fd, &lock->original_stat);
+    git_fork_close_fd_if_matches(&lock->published_fd, &lock->published_stat);
+    git_fork_close_fd_if_matches(
+        &lock->recovery_authority_fd, &lock->recovery_authority_stat);
+}
+
+static void git_fork_child_cleanup(void) {
+    git_config_finalization_t *finalization;
+    git_retirement_transaction_t *transaction;
+
+    git_fork_cleanup_generation(&g_git_snapshot.primary_generation);
+    git_fork_cleanup_generation(&g_git_snapshot.local_generation);
+    git_fork_cleanup_generation(&g_git_snapshot.worktree_generation);
+
+    finalization = g_git_finalization_registry;
+    while (finalization) {
+        git_config_finalization_t *next =
+            finalization->fork_registry_next;
+
+        for (size_t i = 0U;
+             i < sizeof(finalization->locks) /
+                     sizeof(finalization->locks[0]);
+             i++) {
+            git_config_finalization_lock_t *lock =
+                &finalization->locks[i];
+
+            git_fork_close_fd_if_matches(
+                &lock->parent_fd, &lock->parent_stat);
+            git_fork_close_fd_if_matches(
+                &lock->lock_fd, &lock->lock_stat);
+        }
+        finalization->fork_registry_prev = NULL;
+        finalization->fork_registry_next = NULL;
+        finalization->fork_registry_registered = false;
+        finalization = next;
+    }
+    g_git_finalization_registry = NULL;
+
+    transaction = g_git_retirement_registry;
+    while (transaction) {
+        git_retirement_transaction_t *next =
+            transaction->fork_registry_next;
+
+        for (size_t i = 0U; i < transaction->group_count; i++) {
+            git_fork_cleanup_scope_lock(&transaction->groups[i].lock);
+        }
+        transaction->fork_registry_prev = NULL;
+        transaction->fork_registry_next = NULL;
+        transaction->fork_registry_registered = false;
+        transaction = next;
+    }
+    g_git_retirement_registry = NULL;
+}
 
 /* Capture the complete source generation before canonical-lock recovery can
  * fsync a retained FreeBSD lease. UFS may materialize that lease operation's
@@ -11024,6 +11232,7 @@ static int git_retirement_publish_group_atomic(
 static void git_retirement_transaction_release_mode(
     git_retirement_transaction_t *transaction, bool inherited) {
     if (!transaction) return;
+    git_retirement_registry_remove(transaction);
     for (size_t i = 0U; i < transaction->group_count; i++) {
         git_retirement_group_t *group = &transaction->groups[i];
 
@@ -11118,6 +11327,11 @@ static int git_retirement_transaction_prepare_internal(
     }
     transaction = calloc(1U, sizeof(*transaction));
     if (!transaction) goto allocation_failed;
+    if (git_fork_child_cleanup_ensure_registered() != 0) {
+        free(transaction);
+        return -1;
+    }
+    git_retirement_registry_add(transaction);
     transaction->creator_pid = getpid();
     transaction->items = calloc(item_count, sizeof(*transaction->items));
     transaction->publication_refs =
@@ -11289,8 +11503,9 @@ static int git_retirement_transaction_prepare_internal(
             }
             representative = absent_representative;
         }
-        group = &transaction->groups[transaction->group_count++];
+        group = &transaction->groups[transaction->group_count];
         git_scope_lock_init(&group->lock);
+        transaction->group_count++;
         group->representative = representative;
         (void)git_scope_from_publication(
             transaction->publication_refs[representative]->scope,
