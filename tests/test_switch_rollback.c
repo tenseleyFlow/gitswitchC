@@ -5276,6 +5276,366 @@ TEST(abort_only_pending_switch_excludes_competing_entry_matrix) {
     }
 }
 
+/* AR-14 process-epoch boundary: fork copies the prepared-switch record, but
+ * it does not transfer ownership of the parent's runtime lock, switch guard,
+ * Git rollback image, or transaction token.  Both public finalizers must
+ * reject the inherited handle after abandoning only the child's copies.  A
+ * fresh child-local owner must then be usable, while the parent's live switch
+ * remains locked and exactly abortable. */
+TEST(forked_child_cannot_finalize_parent_pending_switch) {
+    gitswitch_ctx_t owner;
+    command_runner_fn previous_runner;
+
+    CHECK_EQ_INT(setup_empty_runtime_dir(), 0);
+    CHECK_EQ_INT(signals_guard_end(), 0);
+    signals_rollback_end();
+    owner = make_ctx();
+    seed_previous_git_identity();
+    previous_runner = run_set_runner(fake_runner);
+    CHECK_EQ_INT(prepare_switch_expect(
+                     &owner, "testacct",
+                     ACCOUNTS_SWITCH_PREPARE_PREPARED),
+                 0);
+    CHECK(!runtime_lock_available_to_child());
+    CHECK(signals_guard_active());
+    CHECK(signals_rollback_active());
+
+    for (int finalizer = 0; finalizer < 2; finalizer++) {
+        int status = 0;
+        pid_t child;
+
+        fflush(NULL);
+        child = fork();
+        CHECK(child >= 0);
+        if (child == 0) {
+            accounts_transaction_token_t child_token = 0;
+
+            errno = 0;
+            if (finalizer == 0) {
+                accounts_switch_commit_state_t state =
+                    ACCOUNTS_SWITCH_COMMIT_COMPLETE;
+
+                if (accounts_switch_commit_result(&owner, &state) != -1 ||
+                    errno != EINVAL ||
+                    state != ACCOUNTS_SWITCH_COMMIT_NOT_COMMITTED) {
+                    _exit(10);
+                }
+            } else {
+                if (accounts_switch_abort(&owner, false) != -1 ||
+                    errno != EINVAL) {
+                    _exit(11);
+                }
+            }
+            if (accounts_transaction_begin(
+                    &owner, ACCOUNTS_TRANSACTION_INITIALIZE,
+                    &child_token) != 0 ||
+                child_token == 0 ||
+                accounts_transaction_finish(
+                    &owner, ACCOUNTS_TRANSACTION_INITIALIZE,
+                    child_token) != 0 ||
+                !accounts_transaction_context_release_safe(&owner)) {
+                _exit(12);
+            }
+            _exit(0);
+        }
+        if (child > 0) {
+            CHECK(waitpid(child, &status, 0) == child);
+            CHECK(WIFEXITED(status));
+            if (WIFEXITED(status)) {
+                CHECK_EQ_INT(WEXITSTATUS(status), 0);
+            }
+        }
+
+        CHECK(!runtime_lock_available_to_child());
+        CHECK(signals_guard_active());
+        CHECK(signals_rollback_active());
+        CHECK(!accounts_transaction_context_release_safe(&owner));
+        CHECK_STR_EQ(g_store_name, "testacct");
+        CHECK_STR_EQ(g_store_email, "test@example.com");
+    }
+
+    CHECK_EQ_INT(accounts_switch_abort(&owner, false), 0);
+    CHECK_STR_EQ(g_store_name, "Previous Name");
+    CHECK_STR_EQ(g_store_email, "prev@example.com");
+    CHECK(runtime_lock_available_to_child());
+    CHECK(!signals_guard_active());
+    CHECK(!signals_rollback_active());
+    CHECK(accounts_transaction_context_release_safe(&owner));
+    run_set_runner(previous_runner);
+}
+
+/* Direct utility-level causal control for automatic fork cleanup. The
+ * grandchild remains alive after its holder exits; the lock must already be
+ * acquirable whether or not child code redundantly calls the explicit abandon
+ * API. The second branch also proves that API is idempotent. */
+TEST(runtime_lock_atfork_releases_inherited_flock_automatically) {
+    CHECK_EQ_INT(setup_empty_runtime_dir(), 0);
+
+    for (int abandon = 0; abandon < 2; abandon++) {
+        int ready[2] = {-1, -1};
+        int release[2] = {-1, -1};
+        int done[2] = {-1, -1};
+        int status = 0;
+        pid_t holder;
+        char marker = '\0';
+        ssize_t count;
+
+        CHECK_EQ_INT(pipe(ready), 0);
+        CHECK_EQ_INT(pipe(release), 0);
+        CHECK_EQ_INT(pipe(done), 0);
+        if (ready[0] < 0 || ready[1] < 0 ||
+            release[0] < 0 || release[1] < 0 ||
+            done[0] < 0 || done[1] < 0) {
+            return;
+        }
+
+        fflush(NULL);
+        holder = fork();
+        CHECK(holder >= 0);
+        if (holder == 0) {
+            int holder_lock = runtime_state_lock_acquire();
+            pid_t child;
+
+            close(ready[0]);
+            close(release[1]);
+            close(done[0]);
+            if (holder_lock < 0) _exit(40);
+            child = fork();
+            if (child < 0) _exit(41);
+            if (child == 0) {
+                if (abandon) {
+                    runtime_state_lock_abandon_inherited();
+                    runtime_state_lock_abandon_inherited();
+                }
+                marker = 'R';
+                do {
+                    count = write(ready[1], &marker, 1);
+                } while (count < 0 && errno == EINTR);
+                close(ready[1]);
+                if (count != 1) _exit(42);
+                do {
+                    count = read(release[0], &marker, 1);
+                } while (count < 0 && errno == EINTR);
+                close(release[0]);
+                if (count != 1) _exit(43);
+                /* Exercise the idempotent public boundary in both branches
+                 * before ending the synchronized child lifetime. */
+                runtime_state_lock_abandon_inherited();
+                marker = 'D';
+                do {
+                    count = write(done[1], &marker, 1);
+                } while (count < 0 && errno == EINTR);
+                close(done[1]);
+                _exit(count == 1 ? 0 : 44);
+            }
+
+            /* Model a holder that exits without an explicit LOCK_UN. The
+             * grandchild is the only remaining owner of copied descriptors. */
+            close(ready[1]);
+            close(release[0]);
+            close(done[1]);
+            _exit(0);
+        }
+
+        close(ready[1]);
+        close(release[0]);
+        close(done[1]);
+        CHECK(waitpid(holder, &status, 0) == holder);
+        CHECK(WIFEXITED(status));
+        if (WIFEXITED(status)) {
+            CHECK_EQ_INT(WEXITSTATUS(status), 0);
+        }
+        do {
+            count = read(ready[0], &marker, 1);
+        } while (count < 0 && errno == EINTR);
+        close(ready[0]);
+        CHECK_EQ_INT(count, 1);
+        CHECK_EQ_INT(marker, 'R');
+        CHECK(runtime_lock_available_to_child());
+
+        marker = 'X';
+        do {
+            count = write(release[1], &marker, 1);
+        } while (count < 0 && errno == EINTR);
+        close(release[1]);
+        CHECK_EQ_INT(count, 1);
+        do {
+            count = read(done[0], &marker, 1);
+        } while (count < 0 && errno == EINTR);
+        close(done[0]);
+        CHECK_EQ_INT(count, 1);
+        CHECK_EQ_INT(marker, 'D');
+        CHECK(runtime_lock_available_to_child());
+    }
+}
+
+/* Closing only the copied public runtime token is insufficient after fork:
+ * the private-lock registry also retains the real flock-bearing descriptor.
+ * Keep the child alive after its inherited-finalizer rejection, release the
+ * parent switch, and prove a third process can acquire immediately. */
+TEST(forked_child_abandons_private_runtime_lock_registry) {
+    gitswitch_ctx_t owner;
+    command_runner_fn previous_runner;
+    int ready[2] = {-1, -1};
+    int release[2] = {-1, -1};
+    int status = 0;
+    pid_t child;
+    char marker = '\0';
+    ssize_t count;
+
+    CHECK_EQ_INT(setup_empty_runtime_dir(), 0);
+    CHECK_EQ_INT(signals_guard_end(), 0);
+    signals_rollback_end();
+    owner = make_ctx();
+    seed_previous_git_identity();
+    previous_runner = run_set_runner(fake_runner);
+    CHECK_EQ_INT(prepare_switch_expect(
+                     &owner, "testacct",
+                     ACCOUNTS_SWITCH_PREPARE_PREPARED),
+                 0);
+    CHECK(!runtime_lock_available_to_child());
+    CHECK_EQ_INT(pipe(ready), 0);
+    CHECK_EQ_INT(pipe(release), 0);
+    if (ready[0] < 0 || ready[1] < 0 ||
+        release[0] < 0 || release[1] < 0) {
+        CHECK_EQ_INT(accounts_switch_abort(&owner, false), 0);
+        run_set_runner(previous_runner);
+        return;
+    }
+
+    fflush(NULL);
+    child = fork();
+    CHECK(child >= 0);
+    if (child == 0) {
+        close(ready[0]);
+        close(release[1]);
+        errno = 0;
+        if (accounts_switch_abort(&owner, false) != -1 ||
+            errno != EINVAL) {
+            _exit(30);
+        }
+        marker = 'R';
+        do {
+            count = write(ready[1], &marker, 1);
+        } while (count < 0 && errno == EINTR);
+        close(ready[1]);
+        if (count != 1) _exit(31);
+        do {
+            count = read(release[0], &marker, 1);
+        } while (count < 0 && errno == EINTR);
+        close(release[0]);
+        _exit(count == 1 ? 0 : 32);
+    }
+
+    close(ready[1]);
+    close(release[0]);
+    do {
+        count = read(ready[0], &marker, 1);
+    } while (count < 0 && errno == EINTR);
+    close(ready[0]);
+    CHECK_EQ_INT(count, 1);
+    CHECK_EQ_INT(marker, 'R');
+    CHECK(!runtime_lock_available_to_child());
+
+    CHECK_EQ_INT(accounts_switch_abort(&owner, false), 0);
+    /* The first child remains alive here. Its abandoned registry must not
+     * extend the parent's flock lifetime. */
+    CHECK(runtime_lock_available_to_child());
+
+    marker = 'X';
+    do {
+        count = write(release[1], &marker, 1);
+    } while (count < 0 && errno == EINTR);
+    close(release[1]);
+    CHECK_EQ_INT(count, 1);
+    CHECK(waitpid(child, &status, 0) == child);
+    CHECK(WIFEXITED(status));
+    if (WIFEXITED(status)) {
+        CHECK_EQ_INT(WEXITSTATUS(status), 0);
+    }
+    CHECK(runtime_lock_available_to_child());
+    CHECK(accounts_transaction_context_release_safe(&owner));
+    run_set_runner(previous_runner);
+}
+
+/* The first inherited entry disposes the child's copied switch ownership even
+ * when restoring inherited signal dispositions fails.  The next independent
+ * begin retries only that restoration: it must neither repeat switch disposal
+ * nor carry forward the inherited-finalizer rejection. */
+TEST(forked_child_signal_reset_retry_admits_fresh_switch_transaction) {
+    gitswitch_ctx_t owner;
+    command_runner_fn previous_runner;
+    int status = 0;
+    pid_t child;
+
+    CHECK_EQ_INT(setup_empty_runtime_dir(), 0);
+    CHECK_EQ_INT(signals_guard_end(), 0);
+    signals_rollback_end();
+    owner = make_ctx();
+    seed_previous_git_identity();
+    previous_runner = run_set_runner(fake_runner);
+    CHECK_EQ_INT(prepare_switch_expect(
+                     &owner, "testacct",
+                     ACCOUNTS_SWITCH_PREPARE_PREPARED),
+                 0);
+    CHECK(!runtime_lock_available_to_child());
+
+    fflush(NULL);
+    child = fork();
+    CHECK(child >= 0);
+    if (child == 0) {
+        accounts_transaction_token_t first_token = 0;
+        accounts_transaction_token_t second_token = 0;
+
+        signals_test_fail_sigaction(
+            SIGTERM, SIGNALS_TEST_SIGACTION_RESTORE, EIO);
+        errno = 0;
+        if (accounts_switch_abort(&owner, false) != -1 || errno != EIO) {
+            _exit(20);
+        }
+        if (accounts_transaction_begin(
+                &owner, ACCOUNTS_TRANSACTION_INITIALIZE,
+                &first_token) != 0 ||
+            first_token == 0 ||
+            accounts_transaction_finish(
+                &owner, ACCOUNTS_TRANSACTION_INITIALIZE,
+                first_token) != 0) {
+            _exit(21);
+        }
+        if (accounts_transaction_begin(
+                &owner, ACCOUNTS_TRANSACTION_INITIALIZE,
+                &second_token) != 0 ||
+            second_token <= first_token ||
+            accounts_transaction_finish(
+                &owner, ACCOUNTS_TRANSACTION_INITIALIZE,
+                second_token) != 0 ||
+            !accounts_transaction_context_release_safe(&owner)) {
+            _exit(22);
+        }
+        _exit(0);
+    }
+    if (child > 0) {
+        CHECK(waitpid(child, &status, 0) == child);
+        CHECK(WIFEXITED(status));
+        if (WIFEXITED(status)) {
+            CHECK_EQ_INT(WEXITSTATUS(status), 0);
+        }
+    }
+
+    CHECK(!runtime_lock_available_to_child());
+    CHECK(signals_guard_active());
+    CHECK(signals_rollback_active());
+    CHECK(!accounts_transaction_context_release_safe(&owner));
+    CHECK_STR_EQ(g_store_name, "testacct");
+    CHECK_STR_EQ(g_store_email, "test@example.com");
+    CHECK_EQ_INT(accounts_switch_abort(&owner, false), 0);
+    CHECK_STR_EQ(g_store_name, "Previous Name");
+    CHECK_STR_EQ(g_store_email, "prev@example.com");
+    CHECK(runtime_lock_available_to_child());
+    CHECK(accounts_transaction_context_release_safe(&owner));
+    run_set_runner(previous_runner);
+}
+
 /* AR-12 M1: failures in the post-commit finalization tail (ownership
  * release, signal-guard restore) occur after the switch's point of no
  * return: the alias has published and git_config_commit() discarded the
@@ -5768,6 +6128,10 @@ TEST(interrupted_switch_retains_pending_signal_on_restore_failure) {
         default_action.sa_handler = SIG_DFL;
         sigemptyset(&default_action.sa_mask);
         if (sigaction(SIGINT, &default_action, NULL) != 0) _exit(60);
+        /* Establish the child's independent accounts epoch before installing
+         * a child-local signal fault. The epoch reset intentionally discards
+         * inherited test seams along with inherited transaction state. */
+        if (!accounts_transaction_context_release_safe(&ctx)) _exit(59);
         g_fail_user_name_set = false;
         g_raise_on_user_name = true;
         g_log = NULL;
@@ -6140,6 +6504,10 @@ TEST_MAIN_BEGIN()
     }
     RUN_TEST(structured_prepare_result_tracks_exact_context_ownership);
     RUN_TEST(clean_pending_switch_excludes_competing_entry_matrix);
+    RUN_TEST(forked_child_cannot_finalize_parent_pending_switch);
+    RUN_TEST(runtime_lock_atfork_releases_inherited_flock_automatically);
+    RUN_TEST(forked_child_abandons_private_runtime_lock_registry);
+    RUN_TEST(forked_child_signal_reset_retry_admits_fresh_switch_transaction);
     RUN_TEST(prepared_commit_rejects_every_frozen_account_field_change);
     RUN_TEST(prepared_switch_gates_public_account_model_mutation_matrix);
     RUN_TEST(prepared_commit_accepts_unchanged_tilde_ssh_path);
