@@ -1713,6 +1713,8 @@ TEST(poll_failure_kills_and_reaps_before_reporting_primary_errno) {
                  "subprocess pipe I/O failed") != NULL);
 }
 
+/* Leave enough launch headroom for a contended scheduler while remaining
+ * below the runner's 250 ms retained-capture grace that these tests preempt. */
 TEST(global_deadline_preempts_descendant_capture_grace) {
     const char *argv[] = {"sh", "-c", "sleep 2 &", NULL};
     char output[32];
@@ -1724,7 +1726,7 @@ TEST(global_deadline_preempts_descendant_capture_grace) {
     opts.out = output;
     opts.out_size = sizeof(output);
     opts.stderr_to_devnull = true;
-    CHECK_EQ_INT(run_deadline_after_millis(80, &opts.deadline_millis), 0);
+    CHECK_EQ_INT(run_deadline_after_millis(200, &opts.deadline_millis), 0);
     opts.use_deadline = true;
     errno = 0;
     CHECK_EQ_INT(run_argv(argv, &opts, &result), -1);
@@ -1749,7 +1751,7 @@ TEST(global_deadline_survives_continuous_descendant_output) {
     opts.out = output;
     opts.out_size = sizeof(output);
     opts.stderr_to_devnull = true;
-    CHECK_EQ_INT(run_deadline_after_millis(80, &opts.deadline_millis), 0);
+    CHECK_EQ_INT(run_deadline_after_millis(200, &opts.deadline_millis), 0);
     opts.use_deadline = true;
     errno = 0;
     CHECK_EQ_INT(run_argv(argv, &opts, &result), -1);
