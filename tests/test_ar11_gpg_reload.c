@@ -125,6 +125,11 @@ static int g_tool_settle_attempts;
 static int g_tool_settle_mutation_applications;
 static bool g_tool_settle_observed_closed;
 static bool g_tool_publisher_open;
+static int g_text_settle_mutation_limit;
+static int g_text_settle_attempts;
+static int g_text_settle_mutation_applications;
+static bool g_text_settle_observed_closed;
+static bool g_text_publisher_open;
 
 static m20_saved_env_t m20_save_env(const char *name) {
     const char *value = getenv(name);
@@ -266,7 +271,7 @@ static int m20_full_sync_fd(int fd) {
     return fsync(fd);
 }
 
-static int m20_open_private_tool_directory(const char *path) {
+static int m20_open_private_directory(const char *path) {
     struct stat named_before;
     struct stat opened;
     struct stat named_after;
@@ -335,8 +340,9 @@ static int m20_sync_private_tool_at(int parent_fd, const char *leaf) {
     return 0;
 }
 
-static int m20_split_tool_path(const char *path, char *parent,
-                               size_t parent_size, const char **leaf_out) {
+static int m20_split_private_path(const char *path, char *parent,
+                                  size_t parent_size,
+                                  const char **leaf_out) {
     char *slash;
 
     if (!path || !parent || !leaf_out ||
@@ -442,7 +448,7 @@ static int m20_replace_gpgconf(const char *path) {
 
     replacement[0] = '\0';
     if (!path ||
-        m20_split_tool_path(path, parent, sizeof(parent), &leaf) != 0 ||
+        m20_split_private_path(path, parent, sizeof(parent), &leaf) != 0 ||
         safe_snprintf(replacement_leaf, sizeof(replacement_leaf),
                       "%s.new", leaf) != 0 ||
         safe_snprintf(sibling, sizeof(sibling), "%s/%s", parent,
@@ -451,7 +457,7 @@ static int m20_replace_gpgconf(const char *path) {
         copy_file(g_self_executable, replacement) != 0) {
         goto out;
     }
-    parent_fd = m20_open_private_tool_directory(parent);
+    parent_fd = m20_open_private_directory(parent);
     if (parent_fd >= 0) g_tool_publisher_open = true;
     if (parent_fd < 0 ||
         m20_sync_private_tool_at(parent_fd, replacement_leaf) != 0 ||
@@ -539,6 +545,338 @@ static int m20_mutate_private_tool_successor(const char *path) {
         return -1;
     }
     return 0;
+}
+
+static int m20_write_all(int fd, const char *text) {
+    size_t length;
+    size_t written = 0;
+
+    if (fd < 0 || !text) {
+        errno = EINVAL;
+        return -1;
+    }
+    length = strlen(text);
+    while (written < length) {
+        ssize_t count = write(fd, text + written, length - written);
+
+        if (count > 0) {
+            written += (size_t)count;
+        } else if (count < 0 && errno == EINTR) {
+            continue;
+        } else {
+            if (count == 0) errno = EIO;
+            return -1;
+        }
+    }
+    return 0;
+}
+
+static int m20_write_private_text_at(int parent_fd, const char *leaf,
+                                     const char *text, bool exclusive) {
+    struct stat opened;
+    int flags = O_WRONLY | O_CLOEXEC | O_NOFOLLOW | O_NONBLOCK;
+    int fd = -1;
+    int saved_errno = 0;
+    bool created = false;
+
+    if (parent_fd < 0 || !leaf || leaf[0] == '\0' ||
+        strchr(leaf, '/') || !text) {
+        errno = EINVAL;
+        return -1;
+    }
+    fd = openat(parent_fd, leaf, flags | O_CREAT | O_EXCL, 0600);
+    if (fd >= 0) {
+        created = true;
+    } else if (!exclusive && errno == EEXIST) {
+        fd = openat(parent_fd, leaf, flags);
+    }
+    if (fd < 0) return -1;
+    if (fstat(fd, &opened) != 0) {
+        saved_errno = errno;
+        goto out;
+    }
+    if (!S_ISREG(opened.st_mode) || opened.st_uid != getuid() ||
+        opened.st_nlink != 1) {
+        saved_errno = EPERM;
+        goto out;
+    }
+    if (fchmod(fd, 0600) != 0 || ftruncate(fd, 0) != 0 ||
+        m20_write_all(fd, text) != 0 ||
+        m20_full_sync_fd(fd) != 0) {
+        saved_errno = errno ? errno : EIO;
+    }
+out:
+    if (fd >= 0 && close(fd) != 0 && saved_errno == 0) {
+        saved_errno = errno;
+    }
+    if (saved_errno != 0 && created) {
+        (void)unlinkat(parent_fd, leaf, 0);
+    }
+    if (saved_errno != 0) {
+        errno = saved_errno;
+        return -1;
+    }
+    return 0;
+}
+
+static int m20_capture_private_text(const char *path, const char *expected,
+                                    struct stat *identity) {
+    char parent[MAX_PATH_LEN];
+    const char *leaf;
+    struct stat named_before;
+    struct stat opened_before;
+    struct stat opened_after;
+    struct stat named_after;
+    size_t expected_length;
+    size_t used = 0;
+    char buffer[512];
+    unsigned char extra;
+    int parent_fd = -1;
+    int fd = -1;
+    int saved_errno = 0;
+
+    if (!path || !expected || !identity) {
+        errno = EINVAL;
+        return -1;
+    }
+    expected_length = strlen(expected);
+    if (expected_length > sizeof(buffer) ||
+        m20_split_private_path(path, parent, sizeof(parent), &leaf) != 0) {
+        if (expected_length > sizeof(buffer)) errno = EOVERFLOW;
+        return -1;
+    }
+    parent_fd = m20_open_private_directory(parent);
+    if (parent_fd < 0) return -1;
+    if (fstatat(parent_fd, leaf, &named_before,
+                AT_SYMLINK_NOFOLLOW) != 0) {
+        saved_errno = errno;
+        goto out;
+    }
+    if (!S_ISREG(named_before.st_mode) ||
+        named_before.st_uid != getuid() ||
+        named_before.st_nlink != 1 ||
+        (named_before.st_mode & 0777) != 0600) {
+        saved_errno = EPERM;
+        goto out;
+    }
+    fd = openat(parent_fd, leaf,
+                O_RDONLY | O_CLOEXEC | O_NOFOLLOW | O_NONBLOCK);
+    if (fd < 0) {
+        saved_errno = errno;
+        goto out;
+    }
+    if (fstat(fd, &opened_before) != 0) {
+        saved_errno = errno;
+        goto out;
+    }
+    if (!m20_same_file_version(&named_before, &opened_before)) {
+        saved_errno = ESTALE;
+        goto out;
+    }
+    while (used < expected_length) {
+        ssize_t count =
+            read(fd, buffer + used, expected_length - used);
+
+        if (count > 0) {
+            used += (size_t)count;
+        } else if (count == 0) {
+            break;
+        } else if (errno != EINTR) {
+            saved_errno = errno;
+            goto out;
+        }
+    }
+    if (used != expected_length ||
+        memcmp(buffer, expected, expected_length) != 0) {
+        saved_errno = ESTALE;
+        goto out;
+    }
+    for (;;) {
+        ssize_t count = read(fd, &extra, 1U);
+
+        if (count == 0) break;
+        if (count > 0) {
+            saved_errno = ESTALE;
+            goto out;
+        }
+        if (errno != EINTR) {
+            saved_errno = errno;
+            goto out;
+        }
+    }
+    if (fstat(fd, &opened_after) != 0 ||
+        fstatat(parent_fd, leaf, &named_after,
+                AT_SYMLINK_NOFOLLOW) != 0) {
+        saved_errno = errno;
+        goto out;
+    }
+    if (!m20_same_file_version(&named_before, &opened_before) ||
+        !m20_same_file_version(&opened_before, &opened_after) ||
+        !m20_same_file_version(&opened_after, &named_after)) {
+        saved_errno = ESTALE;
+        goto out;
+    }
+out:
+    if (fd >= 0 && close(fd) != 0 && saved_errno == 0) {
+        saved_errno = errno;
+    }
+    if (parent_fd >= 0 && close(parent_fd) != 0 &&
+        saved_errno == 0) {
+        saved_errno = errno;
+    }
+    if (saved_errno != 0) {
+        errno = saved_errno;
+        return -1;
+    }
+    *identity = named_after;
+    return 0;
+}
+
+static int m20_private_text_settle_hook(const char *path) {
+    g_text_settle_attempts++;
+    if (g_text_publisher_open) {
+        errno = EBUSY;
+        return -1;
+    }
+    g_text_settle_observed_closed = true;
+    if (g_text_settle_mutation_limit < 0 ||
+        g_text_settle_mutation_applications <
+            g_text_settle_mutation_limit) {
+        if (m20_mutate_private_tool_successor(path) != 0) return -1;
+        g_text_settle_mutation_applications++;
+    }
+    return 0;
+}
+
+static int m20_settle_private_text(const char *path,
+                                   const char *expected) {
+    enum { M20_TEXT_SETTLE_ATTEMPTS = 8 };
+    struct stat previous;
+    bool have_previous = false;
+    int first_errno = 0;
+
+    memset(&previous, 0, sizeof(previous));
+    for (int attempt = 0; attempt < M20_TEXT_SETTLE_ATTEMPTS; attempt++) {
+        struct stat current;
+
+        if (m20_private_text_settle_hook(path) != 0 ||
+            m20_capture_private_text(path, expected, &current) != 0) {
+            if (first_errno == 0) {
+                first_errno = errno ? errno : EIO;
+            }
+            have_previous = false;
+            continue;
+        }
+        if (have_previous &&
+            m20_same_file_version(&previous, &current)) {
+            return 0;
+        }
+        previous = current;
+        have_previous = true;
+    }
+    errno = first_errno ? first_errno : ESTALE;
+    return -1;
+}
+
+static int m20_publish_private_text(const char *path, const char *text) {
+    char parent[MAX_PATH_LEN];
+    const char *leaf;
+    int parent_fd = -1;
+    int saved_errno = 0;
+    int rc = -1;
+
+    if (m20_split_private_path(path, parent, sizeof(parent), &leaf) != 0) {
+        return -1;
+    }
+    parent_fd = m20_open_private_directory(parent);
+    if (parent_fd < 0) return -1;
+    g_text_publisher_open = true;
+    if (m20_write_private_text_at(parent_fd, leaf, text, false) != 0 ||
+        m20_full_sync_fd(parent_fd) != 0) {
+        saved_errno = errno ? errno : EIO;
+        goto out;
+    }
+    if (close(parent_fd) != 0) {
+        saved_errno = errno;
+        parent_fd = -1;
+        goto out;
+    }
+    parent_fd = -1;
+    g_text_publisher_open = false;
+    if (m20_settle_private_text(path, text) != 0) {
+        saved_errno = errno ? errno : ESTALE;
+        goto out;
+    }
+    rc = 0;
+out:
+    if (parent_fd >= 0) {
+        if (close(parent_fd) != 0 && saved_errno == 0) {
+            saved_errno = errno;
+        }
+        parent_fd = -1;
+    }
+    g_text_publisher_open = false;
+    if (rc != 0) errno = saved_errno ? saved_errno : EIO;
+    return rc;
+}
+
+static int m20_replace_private_text_atomically(const char *path,
+                                               const char *text) {
+    static const char temporary_leaf[] =
+        ".gitswitch-ar11-fixture-replacement";
+    char parent[MAX_PATH_LEN];
+    const char *leaf;
+    int parent_fd = -1;
+    int saved_errno = 0;
+    int rc = -1;
+    bool temporary_created = false;
+
+    if (m20_split_private_path(path, parent, sizeof(parent), &leaf) != 0) {
+        return -1;
+    }
+    parent_fd = m20_open_private_directory(parent);
+    if (parent_fd < 0) return -1;
+    g_text_publisher_open = true;
+    if (m20_write_private_text_at(parent_fd, temporary_leaf, text, true) !=
+        0) {
+        saved_errno = errno ? errno : EIO;
+        goto out;
+    }
+    temporary_created = true;
+    if (renameat(parent_fd, temporary_leaf, parent_fd, leaf) != 0) {
+        saved_errno = errno;
+        goto out;
+    }
+    temporary_created = false;
+    if (m20_full_sync_fd(parent_fd) != 0) {
+        saved_errno = errno;
+        goto out;
+    }
+    if (close(parent_fd) != 0) {
+        saved_errno = errno;
+        parent_fd = -1;
+        goto out;
+    }
+    parent_fd = -1;
+    g_text_publisher_open = false;
+    if (m20_settle_private_text(path, text) != 0) {
+        saved_errno = errno ? errno : ESTALE;
+        goto out;
+    }
+    rc = 0;
+out:
+    if (temporary_created && parent_fd >= 0) {
+        (void)unlinkat(parent_fd, temporary_leaf, 0);
+    }
+    if (parent_fd >= 0) {
+        if (close(parent_fd) != 0 && saved_errno == 0) {
+            saved_errno = errno;
+        }
+        parent_fd = -1;
+    }
+    g_text_publisher_open = false;
+    if (rc != 0) errno = saved_errno ? saved_errno : EIO;
+    return rc;
 }
 
 static int m20_mutate_config_during_reload(m20_reload_mutation_t mutation) {
@@ -1098,7 +1436,7 @@ static int m20_create_private_tool_copies(
         errno = saved_errno;
         return -1;
     }
-    tools_fd = m20_open_private_tool_directory(fixture->tools);
+    tools_fd = m20_open_private_directory(fixture->tools);
     if (tools_fd >= 0) g_tool_publisher_open = true;
     if (tools_fd < 0 ||
         m20_sync_private_tool_at(tools_fd, "gpgconf") != 0 ||
@@ -1222,8 +1560,8 @@ static int m20_make_fixture(m20_fixture_t *fixture,
                       "%s/.gitswitch-gpg-agent-reload.state",
                       fixture->home) != 0 ||
         mkdir(fixture->source_home, 0700) != 0 ||
-        write_string_to_file(fixture->source_config, initial_config,
-                             0600) != 0 ||
+        m20_publish_private_text(fixture->source_config,
+                                 initial_config) != 0 ||
         setenv("XDG_RUNTIME_DIR", fixture->root, 1) != 0 ||
         setenv("GITSWITCH_ALLOW_TMP_GPG", "1", 1) != 0 ||
         setenv("GNUPGHOME", fixture->source_home, 1) != 0) {
@@ -1310,8 +1648,8 @@ TEST(changed_and_unchanged_config_reload_exactly_once) {
     CHECK_EQ_INT(g_reload_protocol_errors, 0);
     CHECK_EQ_INT(first.st_ino, second.st_ino);
 
-    CHECK_EQ_INT(write_string_to_file(fixture.source_config,
-                                      m20_config_b, 0600), 0);
+    CHECK_EQ_INT(m20_publish_private_text(fixture.source_config,
+                                          m20_config_b), 0);
     g_expected_reload_config = m20_config_b;
     third_rc = gpg_create_isolated_home(&config, &fixture.account);
     CHECK_EQ_INT(third_rc, 0);
@@ -2005,14 +2343,15 @@ TEST(missing_reload_state_for_matching_config_forces_one_migration_reload) {
     struct stat before;
     struct stat after;
     struct stat state;
+    error_context_t first_error;
     int first_rc;
     int second_rc;
 
     CHECK_EQ_INT(m20_make_fixture(&fixture, m20_config_a, true), 0);
     CHECK_EQ_INT(mkdir(fixture.base, 0700), 0);
     CHECK_EQ_INT(mkdir(fixture.home, 0700), 0);
-    CHECK_EQ_INT(write_string_to_file(fixture.installed_config,
-                                      m20_config_a, 0600), 0);
+    CHECK_EQ_INT(m20_publish_private_text(fixture.installed_config,
+                                          m20_config_a), 0);
     CHECK_EQ_INT(stat(fixture.installed_config, &before), 0);
     errno = 0;
     CHECK(lstat(fixture.reload_state, &state) != 0 && errno == ENOENT);
@@ -2024,10 +2363,15 @@ TEST(missing_reload_state_for_matching_config_forces_one_migration_reload) {
         m20_count_config_commit);
     old_runner = run_set_runner(m20_runner);
     first_rc = gpg_create_isolated_home(&config, &fixture.account);
+    first_error = *get_last_error();
     second_rc = gpg_create_isolated_home(&config, &fixture.account);
     run_set_runner(old_runner);
     gpg_manager_set_agent_conf_precommit_fn(old_commit);
 
+    if (first_rc != 0) {
+        fprintf(stderr, "first migration reload failed: %s\n",
+                first_error.message);
+    }
     CHECK_EQ_INT(first_rc, 0);
     CHECK_EQ_INT(second_rc, 0);
     CHECK_EQ_INT(g_config_commits, 0);
@@ -2071,8 +2415,8 @@ TEST(corrupt_clean_state_for_matching_config_forces_one_reload) {
     CHECK_EQ_INT(g_config_commits, 1);
     CHECK_EQ_INT(g_reload_calls, 1);
 
-    CHECK_EQ_INT(write_string_to_file(fixture.reload_state,
-                                      "not-a-clean-record\n", 0600), 0);
+    CHECK_EQ_INT(m20_publish_private_text(
+                     fixture.reload_state, "not-a-clean-record\n"), 0);
     g_config_commits = 0;
     m20_reset_observation(&fixture, m20_config_a, false);
     corrupt_rc = gpg_create_isolated_home(&config, &fixture.account);
@@ -2103,7 +2447,6 @@ TEST(stale_clean_state_after_identical_config_replacement_forces_reload) {
     gpg_agent_conf_precommit_fn old_commit;
     command_runner_fn old_runner;
     gpg_config_t config;
-    char replacement[MAX_PATH_LEN];
     struct stat original;
     struct stat replaced;
     struct stat after;
@@ -2122,10 +2465,8 @@ TEST(stale_clean_state_after_identical_config_replacement_forces_reload) {
     CHECK_EQ_INT(g_config_commits, 1);
     CHECK_EQ_INT(g_reload_calls, 1);
 
-    CHECK_EQ_INT(safe_snprintf(replacement, sizeof(replacement),
-                               "%s/.replacement", fixture.home), 0);
-    CHECK_EQ_INT(write_string_to_file(replacement, m20_config_a, 0600), 0);
-    CHECK_EQ_INT(rename(replacement, fixture.installed_config), 0);
+    CHECK_EQ_INT(m20_replace_private_text_atomically(
+                     fixture.installed_config, m20_config_a), 0);
     CHECK_EQ_INT(stat(fixture.installed_config, &replaced), 0);
     CHECK(original.st_dev != replaced.st_dev ||
           original.st_ino != replaced.st_ino);
@@ -3053,8 +3394,8 @@ TEST(changed_config_is_observed_by_the_retained_live_agent) {
         TS_SKIP("gpg", "agent does not expose GETINFO s2k_count");
     }
 
-    CHECK_EQ_INT(write_string_to_file(fixture.source_config,
-                                      m20_live_config_b, 0600), 0);
+    CHECK_EQ_INT(m20_publish_private_text(fixture.source_config,
+                                          m20_live_config_b), 0);
     g_live_reload_calls = 0;
     m20_reset_observation(&fixture, m20_live_config_b, false);
     old_runner = run_set_runner(m20_real_recording_runner);
@@ -3081,6 +3422,70 @@ static void m20_reset_tool_settle_seam(int mutation_limit) {
     g_tool_settle_attempts = 0;
     g_tool_settle_mutation_applications = 0;
     g_tool_settle_observed_closed = false;
+}
+
+static void m20_reset_text_settle_seam(int mutation_limit) {
+    g_text_settle_mutation_limit = mutation_limit;
+    g_text_settle_attempts = 0;
+    g_text_settle_mutation_applications = 0;
+    g_text_settle_observed_closed = false;
+    g_text_publisher_open = false;
+}
+
+TEST(private_text_publication_settles_four_closed_successors) {
+    char directory[MAX_PATH_LEN];
+    char path[MAX_PATH_LEN];
+    struct stat first;
+    struct stat second;
+
+    CHECK(ts_mkdtemp_trusted(directory, sizeof(directory),
+                            "gitswitch-ar11-private-text"));
+    CHECK_EQ_INT(chmod(directory, 0700), 0);
+    CHECK_EQ_INT(safe_snprintf(path, sizeof(path), "%s/config",
+                               directory), 0);
+    m20_reset_text_settle_seam(4);
+    CHECK_EQ_INT(m20_publish_private_text(path, m20_config_a), 0);
+    CHECK(g_text_settle_observed_closed);
+    CHECK(!g_text_publisher_open);
+    CHECK_EQ_INT(g_text_settle_mutation_applications, 4);
+    CHECK_EQ_INT(g_text_settle_attempts, 5);
+    CHECK_EQ_INT(m20_capture_private_text(path, m20_config_a, &first), 0);
+    CHECK_EQ_INT(m20_capture_private_text(path, m20_config_a, &second), 0);
+    CHECK(m20_same_file_version(&first, &second));
+
+    m20_reset_text_settle_seam(0);
+    ts_rm_rf(directory);
+}
+
+TEST(private_text_publication_continuous_drift_is_bounded) {
+    char directory[MAX_PATH_LEN];
+    char path[MAX_PATH_LEN];
+    struct stat identity;
+    int failure_errno;
+    int rc;
+
+    CHECK(ts_mkdtemp_trusted(directory, sizeof(directory),
+                            "gitswitch-ar11-private-text"));
+    CHECK_EQ_INT(chmod(directory, 0700), 0);
+    CHECK_EQ_INT(safe_snprintf(path, sizeof(path), "%s/config",
+                               directory), 0);
+    m20_reset_text_settle_seam(-1);
+    errno = 0;
+    rc = m20_publish_private_text(path, m20_config_a);
+    failure_errno = errno;
+    CHECK_EQ_INT(rc, -1);
+    CHECK_EQ_INT(failure_errno, ESTALE);
+    CHECK(g_text_settle_observed_closed);
+    CHECK(!g_text_publisher_open);
+    CHECK_EQ_INT(g_text_settle_mutation_applications, 8);
+    CHECK_EQ_INT(g_text_settle_attempts, 8);
+
+    m20_reset_text_settle_seam(0);
+    CHECK_EQ_INT(m20_capture_private_text(
+                     path, m20_config_a, &identity), 0);
+    CHECK(S_ISREG(identity.st_mode));
+    CHECK_EQ_INT(identity.st_mode & 0777, 0600);
+    ts_rm_rf(directory);
 }
 
 TEST(private_tool_witnesses_settle_only_after_closed_publication) {
@@ -3151,6 +3556,8 @@ int main(int argc, char **argv) {
         return 2;
     }
     error_init(LOG_LEVEL_ERROR, NULL);
+    RUN_TEST(private_text_publication_settles_four_closed_successors);
+    RUN_TEST(private_text_publication_continuous_drift_is_bounded);
     RUN_TEST(private_tool_witnesses_settle_only_after_closed_publication);
     RUN_TEST(private_tool_witness_settlement_is_bounded);
     RUN_TEST(changed_and_unchanged_config_reload_exactly_once);
