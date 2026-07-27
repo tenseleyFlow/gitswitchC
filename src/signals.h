@@ -69,6 +69,19 @@ int signals_guard_begin(void);
  * obligation. */
 bool signals_guard_active(void);
 
+/**
+ * Dispose of transaction state inherited across fork without dispatching a
+ * pending signal or touching registered scratch paths. State is tagged with
+ * its creating process epoch: calling this for current-process state is an
+ * idempotent no-op, so a child-owned guard created before the accounts layer
+ * observes the fork remains intact. For a foreign epoch, restore every
+ * pre-guard disposition and any deferred-dispatch saved mask, then clear
+ * child-local guard, rollback, pending, subprocess, dispatch, and scratch
+ * bookkeeping. If restoration fails, returns -1 and retains only the
+ * retryable disposition and/or saved-mask restoration obligation.
+ */
+int signals_reset_inherited_transaction_state(void);
+
 /* Deterministic, one-shot fault injection for each sigaction(2) stage used by
  * the guard. Failures are stored independently by stage, so a test can arm an
  * installation failure and the rollback restoration failure it triggers at
@@ -276,8 +289,11 @@ int signals_scratch_register(const char *path);
  * it deliberately leaves the exact identity tracked for serialized cleanup.
  * Registration is idempotent only for the same path/device/inode tuple and
  * rejects a collision with a legacy path-only registration or a different
- * identity. The captured object must be a single-link regular file owned by
- * the effective user.
+ * identity. A matching legacy path slot is upgraded atomically so emergency
+ * signal cleanup cannot race through a path-only unlink after ownership has
+ * become identity-sensitive. The captured object must be an owned regular
+ * file with one link, or two links while retiring a just-published source
+ * alias.
  */
 int signals_scratch_register_identity(const char *path,
                                       const struct stat *identity);
@@ -309,6 +325,16 @@ int signals_scratch_cleanup_identities_at(int dir_fd,
 #ifdef GITSWITCH_TESTING
 /** Arm a one-shot serialized identity unlink failure. */
 void signals_test_fail_scratch_unlink(int system_errno);
+
+/**
+ * Install a one-shot checkpoint after a matching path-only scratch slot has
+ * stopped being handler-visible and before its identity metadata is written.
+ * Production objects export no such checkpoint.
+ */
+typedef void (*signals_test_scratch_upgrade_hook_fn)(void);
+signals_test_scratch_upgrade_hook_fn
+signals_test_set_scratch_upgrade_hook(
+    signals_test_scratch_upgrade_hook_fn hook);
 #endif
 
 #endif /* SIGNALS_H */

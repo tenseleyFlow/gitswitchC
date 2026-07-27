@@ -11,6 +11,7 @@
 
 #include "test.h"
 #include "gitswitch.h"
+#define GITSWITCH_SIGNALS_RUNNER_INTERNAL
 #include "signals.h"
 #include "error.h"
 #include "utils.h"
@@ -128,6 +129,31 @@ static const int test_guarded_signals[] = {
 };
 #define TEST_GUARDED_SIGNAL_COUNT \
     (sizeof(test_guarded_signals) / sizeof(test_guarded_signals[0]))
+
+static volatile sig_atomic_t scratch_upgrade_hook_called;
+
+static void replace_scratch_and_force_emergency_signal(void) {
+    scratch_upgrade_hook_called++;
+    test_fixture_unlink("scratch-upgrade-emergency");
+    if (test_fixture_create("scratch-upgrade-emergency") != 0) {
+        _exit(72);
+    }
+    if (raise(SIGTERM) != 0 || raise(SIGTERM) != 0) {
+        _exit(73);
+    }
+    _exit(74);
+}
+
+static void interrupt_scratch_identity_upgrade_once(void) {
+    scratch_upgrade_hook_called++;
+    if (raise(SIGTERM) != 0) {
+        _exit(75);
+    }
+}
+
+static void inherited_state_test_handler(int signal_number) {
+    (void)signal_number;
+}
 
 static void inherited_test_handler(int signal_number) {
     (void)signal_number;
@@ -509,6 +535,300 @@ TEST(guard_end_restores_default_disposition) {
     }
 }
 
+TEST(fork_child_reset_discards_transaction_state_without_cleanup) {
+    char scratch_path[MAX_PATH_LEN];
+    int status = 0;
+    pid_t owner;
+
+    CHECK_EQ_INT(test_fixture_path(
+                     scratch_path, sizeof(scratch_path),
+                     "inherited-reset-scratch"), 0);
+    test_fixture_unlink("inherited-reset-scratch");
+    fflush(NULL);
+    owner = fork();
+    CHECK(owner >= 0);
+    if (owner == 0) {
+        struct sigaction custom;
+        struct sigaction observed;
+        pid_t child;
+
+        memset(&custom, 0, sizeof(custom));
+        custom.sa_handler = inherited_state_test_handler;
+        sigemptyset(&custom.sa_mask);
+        if (sigaction(SIGINT, &custom, NULL) != 0 ||
+            signals_guard_begin() != 0 ||
+            signals_scratch_register(scratch_path) != 0 ||
+            test_fixture_create("inherited-reset-scratch") != 0) {
+            _exit(10);
+        }
+        raise(SIGTERM);
+        signals_rollback_begin();
+        if (!signals_pending() || !signals_rollback_active()) _exit(11);
+
+        child = fork();
+        if (child < 0) _exit(12);
+        if (child == 0) {
+            if (signals_reset_inherited_transaction_state() != 0 ||
+                signals_guard_active() || signals_pending() ||
+                signals_rollback_active() ||
+                sigaction(SIGINT, NULL, &observed) != 0 ||
+                observed.sa_handler != inherited_state_test_handler) {
+                _exit(20);
+            }
+            signals_scratch_cleanup();
+            if (!test_fixture_exists("inherited-reset-scratch") ||
+                signals_reset_inherited_transaction_state() != 0 ||
+                signals_guard_begin() != 0 ||
+                signals_guard_end() != 0) {
+                _exit(21);
+            }
+            _exit(0);
+        }
+        if (waitpid(child, &status, 0) != child ||
+            !WIFEXITED(status) || WEXITSTATUS(status) != 0 ||
+            !signals_guard_active() || !signals_pending() ||
+            !signals_rollback_active() ||
+            !test_fixture_exists("inherited-reset-scratch")) {
+            _exit(13);
+        }
+        if (signals_reset_inherited_transaction_state() != 0) _exit(14);
+        _exit(0);
+    }
+    CHECK_EQ_INT(waitpid(owner, &status, 0), owner);
+    CHECK(WIFEXITED(status));
+    if (WIFEXITED(status)) CHECK_EQ_INT(WEXITSTATUS(status), 0);
+    CHECK(test_fixture_exists("inherited-reset-scratch"));
+    test_fixture_unlink("inherited-reset-scratch");
+}
+
+TEST(fork_child_signal_before_epoch_reset_ignores_parent_state) {
+    char scratch_path[MAX_PATH_LEN];
+    int status = 0;
+    pid_t owner;
+
+    CHECK_EQ_INT(test_fixture_path(
+                     scratch_path, sizeof(scratch_path),
+                     "foreign-epoch-scratch"), 0);
+    test_fixture_unlink("foreign-epoch-scratch");
+    fflush(NULL);
+    owner = fork();
+    CHECK(owner >= 0);
+    if (owner == 0) {
+        struct sigaction ignored;
+        char ready = '\0';
+        int sync_pipe[2];
+        pid_t helper;
+        pid_t foreign_child;
+
+        if (pipe(sync_pipe) != 0 ||
+            signals_guard_begin() != 0 ||
+            signals_scratch_register(scratch_path) != 0 ||
+            test_fixture_create("foreign-epoch-scratch") != 0) {
+            _exit(10);
+        }
+        helper = fork();
+        if (helper < 0) _exit(11);
+        if (helper == 0) {
+            close(sync_pipe[0]);
+            if (setpgid(0, 0) != 0) _exit(20);
+            signals_reset_for_child(NULL);
+            memset(&ignored, 0, sizeof(ignored));
+            ignored.sa_handler = SIG_IGN;
+            sigemptyset(&ignored.sa_mask);
+            if (sigaction(SIGINT, &ignored, NULL) != 0 ||
+                write(sync_pipe[1], "R", 1) != 1) {
+                _exit(21);
+            }
+            for (;;) pause();
+        }
+        close(sync_pipe[1]);
+        if (read(sync_pipe[0], &ready, 1) != 1 || ready != 'R') _exit(12);
+        close(sync_pipe[0]);
+        if (setpgid(helper, helper) != 0 && errno != EACCES) _exit(13);
+        signals_child_group_spawned(helper, helper);
+
+        /* Seed all three inherited hazards: a pending signal, a live proven
+         * subprocess group, and a registered scratch path. The helper ignores
+         * the polite first signal so only a foreign handler touching inherited
+         * state can kill it. */
+        if (raise(SIGINT) != 0 || kill(helper, 0) != 0) _exit(14);
+
+        foreign_child = fork();
+        if (foreign_child < 0) _exit(15);
+        if (foreign_child == 0) {
+            /* Deliberately signal before any reset or signals API call. */
+            (void)raise(SIGTERM);
+            _exit(30);
+        }
+        if (waitpid(foreign_child, &status, 0) != foreign_child ||
+            !WIFSIGNALED(status) || WTERMSIG(status) != SIGTERM ||
+            !test_fixture_exists("foreign-epoch-scratch") ||
+            kill(helper, 0) != 0) {
+            _exit(16);
+        }
+
+        (void)kill(-helper, SIGKILL);
+        if (waitpid(helper, &status, 0) != helper) _exit(17);
+        test_fixture_unlink("foreign-epoch-scratch");
+        _exit(0);
+    }
+    CHECK_EQ_INT(waitpid(owner, &status, 0), owner);
+    CHECK(WIFEXITED(status));
+    if (WIFEXITED(status)) CHECK_EQ_INT(WEXITSTATUS(status), 0);
+    CHECK(!test_fixture_exists("foreign-epoch-scratch"));
+}
+
+TEST(fork_child_reset_retains_only_retryable_disposition_failure) {
+    int status = 0;
+    pid_t owner;
+
+    fflush(NULL);
+    owner = fork();
+    CHECK(owner >= 0);
+    if (owner == 0) {
+        char scratch_path[MAX_PATH_LEN];
+        pid_t child;
+
+        if (test_fixture_path(
+                scratch_path, sizeof(scratch_path),
+                "inherited-reset-failure") != 0 ||
+            signals_guard_begin() != 0 ||
+            signals_scratch_register(scratch_path) != 0 ||
+            test_fixture_create("inherited-reset-failure") != 0) {
+            _exit(10);
+        }
+        raise(SIGTERM);
+        signals_rollback_begin();
+        child = fork();
+        if (child < 0) _exit(11);
+        if (child == 0) {
+            signals_test_fail_sigaction(
+                SIGINT, SIGNALS_TEST_SIGACTION_RESTORE, EIO);
+            errno = 0;
+            if (signals_reset_inherited_transaction_state() != -1 ||
+                errno != EIO || !signals_guard_active() ||
+                signals_pending() || signals_rollback_active()) {
+                _exit(20);
+            }
+            signals_scratch_cleanup();
+            if (!test_fixture_exists("inherited-reset-failure") ||
+                signals_reset_inherited_transaction_state() != 0 ||
+                signals_guard_active() ||
+                signals_reset_inherited_transaction_state() != 0 ||
+                signals_guard_begin() != 0 ||
+                signals_guard_end() != 0) {
+                _exit(21);
+            }
+            _exit(0);
+        }
+        if (waitpid(child, &status, 0) != child ||
+            !WIFEXITED(status) || WEXITSTATUS(status) != 0) {
+            _exit(12);
+        }
+        _exit(0);
+    }
+    CHECK_EQ_INT(waitpid(owner, &status, 0), owner);
+    CHECK(WIFEXITED(status));
+    if (WIFEXITED(status)) CHECK_EQ_INT(WEXITSTATUS(status), 0);
+    CHECK(test_fixture_exists("inherited-reset-failure"));
+    test_fixture_unlink("inherited-reset-failure");
+}
+
+TEST(fork_child_reset_restores_dispatch_mask_with_retry_debt) {
+    struct sigaction original_action;
+    struct sigaction returning_action;
+    sigset_t block;
+    sigset_t original_mask;
+    int status = 0;
+    pid_t owner;
+
+    CHECK_EQ_INT(sigaction(SIGTERM, NULL, &original_action), 0);
+    memset(&returning_action, 0, sizeof(returning_action));
+    returning_action.sa_handler = inherited_state_test_handler;
+    sigemptyset(&returning_action.sa_mask);
+    CHECK_EQ_INT(
+        sigaction(SIGTERM, &returning_action, NULL), 0);
+    fflush(NULL);
+    owner = fork();
+    CHECK(owner >= 0);
+    if (owner == 0) {
+        pid_t child;
+
+        sigemptyset(&block);
+        sigaddset(&block, SIGTERM);
+        if (signals_guard_begin() != 0 ||
+            raise(SIGTERM) != 0 ||
+            sigprocmask(SIG_BLOCK, &block, &original_mask) != 0) {
+            _exit(10);
+        }
+        signals_test_fail_dispatch(
+            SIGNALS_TEST_DISPATCH_MASK_RESTORE, EIO);
+        if (signals_dispatch_pending() != -1 || errno != EIO) {
+            _exit(11);
+        }
+        child = fork();
+        if (child < 0) _exit(12);
+        if (child == 0) {
+            sigset_t observed;
+
+            signals_test_fail_dispatch(
+                SIGNALS_TEST_DISPATCH_MASK_RESTORE, EIO);
+            errno = 0;
+            if (signals_reset_inherited_transaction_state() != -1 ||
+                errno != EIO ||
+                sigprocmask(SIG_SETMASK, NULL, &observed) != 0 ||
+                sigismember(&observed, SIGTERM) != 0 ||
+                signals_guard_active() || signals_pending() ||
+                signals_rollback_active()) {
+                _exit(20);
+            }
+            if (signals_reset_inherited_transaction_state() != 0 ||
+                sigprocmask(SIG_SETMASK, NULL, &observed) != 0 ||
+                sigismember(&observed, SIGTERM) != 1 ||
+                signals_reset_inherited_transaction_state() != 0) {
+                _exit(21);
+            }
+            _exit(0);
+        }
+        if (waitpid(child, &status, 0) != child ||
+            !WIFEXITED(status) || WEXITSTATUS(status) != 0 ||
+            signals_dispatch_pending() != 0 ||
+            sigprocmask(SIG_SETMASK, &original_mask, NULL) != 0) {
+            _exit(13);
+        }
+        _exit(0);
+    }
+    CHECK_EQ_INT(waitpid(owner, &status, 0), owner);
+    CHECK(WIFEXITED(status));
+    if (WIFEXITED(status)) CHECK_EQ_INT(WEXITSTATUS(status), 0);
+    CHECK_EQ_INT(
+        sigaction(SIGTERM, &original_action, NULL), 0);
+}
+
+TEST(child_owned_guard_survives_late_process_epoch_reset) {
+    int status = 0;
+    pid_t child;
+
+    CHECK_EQ_INT(signals_guard_begin(), 0);
+    CHECK_EQ_INT(signals_guard_end(), 0);
+    fflush(NULL);
+    child = fork();
+    CHECK(child >= 0);
+    if (child == 0) {
+        if (signals_guard_begin() != 0 ||
+            !signals_guard_active() ||
+            signals_reset_inherited_transaction_state() != 0 ||
+            !signals_guard_active() ||
+            signals_guard_end() != 0) {
+            _exit(1);
+        }
+        _exit(0);
+    }
+    CHECK_EQ_INT(waitpid(child, &status, 0), child);
+    CHECK(WIFEXITED(status));
+    if (WIFEXITED(status)) CHECK_EQ_INT(WEXITSTATUS(status), 0);
+}
+
 /* An inherited SIG_IGN (nohup ignores SIGHUP) must be preserved: the guard
  * neither overrides it nor records the ignored signal — re-raising it later
  * would resurrect a signal the environment decided must not act. */
@@ -655,6 +975,98 @@ TEST(fixture_creation_and_cleanup_do_not_follow_preplaced_symlink) {
 TEST(scratch_registry_rejects_invalid) {
     CHECK_EQ_INT(signals_scratch_register(NULL), -1);
     CHECK_EQ_INT(signals_scratch_register(""), -1);
+}
+
+/* AR-14: upgrading a handler-visible path slot to identity ownership must
+ * first withdraw pathname authority. The checkpoint replaces the original
+ * name and forces the handler's second-signal emergency path in the exact
+ * upgrade window. A PATH-state mutant unlinks the foreign replacement; the
+ * atomic transition leaves it untouched. */
+TEST(scratch_identity_upgrade_withdraws_handler_path_authority_first) {
+    char scratch_path[256];
+    struct stat identity;
+    int status = 0;
+    pid_t pid;
+
+    CHECK_EQ_INT(test_fixture_path(
+                     scratch_path, sizeof(scratch_path),
+                     "scratch-upgrade-emergency"), 0);
+    test_fixture_unlink("scratch-upgrade-emergency");
+    CHECK_EQ_INT(test_fixture_create("scratch-upgrade-emergency"), 0);
+    CHECK_EQ_INT(lstat(scratch_path, &identity), 0);
+
+    fflush(NULL);
+    pid = fork();
+    CHECK(pid >= 0);
+    if (pid == 0) {
+        scratch_upgrade_hook_called = 0;
+        if (signals_scratch_register(scratch_path) != 0 ||
+            signals_guard_begin() != 0) {
+            _exit(70);
+        }
+        signals_test_set_scratch_upgrade_hook(
+            replace_scratch_and_force_emergency_signal);
+        if (signals_scratch_register_identity(
+                scratch_path, &identity) != 0 ||
+            scratch_upgrade_hook_called != 1) {
+            _exit(71);
+        }
+        _exit(74);
+    }
+    CHECK_EQ_INT(waitpid(pid, &status, 0), pid);
+    CHECK(WIFSIGNALED(status));
+    if (WIFSIGNALED(status)) {
+        CHECK_EQ_INT(WTERMSIG(status), SIGTERM);
+    }
+    CHECK(test_fixture_exists("scratch-upgrade-emergency"));
+    test_fixture_unlink("scratch-upgrade-emergency");
+}
+
+/* A single real guarded-signal interruption at the same transition must not
+ * lose the eventual identity registration: once normal context resumes, the
+ * serialized identity cleanup still owns and removes the exact file. */
+TEST(scratch_identity_upgrade_republishes_complete_cleanup_authority) {
+    char scratch_path[256];
+    struct stat identity;
+    int status = 0;
+    pid_t pid;
+
+    CHECK_EQ_INT(test_fixture_path(
+                     scratch_path, sizeof(scratch_path),
+                     "scratch-upgrade-authority"), 0);
+    test_fixture_unlink("scratch-upgrade-authority");
+    CHECK_EQ_INT(test_fixture_create("scratch-upgrade-authority"), 0);
+    CHECK_EQ_INT(lstat(scratch_path, &identity), 0);
+
+    fflush(NULL);
+    pid = fork();
+    CHECK(pid >= 0);
+    if (pid == 0) {
+        scratch_upgrade_hook_called = 0;
+        if (signals_scratch_register(scratch_path) != 0 ||
+            signals_guard_begin() != 0) {
+            _exit(80);
+        }
+        signals_test_set_scratch_upgrade_hook(
+            interrupt_scratch_identity_upgrade_once);
+        if (signals_scratch_register_identity(
+                scratch_path, &identity) != 0 ||
+            scratch_upgrade_hook_called != 1 || !signals_pending()) {
+            _exit(81);
+        }
+        if (signals_scratch_cleanup_identities_at(
+                test_fixture_root_fd, test_fixture_root) != 0) {
+            _exit(82);
+        }
+        _exit(test_fixture_exists("scratch-upgrade-authority") ? 83 : 0);
+    }
+    CHECK_EQ_INT(waitpid(pid, &status, 0), pid);
+    CHECK(WIFEXITED(status));
+    if (WIFEXITED(status)) {
+        CHECK_EQ_INT(WEXITSTATUS(status), 0);
+    }
+    CHECK(!test_fixture_exists("scratch-upgrade-authority"));
+    test_fixture_unlink("scratch-upgrade-authority");
 }
 
 /* signals_dispatch_pending must terminate the process with the deferred
@@ -1293,6 +1705,7 @@ TEST(rollback_child_kill_escalates_to_sigkill) {
     CHECK(pid >= 0);
     if (pid == 0) {
         pid_t child, w;
+        int helper_sync[2];
         int cst = 0;
 
         close(sync[0]);
@@ -1301,9 +1714,11 @@ TEST(rollback_child_kill_escalates_to_sigkill) {
         if (!signals_pending()) _exit(10);
         signals_rollback_begin();
 
+        if (pipe(helper_sync) != 0) _exit(13);
         child = fork();
         if (child < 0) _exit(13);
         if (child == 0) {
+            close(helper_sync[0]);
             /* No exec, so shed the inherited guard handler explicitly, then
              * ignore the polite signal — only SIGKILL ends this early. The
              * lifetime is BOUNDED (not an infinite pause loop) so a
@@ -1312,9 +1727,17 @@ TEST(rollback_child_kill_escalates_to_sigkill) {
             signal(SIGINT, SIG_DFL);
             signal(SIGHUP, SIG_DFL);
             signal(SIGTERM, SIG_IGN);
+            (void)!write(helper_sync[1], "r", 1);
+            close(helper_sync[1]);
             sleep(30); /* an ignored SIGTERM does not even interrupt this */
             _exit(0);
         }
+        close(helper_sync[1]);
+        {
+            char ready;
+            if (read(helper_sync[0], &ready, 1) != 1) _exit(13);
+        }
+        close(helper_sync[0]);
         signals_child_spawned(child);
         (void)!write(sync[1], "r", 1);
         close(sync[1]);
@@ -1362,12 +1785,22 @@ TEST_MAIN_BEGIN()
     RUN_TEST(guard_begin_skips_only_inherited_sig_ign);
     RUN_TEST(guard_defers_first_signal);
     RUN_TEST(guard_end_restores_default_disposition);
+    RUN_TEST(fork_child_reset_discards_transaction_state_without_cleanup);
+    RUN_TEST(fork_child_signal_before_epoch_reset_ignores_parent_state);
+    RUN_TEST(
+        fork_child_reset_retains_only_retryable_disposition_failure);
+    RUN_TEST(fork_child_reset_restores_dispatch_mask_with_retry_debt);
+    RUN_TEST(child_owned_guard_survives_late_process_epoch_reset);
     RUN_TEST(guard_respects_inherited_sig_ign);
     RUN_TEST(child_spawn_barrier_blocks_only_installed_guard_signals);
     RUN_TEST(fixture_root_is_private_and_pinned);
     RUN_TEST(scratch_registry_unlinks_registered_paths);
     RUN_TEST(fixture_creation_and_cleanup_do_not_follow_preplaced_symlink);
     RUN_TEST(scratch_registry_rejects_invalid);
+    RUN_TEST(
+        scratch_identity_upgrade_withdraws_handler_path_authority_first);
+    RUN_TEST(
+        scratch_identity_upgrade_republishes_complete_cleanup_authority);
     RUN_TEST(dispatch_terminates_with_deferred_signal);
     RUN_TEST(dispatch_retains_pending_until_exact_restoration_succeeds);
     RUN_TEST(dispatch_returning_handler_observes_pending_and_restores_mask);
