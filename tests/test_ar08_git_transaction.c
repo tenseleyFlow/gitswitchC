@@ -30,6 +30,7 @@ typedef enum {
 typedef bool (*git_metadata_test_hook_fn)(git_metadata_test_stage_t stage);
 git_metadata_test_hook_fn git_ops_test_set_metadata_hook(
     git_metadata_test_hook_fn fn);
+size_t git_ops_test_set_cleanup_arena_capacity(size_t capacity);
 
 static git_metadata_test_stage_t g_metadata_mismatch_stage;
 static int g_metadata_mismatch_calls;
@@ -125,6 +126,18 @@ static int write_text_file(const char *path, const char *contents,
     int failed;
     if (!file) return -1;
     failed = fputs(contents, file) == EOF;
+    if (fclose(file) != 0) failed = 1;
+    if (failed) return -1;
+    return chmod(path, mode);
+}
+
+static int write_binary_file(const char *path, const unsigned char *contents,
+                             size_t length, mode_t mode) {
+    FILE *file = fopen(path, "wb");
+    int failed;
+
+    if (!file) return -1;
+    failed = fwrite(contents, 1U, length, file) != length;
     if (fclose(file) != 0) failed = 1;
     if (failed) return -1;
     return chmod(path, mode);
@@ -559,8 +572,26 @@ static int read_file(const char *path, char *output, size_t output_size) {
     return 0;
 }
 
+static int read_binary_file_exact(const char *path, unsigned char *output,
+                                  size_t expected_length) {
+    FILE *file = fopen(path, "rb");
+    size_t length;
+    int trailing;
+    int failed;
+
+    if (!file) return -1;
+    length = fread(output, 1U, expected_length, file);
+    trailing = fgetc(file);
+    failed = length != expected_length || trailing != EOF || ferror(file);
+    if (fclose(file) != 0) failed = 1;
+    return failed ? -1 : 0;
+}
+
 static char g_finalization_lock_path[MAX_PATH_LEN];
 static int g_finalization_hook_calls;
+static const unsigned char g_foreign_finalization_bytes[] = {
+    0x00U, 0x67U, 0x69U, 0x74U, 0xffU, 0x0aU, 0x7fU
+};
 
 static bool finalization_hook_targets_global(const char *lock_leaf) {
     return lock_leaf &&
@@ -622,8 +653,9 @@ static bool replace_finalization_certificate_with_foreign_lock(
         finalization_hook_targets_global(lock_leaf) &&
         g_finalization_hook_calls++ == 0) {
         if (unlink(g_finalization_lock_path) != 0 ||
-            write_text_file(g_finalization_lock_path,
-                            "foreign-git-lock\n", 0600) != 0) {
+            write_binary_file(
+                g_finalization_lock_path, g_foreign_finalization_bytes,
+                sizeof(g_foreign_finalization_bytes), 0600) != 0) {
             return true;
         }
     }
@@ -2360,6 +2392,162 @@ static int prepare_finalization_transaction(const char *post_name) {
     return 0;
 }
 
+TEST(fork_child_cannot_use_parent_snapshot_and_can_start_fresh) {
+    git_fixture_t fixture;
+    git_config_finalization_t *finalization = NULL;
+    char actual[256];
+    pid_t child;
+    int status = 0;
+
+    if (!fixture_init(&fixture)) {
+        CHECK(false);
+        fixture_cleanup(&fixture);
+        return;
+    }
+    CHECK_EQ_INT(git_set("--global", "user.name",
+                         "parent-before-snapshot"), 0);
+    CHECK_EQ_INT(prepare_finalization_transaction(
+                     "parent-sealed-postimage"), 0);
+
+    child = fork();
+    CHECK(child >= 0);
+    if (child == 0) {
+        if (git_config_restore() != -1) _exit(90);
+        if (git_config_finalization_begin(&finalization) != -1 ||
+            finalization != NULL) {
+            _exit(91);
+        }
+        if (git_set_config_value(
+                GIT_CONFIG_USER_NAME, "forbidden-child-write",
+                GIT_SCOPE_GLOBAL) != -1) {
+            _exit(92);
+        }
+        if (git_unset_config_value(
+                GIT_CONFIG_USER_NAME, GIT_SCOPE_GLOBAL) != -1) {
+            _exit(93);
+        }
+        if (git_clear_config(GIT_SCOPE_GLOBAL) != -1) _exit(94);
+        git_config_commit();
+        if (git_config_snapshot(GIT_SCOPE_GLOBAL) != 0) _exit(95);
+        git_config_commit();
+        _exit(0);
+    }
+    if (child > 0) {
+        CHECK(waitpid(child, &status, 0) == child);
+        CHECK(WIFEXITED(status));
+        if (WIFEXITED(status)) CHECK_EQ_INT(WEXITSTATUS(status), 0);
+    }
+    CHECK_EQ_INT(git_get_all("--global", "user.name", actual,
+                             sizeof(actual)), 0);
+    CHECK_STR_EQ(actual, "parent-sealed-postimage\n");
+    CHECK_EQ_INT(git_config_restore(), 0);
+    CHECK_EQ_INT(git_get_all("--global", "user.name", actual,
+                             sizeof(actual)), 0);
+    CHECK_STR_EQ(actual, "parent-before-snapshot\n");
+
+    fixture_cleanup(&fixture);
+}
+
+static int reopen_snapshot_object(int fd) {
+    struct stat identity;
+
+    if (fd < 0 || fstat(fd, &identity) != 0) return -1;
+    if (S_ISDIR(identity.st_mode)) {
+        return openat(
+            fd, ".", O_RDONLY | O_DIRECTORY | O_CLOEXEC | O_NOFOLLOW);
+    }
+#if defined(__linux__)
+    {
+        char proc_path[64];
+
+        if ((size_t)snprintf(
+                proc_path, sizeof(proc_path), "/proc/self/fd/%d", fd) >=
+            sizeof(proc_path)) {
+            errno = ENAMETOOLONG;
+            return -1;
+        }
+        return open(proc_path, O_RDONLY | O_CLOEXEC);
+    }
+#else
+    {
+        int duplicate = fcntl(fd, F_DUPFD, 0);
+
+        if (duplicate >= 0 &&
+            fcntl(duplicate, F_SETFD, FD_CLOEXEC) != 0) {
+            int saved_errno = errno;
+
+            close(duplicate);
+            errno = saved_errno;
+            return -1;
+        }
+        return duplicate;
+    }
+#endif
+}
+
+TEST(fork_child_abandon_preserves_reused_snapshot_descriptors) {
+    git_fixture_t fixture;
+    pid_t child;
+    int status = 0;
+
+    if (!fixture_init(&fixture)) {
+        CHECK(false);
+        fixture_cleanup(&fixture);
+        return;
+    }
+    CHECK_EQ_INT(git_set("--global", "user.name",
+                         "parent-before-fd-reuse"), 0);
+    CHECK_EQ_INT(prepare_finalization_transaction(
+                     "parent-postimage-before-fd-reuse"), 0);
+
+    child = fork();
+    CHECK(child >= 0);
+    if (child == 0) {
+        int inherited[9];
+        int replacements[9];
+        size_t inherited_count =
+            git_ops_test_snapshot_descriptors(
+                inherited, sizeof(inherited) / sizeof(inherited[0]));
+
+        if (inherited_count == 0U ||
+            inherited_count >
+                sizeof(inherited) / sizeof(inherited[0])) {
+            _exit(96);
+        }
+        for (size_t i = 0U; i < inherited_count; i++) {
+            struct stat before;
+            struct stat reopened;
+
+            replacements[i] = reopen_snapshot_object(inherited[i]);
+            if (replacements[i] < 0 ||
+                replacements[i] == inherited[i] ||
+                fstat(inherited[i], &before) != 0 ||
+                fstat(replacements[i], &reopened) != 0 ||
+                before.st_dev != reopened.st_dev ||
+                before.st_ino != reopened.st_ino ||
+                close(inherited[i]) != 0 ||
+                dup2(replacements[i], inherited[i]) != inherited[i]) {
+                _exit(97);
+            }
+        }
+        git_config_commit();
+        for (size_t i = 0U; i < inherited_count; i++) {
+            if (fcntl(inherited[i], F_GETFD) < 0) _exit(98);
+            close(inherited[i]);
+            close(replacements[i]);
+        }
+        _exit(0);
+    }
+    if (child > 0) {
+        CHECK(waitpid(child, &status, 0) == child);
+        CHECK(WIFEXITED(status));
+        if (WIFEXITED(status)) CHECK_EQ_INT(WEXITSTATUS(status), 0);
+    }
+
+    CHECK_EQ_INT(git_config_restore(), 0);
+    fixture_cleanup(&fixture);
+}
+
 TEST(finalization_sigkill_leaves_complete_self_healing_certificate) {
     static const char marker_magic[] = "gitswitch-recovery-v1 ";
     git_fixture_t fixture;
@@ -2486,6 +2674,44 @@ TEST(private_prepublication_sigkill_is_reconciled_exactly) {
     fixture_cleanup(&fixture);
 }
 
+TEST(finalization_arena_exhaustion_precedes_private_and_canonical_creation) {
+    git_fixture_t fixture;
+    git_config_finalization_t *finalization = NULL;
+    size_t previous_capacity;
+    struct stat named;
+
+    if (!fixture_init(&fixture)) {
+        CHECK(false);
+        fixture_cleanup(&fixture);
+        return;
+    }
+    CHECK_EQ_INT(git_set("--global", "user.name",
+                         "before-finalization-capacity"), 0);
+    CHECK((size_t)snprintf(
+              g_finalization_lock_path,
+              sizeof(g_finalization_lock_path), "%s.lock",
+              fixture.global_config) < sizeof(g_finalization_lock_path));
+    CHECK_EQ_INT(prepare_finalization_transaction(
+                     "finalization-capacity-postimage"), 0);
+    previous_capacity = git_ops_test_set_cleanup_arena_capacity(1U);
+    clear_error();
+    errno = 0;
+    CHECK_EQ_INT(git_config_finalization_begin(&finalization), -1);
+    CHECK(finalization == NULL);
+    CHECK_EQ_INT(errno, ENOSPC);
+    CHECK_EQ_INT(get_last_error()->code, ERR_GIT_CONFIG_FAILED);
+    CHECK(strstr(get_last_error()->message,
+                 "exhausted before finalization mutation") != NULL);
+    errno = 0;
+    CHECK(lstat(g_finalization_lock_path, &named) != 0 &&
+          errno == ENOENT);
+    CHECK_EQ_INT((long)count_finalization_private_aliases(fixture.base), 0);
+    (void)git_ops_test_set_cleanup_arena_capacity(previous_capacity);
+    git_config_commit();
+
+    fixture_cleanup(&fixture);
+}
+
 TEST(finalization_release_failure_consumes_handle_and_self_heals) {
     static const char marker_magic[] = "gitswitch-recovery-v1 ";
     git_fixture_t fixture;
@@ -2543,10 +2769,110 @@ TEST(finalization_release_failure_consumes_handle_and_self_heals) {
     fixture_cleanup(&fixture);
 }
 
+TEST(forked_child_finalization_end_is_descriptor_only) {
+    git_fixture_t fixture;
+    git_config_finalization_t *finalization = NULL;
+    struct stat before;
+    struct stat after;
+    char marker_before[1024];
+    char marker_after[1024];
+    pid_t child;
+    int status = 0;
+
+    if (!fixture_init(&fixture)) {
+        CHECK(false);
+        fixture_cleanup(&fixture);
+        return;
+    }
+    CHECK_EQ_INT(git_set("--global", "user.name",
+                         "before-forked-finalization-end"), 0);
+    CHECK((size_t)snprintf(
+              g_finalization_lock_path,
+              sizeof(g_finalization_lock_path), "%s.lock",
+              fixture.global_config) < sizeof(g_finalization_lock_path));
+    CHECK_EQ_INT(prepare_finalization_transaction(
+                     "forked-finalization-postimage"), 0);
+    CHECK_EQ_INT(git_config_finalization_begin(&finalization), 0);
+    CHECK(finalization != NULL);
+    CHECK_EQ_INT(lstat(g_finalization_lock_path, &before), 0);
+    CHECK_EQ_INT(read_file(g_finalization_lock_path, marker_before,
+                           sizeof(marker_before)), 0);
+
+    child = fork();
+    CHECK(child >= 0);
+    if (child == 0) {
+        int inherited[6];
+        int replacements[6];
+        struct stat replacement_identity[6];
+        size_t inherited_count =
+            git_ops_test_finalization_descriptors(
+                finalization, inherited,
+                sizeof(inherited) / sizeof(inherited[0]));
+
+        if (inherited_count == 0U ||
+            inherited_count >
+                sizeof(inherited) / sizeof(inherited[0])) {
+            _exit(87);
+        }
+        for (size_t i = 0U; i < inherited_count; i++) {
+            replacements[i] = reopen_snapshot_object(inherited[i]);
+            if (replacements[i] < 0 ||
+                replacements[i] == inherited[i] ||
+                fstat(replacements[i], &replacement_identity[i]) != 0 ||
+                close(inherited[i]) != 0 ||
+                dup2(replacements[i], inherited[i]) != inherited[i]) {
+                _exit(89);
+            }
+        }
+        clear_error();
+        errno = 0;
+        if (git_config_finalization_end(&finalization) != -1 ||
+            finalization != NULL || errno != EINVAL ||
+            get_last_error()->code != ERR_INVALID_ARGS) {
+            _exit(88);
+        }
+        for (size_t i = 0U; i < inherited_count; i++) {
+            struct stat retained;
+
+            if (fcntl(inherited[i], F_GETFD) < 0 ||
+                fstat(inherited[i], &retained) != 0 ||
+                retained.st_dev != replacement_identity[i].st_dev ||
+                retained.st_ino != replacement_identity[i].st_ino) {
+                _exit(90);
+            }
+            close(inherited[i]);
+            close(replacements[i]);
+        }
+        _exit(0);
+    }
+    if (child > 0) {
+        CHECK(waitpid(child, &status, 0) == child);
+        CHECK(WIFEXITED(status));
+        if (WIFEXITED(status)) CHECK_EQ_INT(WEXITSTATUS(status), 0);
+    }
+    CHECK_EQ_INT(lstat(g_finalization_lock_path, &after), 0);
+    CHECK(before.st_dev == after.st_dev);
+    CHECK(before.st_ino == after.st_ino);
+    CHECK_EQ_INT(read_file(g_finalization_lock_path, marker_after,
+                           sizeof(marker_after)), 0);
+    CHECK_STR_EQ(marker_after, marker_before);
+    CHECK_EQ_INT(git_config_finalization_end(&finalization), 0);
+    CHECK(finalization == NULL);
+    errno = 0;
+    CHECK(lstat(g_finalization_lock_path, &after) != 0 &&
+          errno == ENOENT);
+    git_config_commit();
+
+    fixture_cleanup(&fixture);
+}
+
 TEST(finalization_release_preserves_foreign_replacement) {
     git_fixture_t fixture;
     git_config_finalization_t *finalization = NULL;
-    char contents[256];
+    unsigned char contents[sizeof(g_foreign_finalization_bytes)];
+    char config_before[4096];
+    char config_after[4096];
+    char value[256];
 
     if (!fixture_init(&fixture)) {
         CHECK(false);
@@ -2567,18 +2893,82 @@ TEST(finalization_release_preserves_foreign_replacement) {
         replace_finalization_certificate_with_foreign_lock);
     CHECK_EQ_INT(git_config_finalization_end(&finalization), -1);
     CHECK(finalization == NULL);
+    CHECK_EQ_INT(get_last_error()->code, ERR_GIT_CONFIG_FAILED);
+    CHECK(strstr(get_last_error()->message,
+                 "foreign namespace entry was preserved") != NULL);
     (void)git_ops_test_set_finalization_hook(NULL);
-    CHECK_EQ_INT(read_file(g_finalization_lock_path, contents,
-                           sizeof(contents)), 0);
-    CHECK_STR_EQ(contents, "foreign-git-lock\n");
+    CHECK_EQ_INT(read_binary_file_exact(
+                     g_finalization_lock_path, contents,
+                     sizeof(contents)), 0);
+    CHECK(memcmp(contents, g_foreign_finalization_bytes,
+                 sizeof(contents)) == 0);
     git_config_commit();
+    CHECK_EQ_INT(read_file(fixture.global_config, config_before,
+                           sizeof(config_before)), 0);
+    clear_error();
+    errno = 0;
     CHECK_EQ_INT(git_set_config_value(
                      GIT_CONFIG_USER_NAME, "must-not-overwrite-lock",
                      GIT_SCOPE_GLOBAL), -1);
-    CHECK_EQ_INT(read_file(g_finalization_lock_path, contents,
-                           sizeof(contents)), 0);
-    CHECK_STR_EQ(contents, "foreign-git-lock\n");
+    CHECK_EQ_INT(errno, EEXIST);
+    CHECK_EQ_INT(get_last_error()->code, ERR_GIT_CONFIG_FAILED);
+    CHECK_EQ_INT(get_last_error()->system_errno, 0);
+    CHECK_STR_EQ(get_last_error()->function,
+                 "git_recover_scope_finalization_marker");
+    CHECK_STR_EQ(
+        get_last_error()->message,
+        "Existing Git configuration lock is not an exact recoverable "
+        "gitswitch certificate");
+    CHECK(strstr(get_last_error()->message,
+                 "Failed to set git config") == NULL);
+    CHECK_EQ_INT(read_binary_file_exact(
+                     g_finalization_lock_path, contents,
+                     sizeof(contents)), 0);
+    CHECK(memcmp(contents, g_foreign_finalization_bytes,
+                 sizeof(contents)) == 0);
+    CHECK_EQ_INT(read_file(fixture.global_config, config_after,
+                           sizeof(config_after)), 0);
+    CHECK_STR_EQ(config_after, config_before);
+
+    clear_error();
+    errno = 0;
+    CHECK_EQ_INT(git_unset_config_value(
+                     GIT_CONFIG_USER_NAME, GIT_SCOPE_GLOBAL), -1);
+    CHECK_EQ_INT(errno, EEXIST);
+    CHECK_EQ_INT(get_last_error()->code, ERR_GIT_CONFIG_FAILED);
+    CHECK_EQ_INT(get_last_error()->system_errno, 0);
+    CHECK_STR_EQ(get_last_error()->function,
+                 "git_recover_scope_finalization_marker");
+    CHECK_STR_EQ(
+        get_last_error()->message,
+        "Existing Git configuration lock is not an exact recoverable "
+        "gitswitch certificate");
+    CHECK(strstr(get_last_error()->message,
+                 "Failed to unset git config") == NULL);
+    CHECK_EQ_INT(read_binary_file_exact(
+                     g_finalization_lock_path, contents,
+                     sizeof(contents)), 0);
+    CHECK(memcmp(contents, g_foreign_finalization_bytes,
+                 sizeof(contents)) == 0);
+    CHECK_EQ_INT(read_file(fixture.global_config, config_after,
+                           sizeof(config_after)), 0);
+    CHECK_STR_EQ(config_after, config_before);
+
     CHECK_EQ_INT(unlink(g_finalization_lock_path), 0);
+    /* Both failures must leave the scalar cache uncertain. A later corrective
+     * set and unset therefore execute instead of being elided by stale state. */
+    CHECK_EQ_INT(git_set_config_value(
+                     GIT_CONFIG_USER_NAME, "cache-retry-set",
+                     GIT_SCOPE_GLOBAL), 0);
+    CHECK_EQ_INT(git_get_all("--global", GIT_CONFIG_USER_NAME,
+                             value, sizeof(value)), 0);
+    CHECK_STR_EQ(value, "cache-retry-set\n");
+    CHECK_EQ_INT(git_set("--global", GIT_CONFIG_USER_NAME,
+                         "external-before-retry-unset"), 0);
+    CHECK_EQ_INT(git_unset_config_value(
+                     GIT_CONFIG_USER_NAME, GIT_SCOPE_GLOBAL), 0);
+    CHECK_EQ_INT(git_get_all("--global", GIT_CONFIG_USER_NAME,
+                             value, sizeof(value)), -1);
 
     fixture_cleanup(&fixture);
 }
@@ -2745,9 +3135,13 @@ TEST_MAIN_BEGIN()
     RUN_TEST(replaced_config_file_with_one_conflict_is_never_partially_rebased);
     RUN_TEST(conflict_retry_never_rebases_onto_unrelated_same_path_generation);
     RUN_TEST(postpublish_path_race_retains_the_installed_generation_for_retry);
+    RUN_TEST(fork_child_cannot_use_parent_snapshot_and_can_start_fresh);
+    RUN_TEST(fork_child_abandon_preserves_reused_snapshot_descriptors);
     RUN_TEST(finalization_sigkill_leaves_complete_self_healing_certificate);
     RUN_TEST(private_prepublication_sigkill_is_reconciled_exactly);
+    RUN_TEST(finalization_arena_exhaustion_precedes_private_and_canonical_creation);
     RUN_TEST(finalization_release_failure_consumes_handle_and_self_heals);
+    RUN_TEST(forked_child_finalization_end_is_descriptor_only);
     RUN_TEST(finalization_release_preserves_foreign_replacement);
     RUN_TEST(finalization_postunlink_retry_never_removes_later_foreign_lock);
     RUN_TEST(snapshot_commit_releases_all_generation_descriptors);

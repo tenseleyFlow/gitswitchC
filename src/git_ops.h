@@ -295,11 +295,13 @@ size_t git_retirement_transaction_restored_destination_count(
 
 /**
  * Return one reconciled canonical path and its freshly re-proved exact file
- * identity. The query checked-cleans and syncs that destination's transaction
- * artifacts before sealing the generation, then retains its exact bytes for
- * commit to re-prove after the caller refreshes the publication ledger. This
- * prevents delayed filesystem metadata from making the new ledger stale while
- * still detecting an external Git writer. `index` addresses changed-and-
+ * identity. The query converts the transaction-owned canonical lock into a
+ * complete, fsynced recovery marker before sealing the generation, then
+ * retains the exact restored bytes and marker witness for commit to re-prove
+ * and exact-clean after the caller refreshes the publication ledger. This
+ * prevents delayed filesystem metadata from making the new ledger stale,
+ * blocks cooperative Git writers, and still detects a foreign replacement.
+ * `index` addresses changed-and-
  * restored and unchanged/no-op destinations exactly once per physical config
  * namespace. The transaction must remain uncommitted and fully aborted.
  */
