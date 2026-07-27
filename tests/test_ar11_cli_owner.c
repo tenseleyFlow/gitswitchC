@@ -41,14 +41,37 @@ typedef enum {
     SWITCH_GUARD_INSTALL_BEFORE_INITIAL_FSTAT = 0,
     SWITCH_GUARD_INSTALL_AFTER_STAGE_SYNC,
     SWITCH_GUARD_CLEAR_AFTER_UNLINK,
-    SWITCH_GUARD_SNAPSHOT_AFTER_MARKER_READ
+    SWITCH_GUARD_SNAPSHOT_AFTER_MARKER_READ,
+    SWITCH_GUARD_RECONCILE_AFTER_NORMALIZE_SYNC,
+    SWITCH_GUARD_RETAIN_AFTER_MARKER_SYNC,
+    SWITCH_GUARD_READ_AFTER_EXACT_DESCRIPTOR_PROOF
 } switch_guard_test_stage_t;
 typedef int (*switch_guard_test_hook_fn)(
     switch_guard_test_stage_t stage, int directory_fd);
 switch_guard_test_hook_fn gitswitch_test_set_switch_guard_hook(
     switch_guard_test_hook_fn hook);
+typedef enum {
+    CONFIG_PUBLISH_TEST_SOURCE_UNLINK = 0,
+    CONFIG_PUBLISH_TEST_ROLLBACK_UNLINK,
+    CONFIG_PUBLISH_TEST_AFTER_ROLLBACK_FAILURE,
+    CONFIG_PUBLISH_TEST_RETAINED_SOURCE_RETIRE,
+    CONFIG_PUBLISH_TEST_BEFORE_FIXED_LINK,
+    CONFIG_PUBLISH_TEST_AFTER_FIXED_LINK,
+    CONFIG_PUBLISH_TEST_AFTER_FIXED_SYNC,
+    CONFIG_PUBLISH_TEST_BEFORE_FIXED_RETIRE,
+    CONFIG_PUBLISH_TEST_BEFORE_SOURCE_PIN
+} config_publish_test_stage_t;
+typedef int (*config_publish_test_hook_fn)(
+    config_publish_test_stage_t stage, int directory_fd,
+    const char *source, const char *destination);
+config_publish_test_hook_fn gitswitch_test_set_config_publish_hook(
+    config_publish_test_hook_fn hook);
+unsigned int gitswitch_test_set_retirement_settled_slot_limit(
+    unsigned int limit);
 int gitswitch_test_context_allocations(void);
 int gitswitch_test_context_allocation_total(void);
+int gitswitch_test_switch_guard_directory_fd(
+    const config_switch_guard_t *guard);
 
 typedef struct {
     char root[PATH_MAX];
@@ -98,7 +121,7 @@ typedef struct {
 typedef enum {
     SWITCH_MARKER_MUTATION_NONE = 0,
     SWITCH_MARKER_MUTATION_CTIME_ONLY,
-    SWITCH_MARKER_MUTATION_CHANGED_BYTE_RESTORED_MTIME
+    SWITCH_MARKER_MUTATION_PARSE_VALID_TOKEN_RESTORED_MTIME
 } switch_marker_mutation_t;
 
 static runtime_holder_t g_runtime_holder = { -1, -1 };
@@ -123,25 +146,30 @@ static int g_h1_fault_mutation_rc;
 static bool g_switch_guard_fail_stage;
 static bool g_switch_guard_replace_before_initial_fstat;
 static bool g_switch_guard_fail_clear;
+static bool g_switch_guard_fail_normalize_sync;
 static int g_switch_guard_clear_failures_remaining;
 static int g_switch_guard_hook_calls;
 static int g_switch_guard_replacement_rc;
 static struct stat g_switch_guard_displaced_stage;
 static struct stat g_switch_guard_replacement_stage;
 static bool g_switch_guard_drift_source_after_stage_sync;
+static bool g_switch_guard_drift_source_after_retain_sync;
 static int g_switch_guard_source_drift_calls;
 static int g_switch_guard_source_drift_rc;
 static char g_switch_guard_source_path[PATH_MAX];
 static struct stat g_switch_guard_source_before_drift;
 static struct stat g_switch_guard_source_after_drift;
 static switch_marker_mutation_t g_switch_marker_mutation;
+static switch_guard_test_stage_t g_switch_marker_mutation_stage;
 static int g_switch_marker_mutation_calls;
+static int g_switch_marker_outer_snapshot_calls;
 static int g_switch_marker_mutation_rc;
 static char g_switch_marker_mutation_path[PATH_MAX];
 static struct stat g_switch_marker_before_mutation;
 static struct stat g_switch_marker_after_mutation;
 static unsigned char g_switch_marker_original_byte;
 static unsigned char g_switch_marker_mutated_byte;
+static size_t g_switch_marker_mutation_offset;
 static volatile sig_atomic_t g_returning_signal_calls;
 
 typedef enum {
@@ -298,18 +326,22 @@ static int sync_directory(const char *path) {
     return result;
 }
 
-static int replace_private_atomically(const char *path, const char *text) {
+static int replace_private_bytes_atomically(
+    const char *path, const unsigned char *data, size_t length) {
     char directory[PATH_MAX];
     char temp[PATH_MAX] = "";
     const char *slash;
     size_t directory_length;
-    size_t length = strlen(text);
     size_t total = 0;
     int dir_fd = -1;
     int output_fd = -1;
     int result = -1;
     int saved_errno;
 
+    if (!path || (!data && length != 0U)) {
+        errno = EINVAL;
+        return -1;
+    }
     slash = strrchr(path, '/');
     if (!slash || slash == path) {
         errno = EINVAL;
@@ -328,7 +360,7 @@ static int replace_private_atomically(const char *path, const char *text) {
     output_fd = mkstemp(temp);
     if (output_fd < 0 || fchmod(output_fd, 0600) != 0) goto cleanup;
     while (total < length) {
-        ssize_t count = write(output_fd, text + total, length - total);
+        ssize_t count = write(output_fd, data + total, length - total);
 
         if (count > 0) total += (size_t)count;
         else if (count < 0 && errno == EINTR) continue;
@@ -354,6 +386,15 @@ cleanup:
     if (result != 0 && temp[0] != '\0') (void)unlink(temp);
     errno = saved_errno;
     return result;
+}
+
+static int replace_private_atomically(const char *path, const char *text) {
+    if (!text) {
+        errno = EINVAL;
+        return -1;
+    }
+    return replace_private_bytes_atomically(
+        path, (const unsigned char *)text, strlen(text));
 }
 
 static bool diverge_persistence_rollback(config_io_boundary_t boundary) {
@@ -548,10 +589,13 @@ static int fail_switch_guard_lifecycle(
     }
     if ((stage == SWITCH_GUARD_INSTALL_AFTER_STAGE_SYNC &&
          g_switch_guard_fail_stage) ||
+        (stage == SWITCH_GUARD_RECONCILE_AFTER_NORMALIZE_SYNC &&
+         g_switch_guard_fail_normalize_sync) ||
         (stage == SWITCH_GUARD_CLEAR_AFTER_UNLINK &&
          (g_switch_guard_fail_clear ||
           g_switch_guard_clear_failures_remaining > 0))) {
         g_switch_guard_fail_stage = false;
+        g_switch_guard_fail_normalize_sync = false;
         g_switch_guard_fail_clear = false;
         if (g_switch_guard_clear_failures_remaining > 0) {
             g_switch_guard_clear_failures_remaining--;
@@ -562,6 +606,326 @@ static int fail_switch_guard_lifecycle(
     }
     return 0;
 }
+
+#if defined(__FreeBSD__)
+static int g_freebsd_settlement_stop_stage = -1;
+static int g_freebsd_settlement_fail_stage = -1;
+static int g_freebsd_fixed_replacement_rc = -1;
+static bool g_freebsd_replace_target_with_fixed;
+static int g_freebsd_original_pair_fd = -1;
+static struct stat g_freebsd_original_pair_identity;
+static int g_freebsd_source_fifo_rc = -1;
+static char g_freebsd_source_fifo_name[PATH_MAX];
+
+static bool fail_default_before_publication(
+    config_io_boundary_t boundary) {
+    return boundary == CONFIG_IO_DEFAULT_BEFORE_RENAME;
+}
+
+static int fail_freebsd_retained_settlement(
+    config_publish_test_stage_t stage, int directory_fd,
+    const char *source, const char *destination) {
+    (void)directory_fd;
+    (void)source;
+    (void)destination;
+    if (stage == CONFIG_PUBLISH_TEST_SOURCE_UNLINK ||
+        stage == CONFIG_PUBLISH_TEST_ROLLBACK_UNLINK) {
+        errno = EIO;
+        return -1;
+    }
+    if (stage == CONFIG_PUBLISH_TEST_RETAINED_SOURCE_RETIRE) {
+        signals_test_fail_scratch_unlink(EIO);
+        errno = EIO;
+        return -1;
+    }
+    if ((int)stage == g_freebsd_settlement_stop_stage) {
+        _exit(0);
+    }
+    return 0;
+}
+
+static int fail_freebsd_retained_settlement_in_process(
+    config_publish_test_stage_t stage, int directory_fd,
+    const char *source, const char *destination) {
+    (void)directory_fd;
+    (void)source;
+    (void)destination;
+    if (stage == CONFIG_PUBLISH_TEST_SOURCE_UNLINK ||
+        stage == CONFIG_PUBLISH_TEST_ROLLBACK_UNLINK) {
+        errno = EIO;
+        return -1;
+    }
+    if (stage == CONFIG_PUBLISH_TEST_RETAINED_SOURCE_RETIRE) {
+        signals_test_fail_scratch_unlink(EIO);
+        errno = EIO;
+        return -1;
+    }
+    if ((int)stage == g_freebsd_settlement_fail_stage) {
+        g_freebsd_settlement_fail_stage = -1;
+        errno = EIO;
+        return -1;
+    }
+    return 0;
+}
+
+static int replace_freebsd_fixed_authority_before_retirement(
+    config_publish_test_stage_t stage, int directory_fd,
+    const char *source, const char *destination) {
+    static const char foreign[] = "foreign-fixed\n";
+    unsigned char copied[16384];
+    const char *settled_name =
+        ".gitswitch-resume-hint-settled-0";
+    size_t copied_length = 0U;
+    size_t written = 0U;
+    int fd;
+
+    (void)source;
+    if (stage == CONFIG_PUBLISH_TEST_SOURCE_UNLINK ||
+        stage == CONFIG_PUBLISH_TEST_ROLLBACK_UNLINK) {
+        errno = EIO;
+        return -1;
+    }
+    if (stage == CONFIG_PUBLISH_TEST_RETAINED_SOURCE_RETIRE) {
+        signals_test_fail_scratch_unlink(EIO);
+        errno = EIO;
+        return -1;
+    }
+    if (stage != CONFIG_PUBLISH_TEST_BEFORE_FIXED_RETIRE ||
+        strcmp(destination, ".resume-hint") != 0) {
+        return 0;
+    }
+    g_freebsd_fixed_replacement_rc = -1;
+    if (g_freebsd_replace_target_with_fixed) {
+        fd = openat(
+            directory_fd, destination,
+            O_RDONLY | O_CLOEXEC | O_NOFOLLOW);
+        if (fd < 0) return 0;
+        while (copied_length < sizeof(copied)) {
+            ssize_t count = read(
+                fd, copied + copied_length,
+                sizeof(copied) - copied_length);
+
+            if (count > 0) {
+                copied_length += (size_t)count;
+            } else if (count == 0) {
+                break;
+            } else if (errno != EINTR) {
+                (void)close(fd);
+                return 0;
+            }
+        }
+        if (copied_length == sizeof(copied) ||
+            fstat(fd, &g_freebsd_original_pair_identity) != 0) {
+            (void)close(fd);
+            return 0;
+        }
+        g_freebsd_original_pair_fd = fd;
+        if (
+            unlinkat(directory_fd, settled_name, 0) != 0 ||
+            unlinkat(directory_fd, destination, 0) != 0) {
+            return 0;
+        }
+        fd = openat(
+            directory_fd, destination,
+            O_WRONLY | O_CREAT | O_EXCL | O_CLOEXEC | O_NOFOLLOW,
+            0600);
+        if (fd < 0) return 0;
+        while (written < copied_length) {
+            ssize_t count =
+                write(fd, copied + written, copied_length - written);
+
+            if (count > 0) {
+                written += (size_t)count;
+            } else if (count < 0 && errno == EINTR) {
+                continue;
+            } else {
+                break;
+            }
+        }
+        {
+            int sync_result =
+                written == copied_length ? fsync(fd) : -1;
+            int close_result = close(fd);
+
+            if (written == copied_length &&
+                sync_result == 0 && close_result == 0 &&
+                linkat(
+                    directory_fd, destination,
+                    directory_fd, settled_name, 0) == 0 &&
+                fsync(directory_fd) == 0) {
+                g_freebsd_fixed_replacement_rc = 0;
+            }
+        }
+        secure_zero_memory(copied, sizeof(copied));
+        return 0;
+    }
+    if (unlinkat(directory_fd, settled_name, 0) != 0) return 0;
+    fd = openat(
+        directory_fd, settled_name,
+        O_WRONLY | O_CREAT | O_EXCL | O_CLOEXEC | O_NOFOLLOW,
+        0600);
+    if (fd < 0) return 0;
+    while (written < sizeof(foreign) - 1U) {
+        ssize_t count =
+            write(fd, foreign + written,
+                  sizeof(foreign) - 1U - written);
+
+        if (count > 0) {
+            written += (size_t)count;
+        } else if (count < 0 && errno == EINTR) {
+            continue;
+        } else {
+            break;
+        }
+    }
+    {
+        int sync_result =
+            written == sizeof(foreign) - 1U ? fsync(fd) : -1;
+        int close_result = close(fd);
+
+        if (written == sizeof(foreign) - 1U &&
+            sync_result == 0 && close_result == 0) {
+            g_freebsd_fixed_replacement_rc = 0;
+        }
+    }
+    return 0;
+}
+
+static int replace_freebsd_source_with_fifo_before_pin(
+    config_publish_test_stage_t stage, int directory_fd,
+    const char *source, const char *destination) {
+    if (stage == CONFIG_PUBLISH_TEST_SOURCE_UNLINK ||
+        stage == CONFIG_PUBLISH_TEST_ROLLBACK_UNLINK) {
+        errno = EIO;
+        return -1;
+    }
+    if (stage == CONFIG_PUBLISH_TEST_RETAINED_SOURCE_RETIRE) {
+        signals_test_fail_scratch_unlink(EIO);
+        errno = EIO;
+        return -1;
+    }
+    if (stage != CONFIG_PUBLISH_TEST_BEFORE_SOURCE_PIN ||
+        strcmp(destination, ".resume-hint") != 0) {
+        return 0;
+    }
+
+    g_freebsd_source_fifo_rc = -1;
+    if (safe_strncpy(
+            g_freebsd_source_fifo_name, source,
+            sizeof(g_freebsd_source_fifo_name)) != 0 ||
+        unlinkat(directory_fd, source, 0) != 0 ||
+        mkfifoat(directory_fd, source, 0600) != 0) {
+        return 0;
+    }
+    g_freebsd_source_fifo_rc = 0;
+    errno = EIO;
+    return 0;
+}
+
+static int fail_both_freebsd_publish_unlinks(
+    config_publish_test_stage_t stage, int directory_fd,
+    const char *source, const char *destination) {
+    (void)directory_fd;
+    (void)source;
+    (void)destination;
+    if (stage == CONFIG_PUBLISH_TEST_SOURCE_UNLINK ||
+        stage == CONFIG_PUBLISH_TEST_ROLLBACK_UNLINK) {
+        errno = EIO;
+        return -1;
+    }
+    return 0;
+}
+
+static int fail_freebsd_resume_hint_publish_unlinks(
+    config_publish_test_stage_t stage, int directory_fd,
+    const char *source, const char *destination) {
+    (void)directory_fd;
+    (void)source;
+    if (strcmp(destination, ".resume-hint") == 0 &&
+        (stage == CONFIG_PUBLISH_TEST_SOURCE_UNLINK ||
+         stage == CONFIG_PUBLISH_TEST_ROLLBACK_UNLINK)) {
+        errno = EIO;
+        return -1;
+    }
+    return 0;
+}
+
+static int fail_freebsd_config_document_publish_unlinks(
+    config_publish_test_stage_t stage, int directory_fd,
+    const char *source, const char *destination) {
+    (void)directory_fd;
+    (void)source;
+    if (strcmp(destination, "accounts.toml") == 0 &&
+        (stage == CONFIG_PUBLISH_TEST_SOURCE_UNLINK ||
+         stage == CONFIG_PUBLISH_TEST_ROLLBACK_UNLINK)) {
+        errno = EIO;
+        return -1;
+    }
+    return 0;
+}
+
+static int make_freebsd_generic_publish_uncertain_for(
+    const char *target, config_publish_test_stage_t stage,
+    int directory_fd, const char *destination) {
+    static const char foreign[] = "foreign-publication\n";
+    int fd;
+
+    if (strcmp(destination, target) != 0) return 0;
+    if (stage == CONFIG_PUBLISH_TEST_SOURCE_UNLINK ||
+        stage == CONFIG_PUBLISH_TEST_ROLLBACK_UNLINK) {
+        errno = EIO;
+        return -1;
+    }
+    if (stage != CONFIG_PUBLISH_TEST_AFTER_ROLLBACK_FAILURE) return 0;
+    if (unlinkat(directory_fd, destination, 0) != 0) return -1;
+    fd = openat(
+        directory_fd, destination,
+        O_WRONLY | O_CREAT | O_EXCL | O_CLOEXEC | O_NOFOLLOW, 0600);
+    if (fd < 0 ||
+        write(fd, foreign, sizeof(foreign) - 1U) !=
+            (ssize_t)(sizeof(foreign) - 1U) ||
+        fsync(fd) != 0 || close(fd) != 0) {
+        if (fd >= 0) (void)close(fd);
+        return -1;
+    }
+    return 0;
+}
+
+static int make_freebsd_config_document_publish_uncertain(
+    config_publish_test_stage_t stage, int directory_fd,
+    const char *source, const char *destination) {
+    (void)source;
+    return make_freebsd_generic_publish_uncertain_for(
+        "accounts.toml", stage, directory_fd, destination);
+}
+
+static int make_freebsd_publish_outcome_uncertain(
+    config_publish_test_stage_t stage, int directory_fd,
+    const char *source, const char *destination) {
+    static const char foreign[] = "foreign-switch-marker\n";
+    int fd;
+
+    (void)source;
+    if (stage == CONFIG_PUBLISH_TEST_SOURCE_UNLINK ||
+        stage == CONFIG_PUBLISH_TEST_ROLLBACK_UNLINK) {
+        errno = EIO;
+        return -1;
+    }
+    if (stage != CONFIG_PUBLISH_TEST_AFTER_ROLLBACK_FAILURE) return 0;
+    if (unlinkat(directory_fd, destination, 0) != 0) return -1;
+    fd = openat(
+        directory_fd, destination,
+        O_WRONLY | O_CREAT | O_EXCL | O_CLOEXEC | O_NOFOLLOW, 0600);
+    if (fd < 0 ||
+        write(fd, foreign, sizeof(foreign) - 1U) !=
+            (ssize_t)(sizeof(foreign) - 1U) ||
+        fsync(fd) != 0 || close(fd) != 0) {
+        if (fd >= 0) (void)close(fd);
+        return -1;
+    }
+    return 0;
+}
+#endif
 
 static size_t read_text(const char *path, char *text, size_t size) {
     int fd;
@@ -630,6 +994,77 @@ static size_t h1_read_bounded_file(
     return total;
 }
 
+typedef struct {
+    size_t length_value_offset;
+    size_t length_digit_count;
+    size_t witness_offset;
+    size_t witness_length;
+} h1_switch_marker_layout_t;
+
+typedef enum {
+    H1_MARKER_TRUNCATED_WITNESS = 0,
+    H1_MARKER_TRAILING_BYTE,
+    H1_MARKER_DECLARED_SMALLER,
+    H1_MARKER_DECLARED_LARGER,
+    H1_MARKER_NONCANONICAL_LENGTH,
+    H1_MARKER_EMBEDDED_NUL,
+    H1_MARKER_OVER_TOTAL_CAP
+} h1_switch_marker_malformation_t;
+
+static const unsigned char *h1_find_bytes(
+    const unsigned char *data, size_t length,
+    const unsigned char *needle, size_t needle_length) {
+    if (!data || !needle || needle_length == 0U ||
+        needle_length > length) {
+        return NULL;
+    }
+    for (size_t i = 0U; i <= length - needle_length; i++) {
+        if (memcmp(data + i, needle, needle_length) == 0) {
+            return data + i;
+        }
+    }
+    return NULL;
+}
+
+static int h1_switch_marker_layout(
+    const unsigned char *marker, size_t marker_length,
+    h1_switch_marker_layout_t *layout) {
+    static const unsigned char field[] = "source_witness_length=";
+    const unsigned char *value;
+    const unsigned char *newline;
+    uintmax_t parsed = 0U;
+    size_t digit_count;
+
+    if (!marker || marker_length == 0U || !layout) return -1;
+    value = h1_find_bytes(
+        marker, marker_length, field, sizeof(field) - 1U);
+    if (!value) return -1;
+    value += sizeof(field) - 1U;
+    newline = memchr(
+        value, '\n', marker_length - (size_t)(value - marker));
+    if (!newline || newline == value) return -1;
+    digit_count = (size_t)(newline - value);
+    for (size_t i = 0U; i < digit_count; i++) {
+        if (value[i] < (unsigned char)'0' ||
+            value[i] > (unsigned char)'9' ||
+            parsed > (UINTMAX_MAX - (uintmax_t)(value[i] - '0')) /
+                         10U) {
+            return -1;
+        }
+        parsed = parsed * 10U + (uintmax_t)(value[i] - '0');
+    }
+    if (parsed == 0U || parsed > SIZE_MAX ||
+        (size_t)(marker + marker_length - (newline + 1U)) !=
+            (size_t)parsed) {
+        return -1;
+    }
+    layout->length_value_offset = (size_t)(value - marker);
+    layout->length_digit_count = digit_count;
+    layout->witness_offset = (size_t)(newline + 1U - marker);
+    layout->witness_length = (size_t)parsed;
+    return 0;
+}
+
 static bool h1_same_ctime(
     const struct stat *left, const struct stat *right) {
     if (!left || !right) return false;
@@ -696,28 +1131,54 @@ static int h1_force_ctime_only_drift(
     return -1;
 }
 
-static int h1_change_byte_restore_mtime(
+static int h1_change_token_byte_restore_mtime(
     const char *path, struct stat *before_out, struct stat *after_out,
-    unsigned char *original_byte, unsigned char *mutated_byte) {
+    unsigned char *original_byte, unsigned char *mutated_byte,
+    size_t *mutation_offset) {
+    static const unsigned char token_field[] = "token=";
+    const unsigned char *token;
     struct stat before;
     struct stat drift_before;
     struct stat after;
     struct timespec times[2];
+    unsigned char *data = NULL;
     unsigned char original;
     unsigned char mutated;
+    size_t offset;
     int fd = -1;
     int failure_errno = EIO;
 
     if (!path || !before_out || !after_out ||
-        !original_byte || !mutated_byte) {
+        !original_byte || !mutated_byte || !mutation_offset) {
         errno = EINVAL;
         return -1;
     }
     fd = open(path, O_RDWR | O_CLOEXEC | O_NOFOLLOW | O_NONBLOCK);
     if (fd < 0 || fstat(fd, &before) != 0 ||
         before.st_size <= 0 ||
-        pread(fd, &original, 1, 0) != 1) {
+        (uintmax_t)before.st_size > SIZE_MAX) {
         failure_errno = errno ? errno : ESTALE;
+        goto mutation_fail;
+    }
+    data = malloc((size_t)before.st_size);
+    if (!data ||
+        pread(fd, data, (size_t)before.st_size, 0) != before.st_size) {
+        failure_errno = data ? (errno ? errno : EIO) : ENOMEM;
+        goto mutation_fail;
+    }
+    token = h1_find_bytes(
+        data, (size_t)before.st_size,
+        token_field, sizeof(token_field) - 1U);
+    if (!token ||
+        (size_t)(token - data) + sizeof(token_field) - 1U >=
+            (size_t)before.st_size) {
+        failure_errno = ESTALE;
+        goto mutation_fail;
+    }
+    offset = (size_t)(token - data) + sizeof(token_field) - 1U;
+    original = data[offset];
+    if (original == '\n' || original == '\0') {
+        failure_errno = ESTALE;
         goto mutation_fail;
     }
 #if defined(__APPLE__)
@@ -727,8 +1188,10 @@ static int h1_change_byte_restore_mtime(
     times[0] = before.st_atim;
     times[1] = before.st_mtim;
 #endif
-    mutated = (unsigned char)(original ^ 1U);
-    if (pwrite(fd, &mutated, 1, 0) != 1 ||
+    mutated = original == (unsigned char)'A'
+                  ? (unsigned char)'B'
+                  : (unsigned char)'A';
+    if (pwrite(fd, &mutated, 1, (off_t)offset) != 1 ||
         futimens(fd, times) != 0 || fsync(fd) != 0) {
         failure_errno = errno ? errno : EIO;
         goto mutation_fail;
@@ -752,10 +1215,99 @@ static int h1_change_byte_restore_mtime(
     *after_out = after;
     *original_byte = original;
     *mutated_byte = mutated;
+    *mutation_offset = offset;
+    secure_zero_memory(data, (size_t)before.st_size);
+    free(data);
     return 0;
 
 mutation_fail:
     if (fd >= 0) close(fd);
+    if (data) {
+        secure_zero_memory(data, (size_t)before.st_size);
+        free(data);
+    }
+    errno = failure_errno;
+    return -1;
+}
+
+static int h1_change_ignored_whitespace_restore_mtime(
+    const char *path, struct stat *before_out,
+    struct stat *after_out) {
+    static const char field[] = "description =";
+    struct stat before;
+    struct stat drift_before;
+    struct stat after;
+    struct timespec times[2];
+    unsigned char *data = NULL;
+    char *match;
+    off_t offset;
+    int fd = -1;
+    int failure_errno = EIO;
+
+    if (!path || !before_out || !after_out) {
+        errno = EINVAL;
+        return -1;
+    }
+    fd = open(path, O_RDWR | O_CLOEXEC | O_NOFOLLOW | O_NONBLOCK);
+    if (fd < 0 || fstat(fd, &before) != 0 ||
+        before.st_size <= 0 ||
+        (uintmax_t)before.st_size > SIZE_MAX - 1U) {
+        failure_errno = errno ? errno : ESTALE;
+        goto mutation_fail;
+    }
+    data = calloc((size_t)before.st_size + 1U, 1U);
+    if (!data ||
+        pread(fd, data, (size_t)before.st_size, 0) !=
+            before.st_size) {
+        failure_errno = errno ? errno : EIO;
+        goto mutation_fail;
+    }
+    match = strstr((char *)data, field);
+    if (!match || match[strlen("description")] != ' ') {
+        failure_errno = ESTALE;
+        goto mutation_fail;
+    }
+    offset = (off_t)(match - (char *)data) +
+             (off_t)strlen("description");
+#if defined(__APPLE__)
+    times[0] = before.st_atimespec;
+    times[1] = before.st_mtimespec;
+#else
+    times[0] = before.st_atim;
+    times[1] = before.st_mtim;
+#endif
+    if (pwrite(fd, "\t", 1, offset) != 1 ||
+        futimens(fd, times) != 0 || fsync(fd) != 0) {
+        failure_errno = errno ? errno : EIO;
+        goto mutation_fail;
+    }
+    if (close(fd) != 0) {
+        fd = -1;
+        failure_errno = errno ? errno : EIO;
+        goto mutation_fail;
+    }
+    fd = -1;
+    if (lstat(path, &drift_before) != 0 ||
+        !h1_same_file_state_without_ctime(&before, &drift_before) ||
+        h1_force_ctime_only_drift(
+            path, &drift_before, &after) != 0 ||
+        !h1_same_file_state_without_ctime(&before, &after) ||
+        h1_same_ctime(&before, &after)) {
+        failure_errno = errno ? errno : ESTALE;
+        goto mutation_fail;
+    }
+    *before_out = before;
+    *after_out = after;
+    secure_zero_memory(data, (size_t)before.st_size + 1U);
+    free(data);
+    return 0;
+
+mutation_fail:
+    if (fd >= 0) close(fd);
+    if (data) {
+        secure_zero_memory(data, (size_t)before.st_size + 1U);
+        free(data);
+    }
     errno = failure_errno;
     return -1;
 }
@@ -765,7 +1317,10 @@ static int mutate_switch_guard_marker_after_read(
     switch_marker_mutation_t mutation;
 
     (void)directory_fd;
-    if (stage != SWITCH_GUARD_SNAPSHOT_AFTER_MARKER_READ ||
+    if (stage == SWITCH_GUARD_SNAPSHOT_AFTER_MARKER_READ) {
+        g_switch_marker_outer_snapshot_calls++;
+    }
+    if (stage != g_switch_marker_mutation_stage ||
         g_switch_marker_mutation == SWITCH_MARKER_MUTATION_NONE) {
         return 0;
     }
@@ -786,13 +1341,15 @@ static int mutate_switch_guard_marker_after_read(
         return g_switch_marker_mutation_rc;
     }
     if (mutation ==
-        SWITCH_MARKER_MUTATION_CHANGED_BYTE_RESTORED_MTIME) {
-        g_switch_marker_mutation_rc = h1_change_byte_restore_mtime(
+        SWITCH_MARKER_MUTATION_PARSE_VALID_TOKEN_RESTORED_MTIME) {
+        g_switch_marker_mutation_rc =
+            h1_change_token_byte_restore_mtime(
             g_switch_marker_mutation_path,
             &g_switch_marker_before_mutation,
             &g_switch_marker_after_mutation,
             &g_switch_marker_original_byte,
-            &g_switch_marker_mutated_byte);
+            &g_switch_marker_mutated_byte,
+            &g_switch_marker_mutation_offset);
         return g_switch_marker_mutation_rc;
     }
     errno = EINVAL;
@@ -804,11 +1361,14 @@ static int drift_switch_guard_source_after_stage_sync(
     switch_guard_test_stage_t stage, int directory_fd) {
     (void)directory_fd;
 
-    if (stage != SWITCH_GUARD_INSTALL_AFTER_STAGE_SYNC ||
-        !g_switch_guard_drift_source_after_stage_sync) {
+    if (!((stage == SWITCH_GUARD_INSTALL_AFTER_STAGE_SYNC &&
+           g_switch_guard_drift_source_after_stage_sync) ||
+          (stage == SWITCH_GUARD_RETAIN_AFTER_MARKER_SYNC &&
+           g_switch_guard_drift_source_after_retain_sync))) {
         return 0;
     }
     g_switch_guard_drift_source_after_stage_sync = false;
+    g_switch_guard_drift_source_after_retain_sync = false;
     g_switch_guard_source_drift_calls++;
     g_switch_guard_source_drift_rc = lstat(
         g_switch_guard_source_path,
@@ -972,9 +1532,11 @@ static int h1_guard_case_begin(
 static void h1_guard_case_end(h1_guard_case_t *guard_case) {
     if (!guard_case) return;
     (void)gitswitch_test_set_switch_guard_hook(NULL);
+    (void)gitswitch_test_set_config_publish_hook(NULL);
     g_switch_guard_fail_stage = false;
     g_switch_guard_replace_before_initial_fstat = false;
     g_switch_guard_fail_clear = false;
+    g_switch_guard_fail_normalize_sync = false;
     g_switch_guard_clear_failures_remaining = 0;
     g_switch_guard_hook_calls = 0;
     g_switch_guard_replacement_rc = -1;
@@ -983,6 +1545,7 @@ static void h1_guard_case_end(h1_guard_case_t *guard_case) {
     memset(&g_switch_guard_replacement_stage, 0,
            sizeof(g_switch_guard_replacement_stage));
     g_switch_guard_drift_source_after_stage_sync = false;
+    g_switch_guard_drift_source_after_retain_sync = false;
     g_switch_guard_source_drift_calls = 0;
     g_switch_guard_source_drift_rc = -1;
     memset(g_switch_guard_source_path, 0,
@@ -992,7 +1555,10 @@ static void h1_guard_case_end(h1_guard_case_t *guard_case) {
     memset(&g_switch_guard_source_after_drift, 0,
            sizeof(g_switch_guard_source_after_drift));
     g_switch_marker_mutation = SWITCH_MARKER_MUTATION_NONE;
+    g_switch_marker_mutation_stage =
+        SWITCH_GUARD_SNAPSHOT_AFTER_MARKER_READ;
     g_switch_marker_mutation_calls = 0;
+    g_switch_marker_outer_snapshot_calls = 0;
     g_switch_marker_mutation_rc = -1;
     memset(g_switch_marker_mutation_path, 0,
            sizeof(g_switch_marker_mutation_path));
@@ -1002,6 +1568,7 @@ static void h1_guard_case_end(h1_guard_case_t *guard_case) {
            sizeof(g_switch_marker_after_mutation));
     g_switch_marker_original_byte = 0U;
     g_switch_marker_mutated_byte = 0U;
+    g_switch_marker_mutation_offset = 0U;
     if (guard_case->guard) {
         config_switch_guard_abandon(&guard_case->guard);
     }
@@ -2048,6 +2615,56 @@ static int run_h1_resume_case(const cli_owner_fixture_t *fixture) {
         fixture, NULL, "resume-output");
 }
 
+#if !defined(__FreeBSD__)
+static int run_h1_normalize_sync_failure_case(
+    const cli_owner_fixture_t *fixture) {
+    pid_t child = fork();
+
+    if (child < 0) return -1;
+    if (child == 0) {
+        char program[] = "gitswitch";
+        char no_color[] = "-C";
+        char resume[] = "resume";
+        char *resume_argv[] = { program, no_color, resume, NULL };
+        int resume_rc;
+
+        if (setenv("HOME", fixture->home, 1) != 0 ||
+            setenv("XDG_RUNTIME_DIR", fixture->runtime, 1) != 0 ||
+            setenv("GIT_CONFIG_GLOBAL", fixture->gitconfig, 1) != 0 ||
+            setenv("GIT_CONFIG_NOSYSTEM", "1", 1) != 0 ||
+            setenv("GITSWITCH_ALLOW_TMP_GPG", "1", 1) != 0 ||
+            unsetenv("XDG_CONFIG_HOME") != 0 ||
+            unsetenv("GNUPGHOME") != 0 ||
+            redirect_output(fixture->output) != 0) {
+            _exit(173);
+        }
+        g_switch_guard_fail_normalize_sync = true;
+        g_switch_guard_hook_calls = 0;
+        (void)gitswitch_test_set_switch_guard_hook(
+            fail_switch_guard_lifecycle);
+        optind = 1;
+        resume_rc = gitswitch_cli_main(3, resume_argv);
+        (void)gitswitch_test_set_switch_guard_hook(NULL);
+        if (resume_rc != EXIT_FAILURE ||
+            g_switch_guard_hook_calls != 1 ||
+            gitswitch_test_context_allocations() != 0) {
+            _exit(174);
+        }
+        _exit(0);
+    }
+
+    {
+        int status = 0;
+        pid_t waited;
+
+        do {
+            waited = waitpid(child, &status, 0);
+        } while (waited < 0 && errno == EINTR);
+        return waited == child ? status : -1;
+    }
+}
+#endif
+
 static int run_h1_blocked_resume_case_at(
     const cli_owner_fixture_t *fixture,
     const char *working_directory, const char *output_name) {
@@ -2635,6 +3252,9 @@ static int run_signal_marker_case(const cli_owner_fixture_t *fixture,
         }
 
         g_returning_signal_calls = 0;
+        if (signals_reset_inherited_transaction_state() != 0) {
+            _exit(141);
+        }
         if (marker_case == SIGNAL_MARKER_GUARD_RESTORE) {
             signals_test_fail_sigaction(
                 SIGTERM, SIGNALS_TEST_SIGACTION_RESTORE, EIO);
@@ -2724,6 +3344,26 @@ static bool config_dir_has_temporary(const char *path) {
     closedir(directory);
     return found;
 }
+
+#if defined(__FreeBSD__)
+static size_t config_dir_count_prefix(
+    const char *path, const char *prefix) {
+    DIR *directory = opendir(path);
+    struct dirent *entry;
+    size_t count = 0U;
+
+    if (!directory) return SIZE_MAX;
+    while ((entry = readdir(directory)) != NULL) {
+        if (strncmp(
+                entry->d_name, prefix,
+                strlen(prefix)) == 0) {
+            count++;
+        }
+    }
+    closedir(directory);
+    return count;
+}
+#endif
 
 static void check_case_artifacts(const cli_owner_fixture_t *fixture,
                                  bool persistent) {
@@ -3362,6 +4002,24 @@ TEST(persistent_clear_failure_republishes_restart_callable_fence) {
      * directory-synchronized marker can authorize this fresh recovery. */
     status = run_h1_resume_case(&fixture);
     CHECK(status >= 0);
+    if (status < 0 || !WIFEXITED(status) ||
+        WEXITSTATUS(status) != 0) {
+        char resume_output[16384];
+        char resume_path[PATH_MAX];
+
+        if ((size_t)snprintf(
+                resume_path, sizeof(resume_path),
+                "%s/resume-output", fixture.root) <
+                sizeof(resume_path) &&
+            read_text(
+                resume_path, resume_output,
+                sizeof(resume_output)) > 0) {
+            fprintf(
+                stderr,
+                "AR-14 persistent clear recovery output:\n%s\n",
+                resume_output);
+        }
+    }
     if (status >= 0) {
         CHECK(WIFEXITED(status));
         if (WIFEXITED(status)) CHECK_EQ_INT(WEXITSTATUS(status), 0);
@@ -3617,6 +4275,291 @@ TEST(restart_stage_only_preintent_self_heals_before_switch) {
     CHECK(lstat(fixture.switch_fence, &st) != 0 && errno == ENOENT);
 }
 
+static int h1_malformed_marker_case(
+    h1_switch_marker_malformation_t malformation) {
+    const size_t marker_cap = 2U * CONFIG_DOCUMENT_MAX_SIZE;
+    cli_owner_fixture_t fixture;
+    config_switch_guard_recovery_t recovery;
+    h1_switch_marker_layout_t layout;
+    unsigned char *original = NULL;
+    unsigned char *mutated = NULL;
+    unsigned char *observed = NULL;
+    struct stat before;
+    struct stat after;
+    char hint[256];
+    char gitconfig[4096];
+    size_t original_length;
+    size_t mutated_length = 0U;
+    size_t observed_length;
+    bool blocked = false;
+    int status;
+    int result = -1;
+
+    if (h1_fixture_setup(&fixture) != 0) return -1;
+    status = run_h1_create_guard_marker(&fixture);
+    if (status < 0 || !WIFEXITED(status) ||
+        WEXITSTATUS(status) != 0) {
+        goto done;
+    }
+    original = calloc(marker_cap + 1U, 1U);
+    mutated = calloc(marker_cap + 1U, 1U);
+    observed = calloc(marker_cap + 1U, 1U);
+    if (!original || !mutated || !observed) goto done;
+    original_length = h1_read_bounded_file(
+        fixture.switch_fence, original, marker_cap, NULL);
+    if (original_length == 0U ||
+        h1_switch_marker_layout(
+            original, original_length, &layout) != 0) {
+        goto done;
+    }
+
+    switch (malformation) {
+        case H1_MARKER_TRUNCATED_WITNESS:
+            if (original_length <= layout.witness_offset) goto done;
+            mutated_length = original_length - 1U;
+            memcpy(mutated, original, mutated_length);
+            break;
+        case H1_MARKER_TRAILING_BYTE:
+            if (original_length >= marker_cap) goto done;
+            mutated_length = original_length + 1U;
+            memcpy(mutated, original, original_length);
+            mutated[original_length] = (unsigned char)'X';
+            break;
+        case H1_MARKER_DECLARED_SMALLER:
+        case H1_MARKER_DECLARED_LARGER: {
+            char decimal[32];
+            size_t replacement;
+            int count;
+
+            replacement =
+                malformation == H1_MARKER_DECLARED_SMALLER
+                    ? layout.witness_length - 1U
+                    : layout.witness_length + 1U;
+            count = snprintf(
+                decimal, sizeof(decimal), "%zu", replacement);
+            if (layout.witness_length <= 1U || count <= 0 ||
+                (size_t)count != layout.length_digit_count) {
+                goto done;
+            }
+            mutated_length = original_length;
+            memcpy(mutated, original, original_length);
+            memcpy(
+                mutated + layout.length_value_offset,
+                decimal, (size_t)count);
+            break;
+        }
+        case H1_MARKER_NONCANONICAL_LENGTH:
+            if (original_length >= marker_cap) goto done;
+            mutated_length = original_length + 1U;
+            memcpy(
+                mutated, original, layout.length_value_offset);
+            mutated[layout.length_value_offset] =
+                (unsigned char)'0';
+            memcpy(
+                mutated + layout.length_value_offset + 1U,
+                original + layout.length_value_offset,
+                original_length - layout.length_value_offset);
+            break;
+        case H1_MARKER_EMBEDDED_NUL:
+            mutated_length = original_length;
+            memcpy(mutated, original, original_length);
+            mutated[
+                layout.witness_offset +
+                layout.witness_length / 2U] = '\0';
+            break;
+        case H1_MARKER_OVER_TOTAL_CAP:
+            mutated_length = marker_cap + 1U;
+            memcpy(mutated, original, original_length);
+            memset(
+                mutated + original_length, 'X',
+                mutated_length - original_length);
+            break;
+        default:
+            goto done;
+    }
+
+    if (replace_private_bytes_atomically(
+            fixture.switch_fence, mutated, mutated_length) != 0 ||
+        lstat(fixture.switch_fence, &before) != 0) {
+        goto done;
+    }
+    memset(&recovery, 0, sizeof(recovery));
+    errno = 0;
+    if (config_switch_guard_probe(
+            fixture.config, &blocked, &recovery) != -1 ||
+        !blocked || recovery.valid ||
+        lstat(fixture.switch_fence, &after) != 0 ||
+        !ts_same_identity(&before, &after) ||
+        before.st_size != after.st_size ||
+        before.st_mode != after.st_mode) {
+        goto done;
+    }
+    observed_length = h1_read_bounded_file(
+        fixture.switch_fence, observed, marker_cap + 1U, NULL);
+    if (observed_length != mutated_length ||
+        memcmp(observed, mutated, mutated_length) != 0 ||
+        read_text(fixture.hint, hint, sizeof(hint)) == 0U ||
+        strcmp(hint, "none\nactive=old\n") != 0 ||
+        read_text(
+            fixture.gitconfig, gitconfig,
+            sizeof(gitconfig)) == 0U ||
+        strcmp(gitconfig, h1_old_gitconfig) != 0) {
+        goto done;
+    }
+    result = 0;
+
+done:
+    if (original) {
+        secure_zero_memory(original, marker_cap + 1U);
+        free(original);
+    }
+    if (mutated) {
+        secure_zero_memory(mutated, marker_cap + 1U);
+        free(mutated);
+    }
+    if (observed) {
+        secure_zero_memory(observed, marker_cap + 1U);
+        free(observed);
+    }
+    ts_rm_rf(fixture.root);
+    return result;
+}
+
+TEST(restart_rejects_truncated_source_witness) {
+    CHECK_EQ_INT(
+        h1_malformed_marker_case(H1_MARKER_TRUNCATED_WITNESS), 0);
+}
+
+TEST(restart_rejects_trailing_source_witness_byte) {
+    CHECK_EQ_INT(
+        h1_malformed_marker_case(H1_MARKER_TRAILING_BYTE), 0);
+}
+
+TEST(restart_rejects_smaller_declared_source_witness_length) {
+    CHECK_EQ_INT(
+        h1_malformed_marker_case(H1_MARKER_DECLARED_SMALLER), 0);
+}
+
+TEST(restart_rejects_larger_declared_source_witness_length) {
+    CHECK_EQ_INT(
+        h1_malformed_marker_case(H1_MARKER_DECLARED_LARGER), 0);
+}
+
+TEST(restart_rejects_noncanonical_source_witness_length) {
+    CHECK_EQ_INT(
+        h1_malformed_marker_case(H1_MARKER_NONCANONICAL_LENGTH), 0);
+}
+
+TEST(restart_rejects_embedded_nul_in_source_witness) {
+    CHECK_EQ_INT(
+        h1_malformed_marker_case(H1_MARKER_EMBEDDED_NUL), 0);
+}
+
+TEST(restart_rejects_switch_marker_over_total_size_cap) {
+    CHECK_EQ_INT(
+        h1_malformed_marker_case(H1_MARKER_OVER_TOTAL_CAP), 0);
+}
+
+TEST(restart_adopts_exact_maximum_source_witness) {
+    const size_t marker_cap = 2U * CONFIG_DOCUMENT_MAX_SIZE;
+    cli_owner_fixture_t fixture = {0};
+    h1_guard_case_t guard_case = {0};
+    config_switch_guard_recovery_t recovery;
+    h1_switch_marker_layout_t layout;
+    unsigned char *document = NULL;
+    unsigned char *marker = NULL;
+    struct stat state;
+    size_t marker_length = 0U;
+    bool blocked = false;
+    int fixture_result;
+    int begin_result = -1;
+    int status = -1;
+
+    fixture_result = h1_fixture_setup(&fixture);
+    CHECK_EQ_INT(fixture_result, 0);
+    if (fixture_result == 0) {
+        document = malloc(CONFIG_DOCUMENT_MAX_SIZE);
+        marker = calloc(marker_cap, 1U);
+        CHECK(document != NULL);
+        CHECK(marker != NULL);
+    }
+    if (document && marker) {
+        memcpy(document, h1_accounts_config, sizeof(h1_accounts_config) - 1U);
+        memset(
+            document + sizeof(h1_accounts_config) - 1U, '\n',
+            CONFIG_DOCUMENT_MAX_SIZE -
+                (sizeof(h1_accounts_config) - 1U));
+        CHECK_EQ_INT(
+            replace_private_bytes_atomically(
+                fixture.config, document,
+                CONFIG_DOCUMENT_MAX_SIZE),
+            0);
+        status = run_h1_create_guard_marker(&fixture);
+        CHECK(status >= 0);
+        if (status >= 0) {
+            CHECK(WIFEXITED(status));
+            if (WIFEXITED(status)) {
+                CHECK_EQ_INT(WEXITSTATUS(status), 0);
+            }
+        }
+        marker_length = h1_read_bounded_file(
+            fixture.switch_fence, marker, marker_cap, NULL);
+        CHECK(marker_length > CONFIG_DOCUMENT_MAX_SIZE);
+        CHECK_EQ_INT(
+            h1_switch_marker_layout(
+                marker, marker_length, &layout),
+            0);
+        if (h1_switch_marker_layout(
+                marker, marker_length, &layout) == 0) {
+            CHECK_EQ_INT(
+                (int)layout.witness_length,
+                (int)CONFIG_DOCUMENT_MAX_SIZE);
+            CHECK(memcmp(
+                      marker + layout.witness_offset, document,
+                      CONFIG_DOCUMENT_MAX_SIZE) == 0);
+        }
+
+        memset(&recovery, 0, sizeof(recovery));
+        CHECK_EQ_INT(
+            config_switch_guard_probe(
+                fixture.config, &blocked, &recovery),
+            0);
+        CHECK(blocked);
+        CHECK(recovery.valid);
+
+        begin_result = h1_guard_case_begin(&fixture, &guard_case);
+        CHECK_EQ_INT(begin_result, 0);
+        if (begin_result == 0) {
+            CHECK_EQ_INT(
+                config_switch_guard_install_or_adopt(
+                    guard_case.ctx, guard_case.target,
+                    GIT_SCOPE_GLOBAL, guard_case.destinations,
+                    guard_case.destination_count,
+                    &guard_case.guard),
+                0);
+            CHECK(guard_case.guard != NULL);
+            CHECK(!config_switch_guard_was_created(
+                guard_case.guard));
+            CHECK_EQ_INT(
+                config_switch_guard_clear(&guard_case.guard), 0);
+            CHECK(guard_case.guard == NULL);
+            errno = 0;
+            CHECK(lstat(fixture.switch_fence, &state) != 0 &&
+                  errno == ENOENT);
+        }
+    }
+    h1_guard_case_end(&guard_case);
+    if (document) {
+        secure_zero_memory(document, CONFIG_DOCUMENT_MAX_SIZE);
+        free(document);
+    }
+    if (marker) {
+        secure_zero_memory(marker, marker_cap);
+        free(marker);
+    }
+    ts_rm_rf(fixture.root);
+}
+
 TEST(restart_exact_portable_pair_normalizes_then_resumes) {
     cli_owner_fixture_t fixture;
     char gitconfig[4096];
@@ -3657,6 +4600,286 @@ TEST(restart_exact_portable_pair_normalizes_then_resumes) {
     CHECK(lstat(fixture.switch_stage, &stage) != 0 && errno == ENOENT);
     errno = 0;
     CHECK(lstat(fixture.switch_fence, &marker) != 0 && errno == ENOENT);
+}
+
+#if !defined(__FreeBSD__)
+TEST(restart_exact_pair_retries_after_normalize_sync_failure) {
+    cli_owner_fixture_t fixture;
+    char normalize[PATH_MAX];
+    struct stat marker;
+    struct stat stage;
+    struct stat prepared;
+    int status;
+
+    CHECK_EQ_INT(h1_fixture_setup(&fixture), 0);
+    CHECK(
+        (size_t)snprintf(
+            normalize, sizeof(normalize), "%s/.switch-normalize",
+            fixture.config_dir) < sizeof(normalize));
+    status = run_h1_create_guard_marker(&fixture);
+    CHECK(status >= 0);
+    if (status >= 0) {
+        CHECK(WIFEXITED(status));
+        if (WIFEXITED(status)) CHECK_EQ_INT(WEXITSTATUS(status), 0);
+    }
+    CHECK_EQ_INT(link(fixture.switch_fence, fixture.switch_stage), 0);
+    CHECK_EQ_INT(sync_directory(fixture.config_dir), 0);
+
+    status = run_h1_normalize_sync_failure_case(&fixture);
+    CHECK(status >= 0);
+    if (status >= 0) {
+        CHECK(WIFEXITED(status));
+        if (WIFEXITED(status)) CHECK_EQ_INT(WEXITSTATUS(status), 0);
+    }
+    CHECK_EQ_INT(lstat(fixture.switch_fence, &marker), 0);
+    CHECK_EQ_INT(lstat(fixture.switch_stage, &stage), 0);
+    CHECK_EQ_INT(lstat(normalize, &prepared), 0);
+    CHECK(marker.st_dev == stage.st_dev && marker.st_ino == stage.st_ino);
+    CHECK_EQ_INT(marker.st_nlink, 2);
+    CHECK_EQ_INT(stage.st_nlink, 2);
+    CHECK_EQ_INT(prepared.st_nlink, 1);
+
+    status = run_h1_resume_case(&fixture);
+    CHECK(status >= 0);
+    if (status >= 0) {
+        CHECK(WIFEXITED(status));
+        if (WIFEXITED(status)) CHECK_EQ_INT(WEXITSTATUS(status), 0);
+    }
+    CHECK(h1_work_publication_is_live(&fixture));
+    errno = 0;
+    CHECK(lstat(normalize, &prepared) != 0 && errno == ENOENT);
+    errno = 0;
+    CHECK(lstat(fixture.switch_stage, &stage) != 0 && errno == ENOENT);
+    errno = 0;
+    CHECK(lstat(fixture.switch_fence, &marker) != 0 && errno == ENOENT);
+}
+#endif
+
+TEST(restart_distinct_equal_normalized_pair_resumes) {
+    cli_owner_fixture_t fixture;
+    char marker_text[16384] = {0};
+    struct stat marker;
+    struct stat stage;
+    size_t marker_length;
+    int status;
+
+    CHECK_EQ_INT(h1_fixture_setup(&fixture), 0);
+    status = run_h1_create_guard_marker(&fixture);
+    CHECK(status >= 0);
+    if (status >= 0) {
+        CHECK(WIFEXITED(status));
+        if (WIFEXITED(status)) CHECK_EQ_INT(WEXITSTATUS(status), 0);
+    }
+    marker_length = h1_read_bounded_file(
+        fixture.switch_fence, (unsigned char *)marker_text,
+        sizeof(marker_text) - 1U, &marker);
+    CHECK(marker_length > 0U);
+    CHECK(memchr(marker_text, '\0', marker_length) == NULL);
+    CHECK_EQ_INT(link(fixture.switch_fence, fixture.switch_stage), 0);
+    marker_text[marker_length] = '\0';
+    CHECK_EQ_INT(
+        replace_private_atomically(
+            fixture.switch_fence, marker_text),
+        0);
+    CHECK_EQ_INT(sync_directory(fixture.config_dir), 0);
+    CHECK_EQ_INT(lstat(fixture.switch_fence, &marker), 0);
+    CHECK_EQ_INT(lstat(fixture.switch_stage, &stage), 0);
+    CHECK_EQ_INT(marker.st_nlink, 1);
+    CHECK_EQ_INT(stage.st_nlink, 1);
+    CHECK(marker.st_dev != stage.st_dev || marker.st_ino != stage.st_ino);
+
+    status = run_h1_resume_case(&fixture);
+    CHECK(status >= 0);
+    if (status >= 0) {
+        CHECK(WIFEXITED(status));
+        if (WIFEXITED(status)) CHECK_EQ_INT(WEXITSTATUS(status), 0);
+    }
+    CHECK(h1_work_publication_is_live(&fixture));
+    errno = 0;
+    CHECK(lstat(fixture.switch_stage, &stage) != 0 && errno == ENOENT);
+    errno = 0;
+    CHECK(lstat(fixture.switch_fence, &marker) != 0 && errno == ENOENT);
+    secure_zero_memory(marker_text, sizeof(marker_text));
+}
+
+TEST(restart_distinct_canonical_unequal_pair_fails_closed) {
+    const size_t marker_cap = 2U * CONFIG_DOCUMENT_MAX_SIZE;
+    static const unsigned char token_field[] = "token=";
+    cli_owner_fixture_t fixture;
+    config_switch_guard_recovery_t recovery;
+    unsigned char *original = NULL;
+    unsigned char *mutated = NULL;
+    unsigned char *observed_marker = NULL;
+    unsigned char *observed_stage = NULL;
+    const unsigned char *token;
+    struct stat marker_before;
+    struct stat marker_after;
+    struct stat stage_before;
+    struct stat stage_after;
+    char gitconfig[4096];
+    char hint[256];
+    size_t marker_length;
+    size_t observed_marker_length;
+    size_t observed_stage_length;
+    bool blocked = false;
+    int status;
+
+    CHECK_EQ_INT(h1_fixture_setup(&fixture), 0);
+    status = run_h1_create_guard_marker(&fixture);
+    CHECK(status >= 0);
+    if (status >= 0) {
+        CHECK(WIFEXITED(status));
+        if (WIFEXITED(status)) {
+            CHECK_EQ_INT(WEXITSTATUS(status), 0);
+        }
+    }
+    original = calloc(marker_cap, 1U);
+    mutated = calloc(marker_cap, 1U);
+    observed_marker = calloc(marker_cap, 1U);
+    observed_stage = calloc(marker_cap, 1U);
+    CHECK(original != NULL);
+    CHECK(mutated != NULL);
+    CHECK(observed_marker != NULL);
+    CHECK(observed_stage != NULL);
+    if (original && mutated && observed_marker && observed_stage) {
+        marker_length = h1_read_bounded_file(
+            fixture.switch_fence, original, marker_cap, NULL);
+        CHECK(marker_length > 0U);
+        if (marker_length > 0U) {
+            memcpy(mutated, original, marker_length);
+            token = h1_find_bytes(
+                mutated, marker_length, token_field,
+                sizeof(token_field) - 1U);
+            CHECK(token != NULL);
+            if (token &&
+                (size_t)(token - mutated) +
+                        sizeof(token_field) - 1U <
+                    marker_length) {
+                size_t token_offset =
+                    (size_t)(token - mutated) +
+                    sizeof(token_field) - 1U;
+
+                mutated[token_offset] =
+                    mutated[token_offset] == (unsigned char)'A'
+                        ? (unsigned char)'B'
+                        : (unsigned char)'A';
+                CHECK_EQ_INT(
+                    replace_private_bytes_atomically(
+                        fixture.switch_fence, mutated,
+                        marker_length),
+                    0);
+
+                /* Prove the changed marker is independently canonical
+                 * before presenting it beside a different canonical stage. */
+                memset(&recovery, 0, sizeof(recovery));
+                blocked = false;
+                CHECK_EQ_INT(
+                    config_switch_guard_probe(
+                        fixture.config, &blocked, &recovery),
+                    0);
+                CHECK(blocked);
+                CHECK(recovery.valid);
+
+                CHECK_EQ_INT(
+                    replace_private_bytes_atomically(
+                        fixture.switch_stage, original,
+                        marker_length),
+                    0);
+                CHECK_EQ_INT(
+                    lstat(
+                        fixture.switch_fence,
+                        &marker_before),
+                    0);
+                CHECK_EQ_INT(
+                    lstat(
+                        fixture.switch_stage,
+                        &stage_before),
+                    0);
+                CHECK(
+                    marker_before.st_dev != stage_before.st_dev ||
+                    marker_before.st_ino != stage_before.st_ino);
+
+                memset(&recovery, 0, sizeof(recovery));
+                blocked = false;
+                errno = 0;
+                CHECK_EQ_INT(
+                    config_switch_guard_probe(
+                        fixture.config, &blocked, &recovery),
+                    0);
+                CHECK(blocked);
+                CHECK(!recovery.valid);
+                errno = 0;
+                CHECK_EQ_INT(
+                    config_switch_guard_reconcile_preintent(
+                        fixture.config),
+                    -1);
+
+                CHECK_EQ_INT(
+                    lstat(
+                        fixture.switch_fence,
+                        &marker_after),
+                    0);
+                CHECK_EQ_INT(
+                    lstat(
+                        fixture.switch_stage,
+                        &stage_after),
+                    0);
+                CHECK(ts_same_identity(
+                    &marker_before, &marker_after));
+                CHECK(ts_same_identity(
+                    &stage_before, &stage_after));
+                observed_marker_length = h1_read_bounded_file(
+                    fixture.switch_fence, observed_marker,
+                    marker_cap, NULL);
+                observed_stage_length = h1_read_bounded_file(
+                    fixture.switch_stage, observed_stage,
+                    marker_cap, NULL);
+                CHECK_EQ_INT(
+                    (int)observed_marker_length,
+                    (int)marker_length);
+                CHECK_EQ_INT(
+                    (int)observed_stage_length,
+                    (int)marker_length);
+                if (observed_marker_length == marker_length) {
+                    CHECK(memcmp(
+                              observed_marker, mutated,
+                              marker_length) == 0);
+                }
+                if (observed_stage_length == marker_length) {
+                    CHECK(memcmp(
+                              observed_stage, original,
+                              marker_length) == 0);
+                }
+                CHECK(
+                    read_text(
+                        fixture.hint, hint,
+                        sizeof(hint)) > 0U);
+                CHECK_STR_EQ(hint, "none\nactive=old\n");
+                CHECK(
+                    read_text(
+                        fixture.gitconfig, gitconfig,
+                        sizeof(gitconfig)) > 0U);
+                CHECK_STR_EQ(gitconfig, h1_old_gitconfig);
+            }
+        }
+    }
+    if (original) {
+        secure_zero_memory(original, marker_cap);
+        free(original);
+    }
+    if (mutated) {
+        secure_zero_memory(mutated, marker_cap);
+        free(mutated);
+    }
+    if (observed_marker) {
+        secure_zero_memory(observed_marker, marker_cap);
+        free(observed_marker);
+    }
+    if (observed_stage) {
+        secure_zero_memory(observed_stage, marker_cap);
+        free(observed_stage);
+    }
+    ts_rm_rf(fixture.root);
 }
 
 TEST(restart_distinct_stage_and_marker_pair_fails_closed) {
@@ -4130,6 +5353,8 @@ TEST(parent_guard_probe_accepts_ctime_only_drift_after_marker_read) {
             0);
         g_switch_marker_mutation =
             SWITCH_MARKER_MUTATION_CTIME_ONLY;
+        g_switch_marker_mutation_stage =
+            SWITCH_GUARD_SNAPSHOT_AFTER_MARKER_READ;
         g_switch_marker_mutation_calls = 0;
         g_switch_marker_mutation_rc = -1;
         (void)gitswitch_test_set_switch_guard_hook(
@@ -4141,6 +5366,7 @@ TEST(parent_guard_probe_accepts_ctime_only_drift_after_marker_read) {
             0);
         (void)gitswitch_test_set_switch_guard_hook(NULL);
         CHECK_EQ_INT(g_switch_marker_mutation_calls, 1);
+        CHECK_EQ_INT(g_switch_marker_outer_snapshot_calls, 1);
         CHECK_EQ_INT(g_switch_marker_mutation_rc, 0);
         CHECK(h1_same_file_state_without_ctime(
             &g_switch_marker_before_mutation,
@@ -4164,7 +5390,77 @@ TEST(parent_guard_probe_accepts_ctime_only_drift_after_marker_read) {
     ts_rm_rf(fixture.root);
 }
 
-TEST(parent_guard_probe_rejects_changed_bytes_after_marker_read) {
+TEST(parent_guard_probe_reproves_ctime_drift_after_exact_descriptor_proof) {
+    cli_owner_fixture_t fixture = {0};
+    h1_guard_case_t guard_case = {0};
+    config_switch_guard_recovery_t recovery;
+    bool blocked = false;
+    int begin_result = -1;
+    int fixture_result;
+
+    fixture_result = h1_fixture_setup(&fixture);
+    CHECK_EQ_INT(fixture_result, 0);
+    if (fixture_result == 0) {
+        begin_result = h1_guard_case_begin(&fixture, &guard_case);
+    }
+    CHECK_EQ_INT(begin_result, 0);
+    if (begin_result == 0) {
+        CHECK_EQ_INT(
+            config_switch_guard_install_or_adopt(
+                guard_case.ctx, guard_case.target, GIT_SCOPE_GLOBAL,
+                guard_case.destinations, guard_case.destination_count,
+                &guard_case.guard),
+            0);
+        CHECK(guard_case.guard != NULL);
+        CHECK(config_switch_guard_was_created(guard_case.guard));
+        config_switch_guard_abandon(&guard_case.guard);
+        CHECK(!guard_case.guard);
+
+        CHECK_EQ_INT(
+            safe_strncpy(
+                g_switch_marker_mutation_path, fixture.switch_fence,
+                sizeof(g_switch_marker_mutation_path)),
+            0);
+        g_switch_marker_mutation =
+            SWITCH_MARKER_MUTATION_CTIME_ONLY;
+        g_switch_marker_mutation_stage =
+            SWITCH_GUARD_READ_AFTER_EXACT_DESCRIPTOR_PROOF;
+        g_switch_marker_mutation_calls = 0;
+        g_switch_marker_mutation_rc = -1;
+        (void)gitswitch_test_set_switch_guard_hook(
+            mutate_switch_guard_marker_after_read);
+        memset(&recovery, 0, sizeof(recovery));
+        CHECK_EQ_INT(
+            config_switch_guard_probe(
+                fixture.config, &blocked, &recovery),
+            0);
+        (void)gitswitch_test_set_switch_guard_hook(NULL);
+        CHECK_EQ_INT(g_switch_marker_mutation_calls, 1);
+        CHECK_EQ_INT(g_switch_marker_outer_snapshot_calls, 1);
+        CHECK_EQ_INT(g_switch_marker_mutation_rc, 0);
+        CHECK(h1_same_file_state_without_ctime(
+            &g_switch_marker_before_mutation,
+            &g_switch_marker_after_mutation));
+        CHECK(!h1_same_ctime(
+            &g_switch_marker_before_mutation,
+            &g_switch_marker_after_mutation));
+        CHECK(blocked);
+        CHECK(recovery.valid);
+        CHECK_EQ_INT(recovery.target.id, guard_case.target->id);
+        CHECK(strcmp(
+            recovery.target.incarnation,
+            guard_case.target->incarnation) == 0);
+        CHECK_EQ_INT(
+            recovery.effective_scope, GIT_SCOPE_GLOBAL);
+        CHECK_EQ_INT(
+            (int)recovery.destination_count,
+            (int)guard_case.destination_count);
+    }
+    h1_guard_case_end(&guard_case);
+    ts_rm_rf(fixture.root);
+}
+
+TEST(parent_guard_probe_rejects_parse_valid_token_mutation_after_exact_proof) {
     unsigned char observed[16384] = {0};
     cli_owner_fixture_t fixture = {0};
     h1_guard_case_t guard_case = {0};
@@ -4200,7 +5496,9 @@ TEST(parent_guard_probe_rejects_changed_bytes_after_marker_read) {
                 sizeof(g_switch_marker_mutation_path)),
             0);
         g_switch_marker_mutation =
-            SWITCH_MARKER_MUTATION_CHANGED_BYTE_RESTORED_MTIME;
+            SWITCH_MARKER_MUTATION_PARSE_VALID_TOKEN_RESTORED_MTIME;
+        g_switch_marker_mutation_stage =
+            SWITCH_GUARD_READ_AFTER_EXACT_DESCRIPTOR_PROOF;
         g_switch_marker_mutation_calls = 0;
         g_switch_marker_mutation_rc = -1;
         (void)gitswitch_test_set_switch_guard_hook(
@@ -4215,6 +5513,7 @@ TEST(parent_guard_probe_rejects_changed_bytes_after_marker_read) {
         (void)gitswitch_test_set_switch_guard_hook(NULL);
         CHECK_EQ_INT(probe_errno, ESTALE);
         CHECK_EQ_INT(g_switch_marker_mutation_calls, 1);
+        CHECK_EQ_INT(g_switch_marker_outer_snapshot_calls, 0);
         CHECK_EQ_INT(g_switch_marker_mutation_rc, 0);
         CHECK(h1_same_file_state_without_ctime(
             &g_switch_marker_before_mutation,
@@ -4234,12 +5533,26 @@ TEST(parent_guard_probe_rejects_changed_bytes_after_marker_read) {
             (long)observed_length,
             (long)g_switch_marker_after_mutation.st_size);
         CHECK(observed_length > 0U);
-        if (observed_length > 0U) {
+        CHECK(g_switch_marker_mutation_offset < observed_length);
+        if (g_switch_marker_mutation_offset < observed_length) {
             CHECK_EQ_INT(
-                observed[0], g_switch_marker_mutated_byte);
+                observed[g_switch_marker_mutation_offset],
+                g_switch_marker_mutated_byte);
         }
-        CHECK(ts_same_identity(
+        CHECK(h1_same_file_state_without_ctime(
             &g_switch_marker_after_mutation, &retained));
+
+        /* The altered token remains canonical and parse-valid. A fresh
+         * unhooked probe accepts that stable marker, proving the first probe
+         * failed because the anchored bytes changed rather than parsing. */
+        memset(&recovery, 0, sizeof(recovery));
+        blocked = false;
+        CHECK_EQ_INT(
+            config_switch_guard_probe(
+                fixture.config, &blocked, &recovery),
+            0);
+        CHECK(blocked);
+        CHECK(recovery.valid);
     }
     h1_guard_case_end(&guard_case);
     memset(observed, 0, sizeof(observed));
@@ -4306,6 +5619,922 @@ TEST(parent_guard_abandon_then_adopt_reuses_exact_authority) {
     h1_guard_case_end(&guard_case);
     secure_zero_memory(marker_before, sizeof(marker_before));
     secure_zero_memory(marker_after, sizeof(marker_after));
+    ts_rm_rf(fixture.root);
+}
+
+#if defined(__FreeBSD__)
+TEST(freebsd_committed_publish_alias_is_restart_reconciled) {
+    cli_owner_fixture_t fixture = {0};
+    h1_guard_case_t guard_case = {0};
+    struct stat marker = {0};
+    struct stat stage = {0};
+    int begin_result = -1;
+    int fixture_result;
+
+    fixture_result = h1_fixture_setup(&fixture);
+    CHECK_EQ_INT(fixture_result, 0);
+    if (fixture_result == 0) {
+        begin_result = h1_guard_case_begin(&fixture, &guard_case);
+    }
+    CHECK_EQ_INT(begin_result, 0);
+    if (begin_result == 0) {
+        (void)gitswitch_test_set_config_publish_hook(
+            fail_both_freebsd_publish_unlinks);
+        errno = 0;
+        CHECK_EQ_INT(
+            config_switch_guard_install_or_adopt(
+                guard_case.ctx, guard_case.target, GIT_SCOPE_GLOBAL,
+                guard_case.destinations, guard_case.destination_count,
+                &guard_case.guard),
+            -1);
+        (void)gitswitch_test_set_config_publish_hook(NULL);
+        CHECK(guard_case.guard == NULL);
+        CHECK_EQ_INT(lstat(fixture.switch_fence, &marker), 0);
+        CHECK_EQ_INT(lstat(fixture.switch_stage, &stage), 0);
+        CHECK(marker.st_dev == stage.st_dev &&
+              marker.st_ino == stage.st_ino);
+        CHECK_EQ_INT(marker.st_nlink, 2);
+        CHECK_EQ_INT(stage.st_nlink, 2);
+
+        clear_error();
+        errno = 0;
+        CHECK_EQ_INT(
+            config_switch_guard_install_or_adopt(
+                guard_case.ctx, guard_case.target, GIT_SCOPE_GLOBAL,
+                guard_case.destinations, guard_case.destination_count,
+                &guard_case.guard),
+            0);
+        CHECK(guard_case.guard != NULL);
+        CHECK(!config_switch_guard_was_created(guard_case.guard));
+        CHECK_EQ_INT(
+            config_switch_guard_clear(&guard_case.guard), 0);
+        CHECK(guard_case.guard == NULL);
+    }
+    (void)gitswitch_test_set_config_publish_hook(NULL);
+    h1_guard_case_end(&guard_case);
+    ts_rm_rf(fixture.root);
+}
+
+TEST(freebsd_uncertain_publish_outcome_is_not_precommit) {
+    cli_owner_fixture_t fixture = {0};
+    h1_guard_case_t guard_case = {0};
+    char marker_text[64];
+    struct stat state = {0};
+    int begin_result = -1;
+    int fixture_result;
+
+    fixture_result = h1_fixture_setup(&fixture);
+    CHECK_EQ_INT(fixture_result, 0);
+    if (fixture_result == 0) {
+        begin_result = h1_guard_case_begin(&fixture, &guard_case);
+    }
+    CHECK_EQ_INT(begin_result, 0);
+    if (begin_result == 0) {
+        (void)gitswitch_test_set_config_publish_hook(
+            make_freebsd_publish_outcome_uncertain);
+        errno = 0;
+        CHECK_EQ_INT(
+            config_switch_guard_install_or_adopt(
+                guard_case.ctx, guard_case.target, GIT_SCOPE_GLOBAL,
+                guard_case.destinations, guard_case.destination_count,
+                &guard_case.guard),
+            -1);
+        CHECK_EQ_INT(errno, EINPROGRESS);
+        (void)gitswitch_test_set_config_publish_hook(NULL);
+        CHECK(guard_case.guard == NULL);
+        CHECK(read_text(
+                  fixture.switch_fence, marker_text,
+                  sizeof(marker_text)) > 0);
+        CHECK_STR_EQ(marker_text, "foreign-switch-marker\n");
+        errno = 0;
+        CHECK(lstat(fixture.switch_stage, &state) != 0 &&
+              errno == ENOENT);
+    }
+    (void)gitswitch_test_set_config_publish_hook(NULL);
+    h1_guard_case_end(&guard_case);
+    ts_rm_rf(fixture.root);
+}
+
+TEST(freebsd_absent_resume_hint_retires_retained_random_source) {
+    cli_owner_fixture_t fixture = {0};
+    h1_guard_case_t guard_case = {0};
+    struct stat hint = {0};
+    bool installed = false;
+    int begin_result = -1;
+    int fixture_result;
+
+    fixture_result = h1_fixture_setup(&fixture);
+    CHECK_EQ_INT(fixture_result, 0);
+    if (fixture_result == 0) {
+        begin_result = h1_guard_case_begin(&fixture, &guard_case);
+    }
+    CHECK_EQ_INT(begin_result, 0);
+    if (begin_result == 0) {
+        CHECK_EQ_INT(unlink(fixture.hint), 0);
+        CHECK_EQ_INT(
+            safe_strncpy(
+                guard_case.ctx->config.active_account, "work",
+                sizeof(guard_case.ctx->config.active_account)),
+            0);
+        (void)gitswitch_test_set_config_publish_hook(
+            fail_freebsd_resume_hint_publish_unlinks);
+        CHECK_EQ_INT(
+            config_save_active_account_transactional(
+                guard_case.ctx, fixture.config, &installed),
+            0);
+        (void)gitswitch_test_set_config_publish_hook(NULL);
+        CHECK(installed);
+        CHECK_EQ_INT(lstat(fixture.hint, &hint), 0);
+        CHECK_EQ_INT(hint.st_nlink, 1);
+        CHECK(!config_dir_has_temporary(fixture.config_dir));
+    }
+    (void)gitswitch_test_set_config_publish_hook(NULL);
+    h1_guard_case_end(&guard_case);
+    ts_rm_rf(fixture.root);
+}
+
+TEST(freebsd_absent_config_document_retires_retained_random_source) {
+    cli_owner_fixture_t fixture = {0};
+    h1_guard_case_t guard_case = {0};
+    struct stat document = {0};
+    bool installed = false;
+    int environment_result = -1;
+    int fixture_result;
+
+    fixture_result = fixture_setup(&fixture);
+    CHECK_EQ_INT(fixture_result, 0);
+    if (fixture_result == 0) {
+        CHECK_EQ_INT(unlink(fixture.config), 0);
+        memset(&guard_case, 0, sizeof(guard_case));
+        environment_result =
+            h1_guard_environment_begin(&fixture, &guard_case);
+    }
+    CHECK_EQ_INT(environment_result, 0);
+    if (environment_result == 0) {
+        guard_case.ctx = calloc(1U, sizeof(*guard_case.ctx));
+        CHECK(guard_case.ctx != NULL);
+    }
+    if (guard_case.ctx) {
+        CHECK_EQ_INT(config_init(guard_case.ctx), 0);
+        (void)gitswitch_test_set_config_publish_hook(
+            fail_freebsd_config_document_publish_unlinks);
+        CHECK_EQ_INT(
+            config_save_transactional(
+                guard_case.ctx, fixture.config, &installed),
+            0);
+        (void)gitswitch_test_set_config_publish_hook(NULL);
+        CHECK(installed);
+        CHECK_EQ_INT(lstat(fixture.config, &document), 0);
+        CHECK_EQ_INT(document.st_nlink, 1);
+        CHECK(!config_dir_has_temporary(fixture.config_dir));
+    }
+    (void)gitswitch_test_set_config_publish_hook(NULL);
+    h1_guard_case_end(&guard_case);
+    ts_rm_rf(fixture.root);
+}
+
+TEST(freebsd_uncertain_config_document_tracks_or_retires_source) {
+    cli_owner_fixture_t fixture = {0};
+    h1_guard_case_t guard_case = {0};
+    bool installed = false;
+    int environment_result = -1;
+    int fixture_result;
+
+    fixture_result = fixture_setup(&fixture);
+    CHECK_EQ_INT(fixture_result, 0);
+    if (fixture_result == 0) {
+        CHECK_EQ_INT(unlink(fixture.config), 0);
+        memset(&guard_case, 0, sizeof(guard_case));
+        environment_result =
+            h1_guard_environment_begin(&fixture, &guard_case);
+    }
+    CHECK_EQ_INT(environment_result, 0);
+    if (environment_result == 0) {
+        guard_case.ctx = calloc(1U, sizeof(*guard_case.ctx));
+        CHECK(guard_case.ctx != NULL);
+    }
+    if (guard_case.ctx) {
+        CHECK_EQ_INT(config_init(guard_case.ctx), 0);
+        (void)gitswitch_test_set_config_publish_hook(
+            make_freebsd_config_document_publish_uncertain);
+        errno = 0;
+        CHECK_EQ_INT(
+            config_save_transactional(
+                guard_case.ctx, fixture.config, &installed),
+            -1);
+        CHECK(installed);
+        (void)gitswitch_test_set_config_publish_hook(NULL);
+        CHECK(!config_dir_has_temporary(fixture.config_dir));
+    }
+    (void)gitswitch_test_set_config_publish_hook(NULL);
+    h1_guard_case_end(&guard_case);
+    ts_rm_rf(fixture.root);
+}
+
+TEST(freebsd_default_prepublication_cleanup_never_creates_fixed_pair) {
+    cli_owner_fixture_t fixture = {0};
+    struct stat document = {0};
+    int status = 0;
+    pid_t child;
+
+    CHECK_EQ_INT(fixture_setup(&fixture), 0);
+    CHECK_EQ_INT(unlink(fixture.config), 0);
+    child = fork();
+    CHECK(child >= 0);
+    if (child == 0) {
+        int result;
+
+        (void)config_set_io_fault_fn(
+            fail_default_before_publication);
+        (void)gitswitch_test_set_config_publish_hook(
+            fail_freebsd_retained_settlement);
+        result = config_create_default(fixture.config);
+        _exit(
+            result == -1 &&
+                    access(fixture.config, F_OK) != 0 &&
+                    config_dir_count_prefix(
+                        fixture.config_dir,
+                        ".gitswitch-config-temp-settled-") == 0U
+                ? 0
+                : 1);
+    }
+    if (child > 0) {
+        CHECK_EQ_INT(waitpid(child, &status, 0), child);
+        CHECK(WIFEXITED(status));
+        if (WIFEXITED(status)) {
+            CHECK_EQ_INT(WEXITSTATUS(status), 0);
+        }
+    }
+    CHECK_EQ_INT(config_create_default(fixture.config), 0);
+    CHECK_EQ_INT(lstat(fixture.config, &document), 0);
+    CHECK_EQ_INT(document.st_nlink, 1);
+    /* With no canonical target proving ownership, the later writer preserves
+     * the random-shaped prepublication collision. It must not turn that name
+     * into a fixed pair or delete it merely because its spelling is reserved. */
+    CHECK_EQ_INT(
+        config_dir_count_prefix(
+            fixture.config_dir, "accounts.toml.create."),
+        1U);
+    CHECK_EQ_INT(
+        config_dir_count_prefix(
+            fixture.config_dir,
+            ".gitswitch-config-temp-settled-"),
+        0U);
+    ts_rm_rf(fixture.root);
+}
+
+TEST(freebsd_retained_resume_alias_reconciles_at_every_crash_boundary) {
+    static const int stages[] = {
+        CONFIG_PUBLISH_TEST_BEFORE_FIXED_LINK,
+        CONFIG_PUBLISH_TEST_AFTER_FIXED_LINK,
+        CONFIG_PUBLISH_TEST_AFTER_FIXED_SYNC
+    };
+
+    for (size_t i = 0U;
+         i < sizeof(stages) / sizeof(stages[0]); i++) {
+        cli_owner_fixture_t fixture = {0};
+        h1_guard_case_t guard_case = {0};
+        struct stat hint = {0};
+        bool installed = false;
+        int status = 0;
+        pid_t child;
+
+        CHECK_EQ_INT(h1_fixture_setup(&fixture), 0);
+        CHECK_EQ_INT(
+            h1_guard_case_begin(&fixture, &guard_case), 0);
+        CHECK_EQ_INT(unlink(fixture.hint), 0);
+        CHECK_EQ_INT(
+            safe_strncpy(
+                guard_case.ctx->config.active_account, "work",
+                sizeof(guard_case.ctx->config.active_account)),
+            0);
+        child = fork();
+        CHECK(child >= 0);
+        if (child == 0) {
+            g_freebsd_settlement_stop_stage = stages[i];
+            (void)gitswitch_test_set_config_publish_hook(
+                fail_freebsd_retained_settlement);
+            (void)config_save_active_account_transactional(
+                guard_case.ctx, fixture.config,
+                &(bool){false});
+            _exit(1);
+        }
+        if (child > 0) {
+            CHECK_EQ_INT(waitpid(child, &status, 0), child);
+            CHECK(WIFEXITED(status));
+            if (WIFEXITED(status)) {
+                CHECK_EQ_INT(WEXITSTATUS(status), 0);
+            }
+        }
+        CHECK_EQ_INT(lstat(fixture.hint, &hint), 0);
+        CHECK(hint.st_nlink >= 2);
+        CHECK_EQ_INT(
+            config_save_active_account_transactional(
+                guard_case.ctx, fixture.config, &installed),
+            0);
+        CHECK_EQ_INT(lstat(fixture.hint, &hint), 0);
+        CHECK_EQ_INT(hint.st_nlink, 1);
+        CHECK_EQ_INT(
+            config_dir_count_prefix(
+                fixture.config_dir, ".resume-hint.tmp."),
+            0U);
+        CHECK_EQ_INT(
+            config_dir_count_prefix(
+                fixture.config_dir,
+                ".gitswitch-resume-hint-settled-"),
+            0U);
+        h1_guard_case_end(&guard_case);
+        ts_rm_rf(fixture.root);
+    }
+}
+
+TEST(freebsd_fixed_authority_failures_retry_in_same_process) {
+    static const int stages[] = {
+        CONFIG_PUBLISH_TEST_AFTER_FIXED_LINK,
+        CONFIG_PUBLISH_TEST_AFTER_FIXED_SYNC
+    };
+
+    for (size_t i = 0U;
+         i < sizeof(stages) / sizeof(stages[0]); i++) {
+        cli_owner_fixture_t fixture = {0};
+        h1_guard_case_t guard_case = {0};
+        char foreign_slot[PATH_MAX];
+        char foreign[64];
+        struct stat hint = {0};
+        bool installed = false;
+
+        CHECK_EQ_INT(h1_fixture_setup(&fixture), 0);
+        CHECK_EQ_INT(
+            h1_guard_case_begin(&fixture, &guard_case), 0);
+        CHECK_EQ_INT(unlink(fixture.hint), 0);
+        CHECK_EQ_INT(
+            safe_strncpy(
+                guard_case.ctx->config.active_account, "work",
+                sizeof(guard_case.ctx->config.active_account)),
+            0);
+        CHECK(
+            snprintf(
+                foreign_slot, sizeof(foreign_slot),
+                "%s/.gitswitch-resume-hint-settled-0",
+                fixture.config_dir) > 0);
+        CHECK_EQ_INT(
+            write_private(foreign_slot, "foreign-slot\n"), 0);
+
+        (void)gitswitch_test_set_retirement_settled_slot_limit(2U);
+        g_freebsd_settlement_fail_stage = stages[i];
+        (void)gitswitch_test_set_config_publish_hook(
+            fail_freebsd_retained_settlement_in_process);
+        errno = 0;
+        CHECK_EQ_INT(
+            config_save_active_account_transactional(
+                guard_case.ctx, fixture.config, &installed),
+            -1);
+        CHECK(installed);
+        CHECK_EQ_INT(errno, EIO);
+        CHECK_EQ_INT(lstat(fixture.hint, &hint), 0);
+        CHECK_EQ_INT(hint.st_nlink, 3);
+        CHECK_EQ_INT(
+            config_dir_count_prefix(
+                fixture.config_dir, ".resume-hint.tmp."),
+            1U);
+
+        (void)gitswitch_test_set_config_publish_hook(NULL);
+        g_freebsd_settlement_fail_stage = -1;
+        installed = false;
+        CHECK_EQ_INT(
+            config_save_active_account_transactional(
+                guard_case.ctx, fixture.config, &installed),
+            0);
+        CHECK_EQ_INT(lstat(fixture.hint, &hint), 0);
+        CHECK_EQ_INT(hint.st_nlink, 1);
+        CHECK_EQ_INT(
+            config_dir_count_prefix(
+                fixture.config_dir, ".resume-hint.tmp."),
+            0U);
+        CHECK(read_text(foreign_slot, foreign, sizeof(foreign)) > 0);
+        CHECK_STR_EQ(foreign, "foreign-slot\n");
+
+        (void)gitswitch_test_set_retirement_settled_slot_limit(0U);
+        CHECK_EQ_INT(unlink(foreign_slot), 0);
+        h1_guard_case_end(&guard_case);
+        ts_rm_rf(fixture.root);
+    }
+}
+
+TEST(freebsd_substituted_fixed_authority_is_preserved) {
+    cli_owner_fixture_t fixture = {0};
+    h1_guard_case_t guard_case = {0};
+    char fixed_path[PATH_MAX];
+    char foreign[64];
+    struct stat hint = {0};
+    bool installed = false;
+
+    CHECK_EQ_INT(h1_fixture_setup(&fixture), 0);
+    CHECK_EQ_INT(h1_guard_case_begin(&fixture, &guard_case), 0);
+    CHECK_EQ_INT(unlink(fixture.hint), 0);
+    CHECK_EQ_INT(
+        safe_strncpy(
+            guard_case.ctx->config.active_account, "work",
+            sizeof(guard_case.ctx->config.active_account)),
+        0);
+    CHECK(
+        snprintf(
+            fixed_path, sizeof(fixed_path),
+            "%s/.gitswitch-resume-hint-settled-0",
+            fixture.config_dir) > 0);
+
+    g_freebsd_fixed_replacement_rc = -1;
+    g_freebsd_replace_target_with_fixed = false;
+    (void)gitswitch_test_set_config_publish_hook(
+        replace_freebsd_fixed_authority_before_retirement);
+    errno = 0;
+    CHECK_EQ_INT(
+        config_save_active_account_transactional(
+            guard_case.ctx, fixture.config, &installed),
+        -1);
+    CHECK(installed);
+    CHECK_EQ_INT(errno, ESTALE);
+    CHECK_EQ_INT(g_freebsd_fixed_replacement_rc, 0);
+    CHECK(read_text(fixed_path, foreign, sizeof(foreign)) > 0);
+    CHECK_STR_EQ(foreign, "foreign-fixed\n");
+    CHECK_EQ_INT(
+        config_dir_count_prefix(
+            fixture.config_dir, ".resume-hint.tmp."),
+        0U);
+
+    (void)gitswitch_test_set_config_publish_hook(NULL);
+    installed = false;
+    CHECK_EQ_INT(
+        config_save_active_account_transactional(
+            guard_case.ctx, fixture.config, &installed),
+        0);
+    CHECK_EQ_INT(lstat(fixture.hint, &hint), 0);
+    CHECK_EQ_INT(hint.st_nlink, 1);
+    CHECK(read_text(fixed_path, foreign, sizeof(foreign)) > 0);
+    CHECK_STR_EQ(foreign, "foreign-fixed\n");
+
+    CHECK_EQ_INT(unlink(fixed_path), 0);
+    h1_guard_case_end(&guard_case);
+    ts_rm_rf(fixture.root);
+}
+
+TEST(freebsd_paired_byte_equal_substitution_is_preserved) {
+    cli_owner_fixture_t fixture = {0};
+    h1_guard_case_t guard_case = {0};
+    char fixed_path[PATH_MAX];
+    unsigned char target_bytes[16384];
+    unsigned char fixed_bytes[sizeof(target_bytes)];
+    struct stat target = {0};
+    struct stat fixed = {0};
+    size_t target_length;
+    size_t fixed_length;
+    bool installed = false;
+
+    CHECK_EQ_INT(h1_fixture_setup(&fixture), 0);
+    CHECK_EQ_INT(h1_guard_case_begin(&fixture, &guard_case), 0);
+    CHECK_EQ_INT(unlink(fixture.hint), 0);
+    CHECK_EQ_INT(
+        safe_strncpy(
+            guard_case.ctx->config.active_account, "work",
+            sizeof(guard_case.ctx->config.active_account)),
+        0);
+    CHECK(
+        snprintf(
+            fixed_path, sizeof(fixed_path),
+            "%s/.gitswitch-resume-hint-settled-0",
+            fixture.config_dir) > 0);
+
+    g_freebsd_fixed_replacement_rc = -1;
+    g_freebsd_replace_target_with_fixed = true;
+    g_freebsd_original_pair_fd = -1;
+    memset(
+        &g_freebsd_original_pair_identity, 0,
+        sizeof(g_freebsd_original_pair_identity));
+    (void)gitswitch_test_set_config_publish_hook(
+        replace_freebsd_fixed_authority_before_retirement);
+    errno = 0;
+    CHECK_EQ_INT(
+        config_save_active_account_transactional(
+            guard_case.ctx, fixture.config, &installed),
+        -1);
+    CHECK(installed);
+    CHECK_EQ_INT(errno, ESTALE);
+    CHECK_EQ_INT(g_freebsd_fixed_replacement_rc, 0);
+    CHECK_EQ_INT(lstat(fixture.hint, &target), 0);
+    CHECK_EQ_INT(lstat(fixed_path, &fixed), 0);
+    CHECK(g_freebsd_original_pair_fd >= 0);
+    CHECK(target.st_dev == fixed.st_dev);
+    CHECK(target.st_ino == fixed.st_ino);
+    CHECK(
+        target.st_dev != g_freebsd_original_pair_identity.st_dev ||
+        target.st_ino != g_freebsd_original_pair_identity.st_ino);
+    target_length = h1_read_bounded_file(
+        fixture.hint, target_bytes,
+        sizeof(target_bytes), NULL);
+    fixed_length = h1_read_bounded_file(
+        fixed_path, fixed_bytes,
+        sizeof(fixed_bytes), NULL);
+    CHECK(target_length > 0);
+    CHECK_EQ_INT((int)fixed_length, (int)target_length);
+    if (target_length > 0 && fixed_length == target_length) {
+        CHECK(memcmp(
+                  target_bytes, fixed_bytes,
+                  (size_t)target_length) == 0);
+    }
+
+    (void)gitswitch_test_set_config_publish_hook(NULL);
+    g_freebsd_replace_target_with_fixed = false;
+    if (g_freebsd_original_pair_fd >= 0) {
+        CHECK_EQ_INT(close(g_freebsd_original_pair_fd), 0);
+        g_freebsd_original_pair_fd = -1;
+    }
+    CHECK_EQ_INT(unlink(fixed_path), 0);
+    CHECK_EQ_INT(unlink(fixture.hint), 0);
+    secure_zero_memory(target_bytes, sizeof(target_bytes));
+    secure_zero_memory(fixed_bytes, sizeof(fixed_bytes));
+    h1_guard_case_end(&guard_case);
+    ts_rm_rf(fixture.root);
+}
+
+TEST(freebsd_fifo_substitution_before_source_pin_fails_without_blocking) {
+    cli_owner_fixture_t fixture = {0};
+    h1_guard_case_t guard_case = {0};
+    char fixed_path[PATH_MAX];
+    char fifo_path[PATH_MAX];
+    struct stat hint = {0};
+    struct stat fixed = {0};
+    struct stat fifo = {0};
+    bool installed = false;
+
+    CHECK_EQ_INT(h1_fixture_setup(&fixture), 0);
+    CHECK_EQ_INT(h1_guard_case_begin(&fixture, &guard_case), 0);
+    CHECK_EQ_INT(unlink(fixture.hint), 0);
+    CHECK_EQ_INT(
+        safe_strncpy(
+            guard_case.ctx->config.active_account, "work",
+            sizeof(guard_case.ctx->config.active_account)),
+        0);
+    CHECK(
+        snprintf(
+            fixed_path, sizeof(fixed_path),
+            "%s/.gitswitch-resume-hint-settled-0",
+            fixture.config_dir) > 0);
+
+    g_freebsd_source_fifo_rc = -1;
+    g_freebsd_source_fifo_name[0] = '\0';
+    (void)gitswitch_test_set_config_publish_hook(
+        replace_freebsd_source_with_fifo_before_pin);
+    errno = EIO;
+    CHECK_EQ_INT(
+        config_save_active_account_transactional(
+            guard_case.ctx, fixture.config, &installed),
+        -1);
+    CHECK(installed);
+    CHECK_EQ_INT(errno, ESTALE);
+    CHECK_EQ_INT(g_freebsd_source_fifo_rc, 0);
+    CHECK(g_freebsd_source_fifo_name[0] != '\0');
+    CHECK(
+        snprintf(
+            fifo_path, sizeof(fifo_path), "%s/%s",
+            fixture.config_dir, g_freebsd_source_fifo_name) > 0);
+    CHECK_EQ_INT(lstat(fixture.hint, &hint), 0);
+    CHECK_EQ_INT(lstat(fixed_path, &fixed), 0);
+    CHECK_EQ_INT(lstat(fifo_path, &fifo), 0);
+    CHECK(S_ISREG(hint.st_mode));
+    CHECK(S_ISREG(fixed.st_mode));
+    CHECK(S_ISFIFO(fifo.st_mode));
+    CHECK(hint.st_dev == fixed.st_dev);
+    CHECK(hint.st_ino == fixed.st_ino);
+    CHECK_EQ_INT(hint.st_nlink, 2);
+    CHECK_EQ_INT(fixed.st_nlink, 2);
+
+    (void)gitswitch_test_set_config_publish_hook(NULL);
+    CHECK_EQ_INT(unlink(fifo_path), 0);
+    CHECK_EQ_INT(unlink(fixed_path), 0);
+    CHECK_EQ_INT(lstat(fixture.hint, &hint), 0);
+    CHECK(S_ISREG(hint.st_mode));
+    CHECK_EQ_INT(hint.st_nlink, 1);
+    g_freebsd_source_fifo_rc = -1;
+    g_freebsd_source_fifo_name[0] = '\0';
+    h1_guard_case_end(&guard_case);
+    ts_rm_rf(fixture.root);
+}
+
+TEST(freebsd_retained_alias_arena_preserves_collisions_and_reports_full) {
+    cli_owner_fixture_t fixture = {0};
+    h1_guard_case_t guard_case = {0};
+    char slot0[PATH_MAX];
+    char foreign[64];
+    bool installed = false;
+    int status = 0;
+    pid_t child;
+
+    CHECK_EQ_INT(h1_fixture_setup(&fixture), 0);
+    CHECK_EQ_INT(h1_guard_case_begin(&fixture, &guard_case), 0);
+    CHECK_EQ_INT(unlink(fixture.hint), 0);
+    CHECK_EQ_INT(
+        safe_strncpy(
+            guard_case.ctx->config.active_account, "work",
+            sizeof(guard_case.ctx->config.active_account)),
+        0);
+    CHECK(
+        snprintf(
+            slot0, sizeof(slot0),
+            "%s/.gitswitch-resume-hint-settled-0",
+            fixture.config_dir) > 0);
+    CHECK_EQ_INT(write_private(slot0, "foreign-slot\n"), 0);
+
+    (void)gitswitch_test_set_retirement_settled_slot_limit(2U);
+    child = fork();
+    CHECK(child >= 0);
+    if (child == 0) {
+        g_freebsd_settlement_stop_stage =
+            CONFIG_PUBLISH_TEST_AFTER_FIXED_SYNC;
+        (void)gitswitch_test_set_config_publish_hook(
+            fail_freebsd_retained_settlement);
+        (void)config_save_active_account_transactional(
+            guard_case.ctx, fixture.config, &(bool){false});
+        _exit(1);
+    }
+    if (child > 0) {
+        CHECK_EQ_INT(waitpid(child, &status, 0), child);
+        CHECK(WIFEXITED(status));
+        if (WIFEXITED(status)) CHECK_EQ_INT(WEXITSTATUS(status), 0);
+    }
+    CHECK(read_text(slot0, foreign, sizeof(foreign)) > 0);
+    CHECK_STR_EQ(foreign, "foreign-slot\n");
+    (void)gitswitch_test_set_retirement_settled_slot_limit(0U);
+    CHECK_EQ_INT(
+        config_save_active_account_transactional(
+            guard_case.ctx, fixture.config, &installed),
+        0);
+    CHECK(read_text(slot0, foreign, sizeof(foreign)) > 0);
+    CHECK_STR_EQ(foreign, "foreign-slot\n");
+    CHECK_EQ_INT(unlink(slot0), 0);
+
+    CHECK_EQ_INT(unlink(fixture.hint), 0);
+    CHECK_EQ_INT(write_private(slot0, "foreign-slot\n"), 0);
+    (void)gitswitch_test_set_retirement_settled_slot_limit(1U);
+    child = fork();
+    CHECK(child >= 0);
+    if (child == 0) {
+        bool child_installed = false;
+        int result;
+
+        g_freebsd_settlement_stop_stage = -1;
+        (void)gitswitch_test_set_config_publish_hook(
+            fail_freebsd_retained_settlement);
+        errno = 0;
+        result = config_save_active_account_transactional(
+            guard_case.ctx, fixture.config, &child_installed);
+        _exit(
+            result == -1 && child_installed &&
+                    errno == ENOSPC
+                ? 0
+                : 1);
+    }
+    if (child > 0) {
+        CHECK_EQ_INT(waitpid(child, &status, 0), child);
+        CHECK(WIFEXITED(status));
+        if (WIFEXITED(status)) CHECK_EQ_INT(WEXITSTATUS(status), 0);
+    }
+    (void)gitswitch_test_set_retirement_settled_slot_limit(0U);
+    installed = false;
+    CHECK_EQ_INT(
+        config_save_active_account_transactional(
+            guard_case.ctx, fixture.config, &installed),
+        0);
+    CHECK(read_text(slot0, foreign, sizeof(foreign)) > 0);
+    CHECK_STR_EQ(foreign, "foreign-slot\n");
+    CHECK_EQ_INT(unlink(slot0), 0);
+    h1_guard_case_end(&guard_case);
+    ts_rm_rf(fixture.root);
+}
+
+TEST(freebsd_document_and_default_scanners_close_pre_fixed_crash) {
+    cli_owner_fixture_t fixture = {0};
+    h1_guard_case_t environment = {0};
+    struct stat document = {0};
+    int status = 0;
+    pid_t child;
+
+    CHECK_EQ_INT(fixture_setup(&fixture), 0);
+    CHECK_EQ_INT(unlink(fixture.config), 0);
+    CHECK_EQ_INT(
+        h1_guard_environment_begin(&fixture, &environment), 0);
+    child = fork();
+    CHECK(child >= 0);
+    if (child == 0) {
+        gitswitch_ctx_t *child_ctx =
+            calloc(1U, sizeof(*child_ctx));
+
+        if (!child_ctx || config_init(child_ctx) != 0) _exit(2);
+        g_freebsd_settlement_stop_stage =
+            CONFIG_PUBLISH_TEST_BEFORE_FIXED_LINK;
+        (void)gitswitch_test_set_config_publish_hook(
+            fail_freebsd_retained_settlement);
+        (void)config_save_transactional(
+            child_ctx, fixture.config, &(bool){false});
+        _exit(1);
+    }
+    if (child > 0) {
+        CHECK_EQ_INT(waitpid(child, &status, 0), child);
+        CHECK(WIFEXITED(status));
+        if (WIFEXITED(status)) CHECK_EQ_INT(WEXITSTATUS(status), 0);
+    }
+    CHECK_EQ_INT(lstat(fixture.config, &document), 0);
+    CHECK_EQ_INT(document.st_nlink, 2);
+    errno = 0;
+    CHECK_EQ_INT(config_create_default(fixture.config), -1);
+    CHECK_EQ_INT(errno, EEXIST);
+    CHECK_EQ_INT(
+        config_dir_count_prefix(
+            fixture.config_dir, "accounts.toml.tmp."),
+        0U);
+    h1_guard_environment_end(&environment);
+    ts_rm_rf(fixture.root);
+
+    memset(&fixture, 0, sizeof(fixture));
+    CHECK_EQ_INT(fixture_setup(&fixture), 0);
+    CHECK_EQ_INT(unlink(fixture.config), 0);
+    child = fork();
+    CHECK(child >= 0);
+    if (child == 0) {
+        g_freebsd_settlement_stop_stage =
+            CONFIG_PUBLISH_TEST_BEFORE_FIXED_LINK;
+        (void)gitswitch_test_set_config_publish_hook(
+            fail_freebsd_retained_settlement);
+        (void)config_create_default(fixture.config);
+        _exit(1);
+    }
+    if (child > 0) {
+        CHECK_EQ_INT(waitpid(child, &status, 0), child);
+        CHECK(WIFEXITED(status));
+        if (WIFEXITED(status)) CHECK_EQ_INT(WEXITSTATUS(status), 0);
+    }
+    CHECK_EQ_INT(lstat(fixture.config, &document), 0);
+    CHECK_EQ_INT(document.st_nlink, 2);
+    errno = 0;
+    CHECK_EQ_INT(config_create_default(fixture.config), -1);
+    CHECK_EQ_INT(errno, EEXIST);
+    CHECK_EQ_INT(lstat(fixture.config, &document), 0);
+    CHECK_EQ_INT(document.st_nlink, 1);
+    CHECK_EQ_INT(
+        config_dir_count_prefix(
+            fixture.config_dir, "accounts.toml.create."),
+        0U);
+    ts_rm_rf(fixture.root);
+}
+#endif
+
+TEST(random_shaped_alias_requires_matching_canonical_authority) {
+    for (int target_kind = 0; target_kind < 2; target_kind++) {
+        cli_owner_fixture_t fixture = {0};
+        h1_guard_case_t guard_case = {0};
+        char candidate[PATH_MAX];
+        char foreign[64];
+        bool installed = false;
+
+        CHECK_EQ_INT(h1_fixture_setup(&fixture), 0);
+        CHECK_EQ_INT(
+            h1_guard_case_begin(&fixture, &guard_case), 0);
+        if (target_kind == 0) {
+            CHECK_EQ_INT(unlink(fixture.hint), 0);
+        }
+        CHECK(
+            snprintf(
+                candidate, sizeof(candidate),
+                "%s/.resume-hint.tmp.ABC123",
+                fixture.config_dir) > 0);
+        CHECK_EQ_INT(write_private(candidate, "foreign-random\n"), 0);
+        CHECK_EQ_INT(
+            safe_strncpy(
+                guard_case.ctx->config.active_account, "work",
+                sizeof(guard_case.ctx->config.active_account)),
+            0);
+
+        CHECK_EQ_INT(
+            config_save_active_account_transactional(
+                guard_case.ctx, fixture.config, &installed),
+            0);
+        CHECK(read_text(candidate, foreign, sizeof(foreign)) > 0);
+        CHECK_STR_EQ(foreign, "foreign-random\n");
+
+        CHECK_EQ_INT(unlink(candidate), 0);
+        h1_guard_case_end(&guard_case);
+        ts_rm_rf(fixture.root);
+    }
+}
+
+TEST(fork_child_disposal_preserves_parent_switch_lock_then_reacquires) {
+    cli_owner_fixture_t fixture = {0};
+    h1_guard_case_t guard_case = {0};
+    int ready_pipe[2] = {-1, -1};
+    int release_pipe[2] = {-1, -1};
+    int status = 0;
+    int begin_result = -1;
+    int fixture_result;
+    pid_t child = -1;
+    pid_t contender = -1;
+    char byte = '\0';
+
+    fixture_result = h1_fixture_setup(&fixture);
+    CHECK_EQ_INT(fixture_result, 0);
+    if (fixture_result == 0) {
+        begin_result = h1_guard_case_begin(&fixture, &guard_case);
+    }
+    CHECK_EQ_INT(begin_result, 0);
+    if (begin_result == 0) {
+        CHECK_EQ_INT(
+            config_switch_guard_install_or_adopt(
+                guard_case.ctx, guard_case.target, GIT_SCOPE_GLOBAL,
+                guard_case.destinations, guard_case.destination_count,
+                &guard_case.guard),
+            0);
+        CHECK(config_switch_guard_was_created(guard_case.guard));
+        CHECK_EQ_INT(pipe(ready_pipe), 0);
+        CHECK_EQ_INT(pipe(release_pipe), 0);
+        fflush(NULL);
+        child = fork();
+        CHECK(child >= 0);
+        if (child == 0) {
+            int directory_fd =
+                gitswitch_test_switch_guard_directory_fd(
+                    guard_case.guard);
+            int sentinel = directory_fd >= 0
+                               ? openat(
+                                     directory_fd, ".",
+                                     O_RDONLY | O_DIRECTORY |
+                                         O_CLOEXEC | O_NOFOLLOW)
+                               : -1;
+
+            close(ready_pipe[0]);
+            close(release_pipe[1]);
+            if (directory_fd < 0 || sentinel < 0 ||
+                directory_fd == sentinel ||
+                close(directory_fd) != 0 ||
+                dup2(sentinel, directory_fd) != directory_fd) {
+                _exit(19);
+            }
+            config_switch_guard_abandon(&guard_case.guard);
+            if (guard_case.guard != NULL ||
+                fcntl(directory_fd, F_GETFD) < 0) {
+                _exit(20);
+            }
+            if (write(ready_pipe[1], "r", 1) != 1 ||
+                read(release_pipe[0], &byte, 1) != 1) {
+                _exit(22);
+            }
+            close(directory_fd);
+            close(sentinel);
+            _exit(0);
+        }
+        close(ready_pipe[1]);
+        ready_pipe[1] = -1;
+        close(release_pipe[0]);
+        release_pipe[0] = -1;
+        CHECK_EQ_INT((int)read(ready_pipe[0], &byte, 1), 1);
+        CHECK(config_switch_guard_was_created(guard_case.guard));
+        config_switch_guard_abandon(&guard_case.guard);
+        CHECK(guard_case.guard == NULL);
+        contender = fork();
+        CHECK(contender >= 0);
+        if (contender == 0) {
+            config_switch_guard_t *independent = NULL;
+
+            close(release_pipe[1]);
+            clear_error();
+            errno = 0;
+            if (config_switch_guard_install_or_adopt(
+                    guard_case.ctx, guard_case.target,
+                    GIT_SCOPE_GLOBAL, guard_case.destinations,
+                    guard_case.destination_count,
+                    &independent) != 0 ||
+                independent == NULL ||
+                config_switch_guard_was_created(independent)) {
+                config_switch_guard_abandon(&independent);
+                _exit(23);
+            }
+            config_switch_guard_abandon(&independent);
+            _exit(0);
+        }
+        CHECK_EQ_INT(waitpid(contender, &status, 0), contender);
+        CHECK(WIFEXITED(status));
+        if (WIFEXITED(status)) {
+            CHECK_EQ_INT(WEXITSTATUS(status), 0);
+        }
+        CHECK_EQ_INT((int)write(release_pipe[1], "g", 1), 1);
+        CHECK_EQ_INT(waitpid(child, &status, 0), child);
+        CHECK(WIFEXITED(status));
+        if (WIFEXITED(status)) {
+            CHECK_EQ_INT(WEXITSTATUS(status), 0);
+        }
+    }
+    if (ready_pipe[0] >= 0) close(ready_pipe[0]);
+    if (ready_pipe[1] >= 0) close(ready_pipe[1]);
+    if (release_pipe[0] >= 0) close(release_pipe[0]);
+    if (release_pipe[1] >= 0) close(release_pipe[1]);
+    h1_guard_case_end(&guard_case);
     ts_rm_rf(fixture.root);
 }
 
@@ -4399,6 +6628,387 @@ TEST(parent_guard_retain_republishes_exact_unlinked_marker) {
     ts_rm_rf(fixture.root);
 }
 
+TEST(parent_guard_retain_republishes_unlinked_marker_after_source_ctime_drift) {
+    unsigned char marker_before[16384] = {0};
+    unsigned char marker_after[sizeof(marker_before)] = {0};
+    cli_owner_fixture_t fixture = {0};
+    h1_guard_case_t guard_case = {0};
+    struct stat source_before = {0};
+    struct stat source_after = {0};
+    struct stat state = {0};
+    size_t before_length = 0U;
+    size_t after_length = 0U;
+    int begin_result = -1;
+    int fixture_result;
+    int status = 0;
+    pid_t child = -1;
+
+    fixture_result = h1_fixture_setup(&fixture);
+    CHECK_EQ_INT(fixture_result, 0);
+    if (fixture_result == 0) {
+        begin_result = h1_guard_case_begin(&fixture, &guard_case);
+    }
+    CHECK_EQ_INT(begin_result, 0);
+    if (begin_result == 0) {
+        CHECK_EQ_INT(
+            config_switch_guard_install_or_adopt(
+                guard_case.ctx, guard_case.target, GIT_SCOPE_GLOBAL,
+                guard_case.destinations, guard_case.destination_count,
+                &guard_case.guard),
+            0);
+        before_length = h1_read_bounded_file(
+            fixture.switch_fence, marker_before,
+            sizeof(marker_before), NULL);
+        CHECK(before_length > 0U);
+        CHECK_EQ_INT(lstat(fixture.config, &source_before), 0);
+        CHECK_EQ_INT(
+            h1_force_ctime_only_drift(
+                fixture.config, &source_before, &source_after),
+            0);
+        CHECK(h1_same_file_state_without_ctime(
+            &source_before, &source_after));
+        CHECK(!h1_same_ctime(&source_before, &source_after));
+
+        g_switch_guard_fail_stage = false;
+        g_switch_guard_fail_clear = true;
+        g_switch_guard_clear_failures_remaining = 0;
+        g_switch_guard_hook_calls = 0;
+        (void)gitswitch_test_set_switch_guard_hook(
+            fail_switch_guard_lifecycle);
+        CHECK_EQ_INT(
+            config_switch_guard_clear(&guard_case.guard), -1);
+        (void)gitswitch_test_set_switch_guard_hook(NULL);
+        CHECK(guard_case.guard != NULL);
+        CHECK_EQ_INT(g_switch_guard_hook_calls, 1);
+        errno = 0;
+        CHECK(lstat(fixture.switch_fence, &state) != 0 &&
+              errno == ENOENT);
+
+        CHECK_EQ_INT(
+            config_switch_guard_retain(&guard_case.guard), 0);
+        CHECK(!guard_case.guard);
+        after_length = h1_read_bounded_file(
+            fixture.switch_fence, marker_after,
+            sizeof(marker_after), NULL);
+        CHECK_EQ_INT((int)after_length, (int)before_length);
+        if (before_length > 0U &&
+            after_length == before_length) {
+            CHECK(memcmp(
+                      marker_before, marker_after,
+                      before_length) == 0);
+        }
+
+        fflush(NULL);
+        child = fork();
+        CHECK(child >= 0);
+        if (child == 0) {
+            h1_guard_case_t resumed = {0};
+            config_switch_guard_recovery_t recovery;
+            bool blocked = false;
+
+            memset(&recovery, 0, sizeof(recovery));
+            if (config_switch_guard_probe(
+                    fixture.config, &blocked, &recovery) != 0 ||
+                !blocked || !recovery.valid ||
+                recovery.target.id != guard_case.target->id ||
+                recovery.destination_count !=
+                    guard_case.destination_count) {
+                _exit(31);
+            }
+            if (h1_guard_case_begin(&fixture, &resumed) != 0 ||
+                config_switch_guard_install_or_adopt(
+                    resumed.ctx, resumed.target, GIT_SCOPE_GLOBAL,
+                    resumed.destinations, resumed.destination_count,
+                    &resumed.guard) != 0 ||
+                resumed.guard == NULL ||
+                config_switch_guard_was_created(resumed.guard)) {
+                _exit(32);
+            }
+            if (config_switch_guard_clear(&resumed.guard) != 0 ||
+                resumed.guard != NULL) {
+                _exit(33);
+            }
+            _exit(0);
+        }
+        if (child > 0) {
+            CHECK_EQ_INT(waitpid(child, &status, 0), child);
+            CHECK(WIFEXITED(status));
+            if (WIFEXITED(status)) {
+                CHECK_EQ_INT(WEXITSTATUS(status), 0);
+            }
+        }
+        errno = 0;
+        CHECK(lstat(fixture.switch_fence, &state) != 0 &&
+              errno == ENOENT);
+    }
+    h1_guard_case_end(&guard_case);
+    secure_zero_memory(marker_before, sizeof(marker_before));
+    secure_zero_memory(marker_after, sizeof(marker_after));
+    ts_rm_rf(fixture.root);
+}
+
+TEST(parent_guard_retain_preserves_marker_across_source_ctime_drift) {
+    unsigned char marker_before[16384] = {0};
+    unsigned char marker_after[sizeof(marker_before)] = {0};
+    cli_owner_fixture_t fixture = {0};
+    h1_guard_case_t guard_case = {0};
+    config_switch_guard_recovery_t recovery;
+    struct stat source_before = {0};
+    struct stat source_after = {0};
+    struct stat state = {0};
+    size_t before_length = 0U;
+    size_t after_length = 0U;
+    bool blocked = false;
+    int begin_result = -1;
+    int fixture_result;
+    int status = 0;
+    pid_t child = -1;
+
+    fixture_result = h1_fixture_setup(&fixture);
+    CHECK_EQ_INT(fixture_result, 0);
+    if (fixture_result == 0) {
+        begin_result = h1_guard_case_begin(&fixture, &guard_case);
+    }
+    CHECK_EQ_INT(begin_result, 0);
+    if (begin_result == 0) {
+        CHECK_EQ_INT(
+            config_switch_guard_install_or_adopt(
+                guard_case.ctx, guard_case.target, GIT_SCOPE_GLOBAL,
+                guard_case.destinations, guard_case.destination_count,
+                &guard_case.guard),
+            0);
+        before_length = h1_read_bounded_file(
+            fixture.switch_fence, marker_before,
+            sizeof(marker_before), NULL);
+        CHECK(before_length > 0U);
+        CHECK_EQ_INT(lstat(fixture.config, &source_before), 0);
+        CHECK_EQ_INT(
+            h1_force_ctime_only_drift(
+                fixture.config, &source_before, &source_after),
+            0);
+        CHECK(h1_same_file_state_without_ctime(
+            &source_before, &source_after));
+        CHECK(!h1_same_ctime(&source_before, &source_after));
+
+        CHECK_EQ_INT(
+            config_switch_guard_retain(&guard_case.guard), 0);
+        CHECK(guard_case.guard == NULL);
+        after_length = h1_read_bounded_file(
+            fixture.switch_fence, marker_after,
+            sizeof(marker_after), NULL);
+        CHECK_EQ_INT((int)after_length, (int)before_length);
+        if (before_length > 0U &&
+            after_length == before_length) {
+            CHECK(memcmp(
+                      marker_before, marker_after,
+                      before_length) == 0);
+        }
+
+        memset(&recovery, 0, sizeof(recovery));
+        CHECK_EQ_INT(
+            config_switch_guard_probe(
+                fixture.config, &blocked, &recovery),
+            0);
+        CHECK(blocked);
+        CHECK(recovery.valid);
+
+        fflush(NULL);
+        child = fork();
+        CHECK(child >= 0);
+        if (child == 0) {
+            h1_guard_case_t resumed = {0};
+
+            if (h1_guard_case_begin(&fixture, &resumed) != 0 ||
+                config_switch_guard_install_or_adopt(
+                    resumed.ctx, resumed.target, GIT_SCOPE_GLOBAL,
+                    resumed.destinations, resumed.destination_count,
+                    &resumed.guard) != 0 ||
+                resumed.guard == NULL ||
+                config_switch_guard_was_created(resumed.guard) ||
+                config_switch_guard_clear(&resumed.guard) != 0 ||
+                resumed.guard != NULL) {
+                _exit(41);
+            }
+            _exit(0);
+        }
+        if (child > 0) {
+            CHECK_EQ_INT(waitpid(child, &status, 0), child);
+            CHECK(WIFEXITED(status));
+            if (WIFEXITED(status)) {
+                CHECK_EQ_INT(WEXITSTATUS(status), 0);
+            }
+        }
+        errno = 0;
+        CHECK(lstat(fixture.switch_fence, &state) != 0 &&
+              errno == ENOENT);
+    }
+    h1_guard_case_end(&guard_case);
+    secure_zero_memory(marker_before, sizeof(marker_before));
+    secure_zero_memory(marker_after, sizeof(marker_after));
+    ts_rm_rf(fixture.root);
+}
+
+TEST(parent_guard_retain_accepts_delayed_source_ctime_drift) {
+    unsigned char marker_before[16384] = {0};
+    unsigned char marker_after[sizeof(marker_before)] = {0};
+    cli_owner_fixture_t fixture = {0};
+    h1_guard_case_t guard_case = {0};
+    config_switch_guard_recovery_t recovery;
+    size_t before_length = 0U;
+    size_t after_length = 0U;
+    bool blocked = false;
+    int begin_result = -1;
+    int fixture_result;
+
+    fixture_result = h1_fixture_setup(&fixture);
+    CHECK_EQ_INT(fixture_result, 0);
+    if (fixture_result == 0) {
+        begin_result = h1_guard_case_begin(&fixture, &guard_case);
+    }
+    CHECK_EQ_INT(begin_result, 0);
+    if (begin_result == 0) {
+        CHECK_EQ_INT(
+            config_switch_guard_install_or_adopt(
+                guard_case.ctx, guard_case.target, GIT_SCOPE_GLOBAL,
+                guard_case.destinations, guard_case.destination_count,
+                &guard_case.guard),
+            0);
+        before_length = h1_read_bounded_file(
+            fixture.switch_fence, marker_before,
+            sizeof(marker_before), NULL);
+        CHECK(before_length > 0U);
+
+        CHECK_EQ_INT(
+            safe_strncpy(
+                g_switch_guard_source_path, fixture.config,
+                sizeof(g_switch_guard_source_path)),
+            0);
+        g_switch_guard_drift_source_after_retain_sync = true;
+        g_switch_guard_source_drift_calls = 0;
+        g_switch_guard_source_drift_rc = -1;
+        (void)gitswitch_test_set_switch_guard_hook(
+            drift_switch_guard_source_after_stage_sync);
+        CHECK_EQ_INT(
+            config_switch_guard_retain(&guard_case.guard), 0);
+        (void)gitswitch_test_set_switch_guard_hook(NULL);
+        CHECK(guard_case.guard == NULL);
+        CHECK_EQ_INT(g_switch_guard_source_drift_calls, 1);
+        CHECK_EQ_INT(g_switch_guard_source_drift_rc, 0);
+        CHECK(h1_same_file_state_without_ctime(
+            &g_switch_guard_source_before_drift,
+            &g_switch_guard_source_after_drift));
+        CHECK(!h1_same_ctime(
+            &g_switch_guard_source_before_drift,
+            &g_switch_guard_source_after_drift));
+
+        after_length = h1_read_bounded_file(
+            fixture.switch_fence, marker_after,
+            sizeof(marker_after), NULL);
+        CHECK_EQ_INT((int)after_length, (int)before_length);
+        if (before_length > 0U &&
+            after_length == before_length) {
+            CHECK(memcmp(
+                      marker_before, marker_after,
+                      before_length) == 0);
+        }
+
+        memset(&recovery, 0, sizeof(recovery));
+        CHECK_EQ_INT(
+            config_switch_guard_probe(
+                fixture.config, &blocked, &recovery),
+            0);
+        CHECK(blocked);
+        CHECK(recovery.valid);
+        CHECK_EQ_INT(recovery.target.id, guard_case.target->id);
+        CHECK_EQ_INT(
+            (int)recovery.destination_count,
+            (int)guard_case.destination_count);
+    }
+    h1_guard_case_end(&guard_case);
+    secure_zero_memory(marker_before, sizeof(marker_before));
+    secure_zero_memory(marker_after, sizeof(marker_after));
+    ts_rm_rf(fixture.root);
+}
+
+TEST(fresh_guard_rejects_same_inode_source_mutation_with_restored_mtime) {
+    unsigned char marker_before[16384] = {0};
+    unsigned char marker_after[sizeof(marker_before)] = {0};
+    cli_owner_fixture_t fixture = {0};
+    h1_guard_case_t guard_case = {0};
+    config_switch_guard_recovery_t recovery;
+    struct stat source_before = {0};
+    struct stat source_after = {0};
+    size_t before_length = 0U;
+    size_t after_length = 0U;
+    bool blocked = false;
+    int begin_result = -1;
+    int fixture_result;
+
+    fixture_result = h1_fixture_setup(&fixture);
+    CHECK_EQ_INT(fixture_result, 0);
+    if (fixture_result == 0) {
+        begin_result = h1_guard_case_begin(&fixture, &guard_case);
+    }
+    CHECK_EQ_INT(begin_result, 0);
+    if (begin_result == 0) {
+        CHECK_EQ_INT(
+            config_switch_guard_install_or_adopt(
+                guard_case.ctx, guard_case.target, GIT_SCOPE_GLOBAL,
+                guard_case.destinations, guard_case.destination_count,
+                &guard_case.guard),
+            0);
+        before_length = h1_read_bounded_file(
+            fixture.switch_fence, marker_before,
+            sizeof(marker_before), NULL);
+        CHECK(before_length > 0U);
+        config_switch_guard_abandon(&guard_case.guard);
+        CHECK(guard_case.guard == NULL);
+
+        CHECK_EQ_INT(
+            h1_change_ignored_whitespace_restore_mtime(
+                fixture.config, &source_before, &source_after),
+            0);
+        CHECK(h1_same_file_state_without_ctime(
+            &source_before, &source_after));
+        CHECK(!h1_same_ctime(&source_before, &source_after));
+
+        memset(&recovery, 0, sizeof(recovery));
+        errno = 0;
+        CHECK_EQ_INT(
+            config_switch_guard_probe(
+                fixture.config, &blocked, &recovery),
+            -1);
+        CHECK_EQ_INT(errno, ESTALE);
+        CHECK(blocked);
+        CHECK(!recovery.valid);
+
+        errno = 0;
+        CHECK_EQ_INT(
+            config_switch_guard_install_or_adopt(
+                guard_case.ctx, guard_case.target, GIT_SCOPE_GLOBAL,
+                guard_case.destinations, guard_case.destination_count,
+                &guard_case.guard),
+            -1);
+        CHECK_EQ_INT(errno, ESTALE);
+        CHECK(guard_case.guard == NULL);
+
+        after_length = h1_read_bounded_file(
+            fixture.switch_fence, marker_after,
+            sizeof(marker_after), NULL);
+        CHECK_EQ_INT((int)after_length, (int)before_length);
+        if (before_length > 0U &&
+            after_length == before_length) {
+            CHECK(memcmp(
+                      marker_before, marker_after,
+                      before_length) == 0);
+        }
+    }
+    h1_guard_case_end(&guard_case);
+    secure_zero_memory(marker_before, sizeof(marker_before));
+    secure_zero_memory(marker_after, sizeof(marker_after));
+    ts_rm_rf(fixture.root);
+}
+
 TEST_MAIN_BEGIN()
     RUN_TEST(one_shot_exact_abort_releases_cli_context);
     RUN_TEST(persistent_runtime_lock_retains_then_settles_before_next_entry);
@@ -4413,7 +7023,20 @@ TEST_MAIN_BEGIN()
     RUN_TEST(persistent_clear_failure_republishes_restart_callable_fence);
     RUN_TEST(restart_guard_binds_complete_repository_destination_set);
     RUN_TEST(restart_stage_only_preintent_self_heals_before_switch);
+    RUN_TEST(restart_rejects_truncated_source_witness);
+    RUN_TEST(restart_rejects_trailing_source_witness_byte);
+    RUN_TEST(restart_rejects_smaller_declared_source_witness_length);
+    RUN_TEST(restart_rejects_larger_declared_source_witness_length);
+    RUN_TEST(restart_rejects_noncanonical_source_witness_length);
+    RUN_TEST(restart_rejects_embedded_nul_in_source_witness);
+    RUN_TEST(restart_rejects_switch_marker_over_total_size_cap);
+    RUN_TEST(restart_adopts_exact_maximum_source_witness);
     RUN_TEST(restart_exact_portable_pair_normalizes_then_resumes);
+#if !defined(__FreeBSD__)
+    RUN_TEST(restart_exact_pair_retries_after_normalize_sync_failure);
+#endif
+    RUN_TEST(restart_distinct_equal_normalized_pair_resumes);
+    RUN_TEST(restart_distinct_canonical_unequal_pair_fails_closed);
     RUN_TEST(restart_distinct_stage_and_marker_pair_fails_closed);
     RUN_TEST(fenced_resume_uses_exact_numeric_account_name_not_colliding_id);
     RUN_TEST(ordinary_guard_restore_failure_fences_next_cli_entry);
@@ -4428,7 +7051,47 @@ TEST_MAIN_BEGIN()
     RUN_TEST(
         parent_guard_probe_accepts_ctime_only_drift_after_marker_read);
     RUN_TEST(
-        parent_guard_probe_rejects_changed_bytes_after_marker_read);
+        parent_guard_probe_reproves_ctime_drift_after_exact_descriptor_proof);
+    RUN_TEST(
+        parent_guard_probe_rejects_parse_valid_token_mutation_after_exact_proof);
     RUN_TEST(parent_guard_abandon_then_adopt_reuses_exact_authority);
+#if defined(__FreeBSD__)
+    RUN_TEST(freebsd_committed_publish_alias_is_restart_reconciled);
+    RUN_TEST(freebsd_uncertain_publish_outcome_is_not_precommit);
+    RUN_TEST(
+        freebsd_absent_resume_hint_retires_retained_random_source);
+    RUN_TEST(
+        freebsd_absent_config_document_retires_retained_random_source);
+    RUN_TEST(
+        freebsd_uncertain_config_document_tracks_or_retires_source);
+    RUN_TEST(
+        freebsd_default_prepublication_cleanup_never_creates_fixed_pair);
+    RUN_TEST(
+        freebsd_retained_resume_alias_reconciles_at_every_crash_boundary);
+    RUN_TEST(
+        freebsd_fixed_authority_failures_retry_in_same_process);
+    RUN_TEST(
+        freebsd_substituted_fixed_authority_is_preserved);
+    RUN_TEST(
+        freebsd_paired_byte_equal_substitution_is_preserved);
+    RUN_TEST(
+        freebsd_fifo_substitution_before_source_pin_fails_without_blocking);
+    RUN_TEST(
+        freebsd_retained_alias_arena_preserves_collisions_and_reports_full);
+    RUN_TEST(
+        freebsd_document_and_default_scanners_close_pre_fixed_crash);
+#endif
+    RUN_TEST(
+        random_shaped_alias_requires_matching_canonical_authority);
+    RUN_TEST(
+        fork_child_disposal_preserves_parent_switch_lock_then_reacquires);
     RUN_TEST(parent_guard_retain_republishes_exact_unlinked_marker);
+    RUN_TEST(
+        parent_guard_retain_republishes_unlinked_marker_after_source_ctime_drift);
+    RUN_TEST(
+        parent_guard_retain_preserves_marker_across_source_ctime_drift);
+    RUN_TEST(
+        parent_guard_retain_accepts_delayed_source_ctime_drift);
+    RUN_TEST(
+        fresh_guard_rejects_same_inode_source_mutation_with_restored_mtime);
 TEST_MAIN_END()

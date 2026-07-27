@@ -13,6 +13,7 @@
 
 #include <errno.h>
 #include <fcntl.h>
+#include <limits.h>
 #include <signal.h>
 #include <stdbool.h>
 #include <stdio.h>
@@ -387,6 +388,20 @@ static int extract_parenthesized_value(const char *line, const char *prefix,
 }
 
 typedef struct {
+    bool present;
+    char name[NAME_MAX + 1U];
+    struct stat metadata;
+    size_t contents_length;
+    unsigned char contents[4096];
+} settled_witness_snapshot_t;
+
+enum {
+    SWITCH_SETTLED_WITNESS = 0,
+    CLEANUP_SETTLED_WITNESS,
+    SETTLED_WITNESS_COUNT
+};
+
+typedef struct {
     struct stat home;
     struct stat config_parent;
     struct stat config_dir;
@@ -401,6 +416,7 @@ typedef struct {
     char config_lock_contents[128];
     char switch_lock_contents[128];
     char git_config_contents[4096];
+    settled_witness_snapshot_t settled_witnesses[SETTLED_WITNESS_COUNT];
 } persisted_tree_snapshot_t;
 
 static bool preserved_metadata_equal(const struct stat *before,
@@ -438,28 +454,235 @@ static int snapshot_text_file(const char *path, struct stat *metadata,
     return strlen(contents) == (size_t)metadata->st_size ? 0 : -1;
 }
 
-static int snapshot_persisted_tree(const char *home, const char *config_dir,
-                                   persisted_tree_snapshot_t *snapshot) {
-    static const char *const home_entries[] = {".config", ".gitconfig"};
-    static const char *const config_parent_entries[] = {"gitswitch"};
-    static const char *const config_entries_without_switch_lock[] = {
+static bool cleanup_settled_witness_name_is_exact(const char *name) {
+    static const char prefix[] = ".gitswitch-cleanup-v2-";
+    static const char suffix[] = "-0000000f-settled-0000";
+    const char *hash;
+
+    if (!name || strncmp(name, prefix, sizeof(prefix) - 1U) != 0) {
+        return false;
+    }
+    hash = name + sizeof(prefix) - 1U;
+    for (size_t i = 0U; i < 32U; i++) {
+        if (!((hash[i] >= '0' && hash[i] <= '9') ||
+              (hash[i] >= 'a' && hash[i] <= 'f'))) {
+            return false;
+        }
+    }
+    return strcmp(hash + 32U, suffix) == 0;
+}
+
+static int snapshot_settled_witness_file(
+    const char *path, settled_witness_snapshot_t *witness) {
+    struct stat opened;
+    size_t total = 0U;
+    unsigned char extra;
+    int fd;
+    int saved_errno = 0;
+
+    if (!path || !witness ||
+        lstat(path, &witness->metadata) != 0 ||
+        !S_ISREG(witness->metadata.st_mode) ||
+        witness->metadata.st_nlink != 1 ||
+        witness->metadata.st_uid != geteuid() ||
+        (witness->metadata.st_mode & 0777) != 0600 ||
+        witness->metadata.st_size < 0 ||
+        (uintmax_t)witness->metadata.st_size >
+            (uintmax_t)sizeof(witness->contents)) {
+        fprintf(stderr,
+                "  invalid settled witness '%s': mode=%04o links=%ju "
+                "uid=%ju size=%jd errno=%d\n",
+                path ? path : "(null)",
+                witness ? (unsigned int)(witness->metadata.st_mode & 07777)
+                        : 0U,
+                witness ? (uintmax_t)witness->metadata.st_nlink : 0U,
+                witness ? (uintmax_t)witness->metadata.st_uid : 0U,
+                witness ? (intmax_t)witness->metadata.st_size : -1,
+                errno);
+        return -1;
+    }
+    fd = open(path, O_RDONLY | O_CLOEXEC | O_NOFOLLOW);
+    if (fd < 0 || fstat(fd, &opened) != 0 ||
+        !preserved_metadata_equal(&witness->metadata, &opened)) {
+        saved_errno = errno ? errno : EIO;
+        if (fd >= 0) (void)close(fd);
+        errno = saved_errno;
+        return -1;
+    }
+    while (total < (size_t)opened.st_size) {
+        ssize_t count = read(
+            fd, witness->contents + total,
+            (size_t)opened.st_size - total);
+
+        if (count > 0) {
+            total += (size_t)count;
+        } else if (count < 0 && errno == EINTR) {
+            continue;
+        } else {
+            saved_errno = count == 0 ? EIO : (errno ? errno : EIO);
+            break;
+        }
+    }
+    if (saved_errno == 0) {
+        ssize_t count;
+
+        do {
+            count = read(fd, &extra, 1U);
+        } while (count < 0 && errno == EINTR);
+        if (count != 0) saved_errno = count < 0 && errno ? errno : EIO;
+    }
+    if (close(fd) != 0 && saved_errno == 0) {
+        saved_errno = errno ? errno : EIO;
+    }
+    if (saved_errno != 0) {
+        errno = saved_errno;
+        return -1;
+    }
+    witness->contents_length = total;
+    return 0;
+}
+
+static int snapshot_config_directory_entries(
+    const char *config_dir, persisted_tree_snapshot_t *snapshot) {
+    static const char *const required[] = {
         "accounts.toml", ".resume-hint", ".config.lock"
     };
-    static const char *const config_entries_with_switch_lock[] = {
-        "accounts.toml", ".resume-hint", ".config.lock", ".switch.lock"
-    };
-    char path[8192];
-    bool config_entries_match;
+    bool found[sizeof(required) / sizeof(required[0])] = {false};
+    DIR *dir;
+    struct dirent *entry;
+    int result = 0;
 
-    if (!home || !config_dir || !snapshot) return -1;
-    memset(snapshot, 0, sizeof(*snapshot));
-    if ((size_t)snprintf(path, sizeof(path), "%s/.switch.lock",
-                         config_dir) >= sizeof(path)) {
+    if (!config_dir || !snapshot || !(dir = opendir(config_dir))) {
         return -1;
     }
     errno = 0;
-    if (lstat(path, &snapshot->switch_lock) == 0) {
-        snapshot->switch_lock_present = true;
+    while ((entry = readdir(dir)) != NULL) {
+        bool matched = false;
+
+        if (strcmp(entry->d_name, ".") == 0 ||
+            strcmp(entry->d_name, "..") == 0) {
+            continue;
+        }
+        for (size_t i = 0U; i < sizeof(required) / sizeof(required[0]); i++) {
+            if (strcmp(entry->d_name, required[i]) == 0) {
+                if (found[i]) result = -1;
+                found[i] = true;
+                matched = true;
+                break;
+            }
+        }
+        if (matched) continue;
+        if (strcmp(entry->d_name, ".switch.lock") == 0) {
+            if (snapshot->switch_lock_present) result = -1;
+            snapshot->switch_lock_present = true;
+            continue;
+        }
+        {
+            int witness_index =
+                strcmp(entry->d_name,
+                       ".gitswitch-switch-settled-0") == 0
+                    ? SWITCH_SETTLED_WITNESS
+                    : -1;
+
+            if (witness_index < 0 ||
+                snapshot->settled_witnesses[witness_index].present) {
+                fprintf(stderr,
+                        "  unexpected persisted config entry '%s'\n",
+                        entry->d_name);
+                result = -1;
+                continue;
+            }
+            snapshot->settled_witnesses[witness_index].present = true;
+            if ((size_t)snprintf(
+                    snapshot->settled_witnesses[witness_index].name,
+                    sizeof(snapshot->settled_witnesses[witness_index].name),
+                    "%s", entry->d_name) >=
+                sizeof(snapshot->settled_witnesses[witness_index].name)) {
+                result = -1;
+            }
+        }
+    }
+    if (errno != 0) result = -1;
+    for (size_t i = 0U; i < sizeof(required) / sizeof(required[0]); i++) {
+        if (!found[i]) result = -1;
+    }
+    if (closedir(dir) != 0) result = -1;
+    return result;
+}
+
+static int snapshot_home_directory_entries(
+    const char *home, persisted_tree_snapshot_t *snapshot) {
+    static const char *const required[] = {".config", ".gitconfig"};
+    bool found[sizeof(required) / sizeof(required[0])] = {false};
+    DIR *dir;
+    struct dirent *entry;
+    int result = 0;
+
+    if (!home || !snapshot || !(dir = opendir(home))) return -1;
+    errno = 0;
+    while ((entry = readdir(dir)) != NULL) {
+        bool matched = false;
+
+        if (strcmp(entry->d_name, ".") == 0 ||
+            strcmp(entry->d_name, "..") == 0) {
+            continue;
+        }
+        for (size_t i = 0U; i < sizeof(required) / sizeof(required[0]); i++) {
+            if (strcmp(entry->d_name, required[i]) == 0) {
+                if (found[i]) result = -1;
+                found[i] = true;
+                matched = true;
+                break;
+            }
+        }
+        if (matched) continue;
+        if (!cleanup_settled_witness_name_is_exact(entry->d_name) ||
+            snapshot->settled_witnesses[
+                CLEANUP_SETTLED_WITNESS].present) {
+            fprintf(stderr,
+                    "  unexpected persisted home entry '%s'\n",
+                    entry->d_name);
+            result = -1;
+            continue;
+        }
+        snapshot->settled_witnesses[
+            CLEANUP_SETTLED_WITNESS].present = true;
+        if ((size_t)snprintf(
+                snapshot->settled_witnesses[
+                    CLEANUP_SETTLED_WITNESS].name,
+                sizeof(snapshot->settled_witnesses[
+                    CLEANUP_SETTLED_WITNESS].name),
+                "%s", entry->d_name) >=
+            sizeof(snapshot->settled_witnesses[
+                CLEANUP_SETTLED_WITNESS].name)) {
+            result = -1;
+        }
+    }
+    if (errno != 0) result = -1;
+    for (size_t i = 0U; i < sizeof(required) / sizeof(required[0]); i++) {
+        if (!found[i]) result = -1;
+    }
+    if (closedir(dir) != 0) result = -1;
+    return result;
+}
+
+static int snapshot_persisted_tree(const char *home, const char *config_dir,
+                                   persisted_tree_snapshot_t *snapshot) {
+    static const char *const config_parent_entries[] = {"gitswitch"};
+    char path[8192];
+
+    if (!home || !config_dir || !snapshot) return -1;
+    memset(snapshot, 0, sizeof(*snapshot));
+    if (snapshot_config_directory_entries(config_dir, snapshot) != 0 ||
+        snapshot_home_directory_entries(home, snapshot) != 0) {
+        return -1;
+    }
+    if (snapshot->switch_lock_present) {
+        if ((size_t)snprintf(path, sizeof(path), "%s/.switch.lock",
+                             config_dir) >= sizeof(path) ||
+            lstat(path, &snapshot->switch_lock) != 0) {
+            return -1;
+        }
         if (!S_ISREG(snapshot->switch_lock.st_mode) ||
             snapshot->switch_lock.st_nlink != 1 ||
             snapshot->switch_lock.st_uid != geteuid() ||
@@ -475,22 +698,21 @@ static int snapshot_persisted_tree(const char *home, const char *config_dir,
             (size_t)snapshot->switch_lock.st_size) {
             return -1;
         }
-    } else if (errno != ENOENT) {
-        return -1;
     }
-    config_entries_match = snapshot->switch_lock_present
-        ? directory_has_exact_entries(
-              config_dir, config_entries_with_switch_lock,
-              sizeof(config_entries_with_switch_lock) /
-                  sizeof(config_entries_with_switch_lock[0]))
-        : directory_has_exact_entries(
-              config_dir, config_entries_without_switch_lock,
-              sizeof(config_entries_without_switch_lock) /
-                  sizeof(config_entries_without_switch_lock[0]));
-    if (!directory_has_exact_entries(
-            home, home_entries,
-            sizeof(home_entries) / sizeof(home_entries[0])) ||
-        lstat(home, &snapshot->home) != 0 ||
+    for (size_t i = 0U; i < SETTLED_WITNESS_COUNT; i++) {
+        settled_witness_snapshot_t *witness =
+            &snapshot->settled_witnesses[i];
+        const char *parent =
+            i == CLEANUP_SETTLED_WITNESS ? home : config_dir;
+
+        if (!witness->present) continue;
+        if ((size_t)snprintf(path, sizeof(path), "%s/%s", parent,
+                             witness->name) >= sizeof(path) ||
+            snapshot_settled_witness_file(path, witness) != 0) {
+            return -1;
+        }
+    }
+    if (lstat(home, &snapshot->home) != 0 ||
         (size_t)snprintf(path, sizeof(path), "%s/.config", home) >=
             sizeof(path) ||
         !directory_has_exact_entries(
@@ -498,7 +720,6 @@ static int snapshot_persisted_tree(const char *home, const char *config_dir,
             sizeof(config_parent_entries) /
                 sizeof(config_parent_entries[0])) ||
         lstat(path, &snapshot->config_parent) != 0 ||
-        !config_entries_match ||
         lstat(config_dir, &snapshot->config_dir) != 0) {
         return -1;
     }
@@ -526,6 +747,32 @@ static int snapshot_persisted_tree(const char *home, const char *config_dir,
         return -1;
     }
     return 0;
+}
+
+static bool settled_witnesses_unchanged(
+    const persisted_tree_snapshot_t *before,
+    const persisted_tree_snapshot_t *after) {
+    for (size_t i = 0U; i < SETTLED_WITNESS_COUNT; i++) {
+        const settled_witness_snapshot_t *before_witness =
+            &before->settled_witnesses[i];
+        const settled_witness_snapshot_t *after_witness =
+            &after->settled_witnesses[i];
+
+        if (before_witness->present != after_witness->present) {
+            return false;
+        }
+        if (!before_witness->present) continue;
+        if (strcmp(before_witness->name, after_witness->name) != 0 ||
+            !preserved_metadata_equal(&before_witness->metadata,
+                                      &after_witness->metadata) ||
+            before_witness->contents_length !=
+                after_witness->contents_length ||
+            memcmp(before_witness->contents, after_witness->contents,
+                   before_witness->contents_length) != 0) {
+            return false;
+        }
+    }
+    return true;
 }
 
 static bool persisted_tree_unchanged(
@@ -560,7 +807,8 @@ static bool persisted_tree_unchanged(
            strcmp(before->config_lock_contents,
                   after.config_lock_contents) == 0 &&
            strcmp(before->git_config_contents,
-                  after.git_config_contents) == 0;
+                  after.git_config_contents) == 0 &&
+           settled_witnesses_unchanged(before, &after);
 }
 
 /* Mutating command admission revalidates the persistent lock mode before
@@ -599,7 +847,8 @@ static bool persisted_authority_unchanged(
            strcmp(before->config_lock_contents,
                   after.config_lock_contents) == 0 &&
            strcmp(before->git_config_contents,
-                  after.git_config_contents) == 0;
+                  after.git_config_contents) == 0 &&
+           settled_witnesses_unchanged(before, &after);
 }
 
 /* argv must include argv[0] and its terminating NULL. execv's historical API
@@ -1728,12 +1977,16 @@ static int run_switch_source_generation_proof_case(void) {
         char config_path[8192], original_path[8192];
         char git_config_path[8192], contents[CONFIG_DOCUMENT_MAX_SIZE + 1U];
         struct stat original;
+        struct stat source_before;
         struct timespec times[2];
         gitswitch_ctx_t *ctx = NULL;
         publication_record_t *destinations = NULL;
         account_t *target;
         config_switch_guard_t *guard = NULL;
         size_t destination_count = 0U;
+        unsigned char source_byte = 0U;
+        unsigned char changed_byte;
+        int source_fd = -1;
         int result = 210;
 
         if (make_private_dir(home, sizeof(home),
@@ -1785,8 +2038,77 @@ static int run_switch_source_generation_proof_case(void) {
             config_switch_guard_install_or_adopt(
                 ctx, target, GIT_SCOPE_GLOBAL, destinations,
                 destination_count, &guard) != 0 ||
-            !guard || config_switch_guard_clear(&guard) != 0 || guard) {
+            !guard) {
             result = 213;
+            goto done;
+        }
+
+        /* FreeBSD UFS can expose another reader-induced ctime step after
+         * guard publication but before the committed switch clears its
+         * fence. The opaque handle must retain the proved document bytes so
+         * this later transition can be admitted only after exact reproof. */
+        sleep(1);
+        if (chmod(config_path, 0400) != 0 ||
+            chmod(config_path, 0600) != 0 ||
+            config_switch_guard_clear(&guard) != 0 || guard) {
+            result = 213;
+            goto done;
+        }
+
+        /* The retained witness is content authority, not metadata-only
+         * authority. A same-inode byte change with restored size and mtime
+         * must block clear; restoring the exact byte must make the same
+         * handle retryable. */
+        if (config_switch_guard_install_or_adopt(
+                ctx, target, GIT_SCOPE_GLOBAL, destinations,
+                destination_count, &guard) != 0 ||
+            !guard || stat(config_path, &source_before) != 0 ||
+            (source_fd = open(
+                 config_path,
+                 O_RDWR | O_CLOEXEC | O_NOFOLLOW)) < 0 ||
+            pread(source_fd, &source_byte, 1, 0) != 1) {
+            result = 214;
+            goto done;
+        }
+        changed_byte = (unsigned char)(source_byte ^ UINT8_C(1));
+        if (pwrite(source_fd, &changed_byte, 1, 0) != 1 ||
+            fsync(source_fd) != 0 || close(source_fd) != 0) {
+            source_fd = -1;
+            result = 215;
+            goto done;
+        }
+        source_fd = -1;
+#ifdef __APPLE__
+        times[0] = source_before.st_atimespec;
+        times[1] = source_before.st_mtimespec;
+#else
+        times[0] = source_before.st_atim;
+        times[1] = source_before.st_mtim;
+#endif
+        if (utimensat(AT_FDCWD, config_path, times, 0) != 0) {
+            result = 216;
+            goto done;
+        }
+        clear_error();
+        errno = 0;
+        if (config_switch_guard_clear(&guard) == 0 || !guard ||
+            errno != ESTALE) {
+            result = 217;
+            goto done;
+        }
+        source_fd = open(
+            config_path, O_RDWR | O_CLOEXEC | O_NOFOLLOW);
+        if (source_fd < 0 ||
+            pwrite(source_fd, &source_byte, 1, 0) != 1 ||
+            fsync(source_fd) != 0 || close(source_fd) != 0) {
+            source_fd = -1;
+            result = 218;
+            goto done;
+        }
+        source_fd = -1;
+        if (utimensat(AT_FDCWD, config_path, times, 0) != 0 ||
+            config_switch_guard_clear(&guard) != 0 || guard) {
+            result = 219;
             goto done;
         }
 
@@ -1797,7 +2119,7 @@ static int run_switch_source_generation_proof_case(void) {
             slurp(config_path, contents, sizeof(contents))[0] == '\0' ||
             rename(config_path, original_path) != 0 ||
             write_text_mode(config_path, contents, 0600) != 0) {
-            result = 214;
+            result = 220;
             goto done;
         }
 #ifdef __APPLE__
@@ -1808,7 +2130,7 @@ static int run_switch_source_generation_proof_case(void) {
         times[1] = original.st_mtim;
 #endif
         if (utimensat(AT_FDCWD, config_path, times, 0) != 0) {
-            result = 215;
+            result = 221;
             goto done;
         }
         clear_error();
@@ -1817,12 +2139,13 @@ static int run_switch_source_generation_proof_case(void) {
                 ctx, target, GIT_SCOPE_GLOBAL, destinations,
                 destination_count, &guard) == 0 ||
             guard || errno != ESTALE) {
-            result = 216;
+            result = 222;
             goto done;
         }
         result = 0;
 
 done:
+        if (source_fd >= 0) close(source_fd);
         if (guard) config_switch_guard_abandon(&guard);
         git_config_commit();
         free(destinations);
