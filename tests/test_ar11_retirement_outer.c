@@ -34,6 +34,18 @@ int git_retirement_transaction_prepare_terminal_commit(
     git_retirement_transaction_t *transaction);
 int git_retirement_transaction_finish_terminal_commit(
     git_retirement_transaction_t **transaction);
+int git_retirement_transaction_verify_terminal_commit(
+    git_retirement_transaction_t *transaction);
+size_t git_retirement_transaction_rollback_destination_count(
+    const git_retirement_transaction_t *transaction);
+int git_retirement_transaction_rollback_destination(
+    git_retirement_transaction_t *transaction, size_t index,
+    char *config_path, size_t path_size,
+    publication_identity_t *post_config);
+int git_retirement_transaction_prepare_terminal_rollback(
+    git_retirement_transaction_t *transaction);
+int git_retirement_transaction_finish_terminal_rollback(
+    git_retirement_transaction_t **transaction);
 int git_retirement_recovery_begin(
     const publication_record_t *const publications[],
     size_t publication_count, git_retirement_recovery_t **recovery);
@@ -59,7 +71,20 @@ typedef enum {
     GIT_RETIREMENT_TEST_BEFORE_MARKER_PUBLISH,
     GIT_RETIREMENT_TEST_RESTORED_WITNESS_AFTER_CLOSE,
     GIT_RETIREMENT_TEST_BEFORE_ABSENT_REVALIDATE,
-    GIT_RETIREMENT_TEST_RECOVERY_END_BEFORE_FINAL_PROOF
+    GIT_RETIREMENT_TEST_RECOVERY_END_BEFORE_FINAL_PROOF,
+    GIT_RETIREMENT_TEST_AFTER_CLEANUP_QUARANTINE,
+    GIT_RETIREMENT_TEST_AFTER_CLEANUP_PROOF,
+    GIT_RETIREMENT_TEST_AFTER_FALLBACK_ORIGINAL_UNLINK,
+    GIT_RETIREMENT_TEST_FORCE_FALLBACK_LINK_FAILURE,
+    GIT_RETIREMENT_TEST_AFTER_FALLBACK_CANONICAL_LINK,
+    GIT_RETIREMENT_TEST_AFTER_REVERSE_PUBLISHED_UNLINK,
+    GIT_RETIREMENT_TEST_AFTER_TERMINAL_AUTHORITY_SYNC,
+    GIT_RETIREMENT_TEST_AFTER_TERMINAL_CANONICAL_SYNC,
+    GIT_RETIREMENT_TEST_BEFORE_TERMINAL_SECOND_PROOF,
+    GIT_RETIREMENT_TEST_AFTER_FREEBSD_AUTHORITY_PUBLISH,
+    GIT_RETIREMENT_TEST_AFTER_FREEBSD_AUTHORITY_DIRECTORY_SYNC,
+    GIT_RETIREMENT_TEST_AFTER_PRELOCK_WITNESS,
+    GIT_RETIREMENT_TEST_AFTER_STABLE_WITNESS_CLOSE
 } git_retirement_test_stage_t;
 typedef bool (*git_retirement_test_hook_fn)(
     git_retirement_test_stage_t stage, const char *path,
@@ -92,6 +117,25 @@ gitswitch_test_set_retirement_guard_clear_hook(
 typedef void (*remove_test_hook_fn)(int stage);
 remove_test_hook_fn gitswitch_test_set_remove_hook(
     remove_test_hook_fn hook);
+
+#if defined(__FreeBSD__)
+typedef enum {
+    CONFIG_PUBLISH_TEST_SOURCE_UNLINK = 0,
+    CONFIG_PUBLISH_TEST_ROLLBACK_UNLINK,
+    CONFIG_PUBLISH_TEST_AFTER_ROLLBACK_FAILURE,
+    CONFIG_PUBLISH_TEST_RETAINED_SOURCE_RETIRE,
+    CONFIG_PUBLISH_TEST_BEFORE_FIXED_LINK,
+    CONFIG_PUBLISH_TEST_AFTER_FIXED_LINK,
+    CONFIG_PUBLISH_TEST_AFTER_FIXED_SYNC,
+    CONFIG_PUBLISH_TEST_BEFORE_FIXED_RETIRE,
+    CONFIG_PUBLISH_TEST_BEFORE_SOURCE_PIN
+} config_publish_test_stage_t;
+typedef int (*config_publish_test_hook_fn)(
+    config_publish_test_stage_t stage, int directory_fd,
+    const char *source, const char *destination);
+config_publish_test_hook_fn gitswitch_test_set_config_publish_hook(
+    config_publish_test_hook_fn hook);
+#endif
 
 typedef enum {
     M18_COMMAND_REMOVE = 0,
@@ -220,6 +264,29 @@ static const m18_fixture_t *m18_terminal_cleanup_fixture;
 static bool m18_terminal_cleanup_failure_requested;
 static bool m18_terminal_cleanup_crash_requested;
 static bool m18_terminal_cleanup_observed;
+static const m18_fixture_t *m18_alias_race_fixture;
+static bool m18_alias_race_requested;
+static bool m18_alias_race_observed;
+static int m18_alias_race_error;
+typedef struct {
+    const char *name;
+    char *value;
+    bool present;
+} m18_saved_environment_t;
+static m18_saved_environment_t m18_parent_environment[] = {
+    {"PATH", NULL, false},
+    {"HOME", NULL, false},
+    {"XDG_RUNTIME_DIR", NULL, false},
+    {"GITSWITCH_ALLOW_TMP_GPG", NULL, false},
+    {"GIT_CONFIG_GLOBAL", NULL, false},
+    {"GIT_CONFIG_NOSYSTEM", NULL, false},
+    {"GITSWITCH_TEST_GIT_TRACE", NULL, false},
+    {"GIT_CONFIG_COUNT", NULL, false}
+};
+static bool m18_parent_environment_saved;
+#if defined(__FreeBSD__)
+static int m18_freebsd_alias_failure_stage = -1;
+#endif
 
 static int m18_write_file(const char *path, const void *data,
                           size_t length, mode_t mode);
@@ -232,6 +299,32 @@ static int m24_fixture_replace_with_live_alias_claimant(
 static int m18_terminal_writer_hook(
     retirement_guard_clear_test_stage_t stage, int descriptor,
     const char *marker_name);
+
+#if defined(__FreeBSD__)
+static int m18_fail_freebsd_retained_alias(
+    config_publish_test_stage_t stage, int directory_fd,
+    const char *source, const char *destination) {
+    (void)directory_fd;
+    (void)source;
+    (void)destination;
+    if (stage == CONFIG_PUBLISH_TEST_SOURCE_UNLINK ||
+        stage == CONFIG_PUBLISH_TEST_ROLLBACK_UNLINK) {
+        errno = EIO;
+        return -1;
+    }
+    if (stage == CONFIG_PUBLISH_TEST_RETAINED_SOURCE_RETIRE) {
+        signals_test_fail_scratch_unlink(EIO);
+        errno = EIO;
+        return -1;
+    }
+    if ((int)stage == m18_freebsd_alias_failure_stage) {
+        m18_freebsd_alias_failure_stage = -1;
+        errno = EIO;
+        return -1;
+    }
+    return 0;
+}
+#endif
 
 static int m24_fail_alias_postrename(int dir_fd) {
     (void)dir_fd;
@@ -500,6 +593,25 @@ cleanup:
 static bool m18_retirement_witness_hook(
     git_retirement_test_stage_t stage, const char *path,
     const char *key, const char *value) {
+    if (stage == GIT_RETIREMENT_TEST_AFTER_CLEANUP_PROOF &&
+        m18_alias_race_requested && !m18_alias_race_observed &&
+        m18_alias_race_fixture && path && key && value &&
+        strcmp(path, m18_alias_race_fixture->git_path) == 0 &&
+        strncmp(key, ".gitswitch-finalization-", 24U) == 0) {
+        static const char replacement[] =
+            "foreign private finalization claimant\n";
+        char pending[MAX_PATH_LEN];
+
+        m18_alias_race_observed = true;
+        if (safe_snprintf(pending, sizeof(pending), "%s/%s",
+                          m18_alias_race_fixture->home, value) != 0 ||
+            unlink(pending) != 0 ||
+            m18_write_file(pending, replacement,
+                           sizeof(replacement) - 1U, 0600) != 0) {
+            m18_alias_race_error = errno ? errno : EIO;
+        }
+        return false;
+    }
     if (stage == GIT_RETIREMENT_TEST_CLEANUP_UNLINK &&
         value &&
         (strcmp(value, "terminal rollback recovery marker") == 0 ||
@@ -2644,16 +2756,21 @@ static int m18_replace_retained_fds(
     for (size_t i = 0U; i < count; i++) {
         if (retained[i] < 0) return -1;
         if (retained[i] > maximum) maximum = retained[i];
+        errno = 0;
+        if (fcntl(retained[i], F_GETFD) != -1 ||
+            errno != EBADF) {
+            return -1;
+        }
     }
     for (size_t i = 0U; i < count; i++) {
-        struct stat retained_st;
-        struct stat replacement_st;
+        int source = open("/dev/null", O_RDONLY | O_CLOEXEC);
 
+        if (source < 0) return -1;
 #ifdef F_DUPFD_CLOEXEC
         replacements[i] =
-            fcntl(retained[i], F_DUPFD_CLOEXEC, maximum + 1);
+            fcntl(source, F_DUPFD_CLOEXEC, maximum + 1);
 #else
-        replacements[i] = fcntl(retained[i], F_DUPFD, maximum + 1);
+        replacements[i] = fcntl(source, F_DUPFD, maximum + 1);
         if (replacements[i] >= 0) {
             int flags = fcntl(replacements[i], F_GETFD);
             if (flags < 0 ||
@@ -2664,18 +2781,14 @@ static int m18_replace_retained_fds(
             }
         }
 #endif
-        if (replacements[i] <= maximum ||
-            fstat(retained[i], &retained_st) != 0 ||
-            fstat(replacements[i], &replacement_st) != 0 ||
-            retained_st.st_dev != replacement_st.st_dev ||
-            retained_st.st_ino != replacement_st.st_ino) {
+        close(source);
+        if (replacements[i] <= maximum) {
             return -1;
         }
         maximum = replacements[i];
     }
     for (size_t i = 0U; i < count; i++) {
-        if (close(retained[i]) != 0 ||
-            dup2(replacements[i], retained[i]) != retained[i]) {
+        if (dup2(replacements[i], retained[i]) != retained[i]) {
             return -1;
         }
     }
@@ -2728,6 +2841,8 @@ static int m18_run_foreign_git_capability_fd_aba(
         size_t cleared = 0U;
         pid_t claimant;
         int claimant_status;
+        int retained[12];
+        size_t retained_count;
 
         memset(&ctx, 0, sizeof(ctx));
         if (safe_snprintf(trusted_path, sizeof(trusted_path),
@@ -2753,32 +2868,34 @@ static int m18_run_foreign_git_capability_fd_aba(
             !transaction) {
             _exit(122);
         }
+        retained_count =
+            git_ops_test_retirement_transaction_descriptors(
+                transaction, retained,
+                sizeof(retained) / sizeof(retained[0]));
+        if (retained_count == 0U ||
+            retained_count >
+                sizeof(retained) / sizeof(retained[0])) {
+            _exit(122);
+        }
         claimant = fork();
         if (claimant < 0) _exit(123);
         if (claimant == 0) {
-            int retained[12];
             int replacements[12];
-            size_t count =
-                git_ops_test_retirement_transaction_descriptors(
-                    transaction, retained,
-                    sizeof(retained) / sizeof(retained[0]));
 
             memset(replacements, -1, sizeof(replacements));
-            if (count == 0U ||
-                count > sizeof(retained) / sizeof(retained[0]) ||
-                m18_replace_retained_fds(
-                    retained, count, replacements) != 0) {
+            if (m18_replace_retained_fds(
+                    retained, retained_count, replacements) != 0) {
                 _exit(1);
             }
             errno = 0;
             if (git_retirement_transaction_commit(&transaction) != -1 ||
                 transaction != NULL || errno != EINVAL ||
                 !m18_reused_fds_remain_open(
-                    retained, replacements, count)) {
+                    retained, replacements, retained_count)) {
                 _exit(2);
             }
             m18_close_reused_fds(
-                retained, replacements, count);
+                retained, replacements, retained_count);
             _exit(0);
         }
         claimant_status = m18_wait_status(claimant);
@@ -2803,21 +2920,23 @@ static int m18_run_foreign_git_capability_fd_aba(
                 transaction) != 0) {
             _exit(125);
         }
+        retained_count =
+            git_ops_test_retirement_transaction_descriptors(
+                transaction, retained,
+                sizeof(retained) / sizeof(retained[0]));
+        if (retained_count == 0U ||
+            retained_count >
+                sizeof(retained) / sizeof(retained[0])) {
+            _exit(125);
+        }
         claimant = fork();
         if (claimant < 0) _exit(126);
         if (claimant == 0) {
-            int retained[12];
             int replacements[12];
-            size_t count =
-                git_ops_test_retirement_transaction_descriptors(
-                    transaction, retained,
-                    sizeof(retained) / sizeof(retained[0]));
 
             memset(replacements, -1, sizeof(replacements));
-            if (count == 0U ||
-                count > sizeof(retained) / sizeof(retained[0]) ||
-                m18_replace_retained_fds(
-                    retained, count, replacements) != 0) {
+            if (m18_replace_retained_fds(
+                    retained, retained_count, replacements) != 0) {
                 _exit(3);
             }
             errno = 0;
@@ -2825,11 +2944,11 @@ static int m18_run_foreign_git_capability_fd_aba(
                     &transaction) != -1 ||
                 transaction != NULL || errno != EINVAL ||
                 !m18_reused_fds_remain_open(
-                    retained, replacements, count)) {
+                    retained, replacements, retained_count)) {
                 _exit(4);
             }
             m18_close_reused_fds(
-                retained, replacements, count);
+                retained, replacements, retained_count);
             _exit(0);
         }
         claimant_status = m18_wait_status(claimant);
@@ -2858,32 +2977,34 @@ static int m18_run_foreign_git_capability_fd_aba(
             !recovery) {
             _exit(129);
         }
+        retained_count =
+            git_ops_test_retirement_recovery_descriptors(
+                recovery, retained,
+                sizeof(retained) / sizeof(retained[0]));
+        if (retained_count == 0U ||
+            retained_count >
+                sizeof(retained) / sizeof(retained[0])) {
+            _exit(129);
+        }
         claimant = fork();
         if (claimant < 0) _exit(130);
         if (claimant == 0) {
-            int retained[12];
             int replacements[12];
-            size_t count =
-                git_ops_test_retirement_recovery_descriptors(
-                    recovery, retained,
-                    sizeof(retained) / sizeof(retained[0]));
 
             memset(replacements, -1, sizeof(replacements));
-            if (count == 0U ||
-                count > sizeof(retained) / sizeof(retained[0]) ||
-                m18_replace_retained_fds(
-                    retained, count, replacements) != 0) {
+            if (m18_replace_retained_fds(
+                    retained, retained_count, replacements) != 0) {
                 _exit(5);
             }
             errno = 0;
             if (git_retirement_recovery_end(&recovery) != -1 ||
                 recovery != NULL || errno != EINVAL ||
                 !m18_reused_fds_remain_open(
-                    retained, replacements, count)) {
+                    retained, replacements, retained_count)) {
                 _exit(6);
             }
             m18_close_reused_fds(
-                retained, replacements, count);
+                retained, replacements, retained_count);
             _exit(0);
         }
         claimant_status = m18_wait_status(claimant);
@@ -5665,6 +5786,486 @@ TEST(alias_diagnostic_and_git_end_failure_are_both_retained) {
     m18_fixture_cleanup(&fixture);
 }
 
+static int m18_parent_runtime_begin(
+    const m18_fixture_t *fixture, gitswitch_ctx_t *ctx) {
+    char trusted_path[2U * MAX_PATH_LEN];
+
+    if (!fixture || !ctx) return -1;
+    if (!m18_parent_environment_saved) {
+        for (size_t i = 0U;
+             i < sizeof(m18_parent_environment) /
+                     sizeof(m18_parent_environment[0]);
+             i++) {
+            const char *value = getenv(m18_parent_environment[i].name);
+
+            m18_parent_environment[i].present = value != NULL;
+            if (value) {
+                m18_parent_environment[i].value = strdup(value);
+                if (!m18_parent_environment[i].value) return -1;
+            }
+        }
+        m18_parent_environment_saved = true;
+    }
+    if (
+        safe_snprintf(trusted_path, sizeof(trusted_path),
+                      "%s:/usr/bin:/bin", fixture->home) != 0 ||
+        setenv("PATH", trusted_path, 1) != 0 ||
+        setenv("HOME", fixture->home, 1) != 0 ||
+        setenv("XDG_RUNTIME_DIR", fixture->runtime, 1) != 0 ||
+        setenv("GITSWITCH_ALLOW_TMP_GPG", "1", 1) != 0 ||
+        setenv("GIT_CONFIG_GLOBAL", fixture->git_path, 1) != 0 ||
+        setenv("GIT_CONFIG_NOSYSTEM", "1", 1) != 0 ||
+        setenv("GITSWITCH_TEST_GIT_TRACE",
+               fixture->git_trace_path, 1) != 0 ||
+        unsetenv("GIT_CONFIG_COUNT") != 0) {
+        return -1;
+    }
+    git_ops_test_reset_caches();
+    memset(ctx, 0, sizeof(*ctx));
+    return config_init_readonly(ctx);
+}
+
+static void m18_parent_runtime_end(void) {
+    if (!m18_parent_environment_saved) return;
+    for (size_t i = 0U;
+         i < sizeof(m18_parent_environment) /
+                 sizeof(m18_parent_environment[0]);
+         i++) {
+        if (m18_parent_environment[i].present) {
+            (void)setenv(m18_parent_environment[i].name,
+                         m18_parent_environment[i].value, 1);
+        } else {
+            (void)unsetenv(m18_parent_environment[i].name);
+        }
+        free(m18_parent_environment[i].value);
+        m18_parent_environment[i].value = NULL;
+        m18_parent_environment[i].present = false;
+    }
+    m18_parent_environment_saved = false;
+    git_ops_test_reset_caches();
+}
+
+static const account_t *m18_find_account(
+    const gitswitch_ctx_t *ctx, uint32_t account_id) {
+    if (!ctx) return NULL;
+    for (size_t i = 0U; i < ctx->account_count; i++) {
+        if (ctx->accounts[i].id == account_id) {
+            return &ctx->accounts[i];
+        }
+    }
+    return NULL;
+}
+
+static int m18_prepare_mixed_transaction(
+    m18_fixture_t *fixture, gitswitch_ctx_t *ctx,
+    git_retirement_transaction_t **transaction) {
+    const account_t *work;
+    const account_t *personal;
+    const account_t *accounts[3];
+    const publication_record_t *publications[3];
+
+    if (!fixture || !ctx || !transaction ||
+        m18_parent_runtime_begin(fixture, ctx) != 0) {
+        return -1;
+    }
+    work = m18_find_account(ctx, UINT32_C(1));
+    personal = m18_find_account(ctx, UINT32_C(2));
+    if (!work || !personal) {
+        errno = ESTALE;
+        return -1;
+    }
+    accounts[0] = work;
+    accounts[1] = work;
+    accounts[2] = personal;
+    publications[0] = &fixture->record;
+    publications[1] = &fixture->shared_record;
+    publications[2] = &fixture->no_op_record;
+    return git_retirement_transaction_prepare(
+        accounts, publications, 3U, transaction);
+}
+
+static int m18_prepare_single_terminal_rollback_marker(
+    m18_fixture_t *fixture,
+    git_retirement_transaction_t **transaction) {
+    gitswitch_ctx_t ctx;
+    const account_t *account;
+    const account_t *accounts[1];
+    const publication_record_t *publications[1];
+    config_retirement_destination_t destination;
+    size_t cleared = 0U;
+
+    if (!fixture || !transaction ||
+        m18_parent_runtime_begin(fixture, &ctx) != 0) {
+        return -1;
+    }
+    account = m18_find_account(&ctx, UINT32_C(1));
+    if (!account) {
+        errno = ESTALE;
+        return -1;
+    }
+    accounts[0] = account;
+    publications[0] = &fixture->record;
+    memset(&destination, 0, sizeof(destination));
+    if (git_retirement_transaction_prepare(
+            accounts, publications, 1U, transaction) != 0 ||
+        git_retirement_transaction_publish(
+            *transaction, &cleared) != 0 ||
+        cleared == 0U ||
+        git_retirement_transaction_abort(*transaction) != 0 ||
+        git_retirement_transaction_rollback_destination_count(
+            *transaction) != 1U ||
+        git_retirement_transaction_rollback_destination(
+            *transaction, 0U, destination.config_path,
+            sizeof(destination.config_path),
+            &destination.post_config) != 0 ||
+        git_retirement_transaction_prepare_terminal_rollback(
+            *transaction) != 0) {
+        return -1;
+    }
+    return 0;
+}
+
+static int m18_fresh_single_prepare(
+    m18_fixture_t *fixture,
+    git_retirement_transaction_t **transaction) {
+    gitswitch_ctx_t ctx;
+    const account_t *account;
+    const account_t *accounts[1];
+    const publication_record_t *publications[1];
+
+    if (!fixture || !transaction ||
+        m18_parent_runtime_begin(fixture, &ctx) != 0) {
+        return -1;
+    }
+    account = m18_find_account(&ctx, UINT32_C(1));
+    if (!account) {
+        errno = ESTALE;
+        return -1;
+    }
+    accounts[0] = account;
+    publications[0] = &fixture->record;
+    return git_retirement_transaction_prepare(
+        accounts, publications, 1U, transaction);
+}
+
+TEST(parent_terminal_clean_settles_present_and_absent_destination_groups) {
+    m18_fixture_t fixture;
+    gitswitch_ctx_t ctx;
+    git_retirement_transaction_t *transaction = NULL;
+    char no_op_lock[MAX_PATH_LEN];
+    size_t cleared = 0U;
+
+    CHECK_EQ_INT(m18_fixture_setup(&fixture), 0);
+    CHECK_EQ_INT(m18_fixture_add_shared_and_no_op_destinations(&fixture), 0);
+    CHECK_EQ_INT(unlink(fixture.no_op_git_path), 0);
+    CHECK_EQ_INT(m18_prepare_mixed_transaction(
+                     &fixture, &ctx, &transaction), 0);
+    CHECK(transaction != NULL);
+    CHECK_EQ_INT(git_retirement_transaction_publish(
+                     transaction, &cleared), 0);
+    CHECK(cleared > 0U);
+    CHECK_EQ_INT(git_retirement_transaction_prepare_terminal_commit(
+                     transaction), 0);
+    CHECK_EQ_INT(git_retirement_transaction_verify_terminal_commit(
+                     transaction), 0);
+    CHECK_EQ_INT(git_retirement_transaction_finish_terminal_commit(
+                     &transaction), 0);
+    CHECK(transaction == NULL);
+    CHECK(!m18_git_has_command(&fixture));
+    CHECK_EQ_INT(safe_snprintf(
+                     no_op_lock, sizeof(no_op_lock), "%s.lock",
+                     fixture.no_op_git_path), 0);
+    errno = 0;
+    CHECK(access(fixture.no_op_git_path, F_OK) != 0 && errno == ENOENT);
+    errno = 0;
+    CHECK(access(no_op_lock, F_OK) != 0 && errno == ENOENT);
+    CHECK_EQ_INT(gitswitch_test_context_allocations(), 0);
+    m18_parent_runtime_end();
+    m18_fixture_cleanup(&fixture);
+}
+
+TEST(parent_terminal_rollback_refreshes_publications_with_clean_absent_group) {
+    m18_fixture_t fixture;
+    gitswitch_ctx_t ctx;
+    git_retirement_transaction_t *transaction = NULL;
+    config_retirement_owner_t owners[2];
+    config_retirement_destination_t destinations[2];
+    size_t destination_count;
+    size_t cleared = 0U;
+    bool state_installed = false;
+
+    memset(owners, 0, sizeof(owners));
+    memset(destinations, 0, sizeof(destinations));
+    CHECK_EQ_INT(m18_fixture_setup(&fixture), 0);
+    CHECK_EQ_INT(m18_fixture_add_shared_and_no_op_destinations(&fixture), 0);
+    CHECK_EQ_INT(unlink(fixture.no_op_git_path), 0);
+    CHECK_EQ_INT(m18_prepare_mixed_transaction(
+                     &fixture, &ctx, &transaction), 0);
+    CHECK_EQ_INT(git_retirement_transaction_publish(
+                     transaction, &cleared), 0);
+    CHECK(cleared > 0U);
+    CHECK_EQ_INT(git_retirement_transaction_abort(transaction), 0);
+    destination_count =
+        git_retirement_transaction_rollback_destination_count(transaction);
+    CHECK_EQ_INT((long)destination_count, 2);
+    for (size_t i = 0U; i < destination_count; i++) {
+        CHECK_EQ_INT(git_retirement_transaction_rollback_destination(
+                         transaction, i, destinations[i].config_path,
+                         sizeof(destinations[i].config_path),
+                         &destinations[i].post_config), 0);
+    }
+    owners[0].account_id = UINT32_C(1);
+    owners[1].account_id = UINT32_C(2);
+    CHECK_EQ_INT(safe_strncpy(
+                     owners[0].account_incarnation, M18_INCARNATION,
+                     sizeof(owners[0].account_incarnation)), 0);
+    CHECK_EQ_INT(safe_strncpy(
+                     owners[1].account_incarnation,
+                     M18_SECOND_INCARNATION,
+                     sizeof(owners[1].account_incarnation)), 0);
+    CHECK_EQ_INT(git_retirement_transaction_prepare_terminal_rollback(
+                     transaction), 0);
+    CHECK_EQ_INT(config_refresh_retirement_publications_transactional(
+                     &ctx, fixture.accounts_path, owners, 2U,
+                     destinations, destination_count,
+                     &state_installed), 0);
+    CHECK(state_installed);
+    for (size_t i = 0U; i < destination_count; i++) {
+        config_retirement_destination_t observed;
+
+        memset(&observed, 0, sizeof(observed));
+        CHECK_EQ_INT(git_retirement_transaction_rollback_destination(
+                         transaction, i, observed.config_path,
+                         sizeof(observed.config_path),
+                         &observed.post_config), 0);
+        CHECK_STR_EQ(observed.config_path, destinations[i].config_path);
+        CHECK(publication_identity_equal(
+            &observed.post_config, &destinations[i].post_config));
+    }
+    CHECK_EQ_INT(git_retirement_transaction_finish_terminal_rollback(
+                     &transaction), 0);
+    CHECK(transaction == NULL);
+    CHECK(m18_git_has_command(&fixture));
+    CHECK(m18_mixed_rollback_ledger_is_exact(&fixture));
+    CHECK_EQ_INT(gitswitch_test_context_allocations(), 0);
+    m18_parent_runtime_end();
+    m18_fixture_cleanup(&fixture);
+}
+
+TEST(parent_config_refresh_retires_exact_linked_private_alias) {
+    m18_fixture_t fixture;
+    gitswitch_ctx_t ctx;
+    config_retirement_owner_t owner;
+    config_retirement_destination_t destination;
+    char retained_alias[MAX_PATH_LEN];
+    bool state_installed = false;
+
+    memset(&owner, 0, sizeof(owner));
+    memset(&destination, 0, sizeof(destination));
+    CHECK_EQ_INT(m18_fixture_setup(&fixture), 0);
+    CHECK_EQ_INT(m18_parent_runtime_begin(&fixture, &ctx), 0);
+    owner.account_id = UINT32_C(1);
+    CHECK_EQ_INT(safe_strncpy(
+                     owner.account_incarnation, M18_INCARNATION,
+                     sizeof(owner.account_incarnation)), 0);
+    CHECK_EQ_INT(safe_strncpy(
+                     destination.config_path, fixture.git_path,
+                     sizeof(destination.config_path)), 0);
+    destination.post_config = fixture.record.post_config;
+    CHECK_EQ_INT(safe_snprintf(
+                     retained_alias, sizeof(retained_alias),
+                     "%s/.resume-hint.tmp.A1b2C3",
+                     fixture.config_dir), 0);
+    CHECK_EQ_INT(link(fixture.state_path, retained_alias), 0);
+    CHECK_EQ_INT(config_refresh_retirement_publications_transactional(
+                     &ctx, fixture.accounts_path, &owner, 1U,
+                     &destination, 1U, &state_installed), -1);
+    CHECK(!state_installed);
+    errno = 0;
+    CHECK(access(retained_alias, F_OK) != 0 && errno == ENOENT);
+    CHECK(access(fixture.state_path, F_OK) == 0);
+    m18_parent_runtime_end();
+    m18_fixture_cleanup(&fixture);
+}
+
+TEST(parent_freebsd_reproves_and_retires_retained_private_alias) {
+#if defined(__FreeBSD__)
+    m18_fixture_t fixture;
+    gitswitch_ctx_t ctx;
+    struct stat hint;
+    bool installed = false;
+
+    CHECK_EQ_INT(m18_fixture_setup(&fixture), 0);
+    CHECK_EQ_INT(m18_parent_runtime_begin(&fixture, &ctx), 0);
+    CHECK_EQ_INT(unlink(fixture.state_path), 0);
+    m18_freebsd_alias_failure_stage =
+        CONFIG_PUBLISH_TEST_AFTER_FIXED_LINK;
+    (void)gitswitch_test_set_config_publish_hook(
+        m18_fail_freebsd_retained_alias);
+    CHECK_EQ_INT(config_save_active_account_transactional(
+                     &ctx, fixture.accounts_path, &installed), -1);
+    CHECK(installed);
+    CHECK_EQ_INT(lstat(fixture.state_path, &hint), 0);
+    CHECK_EQ_INT((long)hint.st_nlink, 3);
+
+    (void)gitswitch_test_set_config_publish_hook(NULL);
+    m18_freebsd_alias_failure_stage = -1;
+    installed = false;
+    CHECK_EQ_INT(config_save_active_account_transactional(
+                     &ctx, fixture.accounts_path, &installed), 0);
+    CHECK_EQ_INT(lstat(fixture.state_path, &hint), 0);
+    CHECK_EQ_INT((long)hint.st_nlink, 1);
+    m18_parent_runtime_end();
+    m18_fixture_cleanup(&fixture);
+#else
+    TS_SKIP("persistent-fs",
+            "FreeBSD retained-source hardlink publication only");
+#endif
+}
+
+TEST(parent_recovery_removes_exact_linked_private_alias) {
+    m18_fixture_t fixture;
+    git_retirement_transaction_t *transaction = NULL;
+    git_retirement_transaction_t *fresh = NULL;
+    char lock_path[MAX_PATH_LEN];
+    char alias_path[MAX_PATH_LEN];
+
+    CHECK_EQ_INT(m18_fixture_setup(&fixture), 0);
+    CHECK_EQ_INT(m18_prepare_single_terminal_rollback_marker(
+                     &fixture, &transaction), 0);
+    CHECK_EQ_INT(safe_snprintf(
+                     lock_path, sizeof(lock_path), "%s.lock",
+                     fixture.git_path), 0);
+    CHECK_EQ_INT(safe_snprintf(
+                     alias_path, sizeof(alias_path),
+                     "%s/.gitswitch-finalization-%ld-1",
+                     fixture.home, (long)getpid()), 0);
+    CHECK_EQ_INT(link(lock_path, alias_path), 0);
+    CHECK_EQ_INT(m18_fresh_single_prepare(
+                     &fixture, &fresh), 0);
+    CHECK(fresh != NULL);
+    CHECK_EQ_INT(git_retirement_transaction_commit(&fresh), 0);
+    CHECK(fresh == NULL);
+    errno = 0;
+    CHECK(access(alias_path, F_OK) != 0 && errno == ENOENT);
+    CHECK_EQ_INT(git_retirement_transaction_finish_terminal_rollback(
+                     &transaction), 0);
+    CHECK(transaction == NULL);
+    m18_parent_runtime_end();
+    m18_fixture_cleanup(&fixture);
+}
+
+TEST(parent_recovery_accepts_terminal_marker_with_alias_already_absent) {
+    m18_fixture_t fixture;
+    git_retirement_transaction_t *transaction = NULL;
+    git_retirement_transaction_t *fresh = NULL;
+    char lock_path[MAX_PATH_LEN];
+
+    CHECK_EQ_INT(m18_fixture_setup(&fixture), 0);
+    CHECK_EQ_INT(m18_prepare_single_terminal_rollback_marker(
+                     &fixture, &transaction), 0);
+    CHECK_EQ_INT(safe_snprintf(
+                     lock_path, sizeof(lock_path), "%s.lock",
+                     fixture.git_path), 0);
+    CHECK_EQ_INT(m18_fresh_single_prepare(
+                     &fixture, &fresh), 0);
+    CHECK_EQ_INT(git_retirement_transaction_commit(&fresh), 0);
+    CHECK(fresh == NULL);
+    CHECK_EQ_INT(git_retirement_transaction_finish_terminal_rollback(
+                     &transaction), 0);
+    CHECK(transaction == NULL);
+    m18_parent_runtime_end();
+    m18_fixture_cleanup(&fixture);
+}
+
+TEST(parent_recovery_rejects_wrong_inode_private_alias) {
+    static const char foreign[] = "foreign finalization marker\n";
+    m18_fixture_t fixture;
+    git_retirement_transaction_t *transaction = NULL;
+    git_retirement_transaction_t *fresh = NULL;
+    char lock_path[MAX_PATH_LEN];
+    char extra_link[MAX_PATH_LEN];
+    char alias_path[MAX_PATH_LEN];
+
+    CHECK_EQ_INT(m18_fixture_setup(&fixture), 0);
+    CHECK_EQ_INT(m18_prepare_single_terminal_rollback_marker(
+                     &fixture, &transaction), 0);
+    CHECK_EQ_INT(safe_snprintf(
+                     lock_path, sizeof(lock_path), "%s.lock",
+                     fixture.git_path), 0);
+    CHECK_EQ_INT(safe_snprintf(
+                     extra_link, sizeof(extra_link), "%s/marker-extra",
+                     fixture.home), 0);
+    CHECK_EQ_INT(safe_snprintf(
+                     alias_path, sizeof(alias_path),
+                     "%s/.gitswitch-finalization-%ld-2",
+                     fixture.home, (long)getpid()), 0);
+    CHECK_EQ_INT(link(lock_path, extra_link), 0);
+    CHECK_EQ_INT(m18_write_file(
+                     alias_path, foreign, sizeof(foreign) - 1U, 0600), 0);
+    CHECK_EQ_INT(m18_fresh_single_prepare(
+                     &fixture, &fresh), 0);
+    CHECK(fresh != NULL);
+    CHECK(access(lock_path, F_OK) == 0);
+    CHECK(access(extra_link, F_OK) == 0);
+    CHECK(access(alias_path, F_OK) == 0);
+    CHECK_EQ_INT(git_retirement_transaction_commit(&fresh), 0);
+    CHECK(fresh == NULL);
+    CHECK_EQ_INT(git_retirement_transaction_finish_terminal_rollback(
+                     &transaction), 0);
+    CHECK(transaction == NULL);
+    m18_parent_runtime_end();
+    m18_fixture_cleanup(&fixture);
+}
+
+TEST(parent_recovery_rejects_private_alias_changed_after_proof) {
+#if defined(__FreeBSD__)
+    TS_SKIP("persistent-fs",
+            "FreeBSD removes exact names through descriptor-conditioned unlink");
+#else
+    m18_fixture_t fixture;
+    git_retirement_transaction_t *transaction = NULL;
+    git_retirement_transaction_t *fresh = NULL;
+    char lock_path[MAX_PATH_LEN];
+    char alias_path[MAX_PATH_LEN];
+
+    CHECK_EQ_INT(m18_fixture_setup(&fixture), 0);
+    CHECK_EQ_INT(m18_prepare_single_terminal_rollback_marker(
+                     &fixture, &transaction), 0);
+    CHECK_EQ_INT(safe_snprintf(
+                     lock_path, sizeof(lock_path), "%s.lock",
+                     fixture.git_path), 0);
+    CHECK_EQ_INT(safe_snprintf(
+                     alias_path, sizeof(alias_path),
+                     "%s/.gitswitch-finalization-%ld-3",
+                     fixture.home, (long)getpid()), 0);
+    CHECK_EQ_INT(link(lock_path, alias_path), 0);
+
+    m18_alias_race_fixture = &fixture;
+    m18_alias_race_requested = true;
+    m18_alias_race_observed = false;
+    m18_alias_race_error = 0;
+    (void)git_ops_test_set_retirement_hook(
+        m18_retirement_witness_hook);
+    CHECK_EQ_INT(m18_fresh_single_prepare(
+                     &fixture, &fresh), 0);
+    (void)git_ops_test_set_retirement_hook(NULL);
+    m18_alias_race_requested = false;
+    m18_alias_race_fixture = NULL;
+    CHECK(m18_alias_race_observed);
+    CHECK_EQ_INT(m18_alias_race_error, 0);
+    CHECK(fresh != NULL);
+    CHECK(access(lock_path, F_OK) == 0);
+    CHECK_EQ_INT(git_retirement_transaction_commit(&fresh), 0);
+    CHECK(fresh == NULL);
+    CHECK_EQ_INT(git_retirement_transaction_finish_terminal_rollback(
+                     &transaction), 0);
+    CHECK(transaction == NULL);
+    m18_parent_runtime_end();
+    m18_fixture_cleanup(&fixture);
+#endif
+}
+
 TEST(reset_state_boundary_matrix_preserves_outer_coherence) {
     static const config_io_boundary_t clean_boundaries[] = {
         CONFIG_IO_STATE_AFTER_TEMP,
@@ -6153,6 +6754,14 @@ TEST_MAIN_BEGIN()
     RUN_TEST(recovery_source_change_before_alias_mutation_retains_exact_marker);
     RUN_TEST(git_recovery_end_failure_retains_exact_blocking_marker);
     RUN_TEST(alias_diagnostic_and_git_end_failure_are_both_retained);
+    RUN_TEST(parent_terminal_clean_settles_present_and_absent_destination_groups);
+    RUN_TEST(parent_terminal_rollback_refreshes_publications_with_clean_absent_group);
+    RUN_TEST(parent_config_refresh_retires_exact_linked_private_alias);
+    RUN_TEST(parent_freebsd_reproves_and_retires_retained_private_alias);
+    RUN_TEST(parent_recovery_removes_exact_linked_private_alias);
+    RUN_TEST(parent_recovery_accepts_terminal_marker_with_alias_already_absent);
+    RUN_TEST(parent_recovery_rejects_wrong_inode_private_alias);
+    RUN_TEST(parent_recovery_rejects_private_alias_changed_after_proof);
     RUN_TEST(reset_state_boundary_matrix_preserves_outer_coherence);
     RUN_TEST(reset_persistent_preinstall_fault_retains_guard_and_blocks_switch);
     RUN_TEST(reset_all_clean_rollback_refreshes_shared_and_no_op_destinations);

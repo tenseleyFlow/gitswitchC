@@ -102,6 +102,43 @@ static int make_dir(const char *path) {
     return mkdir(path, 0700) == 0 || errno == EEXIST ? 0 : -1;
 }
 
+static int write_private_text(const char *path, const char *text) {
+    size_t length = strlen(text);
+    size_t written = 0;
+    int fd = open(path, O_WRONLY | O_CREAT | O_TRUNC, 0600);
+
+    if (fd < 0) return -1;
+    while (written < length) {
+        ssize_t count = write(fd, text + written, length - written);
+
+        if (count > 0) {
+            written += (size_t)count;
+        } else if (count < 0 && errno == EINTR) {
+            continue;
+        } else {
+            close(fd);
+            return -1;
+        }
+    }
+    return close(fd);
+}
+
+static int fixture_config_paths(const cli_fixture_t *fixture,
+                                char *directory, size_t directory_size,
+                                char *accounts, size_t accounts_size) {
+    char parent[PATH_MAX];
+
+    if (path_join(parent, sizeof(parent), fixture->home, ".config") != 0 ||
+        make_dir(parent) != 0 ||
+        path_join(directory, directory_size, parent, "gitswitch") != 0 ||
+        make_dir(directory) != 0 ||
+        path_join(accounts, accounts_size, directory,
+                  "accounts.toml") != 0) {
+        return -1;
+    }
+    return 0;
+}
+
 static int fixture_setup(cli_fixture_t *fixture) {
     char template_path[] = "/tmp/gitswitch-ar14-cli-XXXXXX";
 
@@ -632,6 +669,232 @@ TEST(empty_configuration_read_only_commands_release_each_parent_context) {
     }
 }
 
+TEST(resume_check_handles_empty_missing_and_identity_only_active_accounts) {
+    static const char missing_active_config[] =
+        "[settings]\n"
+        "default_scope = \"global\"\n"
+        "active_account = \"missing\"\n";
+    static const char identity_only_config[] =
+        "[settings]\n"
+        "default_scope = \"global\"\n"
+        "active_account = \"work\"\n"
+        "\n"
+        "[accounts.1]\n"
+        "incarnation = \"1111111111111111111111111111111111111111111111111111111111111111\"\n"
+        "name = \"work\"\n"
+        "email = \"work@example.test\"\n"
+        "preferred_scope = \"global\"\n";
+    cli_fixture_t fixture;
+    char program[] = "gitswitch";
+    char resume_check[] = "--resume-check";
+    char *argv[] = { program, resume_check, NULL };
+    char config_dir[PATH_MAX];
+    char accounts[PATH_MAX];
+    cli_result_t empty_result;
+    cli_result_t missing_result;
+    cli_result_t identity_result;
+
+    CHECK_EQ_INT(fixture_setup(&fixture), 0);
+    empty_result = invoke_cli(&fixture, 2, argv);
+    CHECK_EQ_INT(empty_result.status, EXIT_SUCCESS);
+    check_clean_return(&empty_result, 1);
+
+    CHECK_EQ_INT(fixture_config_paths(
+                     &fixture, config_dir, sizeof(config_dir),
+                     accounts, sizeof(accounts)), 0);
+    CHECK_EQ_INT(write_private_text(accounts, missing_active_config), 0);
+    missing_result = invoke_cli(&fixture, 2, argv);
+    CHECK_EQ_INT(missing_result.status, EXIT_SUCCESS);
+    check_clean_return(&missing_result, 1);
+
+    CHECK_EQ_INT(write_private_text(accounts, identity_only_config), 0);
+    identity_result = invoke_cli(&fixture, 2, argv);
+    CHECK_EQ_INT(identity_result.status, EXIT_SUCCESS);
+    check_clean_return(&identity_result, 1);
+}
+
+TEST(resume_check_startup_logging_requires_a_valid_pre_delimiter_option) {
+    static const char startup_message[] =
+        "Error handling system initialized";
+    cli_fixture_t fixture;
+    char program[] = "gitswitch";
+    char resume[] = "--resume-check";
+    char resume_prefix[] = "--resume-c";
+    char verbose_short[] = "-V";
+    char debug_short[] = "-d";
+    char verbose_bundle[] = "-nV";
+    char verbose_long[] = "--verbose";
+    char debug_long[] = "--debug";
+    char verbose_prefix[] = "--verb";
+    char debug_prefix[] = "--deb";
+    char delimiter[] = "--";
+    char malformed_before[] = "-xV";
+    char malformed_after[] = "-Vx";
+    char malformed_long[] = "--verbose=yes";
+    char *cases[][5] = {
+        { program, resume, NULL, NULL, NULL },
+        { program, resume_prefix, NULL, NULL, NULL },
+        { program, verbose_short, resume, NULL, NULL },
+        { program, debug_short, resume, NULL, NULL },
+        { program, verbose_bundle, resume, NULL, NULL },
+        { program, verbose_long, resume, NULL, NULL },
+        { program, debug_long, resume, NULL, NULL },
+        { program, verbose_prefix, resume, NULL, NULL },
+        { program, debug_prefix, resume, NULL, NULL },
+        { program, resume, delimiter, verbose_short, NULL },
+        { program, malformed_before, resume, NULL, NULL },
+        { program, malformed_after, resume, NULL, NULL },
+        { program, malformed_long, resume, NULL, NULL }
+    };
+    const int argcs[] = {
+        2, 2, 3, 3, 3, 3, 3, 3, 3, 4, 3, 3, 3
+    };
+    const bool succeeds[] = {
+        true, true, true, true, true, true, true, true, true,
+        false, false, false, false
+    };
+    const bool requests_logging[] = {
+        false, false, true, true, true, true, true, true, true,
+        false, false, false, false
+    };
+
+    CHECK_EQ_INT(fixture_setup(&fixture), 0);
+    for (size_t index = 0;
+         index < sizeof(cases) / sizeof(cases[0]); index++) {
+        cli_result_t result =
+            invoke_cli(&fixture, argcs[index], cases[index]);
+        bool saw_startup =
+            strstr(result.stderr_text, startup_message) != NULL;
+        bool expect_startup = false;
+
+#ifdef DEBUG
+        expect_startup = requests_logging[index];
+#else
+        (void)requests_logging;
+#endif
+        CHECK_EQ_INT(result.status,
+                     succeeds[index] ? EXIT_SUCCESS : EXIT_FAILURE);
+        CHECK_EQ_INT(saw_startup, expect_startup);
+        check_clean_return(&result, succeeds[index] ? 1 : 0);
+    }
+}
+
+TEST(retirement_guard_blocks_switch_resume_and_unrelated_mutation) {
+    static const char config_text[] =
+        "[settings]\n"
+        "default_scope = \"global\"\n"
+        "\n"
+        "[accounts.1]\n"
+        "incarnation = \"1111111111111111111111111111111111111111111111111111111111111111\"\n"
+        "name = \"work\"\n"
+        "email = \"work@example.test\"\n"
+        "preferred_scope = \"global\"\n";
+    cli_fixture_t fixture;
+    char config_dir[PATH_MAX];
+    char accounts[PATH_MAX];
+    char guard[PATH_MAX];
+    char program[] = "gitswitch";
+    char work[] = "work";
+    char resume[] = "resume";
+    char add[] = "add";
+    char *switch_argv[] = { program, work, NULL };
+    char *resume_argv[] = { program, resume, NULL };
+    char *add_argv[] = { program, add, NULL };
+    cli_result_t switch_result;
+    cli_result_t resume_result;
+    cli_result_t add_result;
+
+    CHECK_EQ_INT(fixture_setup(&fixture), 0);
+    CHECK_EQ_INT(fixture_config_paths(
+                     &fixture, config_dir, sizeof(config_dir),
+                     accounts, sizeof(accounts)), 0);
+    CHECK_EQ_INT(write_private_text(accounts, config_text), 0);
+    CHECK_EQ_INT(path_join(guard, sizeof(guard), config_dir,
+                           ".retirement-incomplete"), 0);
+    CHECK_EQ_INT(write_private_text(guard, "foreign-retirement-marker\n"), 0);
+
+    switch_result = invoke_cli(&fixture, 2, switch_argv);
+    CHECK_EQ_INT(switch_result.status, EXIT_FAILURE);
+    CHECK(strstr(switch_result.stderr_text,
+                 "Cannot switch accounts while Git retirement is incomplete") !=
+          NULL);
+    check_clean_return(&switch_result, 1);
+
+    resume_result = invoke_cli(&fixture, 2, resume_argv);
+    CHECK_EQ_INT(resume_result.status, EXIT_FAILURE);
+    CHECK(strstr(resume_result.stderr_text,
+                 "Cannot resume while Git retirement is incomplete") != NULL);
+    check_clean_return(&resume_result, 1);
+
+    add_result = invoke_cli(&fixture, 2, add_argv);
+    CHECK_EQ_INT(add_result.status, EXIT_FAILURE);
+    CHECK(strstr(add_result.stderr_text,
+                 "Cannot modify account state while Git retirement is incomplete") !=
+          NULL);
+    check_clean_return(&add_result, 1);
+}
+
+TEST(switch_guard_blocks_mutation_but_readiness_probe_fails_closed_silently) {
+    cli_fixture_t fixture;
+    char config_dir[PATH_MAX];
+    char accounts[PATH_MAX];
+    char guard[PATH_MAX];
+    char program[] = "gitswitch";
+    char add[] = "add";
+    char resume_check[] = "--resume-check";
+    char version[] = "--version";
+    char *add_argv[] = { program, add, NULL };
+    char *probe_argv[] = { program, resume_check, NULL };
+    char *version_argv[] = { program, version, NULL };
+    cli_result_t add_result;
+    cli_result_t probe_result;
+    cli_result_t version_result;
+
+    CHECK_EQ_INT(fixture_setup(&fixture), 0);
+    CHECK_EQ_INT(fixture_config_paths(
+                     &fixture, config_dir, sizeof(config_dir),
+                     accounts, sizeof(accounts)), 0);
+    CHECK_EQ_INT(path_join(guard, sizeof(guard), config_dir,
+                           ".switch-incomplete"), 0);
+    CHECK_EQ_INT(write_private_text(guard, "foreign-switch-marker\n"), 0);
+
+    add_result = invoke_cli(&fixture, 2, add_argv);
+    CHECK_EQ_INT(add_result.status, EXIT_FAILURE);
+    CHECK(strstr(add_result.stderr_text,
+                 "Cannot validate incomplete switch recovery") != NULL);
+    check_clean_return(&add_result, 1);
+
+    probe_result = invoke_cli(&fixture, 2, probe_argv);
+    CHECK_EQ_INT(probe_result.status, EXIT_SUCCESS);
+    CHECK(probe_result.stdout_text[0] == '\0');
+    CHECK(probe_result.stderr_text[0] == '\0');
+    check_clean_return(&probe_result, 1);
+
+    version_result = invoke_cli(&fixture, 2, version_argv);
+    CHECK_EQ_INT(version_result.status, EXIT_SUCCESS);
+    CHECK(strstr(version_result.stdout_text, "gitswitch") != NULL);
+    check_clean_return(&version_result, 0);
+}
+
+TEST(reset_all_releases_its_transaction_owner_before_parent_return) {
+    cli_fixture_t fixture;
+    char program[] = "gitswitch";
+    char reset[] = "reset";
+    char yes[] = "--yes";
+    char *argv[] = { program, reset, yes, NULL };
+    cli_result_t first;
+    cli_result_t second;
+
+    CHECK_EQ_INT(fixture_setup(&fixture), 0);
+    first = invoke_cli(&fixture, 3, argv);
+    CHECK_EQ_INT(first.status, EXIT_SUCCESS);
+    check_clean_return(&first, 1);
+
+    second = invoke_cli(&fixture, 3, argv);
+    CHECK_EQ_INT(second.status, EXIT_SUCCESS);
+    check_clean_return(&second, 1);
+}
+
 int main(void) {
     saved_env_t saved_env[
         sizeof(g_fixture_env_names) / sizeof(g_fixture_env_names[0])
@@ -659,6 +922,14 @@ int main(void) {
     RUN_TEST(no_command_uses_private_read_only_fixture_and_releases_context);
     RUN_TEST(successful_ordinary_command_fails_on_final_stdout_error);
     RUN_TEST(empty_configuration_read_only_commands_release_each_parent_context);
+    RUN_TEST(
+        resume_check_handles_empty_missing_and_identity_only_active_accounts);
+    RUN_TEST(
+        resume_check_startup_logging_requires_a_valid_pre_delimiter_option);
+    RUN_TEST(retirement_guard_blocks_switch_resume_and_unrelated_mutation);
+    RUN_TEST(
+        switch_guard_blocks_mutation_but_readiness_probe_fails_closed_silently);
+    RUN_TEST(reset_all_releases_its_transaction_owner_before_parent_return);
     restore_environment(saved_env, sizeof(saved_env) / sizeof(saved_env[0]));
     result = ts_test_finish();
     return result;

@@ -873,6 +873,64 @@ static char **option_first_argv_copy(int argc, char *const argv[]) {
     return copy;
 }
 
+#ifdef DEBUG
+/* Resolve only no-argument long options, including the unambiguous prefixes
+ * accepted by getopt_long(). An '=' suffix is invalid for every option in the
+ * CLI table and must not opt an otherwise quiet readiness probe into startup
+ * telemetry. */
+static int preinit_long_option_value(
+    const char *argument, const struct option options[]) {
+    const char *name;
+    size_t name_length;
+    int matched_value = 0;
+    bool matched = false;
+
+    if (!argument || !options ||
+        argument[0] != '-' || argument[1] != '-' ||
+        argument[2] == '\0') {
+        return 0;
+    }
+    name = argument + 2;
+    if (strchr(name, '=') != NULL) return 0;
+    name_length = strlen(name);
+
+    for (size_t index = 0; options[index].name; index++) {
+        size_t option_length = strlen(options[index].name);
+
+        if (name_length > option_length ||
+            memcmp(name, options[index].name, name_length) != 0) {
+            continue;
+        }
+        if (name_length == option_length) {
+            return options[index].val;
+        }
+        if (matched) {
+            return 0;
+        }
+        matched = true;
+        matched_value = options[index].val;
+    }
+    return matched ? matched_value : 0;
+}
+
+/* All short options are argument-free. A token contributes a pre-init logging
+ * request only when its complete bundle is valid; characters hidden inside a
+ * malformed bundle such as -xV must not enable startup telemetry. */
+static bool preinit_short_logging_option(const char *argument) {
+    bool logging = false;
+
+    if (!argument || argument[0] != '-' || argument[1] == '-' ||
+        argument[1] == '\0') {
+        return false;
+    }
+    for (const char *option = argument + 1; *option; option++) {
+        if (!strchr("hvcCVdngly", *option)) return false;
+        if (*option == 'V' || *option == 'd') logging = true;
+    }
+    return logging;
+}
+#endif
+
 static command_result_t command_result(int status) {
     command_result_t result;
 
@@ -972,7 +1030,7 @@ int main(int argc, char *argv[]) {
     int operand_count = 0;
     int exit_code = EXIT_SUCCESS;
     
-    static struct option long_options[] = {
+    static const struct option long_options[] = {
         {"help", no_argument, 0, 'h'},
         {"version", no_argument, 0, 'v'},
         {"color", no_argument, 0, 'c'},
@@ -999,12 +1057,39 @@ int main(int argc, char *argv[]) {
         {0, 0, 0, 0}
     };
     
-    /* Initialize error handling - use WARN level for release builds, INFO for debug */
+    /* Initialize error handling at the build default, except for the internal
+     * readiness probe whose normal contract is status-only. Resolve the same
+     * no-argument long-option prefixes and complete short-option bundles that
+     * getopt_long accepts so malformed or post-`--` text cannot enable DEBUG
+     * startup telemetry. Explicit verbose/debug options keep that telemetry.
+     * Direct CLI diagnostics remain visible because they do not use INFO
+     * logging. */
+    log_level_t initial_log_level = LOG_LEVEL_WARNING;
 #ifdef DEBUG
-    if (error_init(LOG_LEVEL_INFO, NULL) != 0) {
-#else
-    if (error_init(LOG_LEVEL_WARNING, NULL) != 0) {
+    bool quiet_resume_check = false;
+    bool explicit_logging = false;
+
+    initial_log_level = LOG_LEVEL_INFO;
+    for (int arg_index = 1;
+         argv && arg_index < argc && argv[arg_index]; arg_index++) {
+        const char *argument = argv[arg_index];
+        int long_value;
+
+        if (strcmp(argument, "--") == 0) break;
+        long_value = preinit_long_option_value(argument, long_options);
+        if (long_value == OPT_RESUME_CHECK) {
+            quiet_resume_check = true;
+        }
+        if (long_value == 'V' || long_value == 'd' ||
+            preinit_short_logging_option(argument)) {
+            explicit_logging = true;
+        }
+    }
+    if (quiet_resume_check && !explicit_logging) {
+        initial_log_level = LOG_LEVEL_WARNING;
+    }
 #endif
+    if (error_init(initial_log_level, NULL) != 0) {
         fprintf(stderr, "Failed to initialize error handling\n");
         return EXIT_FAILURE;
     }
@@ -1146,6 +1231,14 @@ int main(int argc, char *argv[]) {
         }
         error_cleanup();
         return rc == 0 ? EXIT_SUCCESS : EXIT_FAILURE;
+    }
+
+    /* The shell readiness probe is plumbing: status alone tells the generated
+     * integration whether to invoke `resume`. Keep expected fail-closed
+     * observations silent even in DEBUG builds, while preserving telemetry
+     * when the caller explicitly requested -V/-d. */
+    if (resume_check && !verbose_requested) {
+        set_log_level(LOG_LEVEL_WARNING);
     }
 
     /* Initialize display system */

@@ -170,6 +170,10 @@ static struct stat g_switch_marker_after_mutation;
 static unsigned char g_switch_marker_original_byte;
 static unsigned char g_switch_marker_mutated_byte;
 static size_t g_switch_marker_mutation_offset;
+static bool g_switch_guard_replace_directory_after_read;
+static int g_switch_guard_directory_replacement_rc;
+static char g_switch_guard_directory_path[PATH_MAX];
+static char g_switch_guard_displaced_directory_path[PATH_MAX];
 static volatile sig_atomic_t g_returning_signal_calls;
 
 typedef enum {
@@ -1357,6 +1361,26 @@ static int mutate_switch_guard_marker_after_read(
     return -1;
 }
 
+static int replace_switch_guard_directory_after_read(
+    switch_guard_test_stage_t stage, int directory_fd) {
+    (void)directory_fd;
+
+    if (stage != SWITCH_GUARD_READ_AFTER_EXACT_DESCRIPTOR_PROOF ||
+        !g_switch_guard_replace_directory_after_read) {
+        return 0;
+    }
+    g_switch_guard_replace_directory_after_read = false;
+    g_switch_guard_directory_replacement_rc = -1;
+    if (rename(
+            g_switch_guard_directory_path,
+            g_switch_guard_displaced_directory_path) != 0 ||
+        mkdir(g_switch_guard_directory_path, 0700) != 0) {
+        return -1;
+    }
+    g_switch_guard_directory_replacement_rc = 0;
+    return 0;
+}
+
 static int drift_switch_guard_source_after_stage_sync(
     switch_guard_test_stage_t stage, int directory_fd) {
     (void)directory_fd;
@@ -1569,6 +1593,12 @@ static void h1_guard_case_end(h1_guard_case_t *guard_case) {
     g_switch_marker_original_byte = 0U;
     g_switch_marker_mutated_byte = 0U;
     g_switch_marker_mutation_offset = 0U;
+    g_switch_guard_replace_directory_after_read = false;
+    g_switch_guard_directory_replacement_rc = -1;
+    memset(g_switch_guard_directory_path, 0,
+           sizeof(g_switch_guard_directory_path));
+    memset(g_switch_guard_displaced_directory_path, 0,
+           sizeof(g_switch_guard_displaced_directory_path));
     if (guard_case->guard) {
         config_switch_guard_abandon(&guard_case->guard);
     }
@@ -5622,6 +5652,376 @@ TEST(parent_guard_abandon_then_adopt_reuses_exact_authority) {
     ts_rm_rf(fixture.root);
 }
 
+#if !defined(__FreeBSD__)
+TEST(parent_guard_adopts_exact_portable_pair_after_normalization) {
+    cli_owner_fixture_t fixture = {0};
+    h1_guard_case_t guard_case = {0};
+    struct stat marker = {0};
+    struct stat stage = {0};
+    int begin_result = -1;
+    int fixture_result;
+
+    fixture_result = h1_fixture_setup(&fixture);
+    CHECK_EQ_INT(fixture_result, 0);
+    if (fixture_result == 0) {
+        begin_result = h1_guard_case_begin(&fixture, &guard_case);
+    }
+    CHECK_EQ_INT(begin_result, 0);
+    if (begin_result == 0) {
+        CHECK_EQ_INT(
+            config_switch_guard_install_or_adopt(
+                guard_case.ctx, guard_case.target, GIT_SCOPE_GLOBAL,
+                guard_case.destinations, guard_case.destination_count,
+                &guard_case.guard),
+            0);
+        CHECK(config_switch_guard_was_created(guard_case.guard));
+        config_switch_guard_abandon(&guard_case.guard);
+        CHECK(!guard_case.guard);
+
+        CHECK_EQ_INT(
+            link(fixture.switch_fence, fixture.switch_stage), 0);
+        CHECK_EQ_INT(sync_directory(fixture.config_dir), 0);
+        CHECK_EQ_INT(lstat(fixture.switch_fence, &marker), 0);
+        CHECK_EQ_INT(lstat(fixture.switch_stage, &stage), 0);
+        CHECK(ts_same_identity(&marker, &stage));
+        CHECK_EQ_INT(marker.st_nlink, 2);
+
+        CHECK_EQ_INT(
+            config_switch_guard_install_or_adopt(
+                guard_case.ctx, guard_case.target, GIT_SCOPE_GLOBAL,
+                guard_case.destinations, guard_case.destination_count,
+                &guard_case.guard),
+            0);
+        CHECK(guard_case.guard != NULL);
+        CHECK(!config_switch_guard_was_created(guard_case.guard));
+        errno = 0;
+        CHECK(lstat(fixture.switch_stage, &stage) != 0 &&
+              errno == ENOENT);
+        CHECK_EQ_INT(lstat(fixture.switch_fence, &marker), 0);
+        CHECK_EQ_INT(marker.st_nlink, 1);
+        CHECK_EQ_INT(
+            config_switch_guard_clear(&guard_case.guard), 0);
+        CHECK(!guard_case.guard);
+    }
+    h1_guard_case_end(&guard_case);
+    ts_rm_rf(fixture.root);
+}
+#endif
+
+TEST(parent_guard_stage_only_preintent_precedes_fresh_publication) {
+    cli_owner_fixture_t fixture = {0};
+    h1_guard_case_t guard_case = {0};
+    struct stat state = {0};
+    int begin_result = -1;
+    int fixture_result;
+
+    fixture_result = h1_fixture_setup(&fixture);
+    CHECK_EQ_INT(fixture_result, 0);
+    if (fixture_result == 0) {
+        begin_result = h1_guard_case_begin(&fixture, &guard_case);
+    }
+    CHECK_EQ_INT(begin_result, 0);
+    if (begin_result == 0) {
+        CHECK_EQ_INT(
+            config_switch_guard_install_or_adopt(
+                guard_case.ctx, guard_case.target, GIT_SCOPE_GLOBAL,
+                guard_case.destinations, guard_case.destination_count,
+                &guard_case.guard),
+            0);
+        CHECK(config_switch_guard_was_created(guard_case.guard));
+        config_switch_guard_abandon(&guard_case.guard);
+        CHECK(!guard_case.guard);
+        CHECK_EQ_INT(
+            rename(fixture.switch_fence, fixture.switch_stage), 0);
+        CHECK_EQ_INT(sync_directory(fixture.config_dir), 0);
+        CHECK_EQ_INT(lstat(fixture.switch_stage, &state), 0);
+        CHECK_EQ_INT(state.st_nlink, 1);
+
+        CHECK_EQ_INT(
+            config_switch_guard_install_or_adopt(
+                guard_case.ctx, guard_case.target, GIT_SCOPE_GLOBAL,
+                guard_case.destinations, guard_case.destination_count,
+                &guard_case.guard),
+            0);
+        CHECK(guard_case.guard != NULL);
+        CHECK(config_switch_guard_was_created(guard_case.guard));
+        errno = 0;
+        CHECK(lstat(fixture.switch_stage, &state) != 0 &&
+              errno == ENOENT);
+        CHECK_EQ_INT(lstat(fixture.switch_fence, &state), 0);
+        CHECK_EQ_INT(
+            config_switch_guard_clear(&guard_case.guard), 0);
+        CHECK(!guard_case.guard);
+    }
+    h1_guard_case_end(&guard_case);
+    ts_rm_rf(fixture.root);
+}
+
+TEST(parent_guard_adopt_accepts_ctime_only_canonical_successor) {
+    cli_owner_fixture_t fixture = {0};
+    h1_guard_case_t guard_case = {0};
+    int begin_result = -1;
+    int fixture_result;
+
+    fixture_result = h1_fixture_setup(&fixture);
+    CHECK_EQ_INT(fixture_result, 0);
+    if (fixture_result == 0) {
+        begin_result = h1_guard_case_begin(&fixture, &guard_case);
+    }
+    CHECK_EQ_INT(begin_result, 0);
+    if (begin_result == 0) {
+        CHECK_EQ_INT(
+            config_switch_guard_install_or_adopt(
+                guard_case.ctx, guard_case.target, GIT_SCOPE_GLOBAL,
+                guard_case.destinations, guard_case.destination_count,
+                &guard_case.guard),
+            0);
+        CHECK(config_switch_guard_was_created(guard_case.guard));
+        config_switch_guard_abandon(&guard_case.guard);
+
+        CHECK_EQ_INT(
+            safe_strncpy(
+                g_switch_marker_mutation_path, fixture.switch_fence,
+                sizeof(g_switch_marker_mutation_path)),
+            0);
+        g_switch_marker_mutation =
+            SWITCH_MARKER_MUTATION_CTIME_ONLY;
+        g_switch_marker_mutation_stage =
+            SWITCH_GUARD_READ_AFTER_EXACT_DESCRIPTOR_PROOF;
+        g_switch_marker_mutation_calls = 0;
+        g_switch_marker_mutation_rc = -1;
+        (void)gitswitch_test_set_switch_guard_hook(
+            mutate_switch_guard_marker_after_read);
+        CHECK_EQ_INT(
+            config_switch_guard_install_or_adopt(
+                guard_case.ctx, guard_case.target, GIT_SCOPE_GLOBAL,
+                guard_case.destinations, guard_case.destination_count,
+                &guard_case.guard),
+            0);
+        (void)gitswitch_test_set_switch_guard_hook(NULL);
+        CHECK_EQ_INT(g_switch_marker_mutation_calls, 1);
+        CHECK_EQ_INT(g_switch_marker_mutation_rc, 0);
+        CHECK(h1_same_file_state_without_ctime(
+            &g_switch_marker_before_mutation,
+            &g_switch_marker_after_mutation));
+        CHECK(!h1_same_ctime(
+            &g_switch_marker_before_mutation,
+            &g_switch_marker_after_mutation));
+        CHECK(guard_case.guard != NULL);
+        CHECK(!config_switch_guard_was_created(guard_case.guard));
+        CHECK_EQ_INT(
+            config_switch_guard_clear(&guard_case.guard), 0);
+    }
+    h1_guard_case_end(&guard_case);
+    ts_rm_rf(fixture.root);
+}
+
+TEST(parent_guard_adopt_rejects_restored_mtime_byte_mutation) {
+    unsigned char observed[16384] = {0};
+    cli_owner_fixture_t fixture = {0};
+    h1_guard_case_t guard_case = {0};
+    struct stat retained = {0};
+    size_t observed_length = 0U;
+    int begin_result = -1;
+    int fixture_result;
+
+    fixture_result = h1_fixture_setup(&fixture);
+    CHECK_EQ_INT(fixture_result, 0);
+    if (fixture_result == 0) {
+        begin_result = h1_guard_case_begin(&fixture, &guard_case);
+    }
+    CHECK_EQ_INT(begin_result, 0);
+    if (begin_result == 0) {
+        CHECK_EQ_INT(
+            config_switch_guard_install_or_adopt(
+                guard_case.ctx, guard_case.target, GIT_SCOPE_GLOBAL,
+                guard_case.destinations, guard_case.destination_count,
+                &guard_case.guard),
+            0);
+        CHECK(config_switch_guard_was_created(guard_case.guard));
+        config_switch_guard_abandon(&guard_case.guard);
+
+        CHECK_EQ_INT(
+            safe_strncpy(
+                g_switch_marker_mutation_path, fixture.switch_fence,
+                sizeof(g_switch_marker_mutation_path)),
+            0);
+        g_switch_marker_mutation =
+            SWITCH_MARKER_MUTATION_PARSE_VALID_TOKEN_RESTORED_MTIME;
+        g_switch_marker_mutation_stage =
+            SWITCH_GUARD_READ_AFTER_EXACT_DESCRIPTOR_PROOF;
+        g_switch_marker_mutation_calls = 0;
+        g_switch_marker_mutation_rc = -1;
+        (void)gitswitch_test_set_switch_guard_hook(
+            mutate_switch_guard_marker_after_read);
+        errno = 0;
+        CHECK_EQ_INT(
+            config_switch_guard_install_or_adopt(
+                guard_case.ctx, guard_case.target, GIT_SCOPE_GLOBAL,
+                guard_case.destinations, guard_case.destination_count,
+                &guard_case.guard),
+            -1);
+        CHECK_EQ_INT(errno, ESTALE);
+        (void)gitswitch_test_set_switch_guard_hook(NULL);
+        CHECK_EQ_INT(g_switch_marker_mutation_calls, 1);
+        CHECK_EQ_INT(g_switch_marker_mutation_rc, 0);
+        CHECK(h1_same_file_state_without_ctime(
+            &g_switch_marker_before_mutation,
+            &g_switch_marker_after_mutation));
+        CHECK(!h1_same_ctime(
+            &g_switch_marker_before_mutation,
+            &g_switch_marker_after_mutation));
+        CHECK(guard_case.guard == NULL);
+        observed_length = h1_read_bounded_file(
+            fixture.switch_fence, observed, sizeof(observed),
+            &retained);
+        CHECK_EQ_INT(
+            (long)observed_length,
+            (long)g_switch_marker_after_mutation.st_size);
+        CHECK(g_switch_marker_mutation_offset < observed_length);
+        if (g_switch_marker_mutation_offset < observed_length) {
+            CHECK_EQ_INT(
+                observed[g_switch_marker_mutation_offset],
+                g_switch_marker_mutated_byte);
+        }
+        CHECK(h1_same_file_state_without_ctime(
+            &g_switch_marker_after_mutation, &retained));
+    }
+    h1_guard_case_end(&guard_case);
+    secure_zero_memory(observed, sizeof(observed));
+    ts_rm_rf(fixture.root);
+}
+
+TEST(parent_guard_rejects_and_retains_foreign_stage_hardlink) {
+    static const char foreign_stage[] = "foreign-stage-hardlink\n";
+    cli_owner_fixture_t fixture = {0};
+    h1_guard_case_t guard_case = {0};
+    char source_path[PATH_MAX] = {0};
+    char observed[64] = {0};
+    struct stat source_before = {0};
+    struct stat source_after = {0};
+    struct stat stage_after = {0};
+    int begin_result = -1;
+    int fixture_result;
+
+    fixture_result = h1_fixture_setup(&fixture);
+    CHECK_EQ_INT(fixture_result, 0);
+    if (fixture_result == 0) {
+        begin_result = h1_guard_case_begin(&fixture, &guard_case);
+    }
+    CHECK_EQ_INT(begin_result, 0);
+    if (begin_result == 0) {
+        CHECK_EQ_INT(
+            config_switch_guard_install_or_adopt(
+                guard_case.ctx, guard_case.target, GIT_SCOPE_GLOBAL,
+                guard_case.destinations, guard_case.destination_count,
+                &guard_case.guard),
+            0);
+        config_switch_guard_abandon(&guard_case.guard);
+        CHECK(
+            (size_t)snprintf(
+                source_path, sizeof(source_path), "%s/foreign-stage",
+                fixture.config_dir) < sizeof(source_path));
+        CHECK_EQ_INT(write_private(source_path, foreign_stage), 0);
+        CHECK_EQ_INT(
+            link(source_path, fixture.switch_stage), 0);
+        CHECK_EQ_INT(sync_directory(fixture.config_dir), 0);
+        CHECK_EQ_INT(lstat(source_path, &source_before), 0);
+        CHECK_EQ_INT(source_before.st_nlink, 2);
+
+        errno = 0;
+        CHECK_EQ_INT(
+            config_switch_guard_install_or_adopt(
+                guard_case.ctx, guard_case.target, GIT_SCOPE_GLOBAL,
+                guard_case.destinations, guard_case.destination_count,
+                &guard_case.guard),
+            -1);
+        CHECK_EQ_INT(errno, EACCES);
+        CHECK(guard_case.guard == NULL);
+        CHECK_EQ_INT(lstat(source_path, &source_after), 0);
+        CHECK_EQ_INT(lstat(fixture.switch_stage, &stage_after), 0);
+        CHECK(ts_same_identity(&source_before, &source_after));
+        CHECK(ts_same_identity(&source_after, &stage_after));
+        CHECK_EQ_INT(source_after.st_nlink, 2);
+        CHECK(read_text(
+                  fixture.switch_stage, observed,
+                  sizeof(observed)) > 0U);
+        CHECK_STR_EQ(observed, foreign_stage);
+    }
+    h1_guard_case_end(&guard_case);
+    ts_rm_rf(fixture.root);
+}
+
+TEST(parent_guard_adopt_rejects_named_directory_replacement) {
+    cli_owner_fixture_t fixture = {0};
+    h1_guard_case_t guard_case = {0};
+    char displaced_marker[PATH_MAX] = {0};
+    struct stat original_directory = {0};
+    struct stat replacement_directory = {0};
+    struct stat marker = {0};
+    int begin_result = -1;
+    int fixture_result;
+
+    fixture_result = h1_fixture_setup(&fixture);
+    CHECK_EQ_INT(fixture_result, 0);
+    if (fixture_result == 0) {
+        begin_result = h1_guard_case_begin(&fixture, &guard_case);
+    }
+    CHECK_EQ_INT(begin_result, 0);
+    if (begin_result == 0) {
+        CHECK_EQ_INT(
+            config_switch_guard_install_or_adopt(
+                guard_case.ctx, guard_case.target, GIT_SCOPE_GLOBAL,
+                guard_case.destinations, guard_case.destination_count,
+                &guard_case.guard),
+            0);
+        config_switch_guard_abandon(&guard_case.guard);
+        CHECK_EQ_INT(
+            lstat(fixture.config_dir, &original_directory), 0);
+        CHECK_EQ_INT(
+            safe_strncpy(
+                g_switch_guard_directory_path, fixture.config_dir,
+                sizeof(g_switch_guard_directory_path)),
+            0);
+        CHECK(
+            (size_t)snprintf(
+                g_switch_guard_displaced_directory_path,
+                sizeof(g_switch_guard_displaced_directory_path),
+                "%s.displaced", fixture.config_dir) <
+            sizeof(g_switch_guard_displaced_directory_path));
+        CHECK(
+            (size_t)snprintf(
+                displaced_marker, sizeof(displaced_marker),
+                "%s/.switch-incomplete",
+                g_switch_guard_displaced_directory_path) <
+            sizeof(displaced_marker));
+        g_switch_guard_replace_directory_after_read = true;
+        g_switch_guard_directory_replacement_rc = -1;
+        (void)gitswitch_test_set_switch_guard_hook(
+            replace_switch_guard_directory_after_read);
+        errno = 0;
+        CHECK_EQ_INT(
+            config_switch_guard_install_or_adopt(
+                guard_case.ctx, guard_case.target, GIT_SCOPE_GLOBAL,
+                guard_case.destinations, guard_case.destination_count,
+                &guard_case.guard),
+            -1);
+        CHECK_EQ_INT(errno, ESTALE);
+        (void)gitswitch_test_set_switch_guard_hook(NULL);
+        CHECK_EQ_INT(g_switch_guard_directory_replacement_rc, 0);
+        CHECK(!g_switch_guard_replace_directory_after_read);
+        CHECK(guard_case.guard == NULL);
+        CHECK_EQ_INT(
+            lstat(fixture.config_dir, &replacement_directory), 0);
+        CHECK(!ts_same_identity(
+            &original_directory, &replacement_directory));
+        CHECK_EQ_INT(lstat(displaced_marker, &marker), 0);
+        CHECK(S_ISREG(marker.st_mode));
+    }
+    h1_guard_case_end(&guard_case);
+    ts_rm_rf(fixture.root);
+}
+
 #if defined(__FreeBSD__)
 TEST(freebsd_committed_publish_alias_is_restart_reconciled) {
     cli_owner_fixture_t fixture = {0};
@@ -6434,6 +6834,7 @@ TEST(fork_child_disposal_preserves_parent_switch_lock_then_reacquires) {
     int status = 0;
     int begin_result = -1;
     int fixture_result;
+    int directory_fd = -1;
     pid_t child = -1;
     pid_t contender = -1;
     char byte = '\0';
@@ -6452,28 +6853,32 @@ TEST(fork_child_disposal_preserves_parent_switch_lock_then_reacquires) {
                 &guard_case.guard),
             0);
         CHECK(config_switch_guard_was_created(guard_case.guard));
+        directory_fd =
+            gitswitch_test_switch_guard_directory_fd(
+                guard_case.guard);
+        CHECK(directory_fd >= 0);
         CHECK_EQ_INT(pipe(ready_pipe), 0);
         CHECK_EQ_INT(pipe(release_pipe), 0);
         fflush(NULL);
         child = fork();
         CHECK(child >= 0);
         if (child == 0) {
-            int directory_fd =
-                gitswitch_test_switch_guard_directory_fd(
-                    guard_case.guard);
-            int sentinel = directory_fd >= 0
-                               ? openat(
-                                     directory_fd, ".",
-                                     O_RDONLY | O_DIRECTORY |
-                                         O_CLOEXEC | O_NOFOLLOW)
-                               : -1;
+            int sentinel;
 
             close(ready_pipe[0]);
             close(release_pipe[1]);
-            if (directory_fd < 0 || sentinel < 0 ||
-                directory_fd == sentinel ||
-                close(directory_fd) != 0 ||
-                dup2(sentinel, directory_fd) != directory_fd) {
+            errno = 0;
+            if (directory_fd < 0 ||
+                fcntl(directory_fd, F_GETFD) != -1 ||
+                errno != EBADF) {
+                _exit(18);
+            }
+            sentinel = open(
+                fixture.config_dir,
+                O_RDONLY | O_DIRECTORY | O_CLOEXEC | O_NOFOLLOW);
+            if (sentinel < 0 ||
+                (sentinel != directory_fd &&
+                 dup2(sentinel, directory_fd) != directory_fd)) {
                 _exit(19);
             }
             config_switch_guard_abandon(&guard_case.guard);
@@ -6486,7 +6891,7 @@ TEST(fork_child_disposal_preserves_parent_switch_lock_then_reacquires) {
                 _exit(22);
             }
             close(directory_fd);
-            close(sentinel);
+            if (sentinel != directory_fd) close(sentinel);
             _exit(0);
         }
         close(ready_pipe[1]);
@@ -7055,6 +7460,20 @@ TEST_MAIN_BEGIN()
     RUN_TEST(
         parent_guard_probe_rejects_parse_valid_token_mutation_after_exact_proof);
     RUN_TEST(parent_guard_abandon_then_adopt_reuses_exact_authority);
+#if !defined(__FreeBSD__)
+    RUN_TEST(
+        parent_guard_adopts_exact_portable_pair_after_normalization);
+#endif
+    RUN_TEST(
+        parent_guard_stage_only_preintent_precedes_fresh_publication);
+    RUN_TEST(
+        parent_guard_adopt_accepts_ctime_only_canonical_successor);
+    RUN_TEST(
+        parent_guard_adopt_rejects_restored_mtime_byte_mutation);
+    RUN_TEST(
+        parent_guard_rejects_and_retains_foreign_stage_hardlink);
+    RUN_TEST(
+        parent_guard_adopt_rejects_named_directory_replacement);
 #if defined(__FreeBSD__)
     RUN_TEST(freebsd_committed_publish_alias_is_restart_reconciled);
     RUN_TEST(freebsd_uncertain_publish_outcome_is_not_precommit);

@@ -1072,6 +1072,7 @@ TEST(post_spawn_runner_failure_reaps_runtime_and_allows_retry) {
     char agent_dir[128], current[192], sock[192], pidfile[192];
     ssh_config_t cfg;
     account_t account;
+    error_context_t launch_error;
     command_runner_fn previous;
     ssh_reap_test_ops_t previous_reap_ops;
     const ssh_reap_test_ops_t fake_reap_ops = {
@@ -1101,28 +1102,88 @@ TEST(post_spawn_runner_failure_reaps_runtime_and_allows_retry) {
     previous = run_set_runner(post_spawn_failure_runner);
     CHECK_EQ_INT(ssh_start_isolated_agent(&cfg, &account), -1);
     run_set_runner(previous);
+    launch_error = *get_last_error();
 
     CHECK(g_post_spawn_agent_pid > 1);
-    for (int i = 0; i < 50 && g_post_spawn_agent_pid > 1 &&
-                        kill(g_post_spawn_agent_pid, 0) == 0; i++) {
-        int status = 0;
-        struct timespec delay = {.tv_sec = 0, .tv_nsec = 10000000L};
-        pid_t waited = waitpid(g_post_spawn_agent_pid, &status, WNOHANG);
-        if (waited == g_post_spawn_agent_pid) break;
-        nanosleep(&delay, NULL);
+    if (cfg.agent_owned) {
+        bool native_generation =
+            cfg.agent_generation.kind == SSH_PROCESS_GENERATION_DARWIN ||
+            cfg.agent_generation.kind == SSH_PROCESS_GENERATION_FREEBSD;
+
+        /*
+         * Hosts without a recoverable process descriptor cannot safely signal
+         * a daemonized PID after an ambiguous parent-side runner failure.
+         * The exact live tuple must instead remain durable until the ordinary
+         * endpoint-retirement path consumes it.
+         */
+        CHECK_EQ_INT(launch_error.code, ERR_SSH_AGENT_START_FAILED);
+        CHECK_EQ_INT(launch_error.system_errno, 0);
+        CHECK_STR_EQ(
+            launch_error.message,
+            "SSH agent runner failed after an ambiguous launch; "
+            "runtime durably retained for retry");
+        CHECK_EQ_INT(kill(g_post_spawn_agent_pid, 0), 0);
+        CHECK(entry_exists(sock));
+        CHECK(entry_exists(pidfile));
+        CHECK(!entry_exists(current));
+        CHECK_EQ_INT(cfg.agent_pid, g_post_spawn_agent_pid);
+        CHECK_STR_EQ(cfg.agent_socket_path, sock);
+        CHECK(cfg.agent_generation.kind != SSH_PROCESS_GENERATION_NONE);
+        CHECK(cfg.agent_image.valid);
+
+        if (native_generation) {
+            CHECK_EQ_INT(ssh_stop_agent(&cfg), 0);
+            CHECK_EQ_INT(kill(g_post_spawn_agent_pid, 0), 0);
+        } else {
+            /*
+             * Linux may also lack a usable pidfd under an older kernel or a
+             * restrictive sandbox, but it has no native endpoint-retirement
+             * fallback. Terminate this test-owned daemon first, then let the
+             * ordinary gone-process path consume the durable tuple.
+             */
+            CHECK_EQ_INT(cfg.agent_generation.kind,
+                         SSH_PROCESS_GENERATION_LINUX);
+            stop_real_agent(g_post_spawn_agent_pid, sock, current);
+            CHECK_EQ_INT(ssh_stop_agent(&cfg), 0);
+        }
+        CHECK(!entry_exists(sock));
+        CHECK(!entry_exists(pidfile));
+        CHECK(!entry_exists(current));
+        CHECK(!cfg.agent_owned);
+        CHECK_EQ_INT(cfg.agent_pid, -1);
+        CHECK(cfg.agent_socket_path[0] == '\0');
+
+        /*
+         * Native endpoint retirement deliberately makes no process-death
+         * claim. The fixture owns this detached daemon, so reap it explicitly
+         * after the product has removed the recoverable namespace.
+         */
+        if (native_generation) {
+            stop_real_agent(g_post_spawn_agent_pid, sock, current);
+        }
+    } else {
+        for (int i = 0; i < 50 && g_post_spawn_agent_pid > 1 &&
+                            kill(g_post_spawn_agent_pid, 0) == 0; i++) {
+            int status = 0;
+            struct timespec delay = {.tv_sec = 0, .tv_nsec = 10000000L};
+            pid_t waited = waitpid(g_post_spawn_agent_pid, &status, WNOHANG);
+            if (waited == g_post_spawn_agent_pid) break;
+            nanosleep(&delay, NULL);
+        }
+        pid_gone = g_post_spawn_agent_pid > 1 &&
+                   kill(g_post_spawn_agent_pid, 0) != 0 && errno == ESRCH;
+        CHECK(pid_gone);
+        CHECK(!entry_exists(sock));
+        CHECK(!entry_exists(pidfile));
+        CHECK(!entry_exists(current));
+        CHECK_EQ_INT(cfg.agent_pid, -1);
+        CHECK(cfg.agent_socket_path[0] == '\0');
     }
-    pid_gone = g_post_spawn_agent_pid > 1 &&
-               kill(g_post_spawn_agent_pid, 0) != 0 && errno == ESRCH;
-    CHECK(pid_gone);
-    CHECK(!entry_exists(sock));
-    CHECK(!entry_exists(pidfile));
-    CHECK(!entry_exists(current));
-    CHECK(!cfg.agent_owned);
-    CHECK_EQ_INT(cfg.agent_pid, -1);
-    CHECK(cfg.agent_socket_path[0] == '\0');
 
     /* Keep the causal pre-fix run leak-free, then prove the recovered
      * namespace accepts an immediate subsequent start and reset. */
+    pid_gone = g_post_spawn_agent_pid > 1 &&
+               kill(g_post_spawn_agent_pid, 0) != 0 && errno == ESRCH;
     if (!pid_gone || entry_exists(sock) || entry_exists(pidfile) ||
         entry_exists(current)) {
         stop_real_agent(g_post_spawn_agent_pid, sock, current);
@@ -1726,6 +1787,12 @@ TEST(targeted_reset_never_reaps_embedded_nul_pid_prefix) {
  * NUL-oriented strto* call on read_proc_file()'s unterminated bytes. */
 TEST(targeted_reset_preserves_live_socket_when_sidecar_pid_is_bystander) {
     char agent_dir[128], sock[192], current[192], pidfile[192];
+    struct stat socket_before = {0}, socket_after = {0};
+    struct stat current_before = {0}, current_after = {0};
+    struct stat pidfile_before = {0}, pidfile_after = {0};
+    error_context_t reset_error;
+    bool before_identity_valid;
+    bool after_identity_valid;
     pid_t agent_pid = -1;
     pid_t bystander_pid = -1;
     int start_rc;
@@ -1760,17 +1827,34 @@ TEST(targeted_reset_preserves_live_socket_when_sidecar_pid_is_bystander) {
     CHECK_EQ_INT(write_agent_record(agent_dir, "ssh-agent.work.pid",
                                     bystander_pid, true, NULL),
                  0);
+    before_identity_valid =
+        lstat(sock, &socket_before) == 0 &&
+        lstat(current, &current_before) == 0 &&
+        lstat(pidfile, &pidfile_before) == 0;
+    CHECK(before_identity_valid);
 
     CHECK_EQ_INT(ssh_manager_reset("work"), -1); /* pre-fix: 0 */
+    reset_error = *get_last_error();
     CHECK_EQ_INT(kill(agent_pid, 0), 0);          /* socket owner untouched */
     CHECK_EQ_INT(kill(bystander_pid, 0), 0);      /* stale PID never signaled */
-    CHECK(entry_exists(sock));
-    CHECK(entry_exists(current));
+    after_identity_valid =
+        lstat(sock, &socket_after) == 0 &&
+        lstat(current, &current_after) == 0 &&
+        lstat(pidfile, &pidfile_after) == 0;
+    CHECK(after_identity_valid);
+    if (before_identity_valid && after_identity_valid) {
+        CHECK(ts_same_identity(&socket_before, &socket_after));
+        CHECK(ts_same_identity(&current_before, &current_after));
+        CHECK(ts_same_identity(&pidfile_before, &pidfile_after));
+    }
     /* A reachable managed socket means the tuple is unresolved. Preserve its
      * exact sidecar as retry evidence instead of creating a live sidecar-less
      * agent merely because the recorded process is unrelated. */
-    CHECK(entry_exists(pidfile));
-    CHECK(strstr(get_last_error()->message, "no safely matched PID") != NULL);
+    CHECK_EQ_INT(reset_error.code, ERR_FILE_IO);
+    CHECK_EQ_INT(reset_error.system_errno, 0);
+    CHECK(strstr(reset_error.message, "no safely matched PID") != NULL ||
+          strstr(reset_error.message,
+                 "process identity outcome UNRELATED") != NULL);
 
     (void)kill(bystander_pid, SIGKILL);
     (void)waitpid(bystander_pid, &status, 0);
@@ -1812,11 +1896,11 @@ TEST(reset_all_retains_live_agent_when_sidecar_is_missing) {
     stop_real_agent(pid, sock, current);
 }
 
-#ifdef __APPLE__
-/* Without pidfd signaling, Darwin retires an exact native v2 endpoint by
+#if defined(__APPLE__) || defined(__FreeBSD__)
+/* Without pidfd signaling, BSD hosts retire an exact native v2 endpoint by
  * clearing identities and detaching its managed namespace. The process may
  * remain alive, which is intentionally distinct from claiming it was reaped. */
-TEST(darwin_reset_retires_managed_agent_endpoint_without_process_claim) {
+TEST(native_reset_retires_managed_agent_endpoint_without_process_claim) {
     char agent_dir[128], sock[192], current[192], pidfile[192];
     char *large_environment;
     char *saved_environment = NULL;
@@ -1876,7 +1960,9 @@ TEST(darwin_reset_retires_managed_agent_endpoint_without_process_claim) {
 
     stop_real_agent(pid, sock, current);
 }
+#endif
 
+#ifdef __APPLE__
 /* Exact process metadata is not enough: a same-shape listener that does not
  * implement the SSH-agent protocol must be retained without signaling. */
 TEST(darwin_reset_retains_non_agent_listener_with_valid_process_record) {
@@ -1952,8 +2038,10 @@ int main(int argc, char **argv) {
     RUN_TEST(targeted_reset_never_reaps_embedded_nul_pid_prefix);
     RUN_TEST(targeted_reset_preserves_live_socket_when_sidecar_pid_is_bystander);
     RUN_TEST(reset_all_retains_live_agent_when_sidecar_is_missing);
+#if defined(__APPLE__) || defined(__FreeBSD__)
+    RUN_TEST(native_reset_retires_managed_agent_endpoint_without_process_claim);
+#endif
 #ifdef __APPLE__
-    RUN_TEST(darwin_reset_retires_managed_agent_endpoint_without_process_claim);
     RUN_TEST(darwin_reset_retains_non_agent_listener_with_valid_process_record);
 #endif
     if (g_fake_agent_listener >= 0) close(g_fake_agent_listener);

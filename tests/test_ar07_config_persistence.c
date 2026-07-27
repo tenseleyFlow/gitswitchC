@@ -708,6 +708,105 @@ TEST(backups_are_durable_monotonic_and_bounded) {
     for (int i = 2; i < 7; i++) CHECK(seen[i]);
 }
 
+TEST(backup_prunes_recognized_legacy_names_in_generation_order) {
+    static const char *const names[] = {
+        "accounts.toml.backup.20240101_000000",
+        "accounts.toml.backup.20240101_000000_1",
+        "accounts.toml.backup.20240101_000000_2",
+        "accounts.toml.backup.20240101_000001",
+        "accounts.toml.backup.20240101_000001_1",
+        "accounts.toml.backup.20240102_000000",
+        "accounts.toml.backup.20240102_000000_9"
+    };
+    char dir[128], path[256], backup[512];
+    config_backup_clock_fn previous_clock;
+
+    CHECK_EQ_INT(private_dir(dir, sizeof(dir)), 0);
+    snprintf(path, sizeof(path), "%s/accounts.toml", dir);
+    CHECK_EQ_INT(write_private(path, one_account), 0);
+    for (size_t i = 0; i < sizeof(names) / sizeof(names[0]); i++) {
+        snprintf(backup, sizeof(backup), "%s/%s", dir, names[i]);
+        CHECK_EQ_INT(write_private(backup, one_account), 0);
+    }
+
+    previous_clock = config_set_backup_clock_fn(fixed_clock);
+    CHECK_EQ_INT(config_backup(path), 0);
+    config_set_backup_clock_fn(previous_clock);
+
+    CHECK_EQ_INT(count_prefix(dir, "accounts.toml.backup."), 5);
+    for (size_t i = 0; i < sizeof(names) / sizeof(names[0]); i++) {
+        snprintf(backup, sizeof(backup), "%s/%s", dir, names[i]);
+        if (i < 3) {
+            CHECK(access(backup, F_OK) != 0);
+        } else {
+            CHECK_EQ_INT(access(backup, F_OK), 0);
+        }
+    }
+    CHECK_EQ_INT(backup_generation_path(backup, sizeof(backup), path, 0), 0);
+    CHECK_EQ_INT(access(backup, F_OK), 0);
+    ts_rm_rf(dir);
+}
+
+TEST(backup_retains_malformed_legacy_near_misses_while_pruning_valid_names) {
+    static const char *const valid_names[] = {
+        "accounts.toml.backup.20230101_000000",
+        "accounts.toml.backup.20230101_000000_1",
+        "accounts.toml.backup.20230102_000000",
+        "accounts.toml.backup.20230102_000000_1",
+        "accounts.toml.backup.20230103_000000",
+        "accounts.toml.backup.20230103_000000_1"
+    };
+    static const char *const malformed_names[] = {
+        "accounts.toml.backup.2023010_000000",
+        "accounts.toml.backup.20230101-000000",
+        "accounts.toml.backup.20230101_00000",
+        "accounts.toml.backup.20230101_000000_",
+        "accounts.toml.backup.20230101_000000_x",
+        "accounts.toml.backup.20230101_000000_18446744073709551616",
+        "accounts.toml.backup.20230101_000000_123456789012345678901",
+        "accounts.toml.backup.20230101_000000junk"
+    };
+    char dir[128], path[256], backup[512];
+    config_backup_clock_fn previous_clock;
+
+    CHECK_EQ_INT(private_dir(dir, sizeof(dir)), 0);
+    snprintf(path, sizeof(path), "%s/accounts.toml", dir);
+    CHECK_EQ_INT(write_private(path, one_account), 0);
+    for (size_t i = 0;
+         i < sizeof(valid_names) / sizeof(valid_names[0]); i++) {
+        snprintf(backup, sizeof(backup), "%s/%s", dir, valid_names[i]);
+        CHECK_EQ_INT(write_private(backup, one_account), 0);
+    }
+    for (size_t i = 0;
+         i < sizeof(malformed_names) / sizeof(malformed_names[0]); i++) {
+        snprintf(backup, sizeof(backup), "%s/%s", dir, malformed_names[i]);
+        CHECK_EQ_INT(write_private(backup, "user data\n"), 0);
+    }
+
+    previous_clock = config_set_backup_clock_fn(fixed_clock);
+    CHECK_EQ_INT(config_backup(path), 0);
+    config_set_backup_clock_fn(previous_clock);
+
+    CHECK_EQ_INT(count_prefix(dir, "accounts.toml.backup."), 13);
+    for (size_t i = 0;
+         i < sizeof(valid_names) / sizeof(valid_names[0]); i++) {
+        snprintf(backup, sizeof(backup), "%s/%s", dir, valid_names[i]);
+        if (i < 2) {
+            CHECK(access(backup, F_OK) != 0);
+        } else {
+            CHECK_EQ_INT(access(backup, F_OK), 0);
+        }
+    }
+    for (size_t i = 0;
+         i < sizeof(malformed_names) / sizeof(malformed_names[0]); i++) {
+        snprintf(backup, sizeof(backup), "%s/%s", dir, malformed_names[i]);
+        CHECK_EQ_INT(access(backup, F_OK), 0);
+    }
+    CHECK_EQ_INT(backup_generation_path(backup, sizeof(backup), path, 0), 0);
+    CHECK_EQ_INT(access(backup, F_OK), 0);
+    ts_rm_rf(dir);
+}
+
 TEST(backup_pruning_requires_complete_directory_enumeration) {
     char dir[128], path[256], backup[512], body[512];
     config_backup_clock_fn previous_clock;
@@ -2051,6 +2150,8 @@ TEST_MAIN_BEGIN()
     RUN_TEST(default_create_fault_matrix_is_atomic_and_closes_fds);
     RUN_TEST(default_create_signal_death_is_truthful_at_every_boundary);
     RUN_TEST(backups_are_durable_monotonic_and_bounded);
+    RUN_TEST(backup_prunes_recognized_legacy_names_in_generation_order);
+    RUN_TEST(backup_retains_malformed_legacy_near_misses_while_pruning_valid_names);
     RUN_TEST(backup_pruning_requires_complete_directory_enumeration);
     RUN_TEST(backup_faults_abort_and_full_save_rolls_state_back);
     RUN_TEST(full_save_rollback_preserves_a_later_state_generation);
