@@ -11,6 +11,8 @@
 
 #include <errno.h>
 #include <fcntl.h>
+#include <limits.h>
+#include <poll.h>
 #include <signal.h>
 #include <stdint.h>
 #include <stdlib.h>
@@ -438,6 +440,48 @@ static int64_t test_monotonic_ms(void) {
     return (int64_t)now.tv_sec * 1000 + now.tv_nsec / 1000000;
 }
 
+static bool read_full_within(int fd, void *buffer, size_t length,
+                             int timeout_ms) {
+    int64_t start = test_monotonic_ms();
+    if (fd < 0 || (!buffer && length != 0) || timeout_ms < 0 ||
+        start < 0 || start > INT64_MAX - (int64_t)timeout_ms) {
+        return false;
+    }
+    int64_t deadline = start + timeout_ms;
+    unsigned char *bytes = buffer;
+    size_t offset = 0;
+    while (offset < length) {
+        int64_t now = test_monotonic_ms();
+        if (now < 0 || now > deadline) return false;
+        int64_t remaining = deadline - now;
+        int poll_timeout =
+            remaining > INT_MAX ? INT_MAX : (int)remaining;
+        struct pollfd descriptor = {
+            .fd = fd,
+            .events = POLLIN,
+            .revents = 0
+        };
+        int ready = poll(&descriptor, 1, poll_timeout);
+        if (ready == 0) return false;
+        if (ready < 0) {
+            if (errno == EINTR) continue;
+            return false;
+        }
+        if ((descriptor.revents & (POLLERR | POLLNVAL)) != 0) {
+            return false;
+        }
+        ssize_t got = read(fd, bytes + offset, length - offset);
+        if (got > 0) {
+            offset += (size_t)got;
+        } else if (got == 0) {
+            return false;
+        } else if (errno != EINTR) {
+            return false;
+        }
+    }
+    return true;
+}
+
 static bool waitpid_within(pid_t pid, int timeout_ms, int *status_out) {
     struct timespec pause = {.tv_sec = 0, .tv_nsec = 10000000L};
     int elapsed = 0;
@@ -459,6 +503,24 @@ static bool reap_within(pid_t pid, int timeout_ms, int *status_out) {
     if (waitpid_within(pid, timeout_ms, status_out)) return true;
     if (kill(pid, SIGKILL) != 0 && errno != ESRCH) return false;
     return waitpid_within(pid, 1000, status_out);
+}
+
+TEST(bounded_pipe_read_times_out_while_writer_remains_open) {
+    int held_open[2];
+    if (pipe(held_open) != 0) {
+        CHECK(false);
+        return;
+    }
+    unsigned char byte = 0;
+    int64_t start = test_monotonic_ms();
+    bool read_succeeded =
+        read_full_within(held_open[0], &byte, sizeof(byte), 50);
+    int64_t elapsed = test_monotonic_ms() - start;
+    close(held_open[0]);
+    close(held_open[1]);
+
+    CHECK(!read_succeeded);
+    CHECK(start >= 0 && elapsed >= 0 && elapsed < 1000);
 }
 
 /* M45/T13: with no descriptor available even for trusted-command pinning,
@@ -1501,6 +1563,15 @@ cleanup:
     return outcome;
 }
 
+static void abort_pty_worker(pid_t worker, int *master) {
+    int status = 0;
+    if (master && *master >= 0) {
+        close(*master);
+        *master = -1;
+    }
+    (void)reap_within(worker, 0, &status);
+}
+
 static bool pty_control_round_trip(unsigned char control,
                                    int expected_signal,
                                    bool expect_pending) {
@@ -1539,10 +1610,11 @@ static bool pty_control_round_trip(unsigned char control,
     close(slave);
     close(ready[1]);
     pid_t caller_group = 0;
-    ssize_t got = read(ready[0], &caller_group, sizeof(caller_group));
+    bool got_ready = read_full_within(
+        ready[0], &caller_group, sizeof(caller_group), 2000);
     close(ready[0]);
-    if (got != (ssize_t)sizeof(caller_group)) {
-        close(master);
+    if (!got_ready) {
+        abort_pty_worker(worker, &master);
         return false;
     }
     bool transferred = false;
@@ -1556,8 +1628,7 @@ static bool pty_control_round_trip(unsigned char control,
         nanosleep(&delay, NULL);
     }
     if (!transferred || write(master, &control, 1U) != 1) {
-        (void)kill(worker, SIGKILL);
-        close(master);
+        abort_pty_worker(worker, &master);
         return false;
     }
     int status = 0;
@@ -1573,7 +1644,7 @@ static bool pty_control_round_trip(unsigned char control,
     }
     if (!reaped) {
         (void)kill(worker, SIGKILL);
-        (void)waitpid_within(worker, 1000, &status);
+        reaped = waitpid_within(worker, 1000, &status);
     }
     bool passed =
         reaped && WIFEXITED(status) && WEXITSTATUS(status) == 0;
@@ -2492,6 +2563,7 @@ int main(int argc, char **argv) {
     RUN_TEST(sigpipe_initial_pending_instance_survives_no_input_execution);
     RUN_TEST(sigpipe_initial_pending_instance_survives_epipe);
     RUN_TEST(sigpipe_runner_generated_epipe_leaves_no_pending_instance);
+    RUN_TEST(bounded_pipe_read_times_out_while_writer_remains_open);
     RUN_TEST(runner_fails_before_spawn_under_fd_exhaustion);
     RUN_TEST(child_setup_status_is_reported_explicitly);
     RUN_TEST(process_group_supervisor_setup_failure_is_truthful_and_reaped);
