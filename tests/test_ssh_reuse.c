@@ -1053,9 +1053,9 @@ TEST(reuse_aborts_on_agent_directory_namespace_replacement) {
 /* A fresh agent is started with a relative -a argument and a pinned cwd.
  * Even when the public directory pathname is replaced inside the runner, no
  * sidecar/link may be split across namespaces and success may not be reported
- * through a public path that names the replacement. Linux can probe and
- * retire the descriptor-anchored old socket; other platforms preserve that
- * inert residue while clearing every ownership claim. */
+ * through a public path that names the replacement. Linux and FreeBSD can
+ * probe and retire the descriptor-anchored old socket; fallback platforms
+ * preserve that inert residue while clearing every ownership claim. */
 TEST(fresh_start_aborts_without_claiming_replaced_namespace) {
     char public_dir[256];
     char public_sock[384];
@@ -1093,7 +1093,7 @@ TEST(fresh_start_aborts_without_claiming_replaced_namespace) {
     snprintf(moved_current, sizeof(moved_current),
              "%s/current.sock", g_moved_agent_dir);
     CHECK(!path_exists(public_sock));
-#if defined(__linux__)
+#if defined(__linux__) || defined(__FreeBSD__)
     CHECK(!path_exists(moved_sock));
 #else
     CHECK(path_exists(moved_sock));
