@@ -9064,7 +9064,11 @@ static int gpg_validate_agent_config_update(
  * pathname generation. */
 static int gpg_reprove_agent_config_after_close(
     int home_fd, gpg_agent_config_update_t *update) {
-    enum { GPG_AGENT_POSTCLOSE_PROOF_ATTEMPTS = 4 };
+    /* FreeBSD/UFS can expose four delayed ctime-only successors under a
+     * loaded suite before the closed file's pathname generation settles.
+     * Keep enough room for those finite filesystem transitions while the
+     * exact byte proof on every attempt still bounds continuous mutation. */
+    enum { GPG_AGENT_POSTCLOSE_PROOF_ATTEMPTS = 8 };
     struct stat expected;
 
     if (home_fd < 0 || !update || update->config_fd >= 0 ||
