@@ -121,11 +121,15 @@ typedef struct {
     char target[MAX_PATH_LEN];
 } ssh_current_link_identity_t;
 
+#define SSH_PID_RECORD_MAX_BYTES (MAX_PATH_LEN + 320U)
+
 typedef struct {
     struct stat identity;
     int fd;
     bool observational;
     char anchor[96];
+    unsigned char *exact_bytes;
+    size_t exact_bytes_len;
 } ssh_runtime_pin_t;
 
 static bool pinned_pid_sidecar_matches_record(
@@ -133,8 +137,8 @@ static bool pinned_pid_sidecar_matches_record(
 static int retire_recorded_agent_endpoint(
     int dir_fd, const char *socket_dir, const char *socket_name,
     const char *socket_path, const char *pid_name,
-    const ssh_runtime_pin_t *socket_pin,
-    const ssh_runtime_pin_t *pid_pin,
+    ssh_runtime_pin_t *socket_pin,
+    ssh_runtime_pin_t *pid_pin,
     const ssh_agent_record_t *record);
 
 /* A malformed sidecar is materially different from an unsafe or unstable
@@ -186,10 +190,10 @@ static int observe_ssh_runtime_entry_at(int dir_fd, const char *name,
                                         ssh_runtime_pin_t *pin);
 static int verify_ssh_runtime_pin_at(int dir_fd, const char *name,
                                      const char *display_path,
-                                     const ssh_runtime_pin_t *pin);
+                                     ssh_runtime_pin_t *pin);
 static int prove_malformed_pid_socket_dead_at(
     int dir_fd, const char *socket_dir, const char *socket_name,
-    const char *socket_path, const ssh_runtime_pin_t *socket_pin,
+    const char *socket_path, ssh_runtime_pin_t *socket_pin,
     bool socket_present, bool allow_detached_namespace,
     const char *record_description);
 static int retire_reaped_socket_if_dead(
@@ -236,7 +240,7 @@ static int unlink_ssh_runtime_identity_at(
 static int unlink_ssh_reset_path_at(int dir_fd, const char *name,
                                     const char *display_path,
                                     const char *description,
-                                    const ssh_runtime_pin_t *pin,
+                                    ssh_runtime_pin_t *pin,
                                     bool expected_present);
 static int wait_for_ssh_probe(int fd, int timeout_ms);
 static int probe_ssh_agent_socket(const char *path, bool *reachable);
@@ -7235,6 +7239,86 @@ static int ssh_config_fd_matches_bytes(int fd, const char *expected,
     }
 }
 
+/* A retained config inode may expose a ctime-only successor after metadata
+ * finalization or a directory durability barrier. Rebind only when every
+ * observation still names the same regular inode with identical
+ * security/content metadata, and only after the retained descriptor's bytes
+ * and EOF match exactly. Including both the public name and a final descriptor
+ * stat in the bounded stability pass prevents a one-sided delayed ctime
+ * observation from becoming a false transaction conflict. */
+static int reprove_ssh_config_ctime_successor(
+    int dir_fd, const char *display_path, const struct stat *identity,
+    int pinned_fd, const char *original, size_t original_len,
+    struct stat *pinned_out, struct stat *named_out) {
+    if (!original || identity->st_size < 0 ||
+        (size_t)identity->st_size != original_len) {
+        return 0;
+    }
+
+    for (int attempt = 0; attempt < 8; attempt++) {
+        struct stat before_read;
+        struct stat after_read;
+        struct stat named;
+        struct stat final;
+        bool bytes_match = false;
+
+        if (fstat(pinned_fd, &before_read) != 0) {
+            set_system_error(ERR_FILE_IO,
+                             "Cannot recheck pinned SSH config: %s",
+                             display_path);
+            return -1;
+        }
+        if (!same_ssh_config_snapshot_except_ctime(identity, &before_read)) {
+            *pinned_out = before_read;
+            return 0;
+        }
+        if (ssh_config_fd_matches_bytes(pinned_fd, original, original_len,
+                                        &bytes_match) != 0) {
+            return -1;
+        }
+        if (!bytes_match) {
+            set_error(ERR_FILE_IO,
+                      "Pinned SSH config bytes changed before update: %s",
+                      display_path);
+            return -1;
+        }
+        if (fstat(pinned_fd, &after_read) != 0) {
+            set_system_error(
+                ERR_FILE_IO,
+                "Cannot finish pinned SSH config revalidation: %s",
+                display_path);
+            return -1;
+        }
+        if (fstatat(dir_fd, "config", &named, AT_SYMLINK_NOFOLLOW) != 0) {
+            set_system_error(ERR_FILE_IO,
+                             "SSH config changed before update: %s",
+                             display_path);
+            return -1;
+        }
+        if (fstat(pinned_fd, &final) != 0) {
+            set_system_error(
+                ERR_FILE_IO,
+                "Cannot finish pinned SSH config revalidation: %s",
+                display_path);
+            return -1;
+        }
+        *pinned_out = final;
+        *named_out = named;
+
+        if (!same_ssh_config_snapshot_except_ctime(identity, &after_read) ||
+            !same_ssh_config_snapshot_except_ctime(identity, &named) ||
+            !same_ssh_config_snapshot_except_ctime(identity, &final)) {
+            return 0;
+        }
+        if (same_ssh_config_snapshot(&before_read, &after_read) &&
+            same_ssh_config_snapshot(&after_read, &named) &&
+            same_ssh_config_snapshot(&named, &final)) {
+            return 1;
+        }
+    }
+    return 0;
+}
+
 /* Refuse to rename over a path whose final component changed after the safe
  * read. For a previously absent config, any newly-created entry is a conflict;
  * for an existing config, both the retained descriptor and public name must
@@ -7246,14 +7330,10 @@ static int ssh_config_recheck_before_rename(int dir_fd,
                                             int pinned_fd,
                                             const char *original,
                                             size_t original_len) {
-    struct stat expected;
     struct stat pinned;
     struct stat now;
 
-    expected = *identity;
     if (existed) {
-        bool bytes_match = false;
-
         if (pinned_fd < 0) {
             set_error(ERR_FILE_IO,
                       "Missing pinned SSH config descriptor: %s",
@@ -7266,63 +7346,6 @@ static int ssh_config_recheck_before_rename(int dir_fd,
                              display_path);
             return -1;
         }
-        if (!same_ssh_config_snapshot(identity, &pinned)) {
-            struct stat candidate;
-            bool stabilized = false;
-
-            /* FreeBSD can advance the retained inode's ctime while finalizing
-             * our own earlier read.  Accept only that single-field shape, and
-             * only after a bounded stable pass proves the pinned bytes and EOF
-             * are still exactly what the transaction parsed. */
-            if (!same_ssh_config_snapshot_except_ctime(identity, &pinned) ||
-                same_ssh_config_ctime(identity, &pinned) ||
-                pinned.st_size < 0 ||
-                (size_t)pinned.st_size != original_len || !original) {
-                set_error(ERR_FILE_IO,
-                          "Pinned SSH config changed before update: %s",
-                          display_path);
-                return -1;
-            }
-            candidate = pinned;
-            for (int attempt = 0; attempt < 2; attempt++) {
-                struct stat after_read;
-
-                if (ssh_config_fd_matches_bytes(pinned_fd, original,
-                                                original_len,
-                                                &bytes_match) != 0) {
-                    return -1;
-                }
-                if (!bytes_match) {
-                    break;
-                }
-                if (fstat(pinned_fd, &after_read) != 0) {
-                    set_system_error(
-                        ERR_FILE_IO,
-                        "Cannot finish pinned SSH config revalidation: %s",
-                        display_path);
-                    return -1;
-                }
-                if (same_ssh_config_snapshot(&candidate, &after_read)) {
-                    expected = after_read;
-                    stabilized = true;
-                    break;
-                }
-                if (attempt == 0 &&
-                    same_ssh_config_snapshot_except_ctime(&candidate,
-                                                          &after_read) &&
-                    !same_ssh_config_ctime(&candidate, &after_read)) {
-                    candidate = after_read;
-                    continue;
-                }
-                break;
-            }
-            if (!stabilized) {
-                set_error(ERR_FILE_IO,
-                          "Pinned SSH config bytes changed before update: %s",
-                          display_path);
-                return -1;
-            }
-        }
     }
 
     if (fstatat(dir_fd, "config", &now, AT_SYMLINK_NOFOLLOW) != 0) {
@@ -7333,24 +7356,35 @@ static int ssh_config_recheck_before_rename(int dir_fd,
                          display_path);
         return -1;
     }
-    if (!existed || !same_ssh_config_snapshot(&expected, &now)) {
-        set_error(ERR_FILE_IO,
-                  "SSH config changed before update; refusing to continue: %s "
-                  "[existed=%d regular=%d dev=%d ino=%d mode=%d uid=%d gid=%d "
-                  "nlink=%d size=%d mtime=%d ctime=%d]",
-                  display_path, existed, S_ISREG(now.st_mode),
-                  expected.st_dev == now.st_dev,
-                  expected.st_ino == now.st_ino,
-                  expected.st_mode == now.st_mode,
-                  expected.st_uid == now.st_uid,
-                  expected.st_gid == now.st_gid,
-                  expected.st_nlink == now.st_nlink,
-                  expected.st_size == now.st_size,
-                  same_ssh_config_mtime(&expected, &now),
-                  same_ssh_config_ctime(&expected, &now));
-        return -1;
+    if (existed && same_ssh_config_snapshot(identity, &pinned) &&
+        same_ssh_config_snapshot(identity, &now)) {
+        return 0;
     }
-    return 0;
+    if (existed &&
+        same_ssh_config_snapshot_except_ctime(identity, &pinned) &&
+        same_ssh_config_snapshot_except_ctime(identity, &now)) {
+        int rebound = reprove_ssh_config_ctime_successor(
+            dir_fd, display_path, identity, pinned_fd, original, original_len,
+            &pinned, &now);
+
+        if (rebound > 0) return 0;
+        if (rebound < 0) return -1;
+    }
+    set_error(ERR_FILE_IO,
+              "SSH config changed before update; refusing to continue: %s "
+              "[existed=%d regular=%d dev=%d ino=%d mode=%d uid=%d gid=%d "
+              "nlink=%d size=%d mtime=%d ctime=%d]",
+              display_path, existed, S_ISREG(now.st_mode),
+              identity->st_dev == now.st_dev,
+              identity->st_ino == now.st_ino,
+              identity->st_mode == now.st_mode,
+              identity->st_uid == now.st_uid,
+              identity->st_gid == now.st_gid,
+              identity->st_nlink == now.st_nlink,
+              identity->st_size == now.st_size,
+              same_ssh_config_mtime(identity, &now),
+              same_ssh_config_ctime(identity, &now));
+    return -1;
 }
 
 /* Rebind the final no-op proof to the currently public HOME/.ssh path. Opening
@@ -9907,10 +9941,47 @@ static bool same_runtime_revision(const struct stat *before,
 #endif
 }
 
+#if defined(__FreeBSD__)
+static bool same_freebsd_runtime_revision_except_ctime(
+    const struct stat *before, const struct stat *after) {
+    return same_runtime_identity(before, after) &&
+           before->st_gid == after->st_gid &&
+           before->st_nlink == after->st_nlink &&
+           before->st_size == after->st_size &&
+           before->st_gen == after->st_gen &&
+           before->st_birthtim.tv_sec == after->st_birthtim.tv_sec &&
+           before->st_birthtim.tv_nsec == after->st_birthtim.tv_nsec &&
+           before->st_mtim.tv_sec == after->st_mtim.tv_sec &&
+           before->st_mtim.tv_nsec == after->st_mtim.tv_nsec;
+}
+#endif
+
 static void ssh_runtime_pin_init(ssh_runtime_pin_t *pin) {
     if (!pin) return;
     memset(pin, 0, sizeof(*pin));
     pin->fd = -1;
+}
+
+static int ssh_runtime_pin_retain_exact_bytes(
+    ssh_runtime_pin_t *pin, const unsigned char *bytes, size_t length) {
+    unsigned char *copy;
+
+    if (!pin || (!bytes && length != 0U)) {
+        set_error(ERR_INVALID_ARGS,
+                  "Invalid SSH runtime exact-byte proof");
+        return -1;
+    }
+    copy = malloc(length == 0U ? 1U : length);
+    if (!copy) {
+        set_error(ERR_MEMORY_ALLOCATION,
+                  "Cannot retain exact SSH runtime bytes");
+        return -1;
+    }
+    if (length != 0U) memcpy(copy, bytes, length);
+    free(pin->exact_bytes);
+    pin->exact_bytes = copy;
+    pin->exact_bytes_len = length;
+    return 0;
 }
 
 static int stat_ssh_runtime_pin(const ssh_runtime_pin_t *pin,
@@ -9928,6 +9999,109 @@ static int stat_ssh_runtime_pin(const ssh_runtime_pin_t *pin,
     errno = EBADF;
     return -1;
 }
+
+#if defined(__FreeBSD__)
+static int ssh_runtime_pin_matches_exact_bytes(
+    const ssh_runtime_pin_t *pin) {
+    unsigned char chunk[4096];
+    size_t offset = 0;
+
+    if (!pin || pin->fd < 0 || !pin->exact_bytes) return 0;
+    while (offset < pin->exact_bytes_len) {
+        size_t wanted = pin->exact_bytes_len - offset;
+        ssize_t n;
+
+        if (wanted > sizeof(chunk)) wanted = sizeof(chunk);
+        do {
+            n = pread(pin->fd, chunk, wanted, (off_t)offset);
+        } while (n < 0 && errno == EINTR);
+        if (n < 0) {
+            set_system_error(
+                ERR_FILE_IO,
+                "Cannot revalidate exact SSH runtime bytes");
+            return -1;
+        }
+        if (n == 0 ||
+            memcmp(chunk, pin->exact_bytes + offset, (size_t)n) != 0) {
+            return 0;
+        }
+        offset += (size_t)n;
+    }
+    for (;;) {
+        ssize_t n = pread(pin->fd, chunk, 1, (off_t)offset);
+        if (n < 0 && errno == EINTR) continue;
+        if (n < 0) {
+            set_system_error(
+                ERR_FILE_IO,
+                "Cannot confirm exact SSH runtime byte length");
+            return -1;
+        }
+        return n == 0 ? 1 : 0;
+    }
+}
+
+/* UFS may expose a ctime successor after a completed read or directory
+ * durability barrier. Rebind only the exact retained regular-file pin, only
+ * when every identity/security/content metadata field except ctime is
+ * unchanged, and only after a bounded stable exact-byte/EOF reproof. */
+static int rebind_freebsd_runtime_pin_ctime_successor(
+    int dir_fd, const char *name, ssh_runtime_pin_t *pin,
+    const struct stat *held, const struct stat *named) {
+    if (!pin || pin->fd < 0 || !pin->exact_bytes ||
+        !S_ISREG(pin->identity.st_mode) ||
+        !same_freebsd_runtime_revision_except_ctime(
+            &pin->identity, held) ||
+        !same_freebsd_runtime_revision_except_ctime(
+            &pin->identity, named)) {
+        return 0;
+    }
+    for (int attempt = 0; attempt < 8; attempt++) {
+        struct stat held_before;
+        struct stat held_after;
+        struct stat named_after;
+        struct stat held_final;
+        int bytes_match;
+
+        if (fstat(pin->fd, &held_before) != 0) {
+            set_system_error(
+                ERR_FILE_IO,
+                "Cannot begin exact SSH runtime revalidation");
+            return -1;
+        }
+        if (!same_freebsd_runtime_revision_except_ctime(
+                &pin->identity, &held_before)) {
+            return 0;
+        }
+        bytes_match = ssh_runtime_pin_matches_exact_bytes(pin);
+        if (bytes_match < 0) return -1;
+        if (bytes_match == 0) return 0;
+        if (fstat(pin->fd, &held_after) != 0 ||
+            fstatat(dir_fd, name, &named_after,
+                    AT_SYMLINK_NOFOLLOW) != 0 ||
+            fstat(pin->fd, &held_final) != 0) {
+            set_system_error(
+                ERR_FILE_IO,
+                "Cannot finish exact SSH runtime revalidation");
+            return -1;
+        }
+        if (!same_freebsd_runtime_revision_except_ctime(
+                &pin->identity, &held_after) ||
+            !same_freebsd_runtime_revision_except_ctime(
+                &pin->identity, &named_after) ||
+            !same_freebsd_runtime_revision_except_ctime(
+                &pin->identity, &held_final)) {
+            return 0;
+        }
+        if (same_runtime_revision(&held_before, &held_after) &&
+            same_runtime_revision(&held_after, &named_after) &&
+            same_runtime_revision(&named_after, &held_final)) {
+            pin->identity = held_final;
+            return 1;
+        }
+    }
+    return 0;
+}
+#endif
 
 /* Hold an object reference across every external scheduling point and
  * deletion hook. A stat tuple alone is not a pin: ext4 may immediately reuse
@@ -10116,7 +10290,7 @@ static int observe_ssh_runtime_entry_at(int dir_fd, const char *name,
 
 static int verify_ssh_runtime_pin_at(int dir_fd, const char *name,
                                      const char *display_path,
-                                     const ssh_runtime_pin_t *pin) {
+                                     ssh_runtime_pin_t *pin) {
     struct stat held;
     struct stat named;
 
@@ -10133,16 +10307,30 @@ static int verify_ssh_runtime_pin_at(int dir_fd, const char *name,
     }
 
     if (stat_ssh_runtime_pin(pin, dir_fd, &held) != 0 ||
-        fstatat(dir_fd, name, &named, AT_SYMLINK_NOFOLLOW) != 0 ||
-        !same_runtime_revision(&pin->identity, &held) ||
-        !same_runtime_revision(&pin->identity, &named)) {
+        fstatat(dir_fd, name, &named, AT_SYMLINK_NOFOLLOW) != 0) {
         set_error(ERR_FILE_IO,
                   "SSH runtime artifact changed while pinned: %s",
                   display_path ? display_path : name);
         errno = ESTALE;
         return -1;
     }
-    return 0;
+    if (same_runtime_revision(&pin->identity, &held) &&
+        same_runtime_revision(&pin->identity, &named)) {
+        return 0;
+    }
+#if defined(__FreeBSD__)
+    {
+        int rebound = rebind_freebsd_runtime_pin_ctime_successor(
+            dir_fd, name, pin, &held, &named);
+        if (rebound > 0) return 0;
+        if (rebound < 0) return -1;
+    }
+#endif
+    set_error(ERR_FILE_IO,
+              "SSH runtime artifact changed while pinned: %s",
+              display_path ? display_path : name);
+    errno = ESTALE;
+    return -1;
 }
 
 /* A safe malformed PID record can never authorize signaling. It can authorize
@@ -10150,7 +10338,7 @@ static int verify_ssh_runtime_pin_at(int dir_fd, const char *name,
  * manager lock, is conclusively absent or unreachable. */
 static int prove_malformed_pid_socket_dead_at(
     int dir_fd, const char *socket_dir, const char *socket_name,
-    const char *socket_path, const ssh_runtime_pin_t *socket_pin,
+    const char *socket_path, ssh_runtime_pin_t *socket_pin,
     bool socket_present, bool allow_detached_namespace,
     const char *record_description) {
     bool reachable = false;
@@ -10262,8 +10450,8 @@ static ssh_process_outcome_t prove_recorded_agent_identity(
 static int retire_recorded_agent_endpoint(
     int dir_fd, const char *socket_dir, const char *socket_name,
     const char *socket_path, const char *pid_name,
-    const ssh_runtime_pin_t *socket_pin,
-    const ssh_runtime_pin_t *pid_pin,
+    ssh_runtime_pin_t *socket_pin,
+    ssh_runtime_pin_t *pid_pin,
     const ssh_agent_record_t *record) {
     ssh_agent_connection_t connection;
     ssh_process_outcome_t process_outcome;
@@ -10479,9 +10667,13 @@ done:
 static int release_ssh_runtime_pin(int dir_fd, ssh_runtime_pin_t *pin) {
     if (!pin) return 0;
     if (pin->observational) {
+        free(pin->exact_bytes);
         ssh_runtime_pin_init(pin);
         return 0;
     }
+    free(pin->exact_bytes);
+    pin->exact_bytes = NULL;
+    pin->exact_bytes_len = 0;
     if (pin->fd >= 0) {
         int fd = pin->fd;
         pin->fd = -1;
@@ -10911,8 +11103,6 @@ int ssh_manager_current_is_live_for_account(const account_t *account,
                                                &present, account, live);
 }
 
-#define SSH_PID_RECORD_MAX_BYTES (MAX_PATH_LEN + 320U)
-
 static int format_ssh_agent_record(const ssh_agent_record_t *record,
                                    char *buffer, size_t buffer_size) {
     size_t path_size;
@@ -10956,6 +11146,23 @@ static int format_ssh_agent_record(const ssh_agent_record_t *record,
     memcpy(buffer + header_size, record->image.executable_path, path_size);
     buffer[(size_t)header_size + path_size] = '\n';
     return header_size + (int)path_size + 1;
+}
+
+static int retain_read_pid_sidecar_pin(
+    ssh_runtime_pin_t *pin, int fd, const struct stat *identity,
+    const char *bytes, size_t length) {
+    if (!pin || fd < 0 || !identity || (!bytes && length != 0U)) {
+        set_error(ERR_INVALID_ARGS,
+                  "Invalid SSH PID sidecar pin proof");
+        return -1;
+    }
+    if (ssh_runtime_pin_retain_exact_bytes(
+            pin, (const unsigned char *)bytes, length) != 0) {
+        return -1;
+    }
+    pin->identity = *identity;
+    pin->fd = fd;
+    return 0;
 }
 
 /* Read a PID sidecar without following or accepting a swapped final
@@ -11103,8 +11310,11 @@ static ssh_pid_sidecar_result_t read_ssh_agent_pid_at(
                 record_out->pid = (pid_t)legacy;
             }
             if (pin) {
-                pin->identity = held;
-                pin->fd = fd;
+                if (retain_read_pid_sidecar_pin(
+                        pin, fd, &held, buf, used) != 0) {
+                    close(fd);
+                    return SSH_PID_SIDECAR_ERROR;
+                }
             } else {
                 close(fd);
             }
@@ -11206,8 +11416,11 @@ static ssh_pid_sidecar_result_t read_ssh_agent_pid_at(
                 memcmp(canonical, buf, used) == 0) {
                 if (record_out) *record_out = parsed_record;
                 if (pin) {
-                    pin->identity = held;
-                    pin->fd = fd;
+                    if (retain_read_pid_sidecar_pin(
+                            pin, fd, &held, buf, used) != 0) {
+                        close(fd);
+                        return SSH_PID_SIDECAR_ERROR;
+                    }
                 } else {
                     close(fd);
                 }
@@ -11276,8 +11489,11 @@ static ssh_pid_sidecar_result_t read_ssh_agent_pid_at(
                 memcmp(canonical, buf, used) == 0) {
                 if (record_out) *record_out = parsed_record;
                 if (pin) {
-                    pin->identity = held;
-                    pin->fd = fd;
+                    if (retain_read_pid_sidecar_pin(
+                            pin, fd, &held, buf, used) != 0) {
+                        close(fd);
+                        return SSH_PID_SIDECAR_ERROR;
+                    }
                 } else {
                     close(fd);
                 }
@@ -11287,8 +11503,11 @@ static ssh_pid_sidecar_result_t read_ssh_agent_pid_at(
     }
     {
         if (pin) {
-            pin->identity = held;
-            pin->fd = fd;
+            if (retain_read_pid_sidecar_pin(
+                    pin, fd, &held, buf, used) != 0) {
+                close(fd);
+                return SSH_PID_SIDECAR_ERROR;
+            }
         } else {
             close(fd);
         }
@@ -11776,7 +11995,7 @@ static int restore_ssh_reset_quarantine(
 static int unlink_ssh_reset_path_at(int dir_fd, const char *name,
                                     const char *display_path,
                                     const char *description,
-                                    const ssh_runtime_pin_t *pin,
+                                    ssh_runtime_pin_t *pin,
                                     bool expected_present) {
     static unsigned long sequence;
     char quarantine[96];

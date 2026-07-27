@@ -211,6 +211,71 @@ static ssh_process_outcome_t classify_agent_gone(
     return SSH_PROCESS_GONE;
 }
 
+#if defined(__FreeBSD__)
+static char g_pid_ctime_successor_path[256];
+static bool g_pid_ctime_successor_injected;
+static char g_config_ctime_successor_path[256];
+static bool g_config_ctime_successor_injected;
+
+static ssh_process_outcome_t classify_agent_gone_after_pid_ctime_successor(
+    const ssh_agent_record_t *record, const char *socket_arg,
+    int runtime_dir_fd) {
+    struct stat before;
+    struct stat after;
+    struct timespec delay = { .tv_sec = 0, .tv_nsec = 2000000 };
+    struct timespec remaining;
+
+    (void)record;
+    (void)socket_arg;
+    (void)runtime_dir_fd;
+    if (stat(g_pid_ctime_successor_path, &before) != 0) {
+        return SSH_PROCESS_INDETERMINATE;
+    }
+    while (nanosleep(&delay, &remaining) != 0) {
+        if (errno != EINTR) return SSH_PROCESS_INDETERMINATE;
+        delay = remaining;
+    }
+    if (chmod(g_pid_ctime_successor_path, 0600) != 0 ||
+        stat(g_pid_ctime_successor_path, &after) != 0) {
+        return SSH_PROCESS_INDETERMINATE;
+    }
+    g_pid_ctime_successor_injected =
+        before.st_ctim.tv_sec != after.st_ctim.tv_sec ||
+        before.st_ctim.tv_nsec != after.st_ctim.tv_nsec;
+    return g_pid_ctime_successor_injected
+               ? SSH_PROCESS_GONE
+               : SSH_PROCESS_INDETERMINATE;
+}
+
+static int sync_config_dir_before_ctime_successor(int dir_fd) {
+    struct stat before;
+    struct stat after;
+    struct timespec delay = { .tv_sec = 0, .tv_nsec = 2000000 };
+    struct timespec remaining;
+
+    if (fsync(dir_fd) != 0 ||
+        stat(g_config_ctime_successor_path, &before) != 0) {
+        return -1;
+    }
+    while (nanosleep(&delay, &remaining) != 0) {
+        if (errno != EINTR) return -1;
+        delay = remaining;
+    }
+    if (chmod(g_config_ctime_successor_path, 0600) != 0 ||
+        stat(g_config_ctime_successor_path, &after) != 0) {
+        return -1;
+    }
+    g_config_ctime_successor_injected =
+        before.st_ctim.tv_sec != after.st_ctim.tv_sec ||
+        before.st_ctim.tv_nsec != after.st_ctim.tv_nsec;
+    if (!g_config_ctime_successor_injected) {
+        errno = EAGAIN;
+        return -1;
+    }
+    return 0;
+}
+#endif
+
 static ssh_agent_record_t synthetic_agent_record(pid_t pid, uint64_t nonce) {
     run_launch_witness_t witness;
     char agent_path[MAX_PATH_LEN];
@@ -1261,6 +1326,55 @@ TEST(stop_agent_cleanup_failure_retains_sidecar_until_durable_retry) {
     ssh_manager_set_reap_fn(previous_reap);
 }
 
+#if defined(__FreeBSD__)
+/* UFS may expose a delayed ctime successor after the sidecar's exact read.
+ * The retained descriptor and exact canonical bytes still identify the same
+ * process record, so cleanup may rebind that one-field successor without
+ * weakening replacement or content-change rejection. */
+TEST(freebsd_stop_rebinds_exact_pid_ctime_successor) {
+    char sock[256];
+    ssh_config_t cfg;
+    ssh_reap_fn previous_reap;
+    ssh_agent_record_t record =
+        synthetic_agent_record((pid_t)12345,
+                               UINT64_C(0x4142434445464748));
+
+    CHECK_EQ_INT(setup_agent_socket("work", sock, sizeof(sock)), 0);
+    CHECK_EQ_INT(safe_snprintf(
+                     g_pid_ctime_successor_path,
+                     sizeof(g_pid_ctime_successor_path),
+                     "%s/gitswitch-ssh/ssh-agent.work.pid", g_xdg),
+                 0);
+    CHECK_EQ_INT(write_agent_sidecar("work", &record), 0);
+    memset(&cfg, 0, sizeof(cfg));
+    cfg.mode = SSH_AGENT_ISOLATED;
+    CHECK_EQ_INT(safe_strncpy(cfg.agent_socket_path, sock,
+                              sizeof(cfg.agent_socket_path)), 0);
+    CHECK_EQ_INT(safe_strncpy(cfg.agent_socket_arg,
+                              "ssh-agent.work.sock",
+                              sizeof(cfg.agent_socket_arg)), 0);
+    cfg.agent_pid = record.pid;
+    cfg.agent_generation = record.generation;
+    cfg.agent_image = record.image;
+    cfg.agent_owned = true;
+    cfg.key_already_loaded = true;
+
+    g_pid_ctime_successor_injected = false;
+    previous_reap = ssh_manager_set_reap_fn(
+        classify_agent_gone_after_pid_ctime_successor);
+    CHECK_EQ_INT(ssh_stop_agent(&cfg), 0);
+    ssh_manager_set_reap_fn(previous_reap);
+
+    CHECK(g_pid_ctime_successor_injected);
+    CHECK(!cfg.agent_owned);
+    CHECK(!cfg.key_already_loaded);
+    CHECK_EQ_INT(cfg.agent_pid, -1);
+    CHECK(cfg.agent_socket_path[0] == '\0');
+    CHECK(!path_exists(sock));
+    CHECK(!path_exists(g_pid_ctime_successor_path));
+}
+#endif
+
 TEST(stop_agent_missing_exact_record_preserves_retry_handle) {
     char sock[256];
     char pid_path[256];
@@ -1540,6 +1654,10 @@ TEST(host_alias_removal_excises_only_named_block) {
     account_t work, personal;
     FILE *f;
     size_t n;
+    int remove_rc;
+#if defined(__FreeBSD__)
+    ssh_dirsync_fn previous_dirsync;
+#endif
 
     snprintf(home, sizeof(home), "/tmp/gswsshrm_XXXXXX");
     CHECK(ts_mkdtemp(home) != NULL);
@@ -1588,8 +1706,23 @@ TEST(host_alias_removal_excises_only_named_block) {
         CHECK(strstr(buf, "HostName example.com") != NULL); /* user content */
     }
 
-    /* Idempotent: removing again (block now absent) is a clean no-op. */
-    CHECK_EQ_INT(ssh_remove_host_alias("github.com-work"), 0);
+    /* Idempotent: removing again (block now absent) is a clean no-op. AR-14:
+     * FreeBSD may expose the retained config inode's delayed ctime successor
+     * after this no-op's directory sync; inject that exact shape so the
+     * descriptor/name/byte stability proof remains deterministic. */
+#if defined(__FreeBSD__)
+    CHECK_EQ_INT(safe_strncpy(g_config_ctime_successor_path, cfg_path,
+                              sizeof(g_config_ctime_successor_path)), 0);
+    g_config_ctime_successor_injected = false;
+    previous_dirsync =
+        ssh_manager_set_dirsync_fn(sync_config_dir_before_ctime_successor);
+#endif
+    remove_rc = ssh_remove_host_alias("github.com-work");
+#if defined(__FreeBSD__)
+    ssh_manager_set_dirsync_fn(previous_dirsync);
+    CHECK(g_config_ctime_successor_injected);
+#endif
+    CHECK_EQ_INT(remove_rc, 0);
     /* Removing against a nonexistent config is also a clean no-op. */
     unlink(cfg_path);
     CHECK_EQ_INT(ssh_remove_host_alias("github.com-personal"), 0);
@@ -1737,6 +1870,9 @@ TEST_MAIN_BEGIN()
     RUN_TEST(pid_sidecar_rejects_temp_path_inode_swap);
     RUN_TEST(stop_agent_reap_failure_preserves_retry_handle);
     RUN_TEST(stop_agent_cleanup_failure_retains_sidecar_until_durable_retry);
+#if defined(__FreeBSD__)
+    RUN_TEST(freebsd_stop_rebinds_exact_pid_ctime_successor);
+#endif
     RUN_TEST(stop_agent_missing_exact_record_preserves_retry_handle);
     RUN_TEST(stop_agent_preserves_a_replacement_pid_sidecar);
     RUN_TEST(clear_agent_keys_tracks_the_destructive_child_result);
