@@ -5992,7 +5992,7 @@ TEST(parent_terminal_rollback_refreshes_publications_with_clean_absent_group) {
     config_retirement_destination_t destinations[2];
     size_t destination_count;
     size_t cleared = 0U;
-    bool state_installed = false;
+    bool stable = false;
 
     memset(owners, 0, sizeof(owners));
     memset(destinations, 0, sizeof(destinations));
@@ -6025,23 +6025,43 @@ TEST(parent_terminal_rollback_refreshes_publications_with_clean_absent_group) {
                      sizeof(owners[1].account_incarnation)), 0);
     CHECK_EQ_INT(git_retirement_transaction_prepare_terminal_rollback(
                      transaction), 0);
-    CHECK_EQ_INT(config_refresh_retirement_publications_transactional(
-                     &ctx, fixture.accounts_path, owners, 2U,
-                     destinations, destination_count,
-                     &state_installed), 0);
-    CHECK(state_installed);
-    for (size_t i = 0U; i < destination_count; i++) {
-        config_retirement_destination_t observed;
+    /* FreeBSD UFS may materialize one final ctime-only successor after the
+     * restored descriptor closes or a sibling destination synchronizes the
+     * shared parent. Exercise the same bounded reseal loop as accounts.c:
+     * publish the complete set, re-query every destination, and replace the
+     * complete set before retrying rather than accepting a mixed ledger. */
+    for (unsigned attempt = 0U; attempt < 3U; attempt++) {
+        bool state_installed = false;
+        bool changed = false;
 
-        memset(&observed, 0, sizeof(observed));
-        CHECK_EQ_INT(git_retirement_transaction_rollback_destination(
-                         transaction, i, observed.config_path,
-                         sizeof(observed.config_path),
-                         &observed.post_config), 0);
-        CHECK_STR_EQ(observed.config_path, destinations[i].config_path);
-        CHECK(publication_identity_equal(
-            &observed.post_config, &destinations[i].post_config));
+        CHECK_EQ_INT(config_refresh_retirement_publications_transactional(
+                         &ctx, fixture.accounts_path, owners, 2U,
+                         destinations, destination_count,
+                         &state_installed), 0);
+        CHECK(state_installed);
+        for (size_t i = 0U; i < destination_count; i++) {
+            config_retirement_destination_t observed;
+
+            memset(&observed, 0, sizeof(observed));
+            CHECK_EQ_INT(git_retirement_transaction_rollback_destination(
+                             transaction, i, observed.config_path,
+                             sizeof(observed.config_path),
+                             &observed.post_config), 0);
+            CHECK_STR_EQ(observed.config_path,
+                         destinations[i].config_path);
+            if (!publication_identity_equal(
+                    &observed.post_config,
+                    &destinations[i].post_config)) {
+                destinations[i].post_config = observed.post_config;
+                changed = true;
+            }
+        }
+        if (!changed) {
+            stable = true;
+            break;
+        }
     }
+    CHECK(stable);
     CHECK_EQ_INT(git_retirement_transaction_finish_terminal_rollback(
                      &transaction), 0);
     CHECK(transaction == NULL);
@@ -6057,6 +6077,7 @@ TEST(parent_config_refresh_retires_exact_linked_private_alias) {
     gitswitch_ctx_t ctx;
     config_retirement_owner_t owner;
     config_retirement_destination_t destination;
+    struct stat state;
     char retained_alias[MAX_PATH_LEN];
     bool state_installed = false;
 
@@ -6077,13 +6098,31 @@ TEST(parent_config_refresh_retires_exact_linked_private_alias) {
                      "%s/.resume-hint.tmp.A1b2C3",
                      fixture.config_dir), 0);
     CHECK_EQ_INT(link(fixture.state_path, retained_alias), 0);
+#if defined(__FreeBSD__)
+    /* Descriptor-conditioned unlink retires the exact stale alias in place,
+     * so the state returns to one link and the refresh can safely continue. */
+    CHECK_EQ_INT(config_refresh_retirement_publications_transactional(
+                     &ctx, fixture.accounts_path, &owner, 1U,
+                     &destination, 1U, &state_installed), 0);
+    CHECK(!state_installed);
+    CHECK(m18_ledger_matches_live_restored_git(&fixture));
+#else
+    /* Portable no-replace quarantine preserves the retired inode until its
+     * bounded arena is reclaimed. Its remaining link makes the active-state
+     * read fail closed before installation. */
     CHECK_EQ_INT(config_refresh_retirement_publications_transactional(
                      &ctx, fixture.accounts_path, &owner, 1U,
                      &destination, 1U, &state_installed), -1);
     CHECK(!state_installed);
+#endif
     errno = 0;
     CHECK(access(retained_alias, F_OK) != 0 && errno == ENOENT);
-    CHECK(access(fixture.state_path, F_OK) == 0);
+    CHECK_EQ_INT(lstat(fixture.state_path, &state), 0);
+#if defined(__FreeBSD__)
+    CHECK_EQ_INT((long)state.st_nlink, 1);
+#else
+    CHECK_EQ_INT((long)state.st_nlink, 2);
+#endif
     m18_parent_runtime_end();
     m18_fixture_cleanup(&fixture);
 }
@@ -6123,10 +6162,12 @@ TEST(parent_freebsd_reproves_and_retires_retained_private_alias) {
 #endif
 }
 
-TEST(parent_recovery_removes_exact_linked_private_alias) {
+TEST(parent_recovery_classifies_linked_alias_by_marker_shape) {
     m18_fixture_t fixture;
     git_retirement_transaction_t *transaction = NULL;
     git_retirement_transaction_t *fresh = NULL;
+    struct stat canonical;
+    struct stat alias;
     char lock_path[MAX_PATH_LEN];
     char alias_path[MAX_PATH_LEN];
 
@@ -6141,13 +6182,29 @@ TEST(parent_recovery_removes_exact_linked_private_alias) {
                      "%s/.gitswitch-finalization-%ld-1",
                      fixture.home, (long)getpid()), 0);
     CHECK_EQ_INT(link(lock_path, alias_path), 0);
+    CHECK_EQ_INT(lstat(lock_path, &canonical), 0);
+    CHECK_EQ_INT(lstat(alias_path, &alias), 0);
+    CHECK(canonical.st_dev == alias.st_dev);
+    CHECK(canonical.st_ino == alias.st_ino);
     CHECK_EQ_INT(m18_fresh_single_prepare(
                      &fixture, &fresh), 0);
     CHECK(fresh != NULL);
     CHECK_EQ_INT(git_retirement_transaction_commit(&fresh), 0);
     CHECK(fresh == NULL);
+#if defined(__FreeBSD__)
+    /* The canonical FreeBSD transaction lock is a zero-byte lease backed by
+     * a separate authority record. A finalization-looking hard link to that
+     * lease is foreign, not a crash-retained finalization certificate, and
+     * must be preserved. The genuine two-link certificate path is exercised
+     * by finalization_sigkill_leaves_complete_self_healing_certificate. */
+    CHECK_EQ_INT((long)canonical.st_size, 0);
+    CHECK_EQ_INT(lstat(alias_path, &alias), 0);
+    CHECK_EQ_INT((long)alias.st_size, 0);
+#else
+    CHECK(canonical.st_size > 0);
     errno = 0;
     CHECK(access(alias_path, F_OK) != 0 && errno == ENOENT);
+#endif
     CHECK_EQ_INT(git_retirement_transaction_finish_terminal_rollback(
                      &transaction), 0);
     CHECK(transaction == NULL);
@@ -6758,7 +6815,7 @@ TEST_MAIN_BEGIN()
     RUN_TEST(parent_terminal_rollback_refreshes_publications_with_clean_absent_group);
     RUN_TEST(parent_config_refresh_retires_exact_linked_private_alias);
     RUN_TEST(parent_freebsd_reproves_and_retires_retained_private_alias);
-    RUN_TEST(parent_recovery_removes_exact_linked_private_alias);
+    RUN_TEST(parent_recovery_classifies_linked_alias_by_marker_shape);
     RUN_TEST(parent_recovery_accepts_terminal_marker_with_alias_already_absent);
     RUN_TEST(parent_recovery_rejects_wrong_inode_private_alias);
     RUN_TEST(parent_recovery_rejects_private_alias_changed_after_proof);
