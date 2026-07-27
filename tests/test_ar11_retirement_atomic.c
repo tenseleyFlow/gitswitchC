@@ -14,6 +14,7 @@
 #include "utils.h"
 
 #include <dirent.h>
+#include <limits.h>
 #include <sys/wait.h>
 
 #define AT_INCARNATION \
