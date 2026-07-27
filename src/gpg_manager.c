@@ -9179,6 +9179,54 @@ static int gpg_close_and_reprove_agent_config(
     return gpg_reprove_agent_config_after_close(home_fd, update);
 }
 
+/* A directory synchronization can itself expose a delayed filesystem
+ * generation after the clean-state descriptor closes. Bind the terminal
+ * config identity only after two consecutive sync-and-exact-proof cycles
+ * observe no generation change. */
+static int gpg_settle_agent_config_after_clean_close(
+    int home_fd, gpg_agent_config_update_t *update) {
+    enum { GPG_AGENT_TERMINAL_SYNC_ATTEMPTS = 8 };
+    int consecutive_equal_cycles = 0;
+
+    if (home_fd < 0 || !update || update->config_fd >= 0) {
+        set_error(ERR_INVALID_ARGS,
+                  "Invalid terminal GPG agent configuration settlement");
+        return -1;
+    }
+    for (int attempt = 0;
+         attempt < GPG_AGENT_TERMINAL_SYNC_ATTEMPTS; attempt++) {
+        struct stat before_sync = update->config_identity;
+
+        if (g_agent_conf_sync(home_fd, true) != 0) {
+            set_system_error(
+                ERR_FILE_IO,
+                "Failed to synchronize completed GPG agent reload state");
+            return -1;
+        }
+        if (gpg_reprove_agent_config_after_close(home_fd, update) != 0) {
+            return -1;
+        }
+        if (gpg_same_file_version(
+                &before_sync, &update->config_identity)) {
+            consecutive_equal_cycles++;
+            if (consecutive_equal_cycles == 2) return 0;
+            continue;
+        }
+        if (!gpg_file_ctime_only_change(
+                &before_sync, &update->config_identity)) {
+            set_error(
+                ERR_FILE_IO,
+                "Installed gpg-agent.conf changed while settling its terminal generation");
+            return -1;
+        }
+        consecutive_equal_cycles = 0;
+    }
+    set_error(
+        ERR_FILE_IO,
+        "Installed gpg-agent.conf terminal generation did not settle");
+    return -1;
+}
+
 /* Persist the obligation before publishing changed config bytes. Existing
  * pending state is adopted after a failed attempt; clean state is changed in
  * place through its retained descriptor. */
@@ -9400,13 +9448,8 @@ static int gpg_set_agent_reload_clean_stable(
             return -1;
         }
         update->marker_fd = -1;
-        if (g_agent_conf_sync(home_fd, true) != 0) {
-            set_system_error(
-                ERR_FILE_IO,
-                "Failed to synchronize completed GPG agent reload state");
-            return -1;
-        }
-        if (gpg_reprove_agent_config_after_close(home_fd, update) != 0) {
+        if (gpg_settle_agent_config_after_clean_close(
+                home_fd, update) != 0) {
             return -1;
         }
         if (gpg_same_file_version(
