@@ -5032,7 +5032,12 @@ static int run_argv_real_impl(
 #ifdef GITSWITCH_TESTING
         int injected_signal = g_test_supervisor_pending_signal;
         g_test_supervisor_pending_signal = 0;
-        if (injected_signal != 0 && raise(injected_signal) != 0) {
+        /* Model the process-directed delivery produced by killpg(2). Darwin's
+         * raise(3) is thread-directed, which is not the supervisor state this
+         * seam is intended to exercise and can behave differently across the
+         * following fork. */
+        if (injected_signal != 0 &&
+            kill(getpid(), injected_signal) != 0) {
             child_report_failure(child_status_fd,
                                  CHILD_STAGE_PROCESS_GROUP, errno, 126);
         }

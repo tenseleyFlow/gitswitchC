@@ -914,7 +914,10 @@ TEST(timeout_kills_the_proven_group_grandchild) {
     opts.out = output;
     opts.out_size = sizeof(output);
     opts.stderr_to_devnull = true;
-    CHECK_EQ_INT(run_deadline_after_millis(100, &opts.deadline_millis), 0);
+    /* The deadline proves group cleanup, not shell startup latency. Leave
+     * enough room for Darwin's sanitizer runtime to start the shell and
+     * publish the descendant PID before expiring the group. */
+    CHECK_EQ_INT(run_deadline_after_millis(1000, &opts.deadline_millis), 0);
     opts.use_deadline = true;
     CHECK_EQ_INT(run_argv(argv, &opts, &result), -1);
     pid_t descendant = (pid_t)strtol(output, NULL, 10);
@@ -1378,6 +1381,7 @@ static int supervisor_pending_blocked_signal_worker(void) {
     sigset_t original_mask;
     sigset_t configured_mask;
     sigset_t after_mask;
+    run_opts_t opts;
     run_result_t result;
 
     if (sigprocmask(SIG_SETMASK, NULL, &original_mask) != 0) return 88;
@@ -1392,7 +1396,14 @@ static int supervisor_pending_blocked_signal_worker(void) {
         return 89;
     }
     run_test_set_supervisor_pending_signal(SIGTERM);
-    int rc = run_argv(argv, NULL, &result);
+    memset(&opts, 0, sizeof(opts));
+    if (run_deadline_after_millis(1000, &opts.deadline_millis) != 0) {
+        run_test_set_supervisor_pending_signal(0);
+        (void)sigprocmask(SIG_SETMASK, &original_mask, NULL);
+        return 90;
+    }
+    opts.use_deadline = true;
+    int rc = run_argv(argv, &opts, &result);
     run_test_set_supervisor_pending_signal(0);
     int query_rc = sigprocmask(SIG_SETMASK, NULL, &after_mask);
     int restore_rc =
@@ -2446,7 +2457,10 @@ int main(int argc, char **argv) {
     }
     if (argc == 2 &&
         strcmp(argv[1], "--ar14-pending-signal-mask-probe") == 0) {
-        return pending_signal_mask_probe_main();
+        /* This probe observes signal state at executable entry. Bypass
+         * sanitizer/stdio exit finalizers so they cannot alter or wait on the
+         * deliberately blocked pending signal after the observation. */
+        _exit(pending_signal_mask_probe_main());
     }
 
     error_init(LOG_LEVEL_WARNING, NULL);
