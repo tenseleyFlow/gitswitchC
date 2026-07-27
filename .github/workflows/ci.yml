@@ -238,8 +238,19 @@ jobs:
         # them in either build configuration.
         run: brew install dash fish gnupg ksh93 readline
       - name: Diagnose Darwin runner signal preflight
+        timeout-minutes: 10
         shell: bash
         run: |
+          collect_tree() {
+            local parent="$1"
+            local child
+            printf '%s\n' "$parent"
+            while IFS= read -r child; do
+              if [[ -n "$child" ]]; then
+                collect_tree "$child"
+              fi
+            done < <(pgrep -P "$parent" 2>/dev/null || true)
+          }
           /usr/bin/make BUILD_TYPE=debug READLINE=1 WERROR=1 \
             build/bin/test_ar07_runner
           build/bin/test_ar07_runner &
@@ -253,19 +264,16 @@ jobs:
           done
           echo "test_ar07_runner exceeded 30 seconds; capturing Darwin samples" >&2
           ps -axo pid,ppid,pgid,state,command
-          while read -r pid; do
+          runner_pids="$(collect_tree "$runner_pid")"
+          while IFS= read -r pid; do
+            [[ -n "$pid" ]] || continue
             echo "Sampling test_ar07_runner process $pid" >&2
             /usr/bin/sample "$pid" 1 1 || true
-          done < <(
-            ps -axo pid=,command= |
-              awk '$0 ~ /build\\/bin\\/test_ar07_runner/ { print $1 }'
-          )
-          while read -r pid; do
+          done <<< "$runner_pids"
+          while IFS= read -r pid; do
+            [[ -n "$pid" ]] || continue
             kill -KILL "$pid" 2>/dev/null || true
-          done < <(
-            ps -axo pid=,command= |
-              awk '$0 ~ /build\\/bin\\/test_ar07_runner/ { print $1 }'
-          )
+          done <<< "$runner_pids"
           wait "$runner_pid" 2>/dev/null || true
           exit 1
       - name: Build + test (ASan/UBSan, warnings-as-errors)
