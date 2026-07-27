@@ -5142,7 +5142,7 @@ static int git_scope_lock_acquire(git_scope_t scope, const char *exact_path,
     struct stat named;
     struct stat opened;
     struct stat captured;
-    struct stat named_after;
+    struct stat verified;
     struct stat created;
 
     git_scope_lock_init(lock);
@@ -5324,7 +5324,8 @@ static int git_scope_lock_acquire(git_scope_t scope, const char *exact_path,
                 g_metadata_test_hook(GIT_METADATA_TEST_SOURCE_PIN);
             errno = 0;
             if (forced_mismatch ||
-                !git_same_file_observation(&named, &opened)) {
+                (!git_same_file_observation(&named, &opened) &&
+                 !git_metadata_ctime_only_change(&named, &opened))) {
                 errno = EAGAIN;
                 set_system_error(
                     ERR_GIT_CONFIG_FAILED,
@@ -5346,9 +5347,9 @@ static int git_scope_lock_acquire(git_scope_t scope, const char *exact_path,
                 &captured) != 0 ||
             (!git_same_file_observation(&opened, &captured) &&
              !git_metadata_ctime_only_change(&opened, &captured)) ||
-            fstatat(lock->dir_fd, lock->leaf, &named_after,
-                    AT_SYMLINK_NOFOLLOW) != 0 ||
-            !git_same_file_observation(&captured, &named_after)) {
+            !git_file_at_matches_witness(
+                lock->dir_fd, lock->leaf, source_fd, &captured,
+                lock->original_data, lock->original_length, &verified)) {
             errno = errno ? errno : EAGAIN;
             set_system_error(
                 ERR_GIT_CONFIG_FAILED,
@@ -5356,7 +5357,10 @@ static int git_scope_lock_acquire(git_scope_t scope, const char *exact_path,
                 lock->path);
             goto fail;
         }
-        lock->original_stat = captured;
+        /* link/unlink/rename metadata can materialize after the first named
+         * observation on Darwin and FreeBSD. Exact bytes through the pinned
+         * descriptor admit only a same-inode ctime successor here. */
+        lock->original_stat = verified;
         lock->original_fd = source_fd;
         source_fd = -1;
         lock->original_witness_valid = true;

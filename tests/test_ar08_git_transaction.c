@@ -2454,10 +2454,11 @@ static int prepare_descriptor_only_retirement(
     if (!fixture || !account || !publication || !transaction ||
         safe_snprintf(config_path, sizeof(config_path),
                       "%s/retirement.gitconfig", fixture->base) != 0 ||
-        write_text_file(config_path, "[fixture]\n\tmarker = keep\n",
+        write_text_file(config_path, "[fixture]\n\tmarker = retired\n",
                         0600) != 0 ||
-        stat(fixture->base, &parent_stat) != 0 ||
-        stat(config_path, &config_stat) != 0) {
+        stat(config_path, &config_stat) != 0 ||
+        unlink(config_path) != 0 ||
+        stat(fixture->base, &parent_stat) != 0) {
         return -1;
     }
 
@@ -2473,6 +2474,10 @@ static int prepare_descriptor_only_retirement(
     publication->account_id = account->id;
     publication->scope = PUBLICATION_SCOPE_GLOBAL;
     publication->state = PUBLICATION_STATE_PUBLISHED;
+    /* An absent recorded destination has no credential mutation to plan, but
+     * retirement must retain its exact parent and canonical lock lease until
+     * settlement. That makes the descriptor contract platform-independent;
+     * a present publication with no attributable values may settle eagerly. */
     publication->capabilities = PUBLICATION_CAP_DESTINATION |
                                 PUBLICATION_CAP_POST_GENERATION;
     if (safe_strncpy(publication->account_incarnation, incarnation,
