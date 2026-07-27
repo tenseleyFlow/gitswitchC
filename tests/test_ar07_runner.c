@@ -19,6 +19,7 @@
 #include <string.h>
 #include <sys/resource.h>
 #include <sys/ioctl.h>
+#include <sys/stat.h>
 #include <sys/time.h>
 #include <sys/wait.h>
 #include <time.h>
@@ -182,19 +183,24 @@ static bool sigpipe_round_trip_passes(sigpipe_disposition_t disposition) {
 
 static bool reap_within(pid_t pid, int timeout_ms, int *status_out);
 
-static bool isolated_runner_check_passes(int (*check)(void)) {
+static bool isolated_runner_check_passes_within(int (*check)(void),
+                                                int timeout_ms) {
     int status = 0;
 
     fflush(NULL);
     pid_t worker = fork();
     if (worker < 0) return false;
     if (worker == 0) _exit(check());
-    if (!reap_within(worker, 2000, &status)) return false;
+    if (!reap_within(worker, timeout_ms, &status)) return false;
     if (!WIFEXITED(status) || WEXITSTATUS(status) != 0) {
         fprintf(stderr, "  isolated runner worker status=%d\n", status);
         return false;
     }
     return true;
+}
+
+static bool isolated_runner_check_passes(int (*check)(void)) {
+    return isolated_runner_check_passes_within(check, 2000);
 }
 
 static bool isolated_runner_check_returns_normally(int (*check)(void)) {
@@ -431,6 +437,37 @@ static int deadline_pause_main(bool close_stdout) {
     struct timespec lifetime = {.tv_sec = 5, .tv_nsec = 0};
     if (close_stdout && close(STDOUT_FILENO) != 0) return 1;
     while (nanosleep(&lifetime, &lifetime) != 0 && errno == EINTR) {}
+    return 0;
+}
+
+static int rollback_heartbeat_main(const char *path) {
+    struct sigaction ignored;
+    struct timespec interval = {.tv_sec = 0, .tv_nsec = 10000000L};
+    int fd;
+
+    if (!path || !*path) return 1;
+    memset(&ignored, 0, sizeof(ignored));
+    ignored.sa_handler = SIG_IGN;
+    if (sigemptyset(&ignored.sa_mask) != 0 ||
+        sigaction(SIGTERM, &ignored, NULL) != 0) {
+        return 2;
+    }
+    fd = open(path, O_WRONLY | O_APPEND);
+    if (fd < 0) return 3;
+    for (int i = 0; i < 1000; i++) {
+        ssize_t written;
+        do {
+            written = write(fd, "x", 1U);
+        } while (written < 0 && errno == EINTR);
+        if (written != 1) {
+            close(fd);
+            return 4;
+        }
+        while (nanosleep(&interval, &interval) != 0 && errno == EINTR) {}
+        interval.tv_sec = 0;
+        interval.tv_nsec = 10000000L;
+    }
+    close(fd);
     return 0;
 }
 
@@ -968,6 +1005,31 @@ static bool process_gone_within(pid_t pid, int timeout_ms) {
     return kill(pid, 0) != 0 && errno == ESRCH;
 }
 
+static bool file_nonempty_within(const char *path, int timeout_ms) {
+    int waited = 0;
+    while (waited <= timeout_ms) {
+        struct stat st;
+        if (stat(path, &st) == 0 && st.st_size > 0) return true;
+        struct timespec delay = {.tv_nsec = 10000000L};
+        nanosleep(&delay, NULL);
+        waited += 10;
+    }
+    return false;
+}
+
+static bool file_size_stops_changing(const char *path, int observation_ms) {
+    struct stat before;
+    struct stat after;
+    struct timespec delay = {
+        .tv_sec = observation_ms / 1000,
+        .tv_nsec = (long)(observation_ms % 1000) * 1000000L
+    };
+
+    if (stat(path, &before) != 0 || before.st_size <= 0) return false;
+    while (nanosleep(&delay, &delay) != 0 && errno == EINTR) {}
+    return stat(path, &after) == 0 && after.st_size == before.st_size;
+}
+
 TEST(timeout_kills_the_proven_group_grandchild) {
     const char *argv[] = {
         "sh", "-c", "sleep 30 & child=$!; echo \"$child\"; wait", NULL
@@ -1032,26 +1094,44 @@ TEST(closed_stdio_daemon_like_descendant_remains_supported) {
 }
 
 static int rollback_group_signal_worker(void) {
+    char heartbeat_path[] = "/tmp/gitswitch-ar14-heartbeat-XXXXXX";
     const char *argv[] = {
-        "sh", "-c", "trap '' TERM; sleep 30 & echo \"$!\"; wait", NULL
+        "sh", "-c",
+        "trap '' TERM; \"$1\" --ar14-rollback-heartbeat \"$2\" & "
+        "echo \"$!\"; wait",
+        "gitswitch-ar14-rollback", g_self_path, heartbeat_path, NULL
     };
     char output[64];
     run_opts_t opts;
     run_result_t result;
-    pid_t signaler;
+    pid_t signaler = -1;
+    pid_t descendant = -1;
+    int heartbeat_fd;
+    int outcome = 0;
+    bool rollback_started = false;
+    bool guard_started = false;
 
+    heartbeat_fd = mkstemp(heartbeat_path);
+    if (heartbeat_fd < 0) return 69;
+    close(heartbeat_fd);
     if (signals_guard_begin() != 0) {
-        return 70;
+        outcome = 70;
+        goto cleanup;
     }
+    guard_started = true;
     signals_rollback_begin();
+    rollback_started = true;
     signaler = fork();
-    if (signaler < 0) return 71;
+    if (signaler < 0) {
+        outcome = 71;
+        goto cleanup;
+    }
     if (signaler == 0) {
+        if (!file_nonempty_within(heartbeat_path, 2000)) _exit(20);
+        if (kill(getppid(), SIGTERM) != 0) _exit(21);
         struct timespec delay = {.tv_nsec = 100000000L};
-        nanosleep(&delay, NULL);
-        (void)kill(getppid(), SIGTERM);
-        nanosleep(&delay, NULL);
-        (void)kill(getppid(), SIGTERM);
+        while (nanosleep(&delay, &delay) != 0 && errno == EINTR) {}
+        if (kill(getppid(), SIGTERM) != 0) _exit(22);
         _exit(0);
     }
     memset(&opts, 0, sizeof(opts));
@@ -1060,16 +1140,39 @@ static int rollback_group_signal_worker(void) {
     opts.stderr_to_devnull = true;
     int rc = run_argv(argv, &opts, &result);
     int signaler_status = 0;
-    (void)waitpid(signaler, &signaler_status, 0);
-    pid_t descendant = (pid_t)strtol(output, NULL, 10);
-    bool gone = descendant > 1 && process_gone_within(descendant, 1000);
-    signals_rollback_end();
-    (void)signals_guard_end();
-    return rc != 0 && gone ? 0 : 72;
+    pid_t waited;
+    do {
+        waited = waitpid(signaler, &signaler_status, 0);
+    } while (waited < 0 && errno == EINTR);
+    descendant = (pid_t)strtol(output, NULL, 10);
+    if (rc == 0) {
+        outcome = 72;
+    } else if (waited != signaler || !WIFEXITED(signaler_status) ||
+               WEXITSTATUS(signaler_status) != 0) {
+        outcome = 73;
+    } else if (descendant <= 1) {
+        outcome = 74;
+    } else if (!file_size_stops_changing(heartbeat_path, 300)) {
+        outcome = 75;
+    }
+
+cleanup:
+    if (outcome != 0 && descendant > 1) {
+        (void)kill(descendant, SIGKILL);
+    }
+    if (signaler > 0) {
+        int ignored_status;
+        (void)waitpid(signaler, &ignored_status, WNOHANG);
+    }
+    if (rollback_started) signals_rollback_end();
+    if (guard_started) (void)signals_guard_end();
+    (void)unlink(heartbeat_path);
+    return outcome;
 }
 
 TEST(repeated_rollback_signal_terminates_group_descendant) {
-    CHECK(isolated_runner_check_passes(rollback_group_signal_worker));
+    CHECK(isolated_runner_check_passes_within(
+        rollback_group_signal_worker, 5000));
 }
 
 static int supervisor_termination_worker(int signal_number,
@@ -2543,6 +2646,10 @@ int main(int argc, char **argv) {
     if (argc == 2 &&
         strcmp(argv[1], "--ar14-deadline-close-stdout") == 0) {
         return deadline_pause_main(true);
+    }
+    if (argc == 3 &&
+        strcmp(argv[1], "--ar14-rollback-heartbeat") == 0) {
+        return rollback_heartbeat_main(argv[2]);
     }
     if (argc == 2 &&
         strcmp(argv[1], "--ar14-pending-signal-mask-probe") == 0) {
