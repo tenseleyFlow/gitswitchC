@@ -14,8 +14,10 @@
 #include "runner_internal.h"
 #include "utils.h"
 
+#include <dirent.h>
 #include <errno.h>
 #include <fcntl.h>
+#include <limits.h>
 #include <stdbool.h>
 #include <stdio.h>
 #include <stdlib.h>
@@ -105,6 +107,9 @@ static int g_postclose_first_stable_at;
 static int g_postclose_mutation_limit;
 static int g_postclose_mutation_at;
 static m20_reload_mutation_t g_postclose_mutation;
+static bool g_postclose_replace_reload_state;
+static bool g_postclose_require_closed_reload_state;
+static bool g_postclose_observed_closed_reload_state;
 
 static m20_saved_env_t m20_save_env(const char *name) {
     const char *value = getenv(name);
@@ -194,17 +199,234 @@ static bool m20_reload_shape_is_exact(const char *const argv[]) {
            strcmp(argv[2], "gpg-agent") == 0;
 }
 
-static int m20_replace_gpgconf(const char *path) {
-    char replacement[MAX_PATH_LEN];
+static bool m20_same_file_version(const struct stat *left,
+                                  const struct stat *right) {
+    if (!left || !right || left->st_dev != right->st_dev ||
+        left->st_ino != right->st_ino || left->st_mode != right->st_mode ||
+        left->st_uid != right->st_uid || left->st_gid != right->st_gid ||
+        left->st_nlink != right->st_nlink ||
+        left->st_size != right->st_size) {
+        return false;
+    }
+#ifdef __APPLE__
+    return left->st_mtimespec.tv_sec == right->st_mtimespec.tv_sec &&
+           left->st_mtimespec.tv_nsec == right->st_mtimespec.tv_nsec &&
+           left->st_ctimespec.tv_sec == right->st_ctimespec.tv_sec &&
+           left->st_ctimespec.tv_nsec == right->st_ctimespec.tv_nsec;
+#else
+    return left->st_mtim.tv_sec == right->st_mtim.tv_sec &&
+           left->st_mtim.tv_nsec == right->st_mtim.tv_nsec &&
+           left->st_ctim.tv_sec == right->st_ctim.tv_sec &&
+           left->st_ctim.tv_nsec == right->st_ctim.tv_nsec;
+#endif
+}
 
-    if (!path ||
-        safe_snprintf(replacement, sizeof(replacement), "%s.new", path) != 0 ||
-        copy_file(g_self_executable, replacement) != 0 ||
-        rename(replacement, path) != 0) {
-        (void)unlink(replacement);
+static bool m20_ctime_only_file_change(const struct stat *left,
+                                       const struct stat *right) {
+    if (!left || !right || left->st_dev != right->st_dev ||
+        left->st_ino != right->st_ino || left->st_mode != right->st_mode ||
+        left->st_uid != right->st_uid || left->st_gid != right->st_gid ||
+        left->st_nlink != right->st_nlink ||
+        left->st_size != right->st_size) {
+        return false;
+    }
+#ifdef __APPLE__
+    return left->st_mtimespec.tv_sec == right->st_mtimespec.tv_sec &&
+           left->st_mtimespec.tv_nsec == right->st_mtimespec.tv_nsec &&
+           (left->st_ctimespec.tv_sec != right->st_ctimespec.tv_sec ||
+            left->st_ctimespec.tv_nsec != right->st_ctimespec.tv_nsec);
+#else
+    return left->st_mtim.tv_sec == right->st_mtim.tv_sec &&
+           left->st_mtim.tv_nsec == right->st_mtim.tv_nsec &&
+           (left->st_ctim.tv_sec != right->st_ctim.tv_sec ||
+            left->st_ctim.tv_nsec != right->st_ctim.tv_nsec);
+#endif
+}
+
+static int m20_full_sync_fd(int fd) {
+#ifdef __APPLE__
+    if (fcntl(fd, F_FULLFSYNC) == 0) return 0;
+    if (errno != ENOTSUP && errno != ENOTTY && errno != EINVAL) return -1;
+#endif
+    return fsync(fd);
+}
+
+static int m20_open_private_tool_directory(const char *path) {
+    struct stat named_before;
+    struct stat opened;
+    struct stat named_after;
+    int saved_errno = 0;
+    int fd;
+
+    if (!path || lstat(path, &named_before) != 0 ||
+        !S_ISDIR(named_before.st_mode) ||
+        named_before.st_uid != getuid() ||
+        (named_before.st_mode & 0777) != 0700) {
+        errno = EPERM;
+        return -1;
+    }
+    fd = open(path, O_RDONLY | O_CLOEXEC | O_DIRECTORY | O_NOFOLLOW);
+    if (fd < 0 || fstat(fd, &opened) != 0 ||
+        fstatat(AT_FDCWD, path, &named_after, AT_SYMLINK_NOFOLLOW) != 0 ||
+        !m20_same_file_version(&named_before, &opened) ||
+        !m20_same_file_version(&opened, &named_after)) {
+        saved_errno = errno ? errno : ESTALE;
+        if (fd >= 0) (void)close(fd);
+        errno = saved_errno;
+        return -1;
+    }
+    return fd;
+}
+
+static int m20_sync_private_tool_at(int parent_fd, const char *leaf) {
+    struct stat named_before;
+    struct stat opened;
+    struct stat named_after;
+    int fd;
+    int saved_errno = 0;
+
+    if (parent_fd < 0 || !leaf ||
+        fstatat(parent_fd, leaf, &named_before, AT_SYMLINK_NOFOLLOW) != 0 ||
+        !S_ISREG(named_before.st_mode) ||
+        named_before.st_uid != getuid() ||
+        named_before.st_nlink != 1 ||
+        (named_before.st_mode & 022) != 0 ||
+        (named_before.st_mode & 0700) != 0700) {
+        errno = EPERM;
+        return -1;
+    }
+    fd = openat(parent_fd, leaf,
+                O_RDWR | O_CLOEXEC | O_NOFOLLOW | O_NONBLOCK);
+    if (fd < 0 || fstat(fd, &opened) != 0 ||
+        !m20_same_file_version(&named_before, &opened)) {
+        saved_errno = errno ? errno : ESTALE;
+        if (fd >= 0) (void)close(fd);
+        errno = saved_errno;
+        return -1;
+    }
+    if (m20_full_sync_fd(fd) != 0) saved_errno = errno;
+    if (close(fd) != 0 && saved_errno == 0) saved_errno = errno;
+    if (saved_errno == 0 &&
+        (fstatat(parent_fd, leaf, &named_after,
+                 AT_SYMLINK_NOFOLLOW) != 0 ||
+         (!m20_same_file_version(&opened, &named_after) &&
+          !m20_ctime_only_file_change(&opened, &named_after)))) {
+        saved_errno = errno ? errno : ESTALE;
+    }
+    if (saved_errno != 0) {
+        errno = saved_errno;
         return -1;
     }
     return 0;
+}
+
+static int m20_split_tool_path(const char *path, char *parent,
+                               size_t parent_size, const char **leaf_out) {
+    char *slash;
+
+    if (!path || !parent || !leaf_out ||
+        safe_strncpy(parent, path, parent_size) != 0 ||
+        !(slash = strrchr(parent, '/')) || slash == parent ||
+        slash[1] == '\0') {
+        errno = EINVAL;
+        return -1;
+    }
+    *leaf_out = path + (slash - parent) + 1;
+    *slash = '\0';
+    return 0;
+}
+
+static int m20_settle_private_tool_witness(int parent_fd, const char *leaf,
+                                           const char *path) {
+    enum { M20_TOOL_SETTLE_ATTEMPTS = 8 };
+    run_launch_witness_t previous;
+    bool have_previous = false;
+    int consecutive = 0;
+
+    memset(&previous, 0, sizeof(previous));
+    for (int attempt = 0; attempt < M20_TOOL_SETTLE_ATTEMPTS; attempt++) {
+        run_launch_witness_t current;
+        struct stat named_before;
+        struct stat opened;
+        struct stat named_after;
+        int fd = -1;
+
+        memset(&current, 0, sizeof(current));
+        if (!run_launch_witness_capture(path, &current) ||
+            fstatat(parent_fd, leaf, &named_before,
+                    AT_SYMLINK_NOFOLLOW) != 0 ||
+            !S_ISREG(named_before.st_mode) ||
+            named_before.st_uid != getuid() ||
+            named_before.st_nlink != 1 ||
+            (named_before.st_mode & 022) != 0 ||
+            (named_before.st_mode & 0111) == 0) {
+            have_previous = false;
+            consecutive = 0;
+            continue;
+        }
+        fd = openat(parent_fd, leaf,
+                    O_RDONLY | O_CLOEXEC | O_NOFOLLOW | O_NONBLOCK);
+        if (fd < 0 || fstat(fd, &opened) != 0 ||
+            !m20_same_file_version(&current.executable_identity,
+                                   &named_before) ||
+            !m20_same_file_version(&named_before, &opened)) {
+            if (fd >= 0) (void)close(fd);
+            have_previous = false;
+            consecutive = 0;
+            continue;
+        }
+        if (close(fd) != 0 ||
+            fstatat(parent_fd, leaf, &named_after,
+                    AT_SYMLINK_NOFOLLOW) != 0 ||
+            !m20_same_file_version(&opened, &named_after)) {
+            have_previous = false;
+            consecutive = 0;
+            continue;
+        }
+        if (have_previous &&
+            run_launch_witness_matches(&previous, &current)) {
+            consecutive++;
+        } else {
+            consecutive = 1;
+        }
+        previous = current;
+        have_previous = true;
+        if (consecutive == 2) return 0;
+    }
+    errno = ESTALE;
+    return -1;
+}
+
+static int m20_replace_gpgconf(const char *path) {
+    char parent[MAX_PATH_LEN];
+    char replacement[MAX_PATH_LEN];
+    char replacement_leaf[MAX_PATH_LEN];
+    const char *leaf;
+    int parent_fd = -1;
+    int rc = -1;
+
+    if (!path ||
+        m20_split_tool_path(path, parent, sizeof(parent), &leaf) != 0 ||
+        safe_snprintf(replacement_leaf, sizeof(replacement_leaf),
+                      "%s.new", leaf) != 0 ||
+        safe_snprintf(replacement, sizeof(replacement), "%s.new", path) != 0 ||
+        copy_file(g_self_executable, replacement) != 0) {
+        goto out;
+    }
+    parent_fd = m20_open_private_tool_directory(parent);
+    if (parent_fd < 0 ||
+        m20_sync_private_tool_at(parent_fd, replacement_leaf) != 0 ||
+        renameat(parent_fd, replacement_leaf, parent_fd, leaf) != 0 ||
+        m20_full_sync_fd(parent_fd) != 0 ||
+        m20_settle_private_tool_witness(
+            parent_fd, leaf, path) != 0) {
+        goto out;
+    }
+    rc = 0;
+out:
+    if (parent_fd >= 0) (void)close(parent_fd);
+    if (rc != 0) (void)unlink(replacement);
+    return rc;
 }
 
 static bool m20_same_ctime(const struct stat *left,
@@ -259,6 +481,53 @@ static int m20_mutate_config_during_reload(m20_reload_mutation_t mutation) {
         return -1;
     }
     return 0;
+}
+
+static int m20_reload_state_descriptor_is_closed(void) {
+    char path[MAX_PATH_LEN];
+    struct stat marker;
+    DIR *directory;
+    struct dirent *entry;
+    int directory_fd;
+    int result = 1;
+
+    if (safe_snprintf(path, sizeof(path),
+                      "%s/.gitswitch-gpg-agent-reload.state",
+                      g_expected_home) != 0 ||
+        fstatat(AT_FDCWD, path, &marker, AT_SYMLINK_NOFOLLOW) != 0 ||
+        !S_ISREG(marker.st_mode) || marker.st_uid != getuid() ||
+        marker.st_nlink != 1) {
+        return -1;
+    }
+    directory = opendir("/dev/fd");
+    if (!directory) return -1;
+    directory_fd = dirfd(directory);
+    for (;;) {
+        char *end = NULL;
+        long descriptor;
+        struct stat opened;
+
+        errno = 0;
+        entry = readdir(directory);
+        if (!entry) {
+            if (errno != 0) result = -1;
+            break;
+        }
+        descriptor = strtol(entry->d_name, &end, 10);
+        if (errno != 0 || !end || *end != '\0' ||
+            descriptor < 0 || descriptor > INT_MAX ||
+            descriptor == directory_fd) {
+            continue;
+        }
+        if (fstat((int)descriptor, &opened) == 0 &&
+            opened.st_dev == marker.st_dev &&
+            opened.st_ino == marker.st_ino) {
+            result = 0;
+            break;
+        }
+    }
+    if (closedir(directory) != 0) result = -1;
+    return result;
 }
 
 static int m20_runner(const char *const argv[], const run_opts_t *opts,
@@ -543,11 +812,32 @@ static int m20_postclose_mutation(int home_fd) {
         }
         return 0;
     }
-    rc = m20_mutate_config_during_reload(g_postclose_mutation);
-    if (rc == 0) {
-        g_postclose_mutation_applications++;
+    if (g_postclose_require_closed_reload_state) {
+        g_postclose_require_closed_reload_state = false;
+        if (m20_reload_state_descriptor_is_closed() != 1) return -1;
+        g_postclose_observed_closed_reload_state = true;
     }
-    return rc;
+    rc = m20_mutate_config_during_reload(g_postclose_mutation);
+    if (rc != 0) return rc;
+    g_postclose_mutation_applications++;
+    if (g_postclose_replace_reload_state) {
+        char replacement[MAX_PATH_LEN];
+        char reload_state[MAX_PATH_LEN];
+
+        g_postclose_replace_reload_state = false;
+        if (safe_snprintf(replacement, sizeof(replacement),
+                          "%s/.gitswitch-gpg-agent-reload.new",
+                          g_expected_home) != 0 ||
+            safe_snprintf(reload_state, sizeof(reload_state),
+                          "%s/.gitswitch-gpg-agent-reload.state",
+                          g_expected_home) != 0 ||
+            write_string_to_file(replacement, "corrupt\n", 0600) != 0 ||
+            rename(replacement, reload_state) != 0) {
+            (void)unlink(replacement);
+            return -1;
+        }
+    }
+    return 0;
 }
 
 static void m20_reset_sync_faults(int fail_file_at, int fail_directory_at) {
@@ -563,6 +853,9 @@ static void m20_reset_sync_faults(int fail_file_at, int fail_directory_at) {
     g_postclose_mutation_limit = 0;
     g_postclose_mutation_at = 0;
     g_postclose_mutation = M20_RELOAD_MUTATION_NONE;
+    g_postclose_replace_reload_state = false;
+    g_postclose_require_closed_reload_state = false;
+    g_postclose_observed_closed_reload_state = false;
 }
 
 static void m20_reset_observation(const m20_fixture_t *fixture,
@@ -603,6 +896,8 @@ static void m20_remove_private_tools(m20_fixture_t *fixture) {
 
 static int m20_create_private_tool_copies(
     m20_fixture_t *fixture, const char *gpgconf_source) {
+    int tools_fd = -1;
+
     if (!fixture || !gpgconf_source || g_self_executable[0] != '/') {
         errno = EINVAL;
         return -1;
@@ -617,6 +912,29 @@ static int m20_create_private_tool_copies(
         copy_file(gpgconf_source, fixture->gpgconf) != 0 ||
         copy_file(gpgconf_source, fixture->gpg) != 0) {
         int saved_errno = errno ? errno : EIO;
+
+        m20_remove_private_tools(fixture);
+        errno = saved_errno;
+        return -1;
+    }
+    tools_fd = m20_open_private_tool_directory(fixture->tools);
+    if (tools_fd < 0 ||
+        m20_sync_private_tool_at(tools_fd, "gpgconf") != 0 ||
+        m20_sync_private_tool_at(tools_fd, "gpg") != 0 ||
+        m20_full_sync_fd(tools_fd) != 0 ||
+        m20_settle_private_tool_witness(
+            tools_fd, "gpgconf", fixture->gpgconf) != 0 ||
+        m20_settle_private_tool_witness(
+            tools_fd, "gpg", fixture->gpg) != 0) {
+        int saved_errno = errno ? errno : EIO;
+
+        if (tools_fd >= 0) (void)close(tools_fd);
+        m20_remove_private_tools(fixture);
+        errno = saved_errno;
+        return -1;
+    }
+    if (close(tools_fd) != 0) {
+        int saved_errno = errno;
 
         m20_remove_private_tools(fixture);
         errno = saved_errno;
@@ -1432,7 +1750,7 @@ TEST(late_clean_state_changed_bytes_fail_then_retry) {
     CHECK_EQ_INT(first_reload_calls, 1);
     CHECK_EQ_INT(first_protocol_errors, 0);
     CHECK(strstr(failure.message,
-                 "changed while recording completed activation") != NULL);
+                 "activation proof was closing") != NULL);
     CHECK_EQ_INT(retry_rc, 0);
     CHECK_EQ_INT(g_config_commits, 2);
     CHECK_EQ_INT(g_reload_calls, 1);
@@ -1617,6 +1935,7 @@ TEST(clean_state_final_reproof_absorbs_ctime_successor) {
     gpg_agent_conf_postclose_fn old_postclose;
     command_runner_fn old_runner;
     gpg_config_t config;
+    bool observed_closed_reload_state;
     int first_mutations;
     int first_stable_at;
     int first_reload_calls;
@@ -1628,9 +1947,10 @@ TEST(clean_state_final_reproof_absorbs_ctime_successor) {
     g_config_commits = 0;
     m20_reset_observation(&fixture, m20_config_a, false);
     m20_reset_sync_faults(0, 0);
-    g_postclose_mutation_at = 2;
+    g_postclose_mutation_at = 3;
     g_postclose_mutation_limit = -1;
     g_postclose_mutation = M20_RELOAD_MUTATION_EXACT_CTIME;
+    g_postclose_require_closed_reload_state = true;
     old_commit = gpg_manager_set_agent_conf_precommit_fn(
         m20_count_config_commit);
     old_postclose = gpg_manager_set_agent_conf_postclose_fn(
@@ -1640,6 +1960,8 @@ TEST(clean_state_final_reproof_absorbs_ctime_successor) {
     first_mutations = g_postclose_mutation_applications;
     first_stable_at = g_postclose_first_stable_at;
     first_reload_calls = g_reload_calls;
+    observed_closed_reload_state =
+        g_postclose_observed_closed_reload_state;
 
     m20_reset_observation(&fixture, m20_config_a, false);
     m20_reset_sync_faults(0, 0);
@@ -1650,8 +1972,9 @@ TEST(clean_state_final_reproof_absorbs_ctime_successor) {
 
     CHECK_EQ_INT(first_rc, 0);
     CHECK_EQ_INT(first_mutations, 1);
-    CHECK_EQ_INT(first_stable_at, 3);
+    CHECK_EQ_INT(first_stable_at, 4);
     CHECK_EQ_INT(first_reload_calls, 1);
+    CHECK(observed_closed_reload_state);
     CHECK_EQ_INT(second_rc, 0);
     CHECK_EQ_INT(g_config_commits, 1);
     CHECK_EQ_INT(g_reload_calls, 0);
@@ -1683,7 +2006,7 @@ TEST(clean_state_final_reproof_rejects_changed_bytes) {
     g_config_commits = 0;
     m20_reset_observation(&fixture, m20_config_a, false);
     m20_reset_sync_faults(0, 0);
-    g_postclose_mutation_at = 2;
+    g_postclose_mutation_at = 3;
     g_postclose_mutation_limit = -1;
     g_postclose_mutation = M20_RELOAD_MUTATION_DIFFERENT_BYTES;
     old_commit = gpg_manager_set_agent_conf_precommit_fn(
@@ -1711,6 +2034,128 @@ TEST(clean_state_final_reproof_rejects_changed_bytes) {
     CHECK_EQ_INT(retry_rc, 0);
     CHECK_EQ_INT(g_config_commits, 2);
     CHECK_EQ_INT(g_reload_calls, 1);
+    CHECK_EQ_INT(g_reload_protocol_errors, 0);
+    CHECK_EQ_INT(m20_restore_env("PATH", &path), 0);
+    CHECK_EQ_INT(m20_restore_env("GNUPGHOME", &gnupg), 0);
+    CHECK_EQ_INT(m20_restore_env("GITSWITCH_ALLOW_TMP_GPG", &optin), 0);
+    CHECK_EQ_INT(m20_restore_env("XDG_RUNTIME_DIR", &runtime), 0);
+}
+
+TEST(closed_clean_state_replacement_fails_closed_then_reloads) {
+    m20_saved_env_t runtime = m20_save_env("XDG_RUNTIME_DIR");
+    m20_saved_env_t optin = m20_save_env("GITSWITCH_ALLOW_TMP_GPG");
+    m20_saved_env_t gnupg = m20_save_env("GNUPGHOME");
+    m20_saved_env_t path = m20_save_env("PATH");
+    m20_fixture_t fixture;
+    gpg_agent_conf_precommit_fn old_commit;
+    gpg_agent_conf_postclose_fn old_postclose;
+    command_runner_fn old_runner;
+    gpg_config_t config;
+    error_context_t failure;
+    int first_mutations;
+    int first_reload_calls;
+    int first_rc;
+    int retry_rc;
+
+    CHECK_EQ_INT(m20_make_fixture(&fixture, m20_config_a, true), 0);
+    m20_prepare_config(&config, &fixture);
+    g_config_commits = 0;
+    m20_reset_observation(&fixture, m20_config_a, false);
+    m20_reset_sync_faults(0, 0);
+    g_postclose_mutation_at = 3;
+    g_postclose_mutation_limit = -1;
+    g_postclose_mutation = M20_RELOAD_MUTATION_EXACT_CTIME;
+    g_postclose_replace_reload_state = true;
+    old_commit = gpg_manager_set_agent_conf_precommit_fn(
+        m20_count_config_commit);
+    old_postclose = gpg_manager_set_agent_conf_postclose_fn(
+        m20_postclose_mutation);
+    old_runner = run_set_runner(m20_runner);
+    first_rc = gpg_create_isolated_home(&config, &fixture.account);
+    failure = *get_last_error();
+    first_mutations = g_postclose_mutation_applications;
+    first_reload_calls = g_reload_calls;
+
+    m20_reset_observation(&fixture, m20_config_a, false);
+    m20_reset_sync_faults(0, 0);
+    retry_rc = gpg_create_isolated_home(&config, &fixture.account);
+    run_set_runner(old_runner);
+    gpg_manager_set_agent_conf_postclose_fn(old_postclose);
+    gpg_manager_set_agent_conf_precommit_fn(old_commit);
+
+    CHECK_EQ_INT(first_rc, -1);
+    CHECK_EQ_INT(first_mutations, 1);
+    CHECK_EQ_INT(first_reload_calls, 1);
+    CHECK(strstr(
+              failure.message,
+              "reload state changed while settling completed activation") !=
+          NULL);
+    CHECK_EQ_INT(retry_rc, 0);
+    CHECK_EQ_INT(g_config_commits, 1);
+    CHECK_EQ_INT(g_reload_calls, 1);
+    CHECK_EQ_INT(g_reload_protocol_errors, 0);
+    CHECK_EQ_INT(m20_restore_env("PATH", &path), 0);
+    CHECK_EQ_INT(m20_restore_env("GNUPGHOME", &gnupg), 0);
+    CHECK_EQ_INT(m20_restore_env("GITSWITCH_ALLOW_TMP_GPG", &optin), 0);
+    CHECK_EQ_INT(m20_restore_env("XDG_RUNTIME_DIR", &runtime), 0);
+}
+
+TEST(unchanged_clean_state_settles_after_marker_close) {
+    m20_saved_env_t runtime = m20_save_env("XDG_RUNTIME_DIR");
+    m20_saved_env_t optin = m20_save_env("GITSWITCH_ALLOW_TMP_GPG");
+    m20_saved_env_t gnupg = m20_save_env("GNUPGHOME");
+    m20_saved_env_t path = m20_save_env("PATH");
+    m20_fixture_t fixture;
+    gpg_agent_conf_precommit_fn old_commit;
+    gpg_agent_conf_postclose_fn old_postclose;
+    command_runner_fn old_runner;
+    gpg_config_t config;
+    bool observed_closed_reload_state;
+    int first_rc;
+    int second_rc;
+    int third_rc;
+    int second_mutations;
+    int second_reload_calls;
+
+    CHECK_EQ_INT(m20_make_fixture(&fixture, m20_config_a, true), 0);
+    m20_prepare_config(&config, &fixture);
+    g_config_commits = 0;
+    m20_reset_observation(&fixture, m20_config_a, false);
+    m20_reset_sync_faults(0, 0);
+    old_commit = gpg_manager_set_agent_conf_precommit_fn(
+        m20_count_config_commit);
+    old_runner = run_set_runner(m20_runner);
+    first_rc = gpg_create_isolated_home(&config, &fixture.account);
+
+    m20_reset_observation(&fixture, m20_config_a, false);
+    m20_reset_sync_faults(0, 0);
+    g_postclose_mutation_at = 1;
+    g_postclose_mutation_limit = -1;
+    g_postclose_mutation = M20_RELOAD_MUTATION_EXACT_CTIME;
+    g_postclose_require_closed_reload_state = true;
+    old_postclose = gpg_manager_set_agent_conf_postclose_fn(
+        m20_postclose_mutation);
+    second_rc = gpg_create_isolated_home(&config, &fixture.account);
+    second_mutations = g_postclose_mutation_applications;
+    second_reload_calls = g_reload_calls;
+    observed_closed_reload_state =
+        g_postclose_observed_closed_reload_state;
+
+    m20_reset_observation(&fixture, m20_config_a, false);
+    m20_reset_sync_faults(0, 0);
+    third_rc = gpg_create_isolated_home(&config, &fixture.account);
+    run_set_runner(old_runner);
+    gpg_manager_set_agent_conf_postclose_fn(old_postclose);
+    gpg_manager_set_agent_conf_precommit_fn(old_commit);
+
+    CHECK_EQ_INT(first_rc, 0);
+    CHECK_EQ_INT(second_rc, 0);
+    CHECK_EQ_INT(second_mutations, 1);
+    CHECK_EQ_INT(second_reload_calls, 0);
+    CHECK(observed_closed_reload_state);
+    CHECK_EQ_INT(third_rc, 0);
+    CHECK_EQ_INT(g_config_commits, 1);
+    CHECK_EQ_INT(g_reload_calls, 0);
     CHECK_EQ_INT(g_reload_protocol_errors, 0);
     CHECK_EQ_INT(m20_restore_env("PATH", &path), 0);
     CHECK_EQ_INT(m20_restore_env("GNUPGHOME", &gnupg), 0);
@@ -2101,6 +2546,8 @@ int main(int argc, char **argv) {
     RUN_TEST(postclose_changed_bytes_fail_before_clean_state);
     RUN_TEST(clean_state_final_reproof_absorbs_ctime_successor);
     RUN_TEST(clean_state_final_reproof_rejects_changed_bytes);
+    RUN_TEST(closed_clean_state_replacement_fails_closed_then_reloads);
+    RUN_TEST(unchanged_clean_state_settles_after_marker_close);
     RUN_TEST(postclose_continuous_ctime_drift_is_bounded);
     RUN_TEST(changed_bytes_with_restored_mtime_fail_then_retry);
     RUN_TEST(unrelated_gpgconf_suite_is_rejected_before_publication);

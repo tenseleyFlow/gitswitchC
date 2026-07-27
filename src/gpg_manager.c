@@ -9061,7 +9061,8 @@ static int gpg_validate_agent_config_update(
  * record must describe the generation after that close, not the one observed
  * while the descriptor was still live. Re-read every expected byte through a
  * no-follow descriptor, close it, and bind the update to the post-close
- * pathname generation. */
+ * pathname generation. Require two consecutive equal closed proofs so one
+ * equality cannot hide a later delayed ctime-only successor. */
 static int gpg_reprove_agent_config_after_close(
     int home_fd, gpg_agent_config_update_t *update) {
     /* FreeBSD/UFS can expose four delayed ctime-only successors under a
@@ -9070,6 +9071,7 @@ static int gpg_reprove_agent_config_after_close(
      * exact byte proof on every attempt still bounds continuous mutation. */
     enum { GPG_AGENT_POSTCLOSE_PROOF_ATTEMPTS = 8 };
     struct stat expected;
+    int consecutive_equal_proofs = 0;
 
     if (home_fd < 0 || !update || update->config_fd >= 0 ||
         (!update->config_witness &&
@@ -9086,6 +9088,7 @@ static int gpg_reprove_agent_config_after_close(
          attempt < GPG_AGENT_POSTCLOSE_PROOF_ATTEMPTS; attempt++) {
         struct stat proven;
         struct stat after_close;
+        bool generation_advanced;
         int proof_fd = -1;
         int match = gpg_agent_conf_matches(
             home_fd, update->config_witness,
@@ -9134,11 +9137,17 @@ static int gpg_reprove_agent_config_after_close(
                 "Installed gpg-agent.conf changed while its activation proof was closing");
             return -1;
         }
-        if (gpg_same_file_version(&proven, &after_close)) {
-            update->config_identity = after_close;
-            return 0;
-        }
+        generation_advanced =
+            !gpg_same_file_version(&expected, &proven) ||
+            !gpg_same_file_version(&proven, &after_close);
+        update->config_identity = after_close;
         expected = after_close;
+        if (generation_advanced) {
+            consecutive_equal_proofs = 0;
+            continue;
+        }
+        consecutive_equal_proofs++;
+        if (consecutive_equal_proofs == 2) return 0;
     }
     set_error(
         ERR_FILE_IO,
@@ -9146,7 +9155,7 @@ static int gpg_reprove_agent_config_after_close(
     return -1;
 }
 
-static int gpg_close_and_reprove_agent_config(
+static int gpg_close_agent_config(
     int home_fd, gpg_agent_config_update_t *update) {
     if (gpg_validate_agent_config_update(home_fd, update) != 0) {
         return -1;
@@ -9159,6 +9168,14 @@ static int gpg_close_and_reprove_agent_config(
         return -1;
     }
     update->config_fd = -1;
+    return 0;
+}
+
+static int gpg_close_and_reprove_agent_config(
+    int home_fd, gpg_agent_config_update_t *update) {
+    if (gpg_close_agent_config(home_fd, update) != 0) {
+        return -1;
+    }
     return gpg_reprove_agent_config_after_close(home_fd, update);
 }
 
@@ -9331,62 +9348,100 @@ static int gpg_set_agent_reload_clean(int home_fd,
     return 0;
 }
 
-/* A sibling-state flush can expose one more delayed UFS ctime step. After the
- * clean record and pathname first agree, perform one final closed exact-byte
- * proof before returning. Rewrite the record if that proof observes a narrow
- * ctime-only successor, and stop after a small fixed number of attempts so
- * continuous mutation fails closed rather than spinning. No config descriptor
- * remains open when this returns, so the persisted generation cannot be
- * invalidated by caller cleanup. */
+/* Closing the sibling clean-state descriptor can expose another delayed UFS
+ * ctime step on the config. Close that descriptor before the terminal config
+ * quorum, and rewrite only after reopening and proving that the same private
+ * marker still contains the exact record for the prior config generation.
+ * Successful settlement leaves neither config nor marker descriptors open. */
 static int gpg_set_agent_reload_clean_stable(
-    int home_fd, gpg_agent_config_update_t *update) {
+    int home_fd, gpg_agent_config_update_t *update,
+    bool state_already_clean) {
     enum { GPG_AGENT_CLEAN_SETTLE_ATTEMPTS = 4 };
-    struct stat named;
 
-    if (home_fd < 0 || !update || update->config_fd >= 0) {
+    if (home_fd < 0 || !update || update->config_fd >= 0 ||
+        update->marker_fd < 0) {
         set_error(ERR_INVALID_ARGS,
                   "Invalid stable GPG agent clean-state request");
         return -1;
     }
     for (int attempt = 0;
          attempt < GPG_AGENT_CLEAN_SETTLE_ATTEMPTS; attempt++) {
-        if (gpg_set_agent_reload_clean(home_fd, update) != 0) {
+        struct stat recorded_config;
+        struct stat recorded_marker;
+
+        if (state_already_clean) {
+            bool matches = false;
+
+            if (gpg_validate_agent_update_entry(
+                    home_fd, GPG_AGENT_RELOAD_STATE, update->marker_fd,
+                    &update->marker_identity,
+                    update->marker_identity.st_size,
+                    "GPG agent reload state") != 0 ||
+                gpg_agent_reload_state_matches_config(
+                    home_fd, update->marker_fd,
+                    &update->marker_identity,
+                    &update->config_identity, update, &matches) != 0 ||
+                !matches) {
+                set_error(
+                    ERR_FILE_IO,
+                    "GPG agent reload state changed before settling completed activation");
+                return -1;
+            }
+        } else if (gpg_set_agent_reload_clean(home_fd, update) != 0) {
             return -1;
         }
-        if (fstatat(home_fd, "gpg-agent.conf", &named,
-                    AT_SYMLINK_NOFOLLOW) != 0 ||
-            !S_ISREG(named.st_mode) || named.st_uid != getuid() ||
-            named.st_nlink != 1 || (named.st_mode & 0777) != 0600 ||
-            named.st_size < 0 ||
-            (uintmax_t)named.st_size !=
-                update->config_witness_length) {
-            set_error(
+        recorded_config = update->config_identity;
+        recorded_marker = update->marker_identity;
+        if (close(update->marker_fd) != 0) {
+            update->marker_fd = -1;
+            set_system_error(
                 ERR_FILE_IO,
-                "Installed gpg-agent.conf changed while recording completed activation");
+                "Failed to close completed GPG agent reload state");
+            return -1;
+        }
+        update->marker_fd = -1;
+        if (gpg_reprove_agent_config_after_close(home_fd, update) != 0) {
             return -1;
         }
         if (gpg_same_file_version(
-                &update->config_identity, &named)) {
-            struct stat recorded = update->config_identity;
-
-            if (gpg_reprove_agent_config_after_close(
-                    home_fd, update) != 0) {
-                return -1;
-            }
-            if (gpg_same_file_version(
-                    &recorded, &update->config_identity)) {
-                return 0;
-            }
-            continue;
+                &recorded_config, &update->config_identity)) {
+            return 0;
         }
         if (!gpg_file_ctime_only_change(
-                &update->config_identity, &named) ||
-            gpg_reprove_agent_config_after_close(
-                home_fd, update) != 0) {
+                &recorded_config, &update->config_identity)) {
             set_error(
                 ERR_FILE_IO,
                 "Installed gpg-agent.conf changed while recording completed activation");
             return -1;
+        }
+        {
+            struct stat reopened;
+            bool present = false;
+            bool pending = false;
+            bool matches = false;
+
+            if (gpg_open_agent_reload_state(
+                    home_fd, &update->marker_fd, &reopened,
+                    &present, &pending) != 0 ||
+                !present || pending ||
+                (!gpg_same_file_version(&recorded_marker, &reopened) &&
+                 !gpg_file_ctime_only_change(
+                     &recorded_marker, &reopened)) ||
+                gpg_agent_reload_state_matches_config(
+                    home_fd, update->marker_fd, &reopened,
+                    &recorded_config, update, &matches) != 0 ||
+                !matches) {
+                if (update->marker_fd >= 0) {
+                    (void)close(update->marker_fd);
+                    update->marker_fd = -1;
+                }
+                set_error(
+                    ERR_FILE_IO,
+                    "GPG agent reload state changed while settling completed activation");
+                return -1;
+            }
+            update->marker_identity = reopened;
+            state_already_clean = false;
         }
     }
     set_error(
@@ -9466,7 +9521,7 @@ static int gpg_reload_agent_config(const gpg_pinned_home_t *home,
         gpg_close_and_reprove_agent_config(
             home->home_fd, update) != 0 ||
         gpg_set_agent_reload_clean_stable(
-            home->home_fd, update) != 0 ||
+            home->home_fd, update, false) != 0 ||
         gpg_validate_pinned_home(home) != 0) {
         return -1;
     }
@@ -10934,7 +10989,6 @@ static int setup_gpg_agent_config(const gpg_config_t *gpg_config,
     int matched_fd = -1;
     int match;
     int source_rc;
-    struct stat clean_identity;
     struct stat matched_identity;
     gpg_source_home_t source = { .fd = -1 };
 
@@ -11131,19 +11185,16 @@ static int setup_gpg_agent_config(const gpg_config_t *gpg_config,
             goto fail;
         }
         if (state_matches) {
-            clean_identity = matched_identity;
             update->config_fd = matched_fd;
             update->config_identity = matched_identity;
             matched_fd = -1;
             update->config_witness = desired;
             update->config_witness_length = desired_len;
             desired = NULL;
-            if (gpg_close_and_reprove_agent_config(
+            if (gpg_close_agent_config(
                     home_fd, update) != 0 ||
-                (!gpg_same_file_version(
-                     &clean_identity, &update->config_identity) &&
-                 gpg_set_agent_reload_clean_stable(
-                     home_fd, update) != 0)) {
+                gpg_set_agent_reload_clean_stable(
+                    home_fd, update, true) != 0) {
                 goto fail;
             }
             if (gpg_agent_config_update_close(update) != 0) {
