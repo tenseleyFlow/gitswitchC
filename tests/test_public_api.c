@@ -388,6 +388,7 @@ TEST(all_retained_public_apis_compile_and_link) {
     REQUIRE_PUBLIC_API(signals_pending);
     REQUIRE_PUBLIC_API(signals_pending_signal);
     REQUIRE_PUBLIC_API(signals_reset_for_child);
+    REQUIRE_PUBLIC_API(signals_reset_inherited_transaction_state);
     REQUIRE_PUBLIC_API(signals_restore_after_child_spawn);
     REQUIRE_PUBLIC_API(signals_rollback_begin);
     REQUIRE_PUBLIC_API(signals_rollback_begin_owned);
@@ -405,6 +406,7 @@ TEST(all_retained_public_apis_compile_and_link) {
     REQUIRE_PUBLIC_API(signals_test_fail_sigaction);
     REQUIRE_PUBLIC_API(signals_test_set_guard_end_hook);
     REQUIRE_PUBLIC_API(signals_test_set_post_wait_hook);
+    REQUIRE_PUBLIC_API(signals_test_set_scratch_upgrade_hook);
     REQUIRE_PUBLIC_API(signals_test_published_child);
 #endif
     REQUIRE_PUBLIC_API(sort_accounts);

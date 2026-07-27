@@ -297,6 +297,7 @@ TEST(identity_registration_rejects_path_and_identity_collisions) {
     struct stat identity;
     struct stat different;
     char *created;
+    int root_fd;
     int fd;
 
     created = ts_mkdtemp(root);
@@ -315,9 +316,20 @@ TEST(identity_registration_rejects_path_and_identity_collisions) {
     signals_scratch_unregister(path);
 
     CHECK_EQ_INT(signals_scratch_register(path), 0);
-    CHECK_EQ_INT(signals_scratch_register_identity(path, &identity), -1);
-    signals_scratch_unregister(path);
-    CHECK_EQ_INT(unlink(path), 0);
+    CHECK_EQ_INT(signals_scratch_register_identity(path, &identity), 0);
+    /* Generic/emergency cleanup must no longer treat the upgraded slot as
+     * path-only authority. */
+    signals_scratch_cleanup();
+    CHECK_EQ_INT(access(path, F_OK), 0);
+    root_fd = open(root, O_RDONLY | O_DIRECTORY);
+    CHECK(root_fd >= 0);
+    if (root_fd >= 0) {
+        CHECK_EQ_INT(
+            signals_scratch_cleanup_identities_at(root_fd, root), 0);
+        CHECK_EQ_INT(close(root_fd), 0);
+    }
+    errno = 0;
+    CHECK(access(path, F_OK) != 0 && errno == ENOENT);
 }
 
 TEST_MAIN_BEGIN()
