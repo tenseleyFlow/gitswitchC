@@ -148,6 +148,8 @@ cmp -s "$expected_members" "$actual_members" ||
 
 tar -xzf "$archive" -C "$tmp"
 source_root=$tmp/$dist_root
+distcheck_build_dir=build-distcheck
+distcheck_build_root=$source_root/$distcheck_build_dir
 
 for required in src tests completions VERSION LICENSE README.md Makefile gitswitcher.spec; do
     [ -e "$source_root/$required" ] || fail "required manifest entry missing: $required"
@@ -183,10 +185,11 @@ spec_version=$(sed -n 's/^Version:[[:space:]]*//p' \
 [ "$spec_version" = "$expected_version" ] ||
     fail "RPM spec Version $spec_version disagrees with VERSION $expected_version"
 
-"$make_cmd" -C "$source_root" BUILD_TYPE=debug test
+"$make_cmd" -C "$source_root" BUILDDIR="$distcheck_build_dir" \
+    BUILD_TYPE=debug test
 
 built_test_count=0
-for binary in "$source_root"/build/bin/test_*; do
+for binary in "$distcheck_build_root"/bin/test_*; do
     [ -x "$binary" ] || continue
     # test_public_api.c deliberately links twice: once with the testing API
     # surface and once against the production-only surface. Count the latter
@@ -199,13 +202,14 @@ for binary in "$source_root"/build/bin/test_*; do
 done
 [ "$built_test_count" -eq "$checkout_test_count" ] ||
     fail "built test count $built_test_count differs from checkout count $checkout_test_count"
-[ -x "$source_root/build/bin/test_public_api_production" ] ||
+[ -x "$distcheck_build_root/bin/test_public_api_production" ] ||
     fail "production public-API link test was not built"
 
-"$make_cmd" -C "$source_root" clean
-"$make_cmd" -C "$source_root" BUILD_TYPE=release all
+"$make_cmd" -C "$source_root" BUILDDIR="$distcheck_build_dir" clean
+"$make_cmd" -C "$source_root" BUILDDIR="$distcheck_build_dir" \
+    BUILD_TYPE=release all
 
-release_bin=$source_root/build/bin/gitswitch
+release_bin=$distcheck_build_root/bin/gitswitch
 version_output=$("$release_bin" --version)
 case $version_output in
     *" $expected_version ("*) ;;
@@ -217,10 +221,11 @@ esac
 # mode rejects a corrupted private copy and proves a post-validation source
 # replacement cannot change the bytes ultimately published.
 sh "$source_root/tests/test_ar07_release.sh" install "$source_root" \
-    "$make_cmd" "$release_bin" "$source_root/build" "$prefix"
+    "$make_cmd" "$release_bin" "$distcheck_build_root" "$prefix"
 
 stage=$tmp/stage
-"$make_cmd" -C "$source_root" BUILD_TYPE=release install DESTDIR="$stage" PREFIX="$prefix"
+"$make_cmd" -C "$source_root" BUILDDIR="$distcheck_build_dir" \
+    BUILD_TYPE=release install DESTDIR="$stage" PREFIX="$prefix"
 
 [ -x "$stage$prefix/bin/gitswitch" ] || fail "installed binary missing"
 [ -f "$stage$prefix/share/bash-completion/completions/gitswitch" ] ||
@@ -235,7 +240,8 @@ stage=$tmp/stage
 # Darwin, so platform CI exercises the flags selected by that platform branch.
 sh "$source_root/tests/test_ar07_release.sh" artifact "$release_bin" \
     "$stage$prefix/bin/gitswitch"
-"$make_cmd" -C "$source_root" uninstall DESTDIR="$stage" PREFIX="$prefix"
+"$make_cmd" -C "$source_root" BUILDDIR="$distcheck_build_dir" uninstall \
+    DESTDIR="$stage" PREFIX="$prefix"
 for removed in \
     "$stage$prefix/bin/gitswitch" \
     "$stage$prefix/share/bash-completion/completions/gitswitch" \

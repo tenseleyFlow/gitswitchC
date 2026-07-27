@@ -63,6 +63,63 @@ static bool sigactions_semantically_equal(const struct sigaction *left,
     return true;
 }
 
+static int install_default_signal_fixture(
+    int signal_number, struct sigaction *original,
+    struct sigaction *configured) {
+    struct sigaction action;
+
+    if (!original || !configured ||
+        sigaction(signal_number, NULL, original) != 0) {
+        return -1;
+    }
+    memset(&action, 0, sizeof(action));
+    action.sa_handler = SIG_DFL;
+    if (sigemptyset(&action.sa_mask) != 0 ||
+        sigaction(signal_number, &action, NULL) != 0) {
+        return -1;
+    }
+    if (sigaction(signal_number, NULL, configured) != 0) {
+        int saved_errno = errno;
+
+        (void)sigaction(signal_number, original, NULL);
+        errno = saved_errno;
+        return -1;
+    }
+    return 0;
+}
+
+typedef bool (*signal_fixture_check_fn)(void);
+
+static bool ignored_signal_fixture_check_passes(
+    int signal_number, signal_fixture_check_fn check) {
+    struct sigaction original;
+    struct sigaction ignored;
+    struct sigaction configured;
+    struct sigaction after;
+    bool passed;
+    int query_rc;
+    int restore_rc;
+
+    if (!check || sigaction(signal_number, NULL, &original) != 0) {
+        return false;
+    }
+    memset(&ignored, 0, sizeof(ignored));
+    ignored.sa_handler = SIG_IGN;
+    if (sigemptyset(&ignored.sa_mask) != 0 ||
+        sigaction(signal_number, &ignored, NULL) != 0) {
+        return false;
+    }
+    if (sigaction(signal_number, NULL, &configured) != 0) {
+        (void)sigaction(signal_number, &original, NULL);
+        return false;
+    }
+    passed = check();
+    query_rc = sigaction(signal_number, NULL, &after);
+    restore_rc = sigaction(signal_number, &original, NULL);
+    return passed && query_rc == 0 && restore_rc == 0 &&
+           sigactions_semantically_equal(&configured, &after);
+}
+
 static int install_sigpipe_disposition(sigpipe_disposition_t disposition,
                                        struct sigaction *original,
                                        struct sigaction *installed) {
@@ -934,24 +991,47 @@ TEST(repeated_rollback_signal_terminates_group_descendant) {
 static int supervisor_termination_worker(int signal_number,
                                          bool post_replay) {
     const char *argv[] = {"sleep", "30", NULL};
+    struct sigaction original_action;
+    struct sigaction configured_action;
+    struct sigaction after_action;
     sigset_t original_mask;
     sigset_t configured_mask;
     sigset_t after_mask;
     run_opts_t opts;
     run_result_t result;
-    int rc;
+    int rc = -1;
+    int outcome = 78;
+    bool action_configured = false;
+    bool mask_configured = false;
+    bool guard_started = false;
+    bool correct = false;
 
-    if (sigprocmask(SIG_SETMASK, NULL, &original_mask) != 0) return 73;
+    if (install_default_signal_fixture(
+            signal_number, &original_action, &configured_action) != 0) {
+        return 73;
+    }
+    action_configured = true;
+    if (sigprocmask(SIG_SETMASK, NULL, &original_mask) != 0) {
+        outcome = 73;
+        goto cleanup;
+    }
     configured_mask = original_mask;
     if (sigdelset(&configured_mask, signal_number) != 0 ||
         sigaddset(&configured_mask, SIGUSR1) != 0 ||
         sigprocmask(SIG_SETMASK, &configured_mask, NULL) != 0) {
-        return 74;
+        outcome = 74;
+        goto cleanup;
     }
-    if (signals_guard_begin() != 0) return 75;
+    mask_configured = true;
+    if (signals_guard_begin() != 0) {
+        outcome = 75;
+        goto cleanup;
+    }
+    guard_started = true;
     memset(&opts, 0, sizeof(opts));
     if (run_deadline_after_millis(1000, &opts.deadline_millis) != 0) {
-        return 76;
+        outcome = 76;
+        goto cleanup;
     }
     opts.use_deadline = true;
     if (post_replay) {
@@ -962,16 +1042,41 @@ static int supervisor_termination_worker(int signal_number,
     rc = run_argv(argv, &opts, &result);
     run_test_set_supervisor_pending_signal(0);
     run_test_set_post_replay_signal(0);
-    if (sigprocmask(SIG_SETMASK, NULL, &after_mask) != 0) return 77;
-    bool correct =
-        rc == -1 && result.spawned && !result.timed_out &&
-        result.exit_code == -1 && result.term_signal == signal_number &&
-        signals_pending_signal() == signal_number &&
-        sigsets_semantically_equal(&configured_mask, &after_mask);
-    int guard_rc = signals_guard_end();
-    int restore_rc =
-        sigprocmask(SIG_SETMASK, &original_mask, NULL);
-    return correct && guard_rc == 0 && restore_rc == 0 ? 0 : 78;
+    if (sigprocmask(SIG_SETMASK, NULL, &after_mask) != 0) {
+        outcome = 77;
+        goto cleanup;
+    }
+    correct = rc == -1 && result.spawned && !result.timed_out &&
+              result.exit_code == -1 &&
+              result.term_signal == signal_number &&
+              signals_pending_signal() == signal_number &&
+              sigsets_semantically_equal(&configured_mask, &after_mask);
+    if (signals_guard_end() != 0) goto cleanup;
+    guard_started = false;
+    if (sigaction(signal_number, NULL, &after_action) != 0 ||
+        !sigactions_semantically_equal(
+            &configured_action, &after_action)) {
+        goto cleanup;
+    }
+    outcome = correct ? 0 : 78;
+
+cleanup:
+    run_test_set_supervisor_pending_signal(0);
+    run_test_set_post_replay_signal(0);
+    if (guard_started && signals_guard_end() != 0 && outcome == 0) {
+        outcome = 78;
+    }
+    if (mask_configured &&
+        sigprocmask(SIG_SETMASK, &original_mask, NULL) != 0 &&
+        outcome == 0) {
+        outcome = 78;
+    }
+    if (action_configured &&
+        sigaction(signal_number, &original_action, NULL) != 0 &&
+        outcome == 0) {
+        outcome = 78;
+    }
+    return outcome;
 }
 
 static int supervisor_pending_sigterm_worker(void) {
@@ -990,16 +1095,27 @@ static int post_replay_group_sigint_worker(void) {
     return supervisor_termination_worker(SIGINT, true);
 }
 
+static bool supervisor_pending_sigint_fixture_passes(void) {
+    return isolated_runner_check_passes(
+        supervisor_pending_sigint_worker);
+}
+
+static bool post_replay_group_sigint_fixture_passes(void) {
+    return isolated_runner_check_passes(
+        post_replay_group_sigint_worker);
+}
+
 TEST(supervisor_only_pending_termination_reaches_gated_worker_once) {
     CHECK(isolated_runner_check_passes(supervisor_pending_sigterm_worker));
-    CHECK(isolated_runner_check_passes(supervisor_pending_sigint_worker));
+    CHECK(ignored_signal_fixture_check_passes(
+        SIGINT, supervisor_pending_sigint_fixture_passes));
 }
 
 TEST(post_replay_group_termination_reaches_worker_once) {
     CHECK(isolated_runner_check_passes(
         post_replay_group_sigterm_worker));
-    CHECK(isolated_runner_check_passes(
-        post_replay_group_sigint_worker));
+    CHECK(ignored_signal_fixture_check_passes(
+        SIGINT, post_replay_group_sigint_fixture_passes));
 }
 
 static int supervisor_stop_worker(bool post_replay) {
@@ -1176,51 +1292,75 @@ static int pty_foreground_signal_worker(int slave_fd, int ready_fd,
                                         bool expect_pending) {
     const char *argv[] = {"sleep", "30", NULL};
     struct sigaction original_action;
-    struct sigaction default_action;
     struct sigaction configured_action;
     struct sigaction after_action;
     run_result_t result;
     pid_t caller_group;
+    int controlled_signal =
+        expect_pending ? expected_signal : SIGTSTP;
+    int outcome = 84;
+    bool action_configured = false;
+    bool guard_started = false;
 
-    if (sigaction(SIGTSTP, NULL, &original_action) != 0) return 79;
-    memset(&default_action, 0, sizeof(default_action));
-    default_action.sa_handler = SIG_DFL;
-    if (sigemptyset(&default_action.sa_mask) != 0 ||
-        sigaction(SIGTSTP, &default_action, NULL) != 0 ||
-        sigaction(SIGTSTP, NULL, &configured_action) != 0) {
+    if (install_default_signal_fixture(
+            controlled_signal, &original_action,
+            &configured_action) != 0) {
         return 79;
     }
-    if (setsid() < 0 || ioctl(slave_fd, TIOCSCTTY, 0) != 0) return 80;
+    action_configured = true;
+    if (setsid() < 0 || ioctl(slave_fd, TIOCSCTTY, 0) != 0) {
+        outcome = 80;
+        goto cleanup;
+    }
     if (dup2(slave_fd, STDIN_FILENO) != STDIN_FILENO ||
         dup2(slave_fd, STDOUT_FILENO) != STDOUT_FILENO ||
         dup2(slave_fd, STDERR_FILENO) != STDERR_FILENO) {
-        return 81;
+        outcome = 81;
+        goto cleanup;
     }
     if (slave_fd > STDERR_FILENO) close(slave_fd);
     caller_group = getpgrp();
     if (tcsetpgrp(STDIN_FILENO, caller_group) != 0 ||
         write(ready_fd, &caller_group, sizeof(caller_group)) !=
             (ssize_t)sizeof(caller_group)) {
-        return 82;
+        outcome = 82;
+        goto cleanup;
     }
     close(ready_fd);
-    if (signals_guard_begin() != 0) return 83;
+    ready_fd = -1;
+    if (signals_guard_begin() != 0) {
+        outcome = 83;
+        goto cleanup;
+    }
+    guard_started = true;
     int rc = run_argv(argv, NULL, &result);
     bool restored = tcgetpgrp(STDIN_FILENO) == caller_group;
     bool relayed = expect_pending
                        ? signals_pending_signal() == expected_signal
                        : signals_pending_signal() == 0;
-    int guard_rc = signals_guard_end();
-    int action_query_rc = sigaction(SIGTSTP, NULL, &after_action);
-    int action_restore_rc =
-        sigaction(SIGTSTP, &original_action, NULL);
-    return rc != 0 && result.spawned &&
-                   result.term_signal == expected_signal &&
-                   restored && relayed && guard_rc == 0 &&
-                   action_query_rc == 0 && action_restore_rc == 0 &&
-                   sigactions_semantically_equal(
-                       &configured_action, &after_action)
-               ? 0 : 84;
+    if (signals_guard_end() != 0) goto cleanup;
+    guard_started = false;
+    if (sigaction(controlled_signal, NULL, &after_action) != 0 ||
+        !sigactions_semantically_equal(
+            &configured_action, &after_action)) {
+        goto cleanup;
+    }
+    outcome = rc != 0 && result.spawned &&
+                      result.term_signal == expected_signal &&
+                      restored && relayed
+                  ? 0 : 84;
+
+cleanup:
+    if (ready_fd >= 0) close(ready_fd);
+    if (guard_started && signals_guard_end() != 0 && outcome == 0) {
+        outcome = 84;
+    }
+    if (action_configured &&
+        sigaction(controlled_signal, &original_action, NULL) != 0 &&
+        outcome == 0) {
+        outcome = 84;
+    }
+    return outcome;
 }
 
 static bool pty_control_round_trip(unsigned char control,
@@ -1289,8 +1429,13 @@ static bool pty_control_round_trip(unsigned char control,
     return passed;
 }
 
+static bool pty_interrupt_fixture_passes(void) {
+    return pty_control_round_trip(0x03U, SIGINT, true);
+}
+
 TEST(pty_interrupt_targets_child_group_and_restores_foreground_owner) {
-    CHECK(pty_control_round_trip(0x03U, SIGINT, true));
+    CHECK(ignored_signal_fixture_check_passes(
+        SIGINT, pty_interrupt_fixture_passes));
 }
 
 TEST(pty_stop_fails_closed_without_hanging_and_restores_foreground_owner) {

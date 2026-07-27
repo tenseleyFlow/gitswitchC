@@ -983,7 +983,9 @@ TEST(full_reset_final_scan_failure_preserves_complete_plan) {
     CHECK_EQ_INT(symlink(home, rollback), 0);
     CHECK_EQ_INT(symlink(home, publish), 0);
     CHECK_EQ_INT(symlink(home, reset), 0);
-    CHECK_EQ_INT(link(reset, witness), 0);
+    /* link(2) follows a symlink on FreeBSD; linkat without AT_SYMLINK_FOLLOW
+     * consistently hard-links the fixture's symlink object. */
+    CHECK_EQ_INT(linkat(AT_FDCWD, reset, AT_FDCWD, witness, 0), 0);
     CHECK_EQ_INT(lstat(home, &home_before), 0);
     CHECK_EQ_INT(lstat(marker, &marker_before), 0);
     CHECK_EQ_INT(lstat(current, &current_before), 0);
@@ -1155,7 +1157,7 @@ TEST(full_reset_forward_quarantine_sync_failure_is_retryable) {
     CHECK_EQ_INT(mkdir(base, 0700), 0);
     CHECK_EQ_INT(symlink("candidate", candidate), 0);
     CHECK_EQ_INT(symlink("expected", witness), 0);
-    CHECK_EQ_INT(link(witness, quarantine), 0);
+    CHECK_EQ_INT(linkat(AT_FDCWD, witness, AT_FDCWD, quarantine, 0), 0);
     CHECK(lstat(current, &st) != 0 && errno == ENOENT);
 
     g_reset_sync_calls = 0;
@@ -1706,10 +1708,12 @@ TEST(create_isolated_home_fails_closed_on_fd_probe_error) {
  * check entirely — failing closed without the GITSWITCH_ALLOW_TMP_GPG opt-in
  * and proceeding with it. */
 TEST(create_isolated_home_refuses_persistent_xdg_base) {
-    char cwd[512], xdg[768], home_expect[1024];
+    char cwd[512], build_root[768], xdg[1024], home_expect[1280];
+    const char *configured_build_root;
     gpg_config_t cfg;
     account_t acct;
     command_runner_fn prev;
+    int written;
 
     /* A directory in the build tree: persistent disk in CI and on dev boxes.
      * If this workspace is itself tmpfs-backed, the scenario can't be built
@@ -1718,11 +1722,49 @@ TEST(create_isolated_home_refuses_persistent_xdg_base) {
         CHECK(false);
         return;
     }
-    if (test_dir_is_tmpfs(cwd)) {
+    configured_build_root = getenv("GITSWITCH_BUILD_ROOT");
+    if (!configured_build_root || configured_build_root[0] == '\0') {
+        fprintf(stderr,
+                "  FAIL: GITSWITCH_BUILD_ROOT is missing or empty\n");
+        CHECK(false);
+        return;
+    }
+    if (configured_build_root[0] == '/') {
+        written = snprintf(build_root, sizeof(build_root), "%s",
+                           configured_build_root);
+    } else {
+        written = snprintf(build_root, sizeof(build_root), "%s/%s", cwd,
+                           configured_build_root);
+    }
+    if (written < 0 || (size_t)written >= sizeof(build_root)) {
+        fprintf(stderr, "  FAIL: GITSWITCH_BUILD_ROOT is too long\n");
+        CHECK(false);
+        return;
+    }
+    {
+        struct stat build_root_st;
+
+        if (stat(build_root, &build_root_st) != 0 ||
+            !S_ISDIR(build_root_st.st_mode)) {
+            fprintf(stderr,
+                    "  FAIL: GITSWITCH_BUILD_ROOT is not a directory: %s\n",
+                    build_root);
+            CHECK(false);
+            return;
+        }
+    }
+    if (test_dir_is_tmpfs(build_root)) {
         TS_SKIP("persistent-fs",
                 "persistent-filesystem premise unavailable on tmpfs workspace");
     }
-    snprintf(xdg, sizeof(xdg), "%s/build/gswgpg-xdg-XXXXXX", cwd);
+    written = snprintf(xdg, sizeof(xdg), "%s/gswgpg-xdg-XXXXXX",
+                       build_root);
+    if (written < 0 || (size_t)written >= sizeof(xdg)) {
+        fprintf(stderr,
+                "  FAIL: GITSWITCH_BUILD_ROOT leaves no room for fixture\n");
+        CHECK(false);
+        return;
+    }
     CHECK(ts_mkdtemp(xdg) != NULL);
     CHECK_EQ_INT(chmod(xdg, 0700), 0);
     setenv("XDG_RUNTIME_DIR", xdg, 1);
