@@ -9400,6 +9400,12 @@ static int gpg_set_agent_reload_clean_stable(
             return -1;
         }
         update->marker_fd = -1;
+        if (g_agent_conf_sync(home_fd, true) != 0) {
+            set_system_error(
+                ERR_FILE_IO,
+                "Failed to synchronize completed GPG agent reload state");
+            return -1;
+        }
         if (gpg_reprove_agent_config_after_close(home_fd, update) != 0) {
             return -1;
         }

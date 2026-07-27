@@ -17,6 +17,7 @@
 #include <dirent.h>
 #include <errno.h>
 #include <fcntl.h>
+#include <inttypes.h>
 #include <limits.h>
 #include <stdbool.h>
 #include <stdio.h>
@@ -101,6 +102,14 @@ typedef enum {
 static m20_reload_mutation_t g_reload_mutation;
 static int g_sync_mutation_at;
 static m20_reload_mutation_t g_sync_mutation;
+static int g_directory_sync_mutation_at;
+static int g_directory_sync_mutation_applications;
+static m20_reload_mutation_t g_directory_sync_mutation;
+static bool g_directory_sync_require_closed_reload_state;
+static bool g_directory_sync_observed_closed_reload_state;
+static bool g_directory_sync_mutation_identity_valid;
+static struct stat g_directory_sync_mutation_before;
+static struct stat g_directory_sync_mutation_after;
 static int g_postclose_mutation_count;
 static int g_postclose_mutation_applications;
 static int g_postclose_first_stable_at;
@@ -530,6 +539,50 @@ static int m20_reload_state_descriptor_is_closed(void) {
     return result;
 }
 
+static bool m20_reload_state_binds_identity(
+    const m20_fixture_t *fixture, const struct stat *identity) {
+    char actual[512];
+    char expected[512];
+    intmax_t mtime_sec;
+    long mtime_nsec;
+    intmax_t ctime_sec;
+    long ctime_nsec;
+    ssize_t read_count;
+    int fd;
+    int written;
+
+    if (!fixture || !identity || identity->st_size < 0) return false;
+#ifdef __APPLE__
+    mtime_sec = (intmax_t)identity->st_mtimespec.tv_sec;
+    mtime_nsec = identity->st_mtimespec.tv_nsec;
+    ctime_sec = (intmax_t)identity->st_ctimespec.tv_sec;
+    ctime_nsec = identity->st_ctimespec.tv_nsec;
+#else
+    mtime_sec = (intmax_t)identity->st_mtim.tv_sec;
+    mtime_nsec = identity->st_mtim.tv_nsec;
+    ctime_sec = (intmax_t)identity->st_ctim.tv_sec;
+    ctime_nsec = identity->st_ctim.tv_nsec;
+#endif
+    written = snprintf(
+        expected, sizeof(expected),
+        "C2;%ju:%ju:%ju:%ju:%ju:%ju:%ju:%jd:%ld:%jd:%ld;",
+        (uintmax_t)identity->st_dev, (uintmax_t)identity->st_ino,
+        (uintmax_t)identity->st_mode, (uintmax_t)identity->st_uid,
+        (uintmax_t)identity->st_gid, (uintmax_t)identity->st_nlink,
+        (uintmax_t)identity->st_size,
+        mtime_sec, mtime_nsec, ctime_sec, ctime_nsec);
+    if (written < 0 || (size_t)written >= sizeof(expected)) return false;
+    fd = open(fixture->reload_state,
+              O_RDONLY | O_CLOEXEC | O_NOFOLLOW | O_NONBLOCK);
+    if (fd < 0) return false;
+    do {
+        read_count = pread(fd, actual, (size_t)written, 0);
+    } while (read_count < 0 && errno == EINTR);
+    if (close(fd) != 0) return false;
+    return read_count == written &&
+           memcmp(actual, expected, (size_t)written) == 0;
+}
+
 static int m20_runner(const char *const argv[], const run_opts_t *opts,
                       run_result_t *result) {
     if (result) {
@@ -769,6 +822,29 @@ static int m20_selective_sync(int fd, bool directory) {
         }
     }
     rc = fsync(fd);
+    if (rc == 0 && directory &&
+        g_directory_sync_mutation_at > 0 &&
+        call == g_directory_sync_mutation_at) {
+        char path[MAX_PATH_LEN];
+        m20_reload_mutation_t mutation = g_directory_sync_mutation;
+
+        g_directory_sync_mutation_at = 0;
+        g_directory_sync_mutation = M20_RELOAD_MUTATION_NONE;
+        if (g_directory_sync_require_closed_reload_state) {
+            g_directory_sync_require_closed_reload_state = false;
+            if (m20_reload_state_descriptor_is_closed() != 1) return -1;
+            g_directory_sync_observed_closed_reload_state = true;
+        }
+        if (safe_snprintf(path, sizeof(path), "%s/gpg-agent.conf",
+                          g_expected_home) != 0 ||
+            stat(path, &g_directory_sync_mutation_before) != 0 ||
+            m20_mutate_config_during_reload(mutation) != 0 ||
+            stat(path, &g_directory_sync_mutation_after) != 0) {
+            return -1;
+        }
+        g_directory_sync_mutation_identity_valid = true;
+        g_directory_sync_mutation_applications++;
+    }
     if (rc == 0 && !directory && g_sync_mutation_at > 0 &&
         call == g_sync_mutation_at) {
         m20_reload_mutation_t mutation = g_sync_mutation;
@@ -847,6 +923,16 @@ static void m20_reset_sync_faults(int fail_file_at, int fail_directory_at) {
     g_fail_directory_sync_at = fail_directory_at;
     g_sync_mutation_at = 0;
     g_sync_mutation = M20_RELOAD_MUTATION_NONE;
+    g_directory_sync_mutation_at = 0;
+    g_directory_sync_mutation_applications = 0;
+    g_directory_sync_mutation = M20_RELOAD_MUTATION_NONE;
+    g_directory_sync_require_closed_reload_state = false;
+    g_directory_sync_observed_closed_reload_state = false;
+    g_directory_sync_mutation_identity_valid = false;
+    memset(&g_directory_sync_mutation_before, 0,
+           sizeof(g_directory_sync_mutation_before));
+    memset(&g_directory_sync_mutation_after, 0,
+           sizeof(g_directory_sync_mutation_after));
     g_postclose_mutation_count = 0;
     g_postclose_mutation_applications = 0;
     g_postclose_first_stable_at = 0;
@@ -1350,7 +1436,7 @@ TEST(clean_state_sync_failure_blocks_publication_and_retries_safely) {
     CHECK_EQ_INT(retry_rc, 0);
     CHECK_EQ_INT(g_config_commits, 0);
     CHECK_EQ_INT(g_sync_file_calls, 0);
-    CHECK_EQ_INT(g_sync_directory_calls, 1);
+    CHECK_EQ_INT(g_sync_directory_calls, 2);
     CHECK_EQ_INT(g_reload_calls, 0);
     CHECK_EQ_INT(g_reload_protocol_errors, 0);
     CHECK_EQ_INT(g_gpg_listing_calls, 1);
@@ -1361,6 +1447,224 @@ TEST(clean_state_sync_failure_blocks_publication_and_retries_safely) {
 
     CHECK_EQ_INT(gpg_manager_cleanup(&retry), 0);
     CHECK_EQ_INT(gpg_manager_cleanup(&first), 0);
+    CHECK_EQ_INT(m20_restore_env("PATH", &path), 0);
+    CHECK_EQ_INT(m20_restore_env("GNUPGHOME", &gnupg), 0);
+    CHECK_EQ_INT(m20_restore_env("GITSWITCH_ALLOW_TMP_GPG", &optin), 0);
+    CHECK_EQ_INT(m20_restore_env("XDG_RUNTIME_DIR", &runtime), 0);
+}
+
+TEST(post_close_directory_sync_failure_after_reload_retries_cleanly) {
+    m20_saved_env_t runtime = m20_save_env("XDG_RUNTIME_DIR");
+    m20_saved_env_t optin = m20_save_env("GITSWITCH_ALLOW_TMP_GPG");
+    m20_saved_env_t gnupg = m20_save_env("GNUPGHOME");
+    m20_saved_env_t path = m20_save_env("PATH");
+    m20_fixture_t fixture;
+    gpg_agent_conf_precommit_fn old_commit;
+    gpg_agent_conf_sync_fn old_sync;
+    command_runner_fn old_runner;
+    gpg_config_t first;
+    gpg_config_t retry;
+    error_context_t failure;
+    struct stat before;
+    struct stat after;
+    int first_rc;
+    int retry_rc;
+
+    CHECK_EQ_INT(m20_make_fixture(&fixture, m20_config_a, true), 0);
+    m20_prepare_config(&first, &fixture);
+    g_config_commits = 0;
+    m20_reset_observation(&fixture, m20_config_a, false);
+    /* Config publication, pending marker, then the post-close barrier. */
+    m20_reset_sync_faults(0, 3);
+    old_commit = gpg_manager_set_agent_conf_precommit_fn(
+        m20_count_config_commit);
+    old_sync = gpg_manager_set_agent_conf_sync_fn(m20_selective_sync);
+    old_runner = run_set_runner(m20_runner);
+    first_rc = gpg_switch_account(&first, &fixture.account);
+    failure = *get_last_error();
+    run_set_runner(old_runner);
+    gpg_manager_set_agent_conf_sync_fn(old_sync);
+
+    CHECK_EQ_INT(first_rc, -1);
+    CHECK(strstr(
+              failure.message,
+              "Failed to synchronize completed GPG agent reload state") !=
+          NULL);
+    CHECK_EQ_INT(g_config_commits, 1);
+    CHECK_EQ_INT(g_sync_file_calls, 3);
+    CHECK_EQ_INT(g_sync_directory_calls, 3);
+    CHECK_EQ_INT(g_reload_calls, 1);
+    CHECK_EQ_INT(g_reload_protocol_errors, 0);
+    CHECK_EQ_INT(g_gpg_listing_calls, 0);
+    CHECK(m20_identity_is_unpublished(&first, &fixture));
+    CHECK_EQ_INT(stat(fixture.installed_config, &before), 0);
+
+    m20_prepare_config(&retry, &fixture);
+    g_config_commits = 0;
+    m20_reset_observation(&fixture, m20_config_a, false);
+    m20_reset_sync_faults(0, 0);
+    old_sync = gpg_manager_set_agent_conf_sync_fn(m20_selective_sync);
+    old_runner = run_set_runner(m20_runner);
+    retry_rc = gpg_switch_account(&retry, &fixture.account);
+    run_set_runner(old_runner);
+    gpg_manager_set_agent_conf_sync_fn(old_sync);
+    gpg_manager_set_agent_conf_precommit_fn(old_commit);
+
+    CHECK_EQ_INT(retry_rc, 0);
+    CHECK_EQ_INT(g_config_commits, 0);
+    CHECK_EQ_INT(g_sync_file_calls, 0);
+    CHECK_EQ_INT(g_sync_directory_calls, 2);
+    CHECK_EQ_INT(g_reload_calls, 0);
+    CHECK_EQ_INT(g_reload_protocol_errors, 0);
+    CHECK_EQ_INT(g_gpg_listing_calls, 1);
+    CHECK_EQ_INT(stat(fixture.installed_config, &after), 0);
+    CHECK_EQ_INT(before.st_ino, after.st_ino);
+    CHECK_STR_EQ(retry.current_key_id, M20_PRIMARY_FPR);
+    CHECK(retry.signing_enabled);
+
+    CHECK_EQ_INT(gpg_manager_cleanup(&retry), 0);
+    CHECK_EQ_INT(gpg_manager_cleanup(&first), 0);
+    CHECK_EQ_INT(m20_restore_env("PATH", &path), 0);
+    CHECK_EQ_INT(m20_restore_env("GNUPGHOME", &gnupg), 0);
+    CHECK_EQ_INT(m20_restore_env("GITSWITCH_ALLOW_TMP_GPG", &optin), 0);
+    CHECK_EQ_INT(m20_restore_env("XDG_RUNTIME_DIR", &runtime), 0);
+}
+
+TEST(post_close_directory_sync_failure_for_clean_state_retries_cleanly) {
+    m20_saved_env_t runtime = m20_save_env("XDG_RUNTIME_DIR");
+    m20_saved_env_t optin = m20_save_env("GITSWITCH_ALLOW_TMP_GPG");
+    m20_saved_env_t gnupg = m20_save_env("GNUPGHOME");
+    m20_saved_env_t path = m20_save_env("PATH");
+    m20_fixture_t fixture;
+    gpg_agent_conf_precommit_fn old_commit;
+    gpg_agent_conf_sync_fn old_sync;
+    command_runner_fn old_runner;
+    gpg_config_t config;
+    error_context_t failure;
+    int initial_rc;
+    int failed_rc;
+    int retry_rc;
+
+    CHECK_EQ_INT(m20_make_fixture(&fixture, m20_config_a, true), 0);
+    m20_prepare_config(&config, &fixture);
+    g_config_commits = 0;
+    m20_reset_observation(&fixture, m20_config_a, false);
+    m20_reset_sync_faults(0, 0);
+    old_commit = gpg_manager_set_agent_conf_precommit_fn(
+        m20_count_config_commit);
+    old_sync = gpg_manager_set_agent_conf_sync_fn(m20_selective_sync);
+    old_runner = run_set_runner(m20_runner);
+    initial_rc = gpg_create_isolated_home(&config, &fixture.account);
+
+    CHECK_EQ_INT(initial_rc, 0);
+    CHECK_EQ_INT(g_config_commits, 1);
+    CHECK_EQ_INT(g_reload_calls, 1);
+    CHECK_EQ_INT(g_reload_protocol_errors, 0);
+
+    g_config_commits = 0;
+    m20_reset_observation(&fixture, m20_config_a, false);
+    /* Unchanged config durability repair, then the post-close barrier. */
+    m20_reset_sync_faults(0, 2);
+    failed_rc = gpg_create_isolated_home(&config, &fixture.account);
+    failure = *get_last_error();
+
+    CHECK_EQ_INT(failed_rc, -1);
+    CHECK(strstr(
+              failure.message,
+              "Failed to synchronize completed GPG agent reload state") !=
+          NULL);
+    CHECK_EQ_INT(g_config_commits, 0);
+    CHECK_EQ_INT(g_sync_file_calls, 0);
+    CHECK_EQ_INT(g_sync_directory_calls, 2);
+    CHECK_EQ_INT(g_reload_calls, 0);
+    CHECK_EQ_INT(g_reload_protocol_errors, 0);
+
+    m20_reset_observation(&fixture, m20_config_a, false);
+    m20_reset_sync_faults(0, 0);
+    retry_rc = gpg_create_isolated_home(&config, &fixture.account);
+    run_set_runner(old_runner);
+    gpg_manager_set_agent_conf_sync_fn(old_sync);
+    gpg_manager_set_agent_conf_precommit_fn(old_commit);
+
+    CHECK_EQ_INT(retry_rc, 0);
+    CHECK_EQ_INT(g_config_commits, 0);
+    CHECK_EQ_INT(g_sync_file_calls, 0);
+    CHECK_EQ_INT(g_sync_directory_calls, 2);
+    CHECK_EQ_INT(g_reload_calls, 0);
+    CHECK_EQ_INT(g_reload_protocol_errors, 0);
+    CHECK_EQ_INT(m20_restore_env("PATH", &path), 0);
+    CHECK_EQ_INT(m20_restore_env("GNUPGHOME", &gnupg), 0);
+    CHECK_EQ_INT(m20_restore_env("GITSWITCH_ALLOW_TMP_GPG", &optin), 0);
+    CHECK_EQ_INT(m20_restore_env("XDG_RUNTIME_DIR", &runtime), 0);
+}
+
+TEST(post_close_directory_sync_ctime_successor_is_bound_before_return) {
+    m20_saved_env_t runtime = m20_save_env("XDG_RUNTIME_DIR");
+    m20_saved_env_t optin = m20_save_env("GITSWITCH_ALLOW_TMP_GPG");
+    m20_saved_env_t gnupg = m20_save_env("GNUPGHOME");
+    m20_saved_env_t path = m20_save_env("PATH");
+    m20_fixture_t fixture;
+    gpg_agent_conf_precommit_fn old_commit;
+    gpg_agent_conf_sync_fn old_sync;
+    command_runner_fn old_runner;
+    gpg_config_t config;
+    struct stat mutation_before;
+    struct stat mutation_after;
+    struct stat final_config;
+    bool mutation_identity_valid;
+    bool observed_closed_reload_state;
+    int mutation_applications;
+    int first_reload_calls;
+    int first_rc;
+    int second_rc;
+
+    CHECK_EQ_INT(m20_make_fixture(&fixture, m20_config_a, true), 0);
+    m20_prepare_config(&config, &fixture);
+    g_config_commits = 0;
+    m20_reset_observation(&fixture, m20_config_a, false);
+    m20_reset_sync_faults(0, 0);
+    /* Config publication, pending marker, then the post-close barrier. */
+    g_directory_sync_mutation_at = 3;
+    g_directory_sync_mutation = M20_RELOAD_MUTATION_EXACT_CTIME;
+    g_directory_sync_require_closed_reload_state = true;
+    old_commit = gpg_manager_set_agent_conf_precommit_fn(
+        m20_count_config_commit);
+    old_sync = gpg_manager_set_agent_conf_sync_fn(m20_selective_sync);
+    old_runner = run_set_runner(m20_runner);
+    first_rc = gpg_create_isolated_home(&config, &fixture.account);
+    mutation_applications = g_directory_sync_mutation_applications;
+    mutation_identity_valid =
+        g_directory_sync_mutation_identity_valid;
+    mutation_before = g_directory_sync_mutation_before;
+    mutation_after = g_directory_sync_mutation_after;
+    observed_closed_reload_state =
+        g_directory_sync_observed_closed_reload_state;
+    first_reload_calls = g_reload_calls;
+
+    CHECK_EQ_INT(stat(fixture.installed_config, &final_config), 0);
+    CHECK(m20_reload_state_binds_identity(&fixture, &final_config));
+
+    g_config_commits = 0;
+    m20_reset_observation(&fixture, m20_config_a, false);
+    m20_reset_sync_faults(0, 0);
+    second_rc = gpg_create_isolated_home(&config, &fixture.account);
+    run_set_runner(old_runner);
+    gpg_manager_set_agent_conf_sync_fn(old_sync);
+    gpg_manager_set_agent_conf_precommit_fn(old_commit);
+
+    CHECK_EQ_INT(first_rc, 0);
+    CHECK_EQ_INT(mutation_applications, 1);
+    CHECK(mutation_identity_valid);
+    CHECK(observed_closed_reload_state);
+    CHECK(m20_ctime_only_file_change(
+        &mutation_before, &mutation_after));
+    CHECK(m20_same_file_version(&mutation_after, &final_config) ||
+          m20_ctime_only_file_change(&mutation_after, &final_config));
+    CHECK_EQ_INT(first_reload_calls, 1);
+    CHECK_EQ_INT(second_rc, 0);
+    CHECK_EQ_INT(g_config_commits, 0);
+    CHECK_EQ_INT(g_reload_calls, 0);
+    CHECK_EQ_INT(g_reload_protocol_errors, 0);
     CHECK_EQ_INT(m20_restore_env("PATH", &path), 0);
     CHECK_EQ_INT(m20_restore_env("GNUPGHOME", &gnupg), 0);
     CHECK_EQ_INT(m20_restore_env("GITSWITCH_ALLOW_TMP_GPG", &optin), 0);
@@ -2534,6 +2838,9 @@ int main(int argc, char **argv) {
     RUN_TEST(config_write_failure_prevents_activation_and_identity_publication);
     RUN_TEST(post_rename_sync_failure_is_retried_without_rewriting_config);
     RUN_TEST(clean_state_sync_failure_blocks_publication_and_retries_safely);
+    RUN_TEST(post_close_directory_sync_failure_after_reload_retries_cleanly);
+    RUN_TEST(post_close_directory_sync_failure_for_clean_state_retries_cleanly);
+    RUN_TEST(post_close_directory_sync_ctime_successor_is_bound_before_return);
     RUN_TEST(reload_failure_is_durably_retried_without_rewriting_config);
     RUN_TEST(missing_reload_state_for_matching_config_forces_one_migration_reload);
     RUN_TEST(corrupt_clean_state_for_matching_config_forces_one_reload);
