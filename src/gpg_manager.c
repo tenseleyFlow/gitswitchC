@@ -9331,12 +9331,13 @@ static int gpg_set_agent_reload_clean(int home_fd,
     return 0;
 }
 
-/* A sibling-state flush can expose one more delayed UFS ctime step. Rewrite
- * the clean record only after an exact byte proof has rebound that narrow
- * transition, and stop after a small fixed number of attempts so continuous
- * mutation fails closed rather than spinning. No config descriptor remains
- * open when this returns, so the persisted generation cannot be invalidated
- * by caller cleanup. */
+/* A sibling-state flush can expose one more delayed UFS ctime step. After the
+ * clean record and pathname first agree, perform one final closed exact-byte
+ * proof before returning. Rewrite the record if that proof observes a narrow
+ * ctime-only successor, and stop after a small fixed number of attempts so
+ * continuous mutation fails closed rather than spinning. No config descriptor
+ * remains open when this returns, so the persisted generation cannot be
+ * invalidated by caller cleanup. */
 static int gpg_set_agent_reload_clean_stable(
     int home_fd, gpg_agent_config_update_t *update) {
     enum { GPG_AGENT_CLEAN_SETTLE_ATTEMPTS = 4 };
@@ -9366,7 +9367,17 @@ static int gpg_set_agent_reload_clean_stable(
         }
         if (gpg_same_file_version(
                 &update->config_identity, &named)) {
-            return 0;
+            struct stat recorded = update->config_identity;
+
+            if (gpg_reprove_agent_config_after_close(
+                    home_fd, update) != 0) {
+                return -1;
+            }
+            if (gpg_same_file_version(
+                    &recorded, &update->config_identity)) {
+                return 0;
+            }
+            continue;
         }
         if (!gpg_file_ctime_only_change(
                 &update->config_identity, &named) ||
