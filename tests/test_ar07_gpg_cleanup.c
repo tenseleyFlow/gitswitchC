@@ -1497,10 +1497,11 @@ TEST(byte_identical_agent_config_performs_no_commit) {
     CHECK_EQ_INT(gpg_create_isolated_home(&config, &account), 0);
     CHECK_EQ_INT(stat(installed, &first), 0);
     CHECK_EQ_INT(g_precommit_calls, 1);
-    /* Config publication, durable reload obligation, then one terminal
-     * directory-sync followed by the bounded exact closed-file proof. */
-    CHECK(g_file_syncs >= 3 && g_file_syncs <= 6);
-    CHECK_EQ_INT(g_directory_syncs, 3);
+    /* Config publication and the durable reload obligation each contribute
+     * one paired sync. The terminal C4 proof contributes one to eight more
+     * pairs while FreeBSD/UFS settles ctime. */
+    CHECK(g_file_syncs >= 3 && g_file_syncs <= 10);
+    CHECK_EQ_INT(g_directory_syncs, g_file_syncs);
 
     g_file_syncs = 0;
     g_directory_syncs = 0;
@@ -1510,9 +1511,15 @@ TEST(byte_identical_agent_config_performs_no_commit) {
     CHECK_EQ_INT(first.st_ino, second.st_ino);
     CHECK(same_mtime(&first, &second));
     CHECK(!has_agent_conf_scratch(config.gnupg_home));
-    CHECK_EQ_INT(g_file_syncs, 0);
-    /* Unchanged-config durability repair plus one terminal barrier/proof. */
-    CHECK_EQ_INT(g_directory_syncs, 2);
+    /* The unchanged path always repairs config-directory durability. It may
+     * either settle the existing C4 proof directly (two more directory than
+     * file syncs), or conservatively reacquire a pending reload after a
+     * delayed ctime successor (one more directory than file syncs). Both
+     * paths remain bounded by the eight-attempt terminal proof loop. */
+    CHECK(g_file_syncs <= 9);
+    CHECK(g_directory_syncs >= 2 && g_directory_syncs <= 10);
+    CHECK(g_directory_syncs == g_file_syncs + 1 ||
+          g_directory_syncs == g_file_syncs + 2);
 
     CHECK_EQ_INT(make_file(source_conf, changed), 0);
     g_file_syncs = 0;
@@ -1525,8 +1532,8 @@ TEST(byte_identical_agent_config_performs_no_commit) {
                  (int)(sizeof(changed) - 1));
     CHECK_STR_EQ(content, changed);
     CHECK(!has_agent_conf_scratch(config.gnupg_home));
-    CHECK(g_file_syncs >= 3 && g_file_syncs <= 6);
-    CHECK_EQ_INT(g_directory_syncs, 3);
+    CHECK(g_file_syncs >= 3 && g_file_syncs <= 10);
+    CHECK_EQ_INT(g_directory_syncs, g_file_syncs);
     gpg_manager_set_agent_conf_precommit_fn(old_hook);
     gpg_manager_set_agent_conf_sync_fn(old_sync);
 
