@@ -293,6 +293,7 @@ int set_error_context(error_code_t code, const char *file, int line,
                       const char *function, const char *fmt, ...) {
     error_context_t next = {0};
     va_list args;
+    int saved_errno = errno;
     int result = 0;
 
     next.code = code;
@@ -322,6 +323,7 @@ int set_error_context(error_code_t code, const char *file, int line,
     log_info("Error set: %s (%s:%d in %s)",
              g_last_error.message, g_last_error.file, line,
              g_last_error.function);
+    errno = saved_errno;
     return result;
 }
 
@@ -361,6 +363,7 @@ int set_system_error_context(error_code_t code, const char *file, int line,
     log_info("System error: %s [errno=%d: %s] (%s:%d in %s)",
              g_last_error.message, saved_errno, strerror(saved_errno),
              g_last_error.file, line, g_last_error.function);
+    errno = saved_errno;
     return result;
 }
 
@@ -582,10 +585,12 @@ void log_message(log_level_t level, const char *file, int line,
     va_list args;
     char timestamp[32];
     char message[1024];
+    int saved_errno = errno;
     int formatted_length;
     
     /* Check if this level should be logged */
     if (!should_log(level)) {
+        errno = saved_errno;
         return;
     }
     
@@ -620,6 +625,7 @@ void log_message(log_level_t level, const char *file, int line,
     if (g_log_to_stderr && g_log_file != stderr) {
         fprintf(stderr, "[%s] %s - %s\n", timestamp, level_str, message);
     }
+    errno = saved_errno;
 }
 
 /* Set logging level */
