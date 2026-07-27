@@ -6538,7 +6538,15 @@ done:
                 &failures, "Git rollback artifact cleanup");
             result.write_failures++;
         }
-        if (failures.active) (void)error_accumulator_publish(&failures);
+        if (failures.active) {
+            (void)error_accumulator_publish(&failures);
+            if (result.write_failures != 0U) {
+                log_warning(
+                    "Git rollback write failure for %s: %s",
+                    git_scope_diagnostic_label(scope),
+                    get_last_error()->message);
+            }
+        }
     }
     return result;
 }
