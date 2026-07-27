@@ -143,9 +143,26 @@ typedef int (*gpg_identity_unlink_fn)(int dir_fd, const char *name,
  * restores the native statx/fsid and fsync implementations. */
 typedef int (*gpg_mount_identity_probe_fn)(int fd, uint64_t *identity);
 typedef int (*gpg_agent_conf_sync_fn)(int fd, bool directory);
+#ifdef GITSWITCH_TESTING
+typedef enum {
+    GPG_AGENT_CONF_PUBLICATION_POSTSYNC_PREOBSERVE = 0,
+    GPG_AGENT_CONF_PUBLICATION_PROOF_PREOPEN
+} gpg_agent_conf_publication_hook_stage_t;
+/* Deterministic publication-proof race seam. The post-sync stage runs after
+ * the directory barrier and before either the retained writable descriptor or
+ * installed pathname is inspected. The proof-preopen stage runs after the
+ * pathname identity is captured and before its read-only proof descriptor is
+ * opened. Production leaves it NULL. */
+typedef int (*gpg_agent_conf_publication_hook_fn)(
+    int home_fd, gpg_agent_conf_publication_hook_stage_t stage);
+/* Deterministic terminal-proof race seam. It runs after the initial pathname
+ * identity is captured and before the no-follow proof descriptor is opened.
+ * Production leaves it NULL. */
+typedef int (*gpg_agent_conf_terminal_preopen_fn)(int home_fd);
 /* Deterministic close-to-path-stat race seam for the exact config proof.
  * Production leaves it NULL. */
 typedef int (*gpg_agent_conf_postclose_fn)(int home_fd);
+#endif
 /* Exact-descriptor probe for the isolated base's storage policy. Return zero
  * and set `memory_backed`, or return -1 with errno on an unknown/error state.
  * NULL restores the native fstatfs implementation. */
@@ -197,9 +214,17 @@ gpg_mount_identity_probe_fn
 gpg_manager_set_mount_identity_probe_fn(gpg_mount_identity_probe_fn fn);
 gpg_agent_conf_sync_fn
 gpg_manager_set_agent_conf_sync_fn(gpg_agent_conf_sync_fn fn);
+#ifdef GITSWITCH_TESTING
+gpg_agent_conf_publication_hook_fn
+gpg_manager_set_agent_conf_publication_hook_fn(
+    gpg_agent_conf_publication_hook_fn fn);
+gpg_agent_conf_terminal_preopen_fn
+gpg_manager_set_agent_conf_terminal_preopen_fn(
+    gpg_agent_conf_terminal_preopen_fn fn);
 gpg_agent_conf_postclose_fn
 gpg_manager_set_agent_conf_postclose_fn(
     gpg_agent_conf_postclose_fn fn);
+#endif
 gpg_memory_backed_probe_fn
 gpg_manager_set_memory_backed_probe_fn(gpg_memory_backed_probe_fn fn);
 gpg_base_warning_probe_fn

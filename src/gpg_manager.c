@@ -168,6 +168,8 @@ static bool gpg_same_mount(const gpg_mount_identity_t *left,
                            const gpg_mount_identity_t *right);
 static bool gpg_same_file_version(const struct stat *left,
                                   const struct stat *right);
+static bool gpg_file_ctime_only_change(const struct stat *before,
+                                       const struct stat *after);
 static int gpg_user_source_home(char *buf, size_t size);
 static int gpg_open_user_source_home(gpg_source_home_t *source);
 static int gpg_validate_source_home(const gpg_source_home_t *source);
@@ -228,7 +230,13 @@ static bool g_process_generation_failure_for_test;
 static gpg_mount_identity_probe_fn g_mount_identity_probe;
 static gpg_agent_conf_sync_fn g_agent_conf_sync =
     gpg_default_agent_conf_sync;
+#ifdef GITSWITCH_TESTING
+static gpg_agent_conf_publication_hook_fn
+    g_agent_conf_publication_hook;
+static gpg_agent_conf_terminal_preopen_fn
+    g_agent_conf_terminal_preopen;
 static gpg_agent_conf_postclose_fn g_agent_conf_postclose;
+#endif
 static gpg_memory_backed_probe_fn g_memory_backed_probe =
     gpg_default_memory_backed_probe;
 static gpg_base_warning_probe_fn g_base_warning_probe =
@@ -415,6 +423,25 @@ gpg_manager_set_agent_conf_sync_fn(gpg_agent_conf_sync_fn fn) {
     return previous;
 }
 
+#ifdef GITSWITCH_TESTING
+gpg_agent_conf_publication_hook_fn
+gpg_manager_set_agent_conf_publication_hook_fn(
+    gpg_agent_conf_publication_hook_fn fn) {
+    gpg_agent_conf_publication_hook_fn previous =
+        g_agent_conf_publication_hook;
+    g_agent_conf_publication_hook = fn;
+    return previous;
+}
+
+gpg_agent_conf_terminal_preopen_fn
+gpg_manager_set_agent_conf_terminal_preopen_fn(
+    gpg_agent_conf_terminal_preopen_fn fn) {
+    gpg_agent_conf_terminal_preopen_fn previous =
+        g_agent_conf_terminal_preopen;
+    g_agent_conf_terminal_preopen = fn;
+    return previous;
+}
+
 gpg_agent_conf_postclose_fn
 gpg_manager_set_agent_conf_postclose_fn(
     gpg_agent_conf_postclose_fn fn) {
@@ -422,6 +449,7 @@ gpg_manager_set_agent_conf_postclose_fn(
     g_agent_conf_postclose = fn;
     return previous;
 }
+#endif
 
 gpg_memory_backed_probe_fn
 gpg_manager_set_memory_backed_probe_fn(gpg_memory_backed_probe_fn fn) {
@@ -8330,7 +8358,7 @@ enum { GPG_AGENT_CONF_MAX = 64 * 1024 };
 
 #define GPG_AGENT_RELOAD_STATE ".gitswitch-gpg-agent-reload.state"
 enum {
-    GPG_AGENT_RELOAD_STATE_MAX = 64 * 1024,
+    GPG_AGENT_RELOAD_STATE_MAX = 96 * 1024,
     GPGCONF_METADATA_MAX = 64 * 1024
 };
 
@@ -8568,27 +8596,58 @@ static int append_conf_bytes(unsigned char *dest, size_t capacity,
     return 0;
 }
 
+typedef enum {
+    GPG_AGENT_CONF_MATCH_STRICT = 0,
+    GPG_AGENT_CONF_MATCH_CLEAN_CTIME,
+    GPG_AGENT_CONF_MATCH_PUBLICATION_CTIME,
+    GPG_AGENT_CONF_MATCH_TERMINAL_CTIME
+} gpg_agent_conf_match_policy_t;
+
+static bool gpg_agent_conf_identity_transition(
+    const struct stat *before, const struct stat *after,
+    gpg_agent_conf_match_policy_t policy, bool *saw_ctime_transition) {
+    if (gpg_same_file_version(before, after)) return true;
+    if (policy == GPG_AGENT_CONF_MATCH_STRICT ||
+        !gpg_file_ctime_only_change(before, after)) {
+        return false;
+    }
+    if (saw_ctime_transition) *saw_ctime_transition = true;
+    return true;
+}
+
 /* Return 1 only for a byte-identical, private regular destination; 0 means a
  * safe atomic replacement is needed, and -1 means comparison raced or failed.
+ * Setup, publication, and terminal proofs may admit ctime-only observation
+ * edges where their callers bind exact bytes and all other metadata.
  * The comparator opens no write descriptor and performs no fsync or rename;
  * its caller still syncs the directory before accepting an identical retry. */
 static int gpg_agent_conf_matches(int home_fd, const unsigned char *desired,
-                                  size_t desired_len, int *matched_fd_out,
+                                  size_t desired_len,
+                                  gpg_agent_conf_match_policy_t policy,
+                                  bool *ctime_transition_out,
+                                  int *matched_fd_out,
                                   struct stat *identity_out) {
     struct stat before;
     struct stat opened;
     struct stat after;
+    struct stat named_after;
     unsigned char buf[4096];
     size_t offset = 0;
+    bool saw_ctime_transition = false;
     int fd;
     int result = 0;
 
-    if ((matched_fd_out == NULL) != (identity_out == NULL)) {
+    if ((matched_fd_out == NULL) != (identity_out == NULL) ||
+        (policy != GPG_AGENT_CONF_MATCH_STRICT &&
+         policy != GPG_AGENT_CONF_MATCH_CLEAN_CTIME &&
+         policy != GPG_AGENT_CONF_MATCH_PUBLICATION_CTIME &&
+         policy != GPG_AGENT_CONF_MATCH_TERMINAL_CTIME)) {
         set_error(ERR_INVALID_ARGS,
                   "Invalid GPG agent config comparison outputs");
         return -1;
     }
     if (matched_fd_out) *matched_fd_out = -1;
+    if (ctime_transition_out) *ctime_transition_out = false;
 
     if (fstatat(home_fd, "gpg-agent.conf", &before,
                 AT_SYMLINK_NOFOLLOW) != 0) {
@@ -8601,12 +8660,44 @@ static int gpg_agent_conf_matches(int home_fd, const unsigned char *desired,
         before.st_nlink != 1 || (before.st_mode & 0777) != 0600) {
         return 0;
     }
+#ifdef GITSWITCH_TESTING
+    if (policy == GPG_AGENT_CONF_MATCH_TERMINAL_CTIME &&
+        g_agent_conf_terminal_preopen &&
+        g_agent_conf_terminal_preopen(home_fd) != 0) {
+        int saved_errno = errno ? errno : EIO;
+
+        errno = saved_errno;
+        set_system_error(
+            ERR_FILE_IO,
+            "GPG agent configuration terminal pre-open hook failed");
+        return -1;
+    }
+    if (policy == GPG_AGENT_CONF_MATCH_PUBLICATION_CTIME &&
+        g_agent_conf_publication_hook &&
+        g_agent_conf_publication_hook(
+            home_fd,
+            GPG_AGENT_CONF_PUBLICATION_PROOF_PREOPEN) != 0) {
+        int saved_errno = errno ? errno : EIO;
+
+        errno = saved_errno;
+        set_system_error(
+            ERR_FILE_IO,
+            "GPG agent configuration publication proof hook failed");
+        return -1;
+    }
+#endif
     fd = openat(home_fd, "gpg-agent.conf",
                 O_RDONLY | O_CLOEXEC | O_NOFOLLOW | O_NONBLOCK);
-    if (fd < 0 || fstat(fd, &opened) != 0 ||
-        !gpg_same_file_version(&before, &opened) ||
+    if (fd < 0) {
+        set_error(ERR_FILE_IO,
+                  "Installed gpg-agent.conf changed while opening");
+        return -1;
+    }
+    if (fstat(fd, &opened) != 0 ||
+        !gpg_agent_conf_identity_transition(
+            &before, &opened, policy, &saw_ctime_transition) ||
         opened.st_nlink != 1 || !S_ISREG(opened.st_mode)) {
-        if (fd >= 0) close(fd);
+        (void)close(fd);
         set_error(ERR_FILE_IO,
                   "Installed gpg-agent.conf changed while opening");
         return -1;
@@ -8635,19 +8726,24 @@ static int gpg_agent_conf_matches(int home_fd, const unsigned char *desired,
         }
     }
     if (fstat(fd, &after) != 0 ||
-        fstatat(home_fd, "gpg-agent.conf", &before,
+        fstatat(home_fd, "gpg-agent.conf", &named_after,
                 AT_SYMLINK_NOFOLLOW) != 0 ||
-        !gpg_same_file_version(&opened, &after) ||
-        !gpg_same_file_version(&opened, &before) ||
-        after.st_nlink != 1 || before.st_nlink != 1) {
+        !gpg_agent_conf_identity_transition(
+            &opened, &after, policy, &saw_ctime_transition) ||
+        !gpg_agent_conf_identity_transition(
+            &after, &named_after, policy, &saw_ctime_transition) ||
+        after.st_nlink != 1 || named_after.st_nlink != 1) {
         result = -1;
     }
     if (result == 1 && matched_fd_out) {
         *matched_fd_out = fd;
-        *identity_out = opened;
+        *identity_out = named_after;
         fd = -1;
     }
     if (fd >= 0 && close(fd) != 0) result = -1;
+    if (result == 1 && ctime_transition_out) {
+        *ctime_transition_out = saw_ctime_transition;
+    }
     if (result < 0) {
         set_system_error(ERR_FILE_IO,
                          "Failed to compare installed gpg-agent.conf safely");
@@ -8718,10 +8814,12 @@ static int gpg_open_agent_reload_state(int home_fd, int *fd_out,
     return 0;
 }
 
-/* A clean record certifies one exact installed config generation. Binding the
- * inode plus size/mtime/ctime closes both the pre-M20 migration gap (no record)
- * and non-cooperating same-uid rewrites which leave desired bytes unchanged
- * but may have reloaded a different intermediate configuration. */
+/* A clean record certifies one exact installed config generation. C4 retains
+ * C3's length-prefixed bytes and bound helper witnesses, while restoring ctime
+ * as the causal token which distinguishes a transient A -> B -> reload -> A
+ * rewrite from a genuinely unchanged live-agent configuration. FreeBSD/UFS
+ * ctime-only successors are admitted only inside the bounded proof which
+ * publishes or settles this record; a later invocation reloads conservatively. */
 static int gpg_append_clean_record(unsigned char *output, size_t output_size,
                                    size_t *used, const char *format, ...) {
     va_list args;
@@ -8819,10 +8917,20 @@ static int gpg_format_agent_reload_clean(
     size_t used = 0;
 
     if (!config_identity || !update || !update->gpg_config ||
+        (!update->config_witness &&
+         update->config_witness_length != 0U) ||
         !output || output_size == 0U || !length_out ||
-        gpg_append_clean_record(output, output_size, &used, "C2;") != 0 ||
-        gpg_append_clean_identity(output, output_size, &used,
-                                  config_identity) != 0 ||
+        gpg_append_clean_record(output, output_size, &used, "C4;") != 0 ||
+        gpg_append_clean_identity(
+            output, output_size, &used, config_identity) != 0 ||
+        gpg_append_clean_record(
+            output, output_size, &used, "%zu:",
+            update->config_witness_length) != 0 ||
+        (update->config_witness_length != 0U &&
+         append_conf_bytes(
+             output, output_size, &used, update->config_witness,
+             update->config_witness_length) != 0) ||
+        gpg_append_clean_record(output, output_size, &used, ";") != 0 ||
         gpg_append_clean_witness(
             output, output_size, &used,
             &update->gpg_config->executable_witness) != 0 ||
@@ -8938,6 +9046,7 @@ static bool gpg_file_ctime_only_change(const struct stat *before,
 
     if (!before || !after) return false;
     same_without_ctime = gpg_same_reset_entry(before, after) &&
+                         before->st_gid == after->st_gid &&
                          before->st_nlink == after->st_nlink &&
                          before->st_size == after->st_size;
 #ifdef __APPLE__
@@ -8998,80 +9107,242 @@ static int gpg_config_witness_matches_fd(
     return 0;
 }
 
-/* Validate the retained config descriptor normally. If only ctime advanced
- * since this invocation published the file, re-prove every byte and refresh
- * the in-memory identity. This does not weaken cross-invocation clean-state
- * matching: a later same-inode rewrite still changes the persisted generation
- * and therefore forces another agent reload. */
+static bool gpg_is_published_agent_config_identity(
+    const struct stat *identity, const struct stat *created,
+    size_t expected_length) {
+    return identity && created && identity->st_dev == created->st_dev &&
+           identity->st_ino == created->st_ino &&
+           S_ISREG(identity->st_mode) &&
+           identity->st_uid == getuid() &&
+           identity->st_gid == created->st_gid &&
+           identity->st_nlink == 1 &&
+           (identity->st_mode & 0777) == 0600 &&
+           identity->st_size >= 0 &&
+           (uintmax_t)identity->st_size ==
+               (uintmax_t)expected_length;
+}
+
+/* A directory fsync can make FreeBSD/UFS expose adjacent ctime generations
+ * through the retained writable descriptor and its newly installed pathname.
+ * Bind both observations to the last strict pre-sync identity, prove the exact
+ * desired bytes, and admit no other metadata transition before close. */
+static int gpg_prove_published_agent_config_while_open(
+    int home_fd, int fd, const struct stat *created,
+    const struct stat *pre_sync_identity,
+    const unsigned char *desired, size_t desired_len,
+    struct stat *identity_out) {
+    struct stat opened_before;
+    struct stat named_before;
+    struct stat opened_after;
+    struct stat named_after;
+
+    if (home_fd < 0 || fd < 0 || !created || !pre_sync_identity ||
+        (!desired && desired_len != 0U) || !identity_out) {
+        set_error(
+            ERR_FILE_IO,
+            "Installed gpg-agent.conf proof is invalid after synchronization");
+        return -1;
+    }
+#ifdef GITSWITCH_TESTING
+    if (g_agent_conf_publication_hook &&
+        g_agent_conf_publication_hook(
+            home_fd,
+            GPG_AGENT_CONF_PUBLICATION_POSTSYNC_PREOBSERVE) != 0) {
+        int saved_errno = errno ? errno : EIO;
+
+        errno = saved_errno;
+        set_system_error(
+            ERR_FILE_IO,
+            "GPG agent configuration post-sync proof hook failed");
+        return -1;
+    }
+#endif
+    if (fstat(fd, &opened_before) != 0 ||
+        fstatat(home_fd, "gpg-agent.conf", &named_before,
+                AT_SYMLINK_NOFOLLOW) != 0 ||
+        !gpg_is_published_agent_config_identity(
+            &opened_before, created, desired_len) ||
+        !gpg_is_published_agent_config_identity(
+            &named_before, created, desired_len) ||
+        !gpg_agent_conf_identity_transition(
+            pre_sync_identity, &opened_before,
+            GPG_AGENT_CONF_MATCH_PUBLICATION_CTIME, NULL) ||
+        !gpg_agent_conf_identity_transition(
+            pre_sync_identity, &named_before,
+            GPG_AGENT_CONF_MATCH_PUBLICATION_CTIME, NULL) ||
+        !gpg_agent_conf_identity_transition(
+            &opened_before, &named_before,
+            GPG_AGENT_CONF_MATCH_PUBLICATION_CTIME, NULL) ||
+        gpg_config_witness_matches_fd(
+            fd, desired, desired_len) != 0 ||
+        fstat(fd, &opened_after) != 0 ||
+        fstatat(home_fd, "gpg-agent.conf", &named_after,
+                AT_SYMLINK_NOFOLLOW) != 0 ||
+        !gpg_is_published_agent_config_identity(
+            &opened_after, created, desired_len) ||
+        !gpg_is_published_agent_config_identity(
+            &named_after, created, desired_len) ||
+        !gpg_agent_conf_identity_transition(
+            &opened_before, &opened_after,
+            GPG_AGENT_CONF_MATCH_PUBLICATION_CTIME, NULL) ||
+        !gpg_agent_conf_identity_transition(
+            &named_before, &named_after,
+            GPG_AGENT_CONF_MATCH_PUBLICATION_CTIME, NULL) ||
+        !gpg_agent_conf_identity_transition(
+            &opened_after, &named_after,
+            GPG_AGENT_CONF_MATCH_PUBLICATION_CTIME, NULL)) {
+        set_error(
+            ERR_FILE_IO,
+            "Installed gpg-agent.conf changed after synchronization");
+        return -1;
+    }
+    *identity_out = named_after;
+    return 0;
+}
+
+/* After the writable publisher closes, acquire the read-only descriptor that
+ * crosses the reload boundary. Discard any proof that observed a delayed
+ * ctime-only successor and retry from that exact generation; a stable
+ * comparator spans pathname-open-read-pathname and leaves its fd retained. */
+static int gpg_acquire_published_agent_config(
+    int home_fd, const struct stat *created,
+    const struct stat *initial_identity,
+    const unsigned char *desired, size_t desired_len,
+    int *matched_fd_out, struct stat *identity_out) {
+    enum { GPG_AGENT_PUBLICATION_PROOF_ATTEMPTS = 8 };
+    struct stat expected;
+
+    if (home_fd < 0 || !created || !initial_identity ||
+        (!desired && desired_len != 0U) ||
+        !matched_fd_out || !identity_out) {
+        set_error(
+            ERR_INVALID_ARGS,
+            "Invalid published GPG agent configuration proof");
+        return -1;
+    }
+    *matched_fd_out = -1;
+    expected = *initial_identity;
+    for (int attempt = 0;
+         attempt < GPG_AGENT_PUBLICATION_PROOF_ATTEMPTS; attempt++) {
+        struct stat proven;
+        bool comparator_ctime_transition = false;
+        bool generation_advanced;
+        int proof_fd = -1;
+        int match = gpg_agent_conf_matches(
+            home_fd, desired, desired_len,
+            GPG_AGENT_CONF_MATCH_PUBLICATION_CTIME,
+            &comparator_ctime_transition, &proof_fd, &proven);
+
+        if (match != 1 || proof_fd < 0 ||
+            !gpg_is_published_agent_config_identity(
+                &proven, created, desired_len) ||
+            (!gpg_same_file_version(&expected, &proven) &&
+             !gpg_file_ctime_only_change(&expected, &proven))) {
+            if (proof_fd >= 0) (void)close(proof_fd);
+            if (match >= 0) {
+                set_error(
+                    ERR_FILE_IO,
+                    "Installed gpg-agent.conf changed after publication");
+            }
+            return -1;
+        }
+        generation_advanced =
+            comparator_ctime_transition ||
+            !gpg_same_file_version(&expected, &proven);
+        if (!generation_advanced) {
+            *matched_fd_out = proof_fd;
+            *identity_out = proven;
+            return 0;
+        }
+        expected = proven;
+        if (close(proof_fd) != 0) {
+            set_system_error(
+                ERR_FILE_IO,
+                "Failed to close superseded GPG agent publication proof");
+            return -1;
+        }
+    }
+    set_error(
+        ERR_FILE_IO,
+        "Installed gpg-agent.conf did not settle after publication");
+    return -1;
+}
+
+/* Validate the retained config descriptor normally. If only ctime advances
+ * across the retained identity, descriptor, or pathname observations, re-prove
+ * every byte and refresh to the latest named identity. FreeBSD/UFS can expose
+ * such a delayed successor between two observations of the same inode. Every
+ * successful close path immediately follows this check with a no-descriptor
+ * terminal proof. */
 static int gpg_validate_agent_config_update(
     int home_fd, gpg_agent_config_update_t *update) {
     struct stat opened_before;
     struct stat named_before;
     struct stat opened_after;
     struct stat named_after;
-    bool opened_admissible;
-    bool named_admissible;
+    bool identity_changed;
 
     if (home_fd < 0 || !update || update->config_fd < 0 ||
         (!update->config_witness && update->config_witness_length != 0U) ||
         update->config_identity.st_size < 0 ||
         (uintmax_t)update->config_identity.st_size !=
             update->config_witness_length ||
-        fstat(update->config_fd, &opened_before) != 0 ||
-        fstatat(home_fd, "gpg-agent.conf", &named_before,
-                AT_SYMLINK_NOFOLLOW) != 0) {
+        fstat(update->config_fd, &opened_before) != 0) {
         set_error(ERR_FILE_IO,
-                  "Installed gpg-agent.conf changed during GPG agent activation");
+                  "Installed gpg-agent.conf retained proof is invalid during GPG agent activation");
         return -1;
     }
-    if (!S_ISREG(opened_before.st_mode) ||
+    if (fstatat(home_fd, "gpg-agent.conf", &named_before,
+                AT_SYMLINK_NOFOLLOW) != 0 ||
+        !S_ISREG(opened_before.st_mode) ||
         opened_before.st_uid != getuid() || opened_before.st_nlink != 1 ||
         (opened_before.st_mode & 0777) != 0600 ||
-        !gpg_same_file_version(&opened_before, &named_before)) {
+        !gpg_agent_conf_identity_transition(
+            &update->config_identity, &opened_before,
+            GPG_AGENT_CONF_MATCH_TERMINAL_CTIME, NULL) ||
+        !gpg_agent_conf_identity_transition(
+            &opened_before, &named_before,
+            GPG_AGENT_CONF_MATCH_TERMINAL_CTIME, NULL)) {
         set_error(ERR_FILE_IO,
-                  "Installed gpg-agent.conf changed during GPG agent activation");
+                  "Installed gpg-agent.conf identity changed during GPG agent activation");
         return -1;
     }
-    if (gpg_same_file_version(&update->config_identity, &opened_before)) {
+    identity_changed =
+        !gpg_same_file_version(
+            &update->config_identity, &opened_before) ||
+        !gpg_same_file_version(&opened_before, &named_before);
+    if (!identity_changed) {
         return 0;
     }
-    opened_admissible = gpg_file_ctime_only_change(
-        &update->config_identity, &opened_before);
-    named_admissible = gpg_file_ctime_only_change(
-        &update->config_identity, &named_before);
-    if (!opened_admissible || !named_admissible ||
-        gpg_config_witness_matches_fd(
+    if (gpg_config_witness_matches_fd(
             update->config_fd, update->config_witness,
             update->config_witness_length) != 0 ||
         fstat(update->config_fd, &opened_after) != 0 ||
         fstatat(home_fd, "gpg-agent.conf", &named_after,
                 AT_SYMLINK_NOFOLLOW) != 0 ||
-        !gpg_same_file_version(&opened_before, &opened_after) ||
-        !gpg_same_file_version(&opened_after, &named_after)) {
+        !gpg_agent_conf_identity_transition(
+            &opened_before, &opened_after,
+            GPG_AGENT_CONF_MATCH_TERMINAL_CTIME, NULL) ||
+        !gpg_agent_conf_identity_transition(
+            &opened_after, &named_after,
+            GPG_AGENT_CONF_MATCH_TERMINAL_CTIME, NULL)) {
         set_error(ERR_FILE_IO,
-                  "Installed gpg-agent.conf changed during GPG agent activation");
+                  "Installed gpg-agent.conf bytes or identity changed during GPG agent activation");
         return -1;
     }
-    update->config_identity = opened_after;
+    update->config_identity = named_after;
     return 0;
 }
 
-/* Finish the exact config proof with no descriptor left open. FreeBSD/UFS can
- * expose a ctime-only step when the retained reader closes; the clean-state
- * record must describe the generation after that close, not the one observed
- * while the descriptor was still live. Re-read every expected byte through a
- * no-follow descriptor, close it, and bind the update to the post-close
- * pathname generation. Require two consecutive equal closed proofs so one
- * equality cannot hide a later delayed ctime-only successor. */
+/* Finish the exact config proof with no descriptor left open. A ctime-only
+ * edge may be admitted only inside this invocation after exact byte proof.
+ * Because one edge can conceal a same-inode byte rewrite with restored mtime,
+ * advance to that observation and require one complete
+ * scan/open/close/pathname pass with no transition before accepting it. */
 static int gpg_reprove_agent_config_after_close(
     int home_fd, gpg_agent_config_update_t *update) {
-    /* FreeBSD/UFS can expose four delayed ctime-only successors under a
-     * loaded suite before the closed file's pathname generation settles.
-     * Keep enough room for those finite filesystem transitions while the
-     * exact byte proof on every attempt still bounds continuous mutation. */
-    enum { GPG_AGENT_POSTCLOSE_PROOF_ATTEMPTS = 8 };
+    enum { GPG_AGENT_TERMINAL_PROOF_ATTEMPTS = 8 };
     struct stat expected;
-    int consecutive_equal_proofs = 0;
 
     if (home_fd < 0 || !update || update->config_fd >= 0 ||
         (!update->config_witness &&
@@ -9085,18 +9356,23 @@ static int gpg_reprove_agent_config_after_close(
     }
     expected = update->config_identity;
     for (int attempt = 0;
-         attempt < GPG_AGENT_POSTCLOSE_PROOF_ATTEMPTS; attempt++) {
+         attempt < GPG_AGENT_TERMINAL_PROOF_ATTEMPTS; attempt++) {
         struct stat proven;
         struct stat after_close;
+        bool comparator_ctime_transition = false;
         bool generation_advanced;
         int proof_fd = -1;
         int match = gpg_agent_conf_matches(
             home_fd, update->config_witness,
-            update->config_witness_length, &proof_fd, &proven);
+            update->config_witness_length,
+            GPG_AGENT_CONF_MATCH_TERMINAL_CTIME,
+            &comparator_ctime_transition, &proof_fd, &proven);
 
         if (match != 1 || proof_fd < 0 ||
-            !S_ISREG(proven.st_mode) || proven.st_uid != getuid() ||
-            proven.st_nlink != 1 || (proven.st_mode & 0777) != 0600 ||
+            !S_ISREG(proven.st_mode) ||
+            proven.st_uid != getuid() ||
+            proven.st_nlink != 1 ||
+            (proven.st_mode & 0777) != 0600 ||
             proven.st_size < 0 ||
             (uintmax_t)proven.st_size !=
                 update->config_witness_length ||
@@ -9108,12 +9384,16 @@ static int gpg_reprove_agent_config_after_close(
                 "Installed gpg-agent.conf changed while its activation proof was closing");
             return -1;
         }
+        generation_advanced =
+            comparator_ctime_transition ||
+            !gpg_same_file_version(&expected, &proven);
         if (close(proof_fd) != 0) {
             set_system_error(
                 ERR_FILE_IO,
                 "Failed to close exact GPG agent configuration proof");
             return -1;
         }
+#ifdef GITSWITCH_TESTING
         if (g_agent_conf_postclose &&
             g_agent_conf_postclose(home_fd) != 0) {
             set_system_error(
@@ -9121,6 +9401,7 @@ static int gpg_reprove_agent_config_after_close(
                 "GPG agent configuration post-close proof hook failed");
             return -1;
         }
+#endif
         if (fstatat(home_fd, "gpg-agent.conf", &after_close,
                     AT_SYMLINK_NOFOLLOW) != 0 ||
             !S_ISREG(after_close.st_mode) ||
@@ -9131,23 +9412,21 @@ static int gpg_reprove_agent_config_after_close(
             (uintmax_t)after_close.st_size !=
                 update->config_witness_length ||
             (!gpg_same_file_version(&proven, &after_close) &&
-             !gpg_file_ctime_only_change(&proven, &after_close))) {
+             !gpg_file_ctime_only_change(
+                 &proven, &after_close))) {
             set_error(
                 ERR_FILE_IO,
                 "Installed gpg-agent.conf changed while its activation proof was closing");
             return -1;
         }
         generation_advanced =
-            !gpg_same_file_version(&expected, &proven) ||
+            generation_advanced ||
             !gpg_same_file_version(&proven, &after_close);
-        update->config_identity = after_close;
-        expected = after_close;
-        if (generation_advanced) {
-            consecutive_equal_proofs = 0;
-            continue;
+        if (!generation_advanced) {
+            update->config_identity = after_close;
+            return 0;
         }
-        consecutive_equal_proofs++;
-        if (consecutive_equal_proofs == 2) return 0;
+        expected = after_close;
     }
     set_error(
         ERR_FILE_IO,
@@ -9179,52 +9458,38 @@ static int gpg_close_and_reprove_agent_config(
     return gpg_reprove_agent_config_after_close(home_fd, update);
 }
 
-/* A directory synchronization can itself expose a delayed filesystem
- * generation after the clean-state descriptor closes. Bind the terminal
- * config identity only after two consecutive sync-and-exact-proof cycles
- * observe no generation change. */
+/* Persist the completed-state namespace once, then byte-prove the config and
+ * bind its full generation. A ctime-only successor discovered here is returned
+ * to the bounded C4 rebinding loop; it is never erased from durable state. */
 static int gpg_settle_agent_config_after_clean_close(
     int home_fd, gpg_agent_config_update_t *update) {
-    enum { GPG_AGENT_TERMINAL_SYNC_ATTEMPTS = 8 };
-    int consecutive_equal_cycles = 0;
+    struct stat before_sync;
 
     if (home_fd < 0 || !update || update->config_fd >= 0) {
         set_error(ERR_INVALID_ARGS,
-                  "Invalid terminal GPG agent configuration settlement");
+                  "Invalid completed GPG agent configuration settlement");
         return -1;
     }
-    for (int attempt = 0;
-         attempt < GPG_AGENT_TERMINAL_SYNC_ATTEMPTS; attempt++) {
-        struct stat before_sync = update->config_identity;
-
-        if (g_agent_conf_sync(home_fd, true) != 0) {
-            set_system_error(
-                ERR_FILE_IO,
-                "Failed to synchronize completed GPG agent reload state");
-            return -1;
-        }
-        if (gpg_reprove_agent_config_after_close(home_fd, update) != 0) {
-            return -1;
-        }
-        if (gpg_same_file_version(
-                &before_sync, &update->config_identity)) {
-            consecutive_equal_cycles++;
-            if (consecutive_equal_cycles == 2) return 0;
-            continue;
-        }
-        if (!gpg_file_ctime_only_change(
-                &before_sync, &update->config_identity)) {
-            set_error(
-                ERR_FILE_IO,
-                "Installed gpg-agent.conf changed while settling its terminal generation");
-            return -1;
-        }
-        consecutive_equal_cycles = 0;
+    before_sync = update->config_identity;
+    if (g_agent_conf_sync(home_fd, true) != 0) {
+        set_system_error(
+            ERR_FILE_IO,
+            "Failed to synchronize completed GPG agent reload state");
+        return -1;
     }
-    set_error(
-        ERR_FILE_IO,
-        "Installed gpg-agent.conf terminal generation did not settle");
-    return -1;
+    if (gpg_reprove_agent_config_after_close(home_fd, update) != 0) {
+        return -1;
+    }
+    if (!gpg_same_file_version(
+            &before_sync, &update->config_identity) &&
+        !gpg_file_ctime_only_change(
+            &before_sync, &update->config_identity)) {
+        set_error(
+            ERR_FILE_IO,
+            "Installed gpg-agent.conf changed while settling completed activation");
+        return -1;
+    }
+    return 0;
 }
 
 /* Persist the obligation before publishing changed config bytes. Existing
@@ -9322,6 +9587,43 @@ static int gpg_set_agent_reload_pending(int home_fd,
     return 0;
 }
 
+static int gpg_reopen_agent_config_for_reload(
+    int home_fd, gpg_agent_config_update_t *update) {
+    struct stat reopened;
+    int reopened_fd = -1;
+    int match;
+
+    if (home_fd < 0 || !update || update->config_fd >= 0 ||
+        update->marker_fd < 0 ||
+        (!update->config_witness &&
+         update->config_witness_length != 0U)) {
+        set_error(
+            ERR_INVALID_ARGS,
+            "Invalid GPG agent configuration reload reacquisition");
+        return -1;
+    }
+    match = gpg_agent_conf_matches(
+        home_fd, update->config_witness,
+        update->config_witness_length,
+        GPG_AGENT_CONF_MATCH_STRICT, NULL,
+        &reopened_fd, &reopened);
+    if (match != 1 || reopened_fd < 0 ||
+        !gpg_same_file_version(
+            &update->config_identity, &reopened)) {
+        if (reopened_fd >= 0) (void)close(reopened_fd);
+        if (match >= 0) {
+            set_error(
+                ERR_FILE_IO,
+                "Installed gpg-agent.conf changed before corrective reload");
+        }
+        return -1;
+    }
+    update->config_fd = reopened_fd;
+    update->config_identity = reopened;
+    update->reload_required = true;
+    return gpg_set_agent_reload_pending(home_fd, update);
+}
+
 static int gpg_set_agent_reload_clean(int home_fd,
                                       gpg_agent_config_update_t *update) {
     unsigned char clean[GPG_AGENT_RELOAD_STATE_MAX];
@@ -9396,15 +9698,15 @@ static int gpg_set_agent_reload_clean(int home_fd,
     return 0;
 }
 
-/* Closing the sibling clean-state descriptor can expose another delayed UFS
- * ctime step on the config. Close that descriptor before the terminal config
- * quorum, and rewrite only after reopening and proving that the same private
- * marker still contains the exact record for the prior config generation.
- * Successful settlement leaves neither config nor marker descriptors open. */
+/* Close the sibling clean-state descriptor before the durable directory
+ * barrier and final exact config reproof. If this invocation observes an
+ * eligible ctime-only successor, reopen and prove the exact prior C4 marker,
+ * then rewrite it for the newly proved config generation. This exception is
+ * bounded to the current invocation; C4 keeps ctime durable across entries. */
 static int gpg_set_agent_reload_clean_stable(
     int home_fd, gpg_agent_config_update_t *update,
     bool state_already_clean) {
-    enum { GPG_AGENT_CLEAN_SETTLE_ATTEMPTS = 4 };
+    enum { GPG_AGENT_CLEAN_SETTLE_ATTEMPTS = 8 };
 
     if (home_fd < 0 || !update || update->config_fd >= 0 ||
         update->marker_fd < 0) {
@@ -11208,10 +11510,18 @@ static int setup_gpg_agent_config(const gpg_config_t *gpg_config,
         }
     }
 
-    match = gpg_agent_conf_matches(home_fd, desired, desired_len,
-                                   &matched_fd, &matched_identity);
+    match = gpg_agent_conf_matches(
+        home_fd, desired, desired_len,
+        GPG_AGENT_CONF_MATCH_CLEAN_CTIME,
+        NULL, &matched_fd, &matched_identity);
     if (match < 0) goto fail;
     if (match > 0) {
+        update->config_fd = matched_fd;
+        update->config_identity = matched_identity;
+        matched_fd = -1;
+        update->config_witness = desired;
+        update->config_witness_length = desired_len;
+        desired = NULL;
         /* Matching bytes do not prove that a prior rename is directory-durable.
          * Re-sync the pinned home so a retry after post-rename fsync failure
          * repairs that uncertain namespace commit before reporting success. */
@@ -11229,26 +11539,38 @@ static int setup_gpg_agent_config(const gpg_config_t *gpg_config,
         if (bind_toolchain && state_present && !state_pending &&
             gpg_agent_reload_state_matches_config(
                 home_fd, update->marker_fd, &update->marker_identity,
-                &matched_identity, update, &state_matches) != 0) {
-            goto fail;
-        }
-        if (state_matches &&
-            gpg_validate_agent_update_entry(
-                home_fd, "gpg-agent.conf", matched_fd,
-                &matched_identity, matched_identity.st_size,
-                "Installed gpg-agent.conf") != 0) {
+                &update->config_identity, update, &state_matches) != 0) {
             goto fail;
         }
         if (state_matches) {
-            update->config_fd = matched_fd;
-            update->config_identity = matched_identity;
-            matched_fd = -1;
-            update->config_witness = desired;
-            update->config_witness_length = desired_len;
-            desired = NULL;
-            if (gpg_close_agent_config(
-                    home_fd, update) != 0 ||
-                gpg_set_agent_reload_clean_stable(
+            if (gpg_close_agent_config(home_fd, update) != 0) {
+                goto fail;
+            }
+            if (!gpg_same_file_version(
+                    &matched_identity, &update->config_identity)) {
+                if (!gpg_file_ctime_only_change(
+                        &matched_identity,
+                        &update->config_identity)) {
+                    set_error(
+                        ERR_FILE_IO,
+                        "Installed gpg-agent.conf changed after its clean state was verified");
+                    goto fail;
+                }
+                /* The prior C4 attests the generation observed by the live
+                 * agent. A later ctime generation may be benign delayed UFS
+                 * disclosure, but is indistinguishable from a transient
+                 * A -> B -> reload -> A rewrite. Preserve exact bytes and
+                 * conservatively reacquire a pending corrective reload. */
+                if (gpg_reopen_agent_config_for_reload(
+                        home_fd, update) != 0) {
+                    goto fail;
+                }
+                log_debug(
+                    "Reused changed-generation GPG agent configuration pending corrective reload: %s",
+                    gpg_agent_conf_path);
+                return 0;
+            }
+            if (gpg_set_agent_reload_clean_stable(
                     home_fd, update, true) != 0) {
                 goto fail;
             }
@@ -11262,16 +11584,10 @@ static int setup_gpg_agent_config(const gpg_config_t *gpg_config,
                       gpg_agent_conf_path);
             return 0;
         }
-        update->config_fd = matched_fd;
-        update->config_identity = matched_identity;
-        matched_fd = -1;
         update->reload_required = true;
         if (gpg_set_agent_reload_pending(home_fd, update) != 0) {
             goto fail;
         }
-        update->config_witness = desired;
-        update->config_witness_length = desired_len;
-        desired = NULL;
         log_debug("Reused pending GPG agent configuration: %s",
                   gpg_agent_conf_path);
         return 0;
@@ -11377,12 +11693,9 @@ static int setup_gpg_agent_config(const gpg_config_t *gpg_config,
                          "Failed to synchronize installed gpg-agent.conf");
         goto fail;
     }
-    if (fstat(fd, &fd_now) != 0 ||
-        fstatat(home_fd, "gpg-agent.conf", &entry,
-                AT_SYMLINK_NOFOLLOW) != 0 ||
-        !gpg_same_file_version(&fd_now, &entry)) {
-        set_error(ERR_FILE_IO,
-                  "Installed gpg-agent.conf changed after synchronization");
+    if (gpg_prove_published_agent_config_while_open(
+            home_fd, fd, &created, &fd_now, desired, desired_len,
+            &entry) != 0) {
         goto fail;
     }
     /* FreeBSD/UFS can materialize the final ctime only when the writable
@@ -11397,14 +11710,9 @@ static int setup_gpg_agent_config(const gpg_config_t *gpg_config,
         goto fail;
     }
     fd = -1;
-    match = gpg_agent_conf_matches(home_fd, desired, desired_len,
-                                   &matched_fd, &matched_identity);
-    if (match != 1 || matched_identity.st_dev != created.st_dev ||
-        matched_identity.st_ino != created.st_ino) {
-        if (match >= 0) {
-            set_error(ERR_FILE_IO,
-                      "Installed gpg-agent.conf changed after publication");
-        }
+    if (gpg_acquire_published_agent_config(
+            home_fd, &created, &entry, desired, desired_len,
+            &matched_fd, &matched_identity) != 0) {
         goto fail;
     }
     update->config_fd = matched_fd;

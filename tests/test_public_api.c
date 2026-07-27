@@ -14,6 +14,7 @@
 #include "git_ops.h"
 #include "gitswitch.h"
 #include "gpg_manager.h"
+#include "process_fork_internal.h"
 #include "prompt.h"
 #include "publication.h"
 #include "runner_internal.h"
@@ -261,7 +262,11 @@ TEST(all_retained_public_apis_compile_and_link) {
     REQUIRE_PUBLIC_API(gpg_manager_set_agent_conf_precommit_fn);
     REQUIRE_PUBLIC_API(gpg_manager_set_agent_conf_preopen_fn);
     REQUIRE_PUBLIC_API(gpg_manager_set_agent_conf_sync_fn);
+#ifdef GITSWITCH_TESTING
+    REQUIRE_PUBLIC_API(gpg_manager_set_agent_conf_publication_hook_fn);
+    REQUIRE_PUBLIC_API(gpg_manager_set_agent_conf_terminal_preopen_fn);
     REQUIRE_PUBLIC_API(gpg_manager_set_agent_conf_postclose_fn);
+#endif
     REQUIRE_PUBLIC_API(gpg_manager_set_base_warning_probe_fn);
     REQUIRE_PUBLIC_API(gpg_manager_set_cleanup_predelete_fn);
     REQUIRE_PUBLIC_API(gpg_manager_set_identity_unlink_fn);
@@ -341,6 +346,8 @@ TEST(all_retained_public_apis_compile_and_link) {
     REQUIRE_PUBLIC_API(run_test_set_fork_failure);
     REQUIRE_PUBLIC_API(run_test_set_post_fork_pre_publish_hook);
 #ifdef GITSWITCH_TESTING
+    REQUIRE_PUBLIC_API(run_test_clear_launch_witness_epochs);
+    REQUIRE_PUBLIC_API(run_test_set_launch_witness_epoch);
     REQUIRE_PUBLIC_API(run_test_set_child_setup_delay);
     REQUIRE_PUBLIC_API(run_test_set_monotonic_failure);
     REQUIRE_PUBLIC_API(run_test_set_monotonic_rollback);
@@ -353,6 +360,7 @@ TEST(all_retained_public_apis_compile_and_link) {
     REQUIRE_PUBLIC_API(run_test_set_exec_acl_failure);
 #endif
     REQUIRE_PUBLIC_API(run_uses_default_runner);
+    REQUIRE_PUBLIC_API(process_fork_child_cleanup_register);
     REQUIRE_PUBLIC_API(runtime_lock_test_fail_release_stat);
     REQUIRE_PUBLIC_API(runtime_state_lock_abandon_inherited);
     REQUIRE_PUBLIC_API(runtime_state_lock_acquire);

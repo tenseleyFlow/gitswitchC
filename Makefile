@@ -484,6 +484,8 @@ AR07_RESET_MAIN_OBJECT = $(OBJDIR)/main_ar07_reset.o
 AR08_REMOVE_ACCOUNTS_OBJECT = $(OBJDIR)/accounts_ar08_remove.o
 AR08_HINT_CONFIG_OBJECT = $(OBJDIR)/config_ar08_hint.o
 AR08_COPY_UTILS_OBJECT = $(OBJDIR)/utils_ar08_copy.o
+AR11_GPG_RELOAD_UTILS_OBJECT = $(OBJDIR)/utils_ar11_gpg_reload.o
+AR11_GPG_RELOAD_GPG_OBJECT = $(OBJDIR)/gpg_manager_ar11_gpg_reload.o
 AR09_SECURITY_UTILS_OBJECT = $(OBJDIR)/utils_ar09_security.o
 AR09_DISPATCH_SIGNALS_OBJECT = $(OBJDIR)/signals_ar09_dispatch.o
 AR09_DISPATCH_TEST_OBJECT = $(OBJDIR)/test_signals_ar09_dispatch.o
@@ -492,6 +494,8 @@ DEPFILES = $(OBJECTS:.o=.d) $(TEST_OBJECTS:.o=.d) \
            $(AR08_REMOVE_ACCOUNTS_OBJECT:.o=.d) \
            $(AR08_HINT_CONFIG_OBJECT:.o=.d) \
            $(AR08_COPY_UTILS_OBJECT:.o=.d) \
+           $(AR11_GPG_RELOAD_UTILS_OBJECT:.o=.d) \
+           $(AR11_GPG_RELOAD_GPG_OBJECT:.o=.d) \
            $(AR09_SECURITY_UTILS_OBJECT:.o=.d) \
            $(AR09_DISPATCH_SIGNALS_OBJECT:.o=.d) \
            $(AR09_DISPATCH_TEST_OBJECT:.o=.d) \
@@ -1685,6 +1689,21 @@ $(AR08_COPY_UTILS_OBJECT): $(SRCDIR)/utils.c $(BUILDTYPE_STAMP) | $(OBJDIR)
 		-DGITSWITCH_TESTING $(RELEASE_ENFORCED_CFLAGS) \
 		$(TU_HARDENING_FLAGS) -c $< -o $@
 
+# The GPG reload suite overlays deterministic witness generations only after
+# the real executable trust walk has captured an opened descriptor identity.
+$(AR11_GPG_RELOAD_UTILS_OBJECT): $(SRCDIR)/utils.c $(BUILDTYPE_STAMP) | $(OBJDIR)
+	@echo "Compiling AR-11 GPG witness test object..."
+	$(CC) $(CPPFLAGS) $(CFLAGS) $(FRAME_SIZE_WARNING) $(INCLUDES) $(DEPFLAGS) \
+		-DGITSWITCH_TESTING $(RELEASE_ENFORCED_CFLAGS) \
+		$(TU_HARDENING_FLAGS) -c $< -o $@
+
+# The publication-proof race seams exist only in the testing GPG profile.
+$(AR11_GPG_RELOAD_GPG_OBJECT): $(SRCDIR)/gpg_manager.c $(BUILDTYPE_STAMP) | $(OBJDIR)
+	@echo "Compiling AR-11 GPG reload test object..."
+	$(CC) $(CPPFLAGS) $(CFLAGS) $(FRAME_SIZE_WARNING) $(INCLUDES) $(DEPFLAGS) \
+		-DGITSWITCH_TESTING $(RELEASE_ENFORCED_CFLAGS) \
+		$(TU_HARDENING_FLAGS) -c $< -o $@
+
 # The runtime-lock classification suite injects synthetic ownership and ACL
 # facts so lifetime mutability is deterministic on every supported host.
 $(AR09_SECURITY_UTILS_OBJECT): $(SRCDIR)/utils.c $(BUILDTYPE_STAMP) | $(OBJDIR)
@@ -1850,11 +1869,21 @@ $(BINDIR)/test_ar11_gpg_program: \
 	@echo "Linking test $@..."
 	$(CC) $(LDFLAGS) $^ -o $@ $(LIBS) $(RELEASE_ENFORCED_LDFLAGS)
 
+$(BINDIR)/test_ar11_gpg_reload: \
+		$(OBJDIR)/test_ar11_gpg_reload.o \
+		$(AR11_GPG_RELOAD_UTILS_OBJECT) \
+		$(AR11_GPG_RELOAD_GPG_OBJECT) \
+		$(AR09_DISPATCH_SIGNALS_OBJECT) \
+		$(filter-out $(OBJDIR)/main.o $(OBJDIR)/utils.o $(OBJDIR)/gpg_manager.o $(OBJDIR)/signals.o,$(OBJECTS)) | $(BINDIR)
+	@echo "Linking test $@..."
+	$(CC) $(LDFLAGS) $^ -o $@ $(LIBS) $(RELEASE_ENFORCED_LDFLAGS)
+
 $(BINDIR)/test_public_api: \
 		$(OBJDIR)/test_public_api.o \
 		$(AR08_COPY_UTILS_OBJECT) \
+		$(AR11_GPG_RELOAD_GPG_OBJECT) \
 		$(AR09_DISPATCH_SIGNALS_OBJECT) \
-		$(filter-out $(OBJDIR)/main.o $(OBJDIR)/utils.o $(OBJDIR)/signals.o,$(OBJECTS)) | $(BINDIR)
+		$(filter-out $(OBJDIR)/main.o $(OBJDIR)/utils.o $(OBJDIR)/gpg_manager.o $(OBJDIR)/signals.o,$(OBJECTS)) | $(BINDIR)
 	@echo "Linking test $@..."
 	$(CC) $(LDFLAGS) $^ -o $@ $(LIBS) $(RELEASE_ENFORCED_LDFLAGS)
 
@@ -2605,4 +2634,5 @@ _rpm-release-locked: _dist-release-locked tools/release_rpm.sh
 # Prevent make from removing intermediate files
 .SECONDARY: $(OBJECTS) $(TEST_OBJECTS) $(PUBLIC_API_PRODUCTION_OBJECT) \
 	$(AR07_RESET_MAIN_OBJECT) \
-	$(AR08_REMOVE_ACCOUNTS_OBJECT) $(AR08_HINT_CONFIG_OBJECT)
+	$(AR08_REMOVE_ACCOUNTS_OBJECT) $(AR08_HINT_CONFIG_OBJECT) \
+	$(AR11_GPG_RELOAD_UTILS_OBJECT) $(AR11_GPG_RELOAD_GPG_OBJECT)
