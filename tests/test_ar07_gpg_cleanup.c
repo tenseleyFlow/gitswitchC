@@ -1497,10 +1497,10 @@ TEST(byte_identical_agent_config_performs_no_commit) {
     CHECK_EQ_INT(gpg_create_isolated_home(&config, &account), 0);
     CHECK_EQ_INT(stat(installed, &first), 0);
     CHECK_EQ_INT(g_precommit_calls, 1);
-    /* Config temp, durable reload obligation, then one to four bounded
-     * completed-reload writes while a delayed ctime generation settles. */
+    /* Config publication, durable reload obligation, then two unchanged
+     * terminal directory-sync/reproof cycles. */
     CHECK(g_file_syncs >= 3 && g_file_syncs <= 6);
-    CHECK_EQ_INT(g_directory_syncs, 2);
+    CHECK_EQ_INT(g_directory_syncs, 4);
 
     g_file_syncs = 0;
     g_directory_syncs = 0;
@@ -1511,7 +1511,8 @@ TEST(byte_identical_agent_config_performs_no_commit) {
     CHECK(same_mtime(&first, &second));
     CHECK(!has_agent_conf_scratch(config.gnupg_home));
     CHECK_EQ_INT(g_file_syncs, 0);
-    CHECK_EQ_INT(g_directory_syncs, 1);
+    /* Unchanged-config durability repair plus two terminal cycles. */
+    CHECK_EQ_INT(g_directory_syncs, 3);
 
     CHECK_EQ_INT(make_file(source_conf, changed), 0);
     g_file_syncs = 0;
@@ -1525,7 +1526,7 @@ TEST(byte_identical_agent_config_performs_no_commit) {
     CHECK_STR_EQ(content, changed);
     CHECK(!has_agent_conf_scratch(config.gnupg_home));
     CHECK(g_file_syncs >= 3 && g_file_syncs <= 6);
-    CHECK_EQ_INT(g_directory_syncs, 2);
+    CHECK_EQ_INT(g_directory_syncs, 4);
     gpg_manager_set_agent_conf_precommit_fn(old_hook);
     gpg_manager_set_agent_conf_sync_fn(old_sync);
 
