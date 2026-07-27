@@ -161,7 +161,8 @@ typedef enum {
     RETIREMENT_GUARD_CLEAR_AFTER_BARRIER_BEFORE_RENAME,
     RETIREMENT_GUARD_CLEAR_AFTER_SETTLED_SLOT_MOVE,
     RETIREMENT_GUARD_CLEAR_AFTER_NAMESPACE_COMMIT,
-    RETIREMENT_GUARD_CLEAR_AFTER_PREPARED_PUBLISH
+    RETIREMENT_GUARD_CLEAR_AFTER_PREPARED_PUBLISH,
+    RETIREMENT_GUARD_INSTALL_BEFORE_PRIOR_RETIRE
 } retirement_guard_clear_test_stage_t;
 typedef int (*retirement_guard_clear_test_hook_fn)(
     retirement_guard_clear_test_stage_t stage, int directory_fd,
@@ -246,7 +247,8 @@ enum {
     RETIREMENT_GUARD_CLEAR_AFTER_BARRIER_BEFORE_RENAME,
     RETIREMENT_GUARD_CLEAR_AFTER_SETTLED_SLOT_MOVE,
     RETIREMENT_GUARD_CLEAR_AFTER_NAMESPACE_COMMIT,
-    RETIREMENT_GUARD_CLEAR_AFTER_PREPARED_PUBLISH
+    RETIREMENT_GUARD_CLEAR_AFTER_PREPARED_PUBLISH,
+    RETIREMENT_GUARD_INSTALL_BEFORE_PRIOR_RETIRE
 };
 #define RETIREMENT_GUARD_CLEAR_TEST_CHECKPOINT(stage, fd, name)             \
     ((void)(stage), (void)(fd), (void)(name), 0)
@@ -476,6 +478,10 @@ static int config_reprove_private_alias_at(
     const struct stat *expected_identity,
     const unsigned char *expected_data, size_t expected_length,
     struct stat *accepted_identity);
+static int config_reprove_pinned_private_fd(
+    int fd, const struct stat *expected_identity,
+    const unsigned char *expected_data, size_t expected_length,
+    struct stat *accepted_identity);
 static bool config_pread_full(int fd, unsigned char *buffer, size_t length,
                               off_t offset);
 
@@ -620,19 +626,39 @@ static int config_retire_exact_name_at(
     const char *settled_prefix) {
 #if defined(__FreeBSD__)
     struct stat pinned;
-    int fd;
+    int fd = -1;
     int saved_errno;
 
     (void)settled_prefix;
-    (void)expected_data;
-    (void)expected_length;
-    fd = openat(
-        dir_fd, source, O_PATH | O_CLOEXEC | O_NOFOLLOW);
-    if (fd < 0 || fstat(fd, &pinned) != 0 ||
-        !config_metadata_snapshot_same(expected, &pinned) ||
-        funlinkat(dir_fd, source, fd, 0) != 0) {
+    if (expected_data && expected_length > 0U) {
+        fd = openat(
+            dir_fd, source,
+            O_RDONLY | O_CLOEXEC | O_NOFOLLOW | O_NONBLOCK);
+        if (fd < 0 ||
+            config_reprove_pinned_private_fd(
+                fd, expected, expected_data, expected_length,
+                &pinned) != 0 ||
+            (!config_metadata_snapshot_same(expected, &pinned) &&
+             !config_metadata_ctime_only_change(expected, &pinned))) {
+            saved_errno = errno ? errno : ESTALE;
+            if (fd >= 0) (void)close(fd);
+            errno = saved_errno;
+            return -1;
+        }
+    } else {
+        fd = openat(
+            dir_fd, source, O_PATH | O_CLOEXEC | O_NOFOLLOW);
+        if (fd < 0 || fstat(fd, &pinned) != 0 ||
+            !config_metadata_snapshot_same(expected, &pinned)) {
+            saved_errno = errno ? errno : ESTALE;
+            if (fd >= 0) (void)close(fd);
+            errno = saved_errno;
+            return -1;
+        }
+    }
+    if (funlinkat(dir_fd, source, fd, 0) != 0) {
         saved_errno = errno ? errno : ESTALE;
-        if (fd >= 0) (void)close(fd);
+        (void)close(fd);
         errno = saved_errno;
         return -1;
     }
@@ -6019,10 +6045,13 @@ int config_retirement_guard_install_or_adopt_with_ssh_alias_obligation(
     }
 #if defined(__FreeBSD__)
     if (prior_marker_moved &&
-        config_retire_exact_name_at(
-            directory_fd, settled_slot, &prior_settled_identity,
-            pair.completion_data, pair.completion_length,
-            CONFIG_RETIREMENT_SETTLED_PREFIX) != 0) {
+        (RETIREMENT_GUARD_CLEAR_TEST_CHECKPOINT(
+             RETIREMENT_GUARD_INSTALL_BEFORE_PRIOR_RETIRE,
+             directory_fd, settled_slot) != 0 ||
+         config_retire_exact_name_at(
+             directory_fd, settled_slot, &prior_settled_identity,
+             pair.completion_data, pair.completion_length,
+             CONFIG_RETIREMENT_SETTLED_PREFIX) != 0)) {
         set_system_error(
             ERR_FILE_IO,
             "Cannot retire the prior FreeBSD guard generation");

@@ -36,7 +36,8 @@ typedef enum {
     RETIREMENT_GUARD_CLEAR_AFTER_BARRIER_BEFORE_RENAME,
     RETIREMENT_GUARD_CLEAR_AFTER_SETTLED_SLOT_MOVE,
     RETIREMENT_GUARD_CLEAR_AFTER_NAMESPACE_COMMIT,
-    RETIREMENT_GUARD_CLEAR_AFTER_PREPARED_PUBLISH
+    RETIREMENT_GUARD_CLEAR_AFTER_PREPARED_PUBLISH,
+    RETIREMENT_GUARD_INSTALL_BEFORE_PRIOR_RETIRE
 } retirement_guard_clear_test_stage_t;
 typedef int (*retirement_guard_clear_test_hook_fn)(
     retirement_guard_clear_test_stage_t stage, int descriptor,
@@ -2273,6 +2274,67 @@ TEST(settled_pair_rotates_fresh_and_residue_is_bounded) {
     guard_fixture_cleanup(&fixture);
 }
 
+#if defined(__FreeBSD__)
+TEST(settled_pair_rotation_accepts_prior_ctime_only_drift) {
+    guard_fixture_t fixture;
+    config_retirement_guard_t *installed = NULL;
+
+    CHECK_EQ_INT(guard_fixture_init(&fixture), 0);
+    CHECK_EQ_INT(config_retirement_guard_clear(&fixture.guard), 0);
+    CHECK(fixture.guard == NULL);
+
+    guard_arm_hook(
+        RETIREMENT_GUARD_INSTALL_BEFORE_PRIOR_RETIRE,
+        HOOK_CTIME_AT_INSTALL_SYNC);
+    CHECK_EQ_INT(config_retirement_guard_install_or_adopt(
+                     fixture.config_path, CONFIG_RETIREMENT_RESET,
+                     &fixture.owner, 1U, &installed), 0);
+    (void)gitswitch_test_set_retirement_guard_clear_hook(NULL);
+    CHECK(installed != NULL);
+    CHECK(config_retirement_guard_was_created(installed));
+    CHECK(!hook_armed);
+    CHECK(hook_action_observed);
+    CHECK_EQ_INT(hook_action_error, 0);
+    CHECK(guard_same_except_ctime(
+        &hook_identity_before, &hook_identity_after));
+    CHECK(!guard_same_ctime(
+        &hook_identity_before, &hook_identity_after));
+
+    fixture.guard = installed;
+    guard_fixture_cleanup(&fixture);
+}
+
+TEST(settled_pair_rotation_rejects_prior_content_change) {
+    guard_fixture_t fixture;
+    config_retirement_guard_t *installed = NULL;
+    bool blocked = false;
+    int install_errno;
+
+    CHECK_EQ_INT(guard_fixture_init(&fixture), 0);
+    CHECK_EQ_INT(config_retirement_guard_clear(&fixture.guard), 0);
+    CHECK(fixture.guard == NULL);
+
+    guard_arm_hook(
+        RETIREMENT_GUARD_INSTALL_BEFORE_PRIOR_RETIRE,
+        HOOK_CHANGED_BYTES_RESTORED_MTIME);
+    errno = 0;
+    CHECK_EQ_INT(config_retirement_guard_install_or_adopt(
+                     fixture.config_path, CONFIG_RETIREMENT_RESET,
+                     &fixture.owner, 1U, &installed), -1);
+    install_errno = errno;
+    (void)gitswitch_test_set_retirement_guard_clear_hook(NULL);
+    CHECK(installed == NULL);
+    CHECK_EQ_INT(install_errno, ESTALE);
+    CHECK(!hook_armed);
+    CHECK(hook_action_observed);
+    CHECK_EQ_INT(hook_action_error, 0);
+    CHECK(guard_probe(&fixture, &blocked));
+    CHECK(blocked);
+
+    guard_fixture_cleanup(&fixture);
+}
+#endif
+
 TEST(lone_and_mismatched_certificates_block) {
     guard_fixture_t fixture;
     unsigned char completion[GUARD_MAX_BYTES];
@@ -3403,6 +3465,10 @@ TEST_MAIN_BEGIN()
     RUN_TEST(canonical_replacement_before_publication_fails_closed);
     RUN_TEST(completion_insertion_before_publication_fails_closed);
     RUN_TEST(settled_pair_rotates_fresh_and_residue_is_bounded);
+#if defined(__FreeBSD__)
+    RUN_TEST(settled_pair_rotation_accepts_prior_ctime_only_drift);
+    RUN_TEST(settled_pair_rotation_rejects_prior_content_change);
+#endif
     RUN_TEST(lone_and_mismatched_certificates_block);
     RUN_TEST(lifecycle_lock_serializes_guard_owners);
     RUN_TEST(unproven_install_is_not_adopted_until_directory_sync_succeeds);
