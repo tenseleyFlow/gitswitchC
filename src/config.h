@@ -171,14 +171,13 @@ int config_revalidate_loaded_source(const gitswitch_ctx_t *ctx);
  * explicitly bounded to the last check-to-rename interval.
  */
 int config_save(gitswitch_ctx_t *ctx, const char *config_path);
-/* Full-document transactional save. `config_installed` becomes true after the
- * accounts.toml rename and is cleared when canonical reproof establishes that
- * the parent or exact leaf generation is missing, substituted, or different.
- * A directory-sync failure with an exact canonical generation, or a
- * non-namespace proof I/O failure that cannot disprove it, retains true as an
- * installed/uncertain result. On complete durable success, the mutable context
- * is rebound to the exact installed source generation so another save from
- * that context is admitted. */
+/* Full-document transactional save. `config_installed` latches true when the
+ * accounts.toml rename commits and no later canonical reproof, substitution,
+ * or directory-sync failure revokes that fact. Such failures distinguish an
+ * installed-but-no-longer-current or installed-but-durability-uncertain result
+ * from a pre-install failure. Only complete durable success rebinds the mutable
+ * context to the exact installed source generation so another save from that
+ * context is admitted. */
 int config_save_transactional(gitswitch_ctx_t *ctx,
                               const char *config_path,
                               bool *config_installed);
@@ -260,10 +259,14 @@ typedef struct {
 
 typedef struct {
     char config_path[MAX_PATH_LEN];
+    /* A present identity replaces matching PUBLISHED records' post_config.
+     * A canonical all-zero absent identity participates in exact-set
+     * accounting while preserving each matching record's prior identity. */
     publication_identity_t post_config;
 } config_retirement_destination_t;
 
 typedef struct config_retirement_guard config_retirement_guard_t;
+typedef int (*config_retirement_guard_precommit_fn)(void *context);
 
 /* Token-free projection of one active retirement marker. `valid` is true
  * only for a stable canonical incomplete generation; absent namespaces and
@@ -349,10 +352,21 @@ bool config_retirement_guard_was_created(
 /* Re-prove that a lock-owning handle still names its exact incomplete marker
  * generation. This is read-only: it neither reacquires the lifecycle lock nor
  * mutates, clears, or frees the handle or any retirement namespace record.
- * Replacement, byte/token change, stage/certificate interference, settlement,
- * or directory namespace replacement fails closed. */
+ * Replacement, byte/token change, stage/certificate insertion, removal or
+ * replacement, settlement, or directory namespace replacement fails closed.
+ * A pre-existing completion certificate is bound as part of the observed
+ * namespace generation, and a handle that successfully prepared its exact
+ * completion stage revalidates that stage as part of the owned generation. */
 int config_retirement_guard_revalidate(
     const config_retirement_guard_t *guard);
+
+/* Durably materialize and jointly re-prove the exact owned completion stage
+ * while the fixed transition name keeps probes blocked. On success the handle
+ * is prepared for a final clear whose stage-to-certificate rename is the
+ * logical commit. Any failure retains the handle and any created blocking
+ * stage for retry or normal fresh-process adoption. */
+int config_retirement_guard_prepare_clear(
+    config_retirement_guard_t *guard);
 
 /* Complete only the exact owned marker generation (inode, complete bytes, and
  * embedded token) by atomically replacing the fixed completion certificate;
@@ -365,9 +379,34 @@ int config_retirement_guard_revalidate(
  */
 int config_retirement_guard_clear(config_retirement_guard_t **guard);
 
+/* As clear(), with an optional prepared-generation commit barrier. A non-NULL
+ * barrier is valid only after prepare_clear() succeeds. The exact marker,
+ * completion, stage, named lifecycle lock, and pinned-directory proof runs
+ * before the callback. Returning zero authorizes the terminal
+ * stage-to-certificate rename; returning nonzero preserves the callback's
+ * diagnostic and errno and retains the prepared handle and blocking stage for
+ * retry. `context` is borrowed only for the synchronous call. The callback
+ * must not mutate the retirement namespace, call retirement-guard lifecycle
+ * APIs, or retain the borrowed context. A later pre-rename failure can cause a
+ * successful callback to be invoked again on retry, so it must be idempotent.
+ * After callback success, publication uses a no-overwrite namespace
+ * operation and exact generation proof; a raced stage or certificate is
+ * preserved and the prepared handle remains blocking. Once that proof
+ * succeeds, no additional callback or fallible acknowledgement intervenes
+ * before destruction of the in-memory capability. A NULL barrier retains
+ * clear() compatibility for both prepared and unprepared handles. */
+int config_retirement_guard_clear_with_barrier(
+    config_retirement_guard_t **guard,
+    config_retirement_guard_precommit_fn barrier, void *context);
+
 /* Release the lifecycle lock and free/NULL the handle without namespace
- * repair. clear() never removes the canonical marker; a failed transition may
- * retain the one fixed stage, and both states remain probe-blocking. */
+ * repair. A fork child disposing an inherited handle closes only its
+ * descriptor references and child-local owner token; it never unlocks the
+ * parent's shared flock description. This foreign-child disposal remains
+ * valid when fork occurred inside a commit barrier; the creating process
+ * still cannot abandon or reenter its own barrier. clear() never removes the
+ * canonical marker; a failed transition may retain the one fixed stage, and
+ * both states remain probe-blocking. */
 void config_retirement_guard_abandon(config_retirement_guard_t **guard);
 
 /* Durable recovery owner for a switch whose active-state before/post image
@@ -412,7 +451,10 @@ bool config_switch_guard_was_created(
  * private switch lifecycle lock: a lone stable private stage is removed, and
  * an exact stage/marker hard-link pair left by the portable no-replace
  * fallback is reduced to the canonical marker. No live identity mutation can
- * precede either shape. Unsafe, changing, or distinct pairs fail closed.
+ * precede either shape. A normalized distinct pair is accepted only when both
+ * entries are independently canonical and their complete serialized bytes
+ * and decoded models are equal. Unsafe, changing, or unequal pairs fail
+ * closed.
  * Callers that mutate account state must serialize this operation with the
  * ordinary configuration write lock and probe again before mutation. */
 int config_switch_guard_reconcile_preintent(
@@ -420,12 +462,14 @@ int config_switch_guard_reconcile_preintent(
 
 /* Read-only, fail-closed startup gate. `blocked` remains true for a canonical
  * marker or malformed/unsafe/unstable state. A stable private stage-only
- * generation and an exact stage/marker hard-link pair are reported unblocked
- * only so a real mutating entry can acquire the configuration lock, call
- * config_switch_guard_reconcile_preintent(), and probe again; neither shape
- * authorizes resume. A stable canonical marker is decoded into `recovery`;
- * absent state returns blocked=false and recovery.valid=false. This call never
- * creates or repairs filesystem state. */
+ * generation, an exact stage/marker hard-link pair, and an independently
+ * canonical normalized pair with byte-identical serialized contents and equal
+ * decoded models are reported unblocked only so a real mutating entry can
+ * acquire the configuration lock, call
+ * config_switch_guard_reconcile_preintent(), and probe again; none of these
+ * shapes authorizes resume. A stable canonical marker is decoded into
+ * `recovery`; absent state returns blocked=false and recovery.valid=false.
+ * This call never creates or repairs filesystem state. */
 int config_switch_guard_probe(
     const char *config_path, bool *blocked,
     config_switch_guard_recovery_t *recovery);
@@ -442,7 +486,9 @@ int config_switch_guard_clear(config_switch_guard_t **guard);
 int config_switch_guard_retain(config_switch_guard_t **guard);
 
 /* Release the lifecycle lock and free/NULL the handle without changing either
- * fixed switch-guard namespace entry. */
+ * fixed switch-guard namespace entry. A fork child disposing an inherited
+ * handle closes only descriptor references and its child-local owner token;
+ * it cannot unlock the parent's shared flock description. */
 void config_switch_guard_abandon(config_switch_guard_t **guard);
 
 /* Refresh only the Git post-config generation witnesses for PUBLISHED ledger

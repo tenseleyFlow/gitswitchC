@@ -8,6 +8,8 @@
 #include "error.h"
 
 #include <stdint.h>
+#include <sys/file.h>
+#include <sys/wait.h>
 #include <time.h>
 
 #define GUARD_MAX_BYTES 8192U
@@ -15,6 +17,7 @@
 #define COMPLETE_NAME ".retirement-complete"
 #define STAGE_NAME ".retirement-transition"
 #define LOCK_NAME ".retirement.lock"
+#define SETTLED_PREFIX ".gitswitch-retirement-settled-"
 
 typedef enum {
     RETIREMENT_GUARD_CLEAR_BEFORE_STAGE_CREATE = 0,
@@ -28,7 +31,12 @@ typedef enum {
     RETIREMENT_GUARD_INSTALL_BEFORE_DIR_SYNC,
     RETIREMENT_GUARD_READ_AFTER_CLOSE,
     RETIREMENT_GUARD_PAIR_AFTER_COMPLETION_READ,
-    RETIREMENT_GUARD_STAGE_AFTER_CLOSE
+    RETIREMENT_GUARD_STAGE_AFTER_CLOSE,
+    RETIREMENT_GUARD_READ_BEFORE_FINAL_METADATA_CHECK,
+    RETIREMENT_GUARD_CLEAR_AFTER_BARRIER_BEFORE_RENAME,
+    RETIREMENT_GUARD_CLEAR_AFTER_SETTLED_SLOT_MOVE,
+    RETIREMENT_GUARD_CLEAR_AFTER_NAMESPACE_COMMIT,
+    RETIREMENT_GUARD_CLEAR_AFTER_PREPARED_PUBLISH
 } retirement_guard_clear_test_stage_t;
 typedef int (*retirement_guard_clear_test_hook_fn)(
     retirement_guard_clear_test_stage_t stage, int descriptor,
@@ -36,6 +44,10 @@ typedef int (*retirement_guard_clear_test_hook_fn)(
 retirement_guard_clear_test_hook_fn
 gitswitch_test_set_retirement_guard_clear_hook(
     retirement_guard_clear_test_hook_fn hook);
+unsigned int gitswitch_test_set_retirement_settled_slot_limit(
+    unsigned int limit);
+int gitswitch_test_retirement_guard_directory_fd(
+    const config_retirement_guard_t *guard);
 
 typedef struct {
     config_retirement_guard_t *guard;
@@ -511,17 +523,94 @@ static void guard_fixture_cleanup(guard_fixture_t *fixture) {
     (void)unlink(fixture->completion_path);
     (void)unlink(fixture->stage_path);
     (void)unlink(fixture->lock_path);
+    for (unsigned int slot = 0U; slot < 4U; slot++) {
+        char path[256];
+
+        if ((size_t)snprintf(
+                path, sizeof(path), "%s/%s%u",
+                fixture->directory, SETTLED_PREFIX, slot) <
+            sizeof(path)) {
+            (void)unlink(path);
+        }
+    }
     (void)rmdir(fixture->directory);
 }
+
+TEST(fork_child_abandon_preserves_reused_retirement_guard_directory_fd) {
+    guard_fixture_t fixture;
+    pid_t child;
+    int status = 0;
+
+    CHECK_EQ_INT(guard_fixture_init(&fixture), 0);
+    child = fork();
+    CHECK(child >= 0);
+    if (child == 0) {
+        int directory_fd =
+            gitswitch_test_retirement_guard_directory_fd(fixture.guard);
+        int sentinel = directory_fd >= 0
+                           ? openat(
+                                 directory_fd, ".",
+                                 O_RDONLY | O_DIRECTORY | O_CLOEXEC |
+                                     O_NOFOLLOW)
+                           : -1;
+
+        if (directory_fd < 0 || sentinel < 0 ||
+            directory_fd == sentinel ||
+            close(directory_fd) != 0 ||
+            dup2(sentinel, directory_fd) != directory_fd) {
+            _exit(90);
+        }
+        config_retirement_guard_abandon(&fixture.guard);
+        if (fixture.guard != NULL ||
+            fcntl(directory_fd, F_GETFD) < 0) {
+            _exit(91);
+        }
+        close(directory_fd);
+        close(sentinel);
+        _exit(0);
+    }
+    if (child > 0) {
+        CHECK_EQ_INT(waitpid(child, &status, 0), child);
+        CHECK(WIFEXITED(status));
+        if (WIFEXITED(status)) CHECK_EQ_INT(WEXITSTATUS(status), 0);
+    }
+    guard_fixture_cleanup(&fixture);
+}
+
+#if !defined(__FreeBSD__)
+static int guard_fixture_rotate_active(guard_fixture_t *fixture) {
+    if (!fixture ||
+        config_retirement_guard_clear(&fixture->guard) != 0 ||
+        config_retirement_guard_install_or_adopt(
+            fixture->config_path, CONFIG_RETIREMENT_RESET,
+            &fixture->owner, 1U, &fixture->guard) != 0) {
+        return -1;
+    }
+    fixture->marker_length = guard_read_file(
+        fixture->marker_path, fixture->marker_data,
+        sizeof(fixture->marker_data));
+    return fixture->marker_length > 0U &&
+                   stat(fixture->marker_path,
+                        &fixture->marker_identity) == 0
+               ? 0
+               : -1;
+}
+#endif
 
 typedef enum {
     HOOK_FAIL = 0,
     HOOK_SYNC_THEN_FAIL,
     HOOK_REPLACE_CANONICAL,
+    HOOK_REPLACE_COMPLETION,
+    HOOK_REPLACE_STAGE,
+    HOOK_REPLACE_NAMED,
     HOOK_CTIME_AT_INSTALL_SYNC,
     HOOK_CTIME_AFTER_FRESH_READ,
     HOOK_REPLACE_AFTER_FRESH_READ,
-    HOOK_CHANGED_BYTES_RESTORED_MTIME
+    HOOK_CHANGED_BYTES_RESTORED_MTIME,
+    HOOK_CTIME_AFTER_STAGE_REMOVAL,
+    HOOK_CHANGED_BYTES_AFTER_STAGE_REMOVAL,
+    HOOK_REPLACE_LOCK
 } hook_action_t;
 
 static retirement_guard_clear_test_stage_t hook_stage;
@@ -530,6 +619,7 @@ static bool hook_armed;
 static bool hook_fresh_publish_seen;
 static bool hook_action_observed;
 static int hook_action_error;
+static unsigned int hook_action_count;
 static struct stat hook_identity_before;
 static struct stat hook_identity_after;
 static unsigned char hook_original[GUARD_MAX_BYTES];
@@ -558,8 +648,25 @@ static int guard_fault_hook(
          !hook_fresh_publish_seen)) {
         return 0;
     }
+    if (hook_action == HOOK_CTIME_AFTER_STAGE_REMOVAL ||
+        hook_action == HOOK_CHANGED_BYTES_AFTER_STAGE_REMOVAL) {
+        struct stat stage_identity;
+
+        if (!marker_name || strcmp(marker_name, GUARD_NAME) != 0) return 0;
+        errno = 0;
+        if (fstatat(descriptor, STAGE_NAME, &stage_identity,
+                    AT_SYMLINK_NOFOLLOW) == 0) {
+            return 0;
+        }
+        if (errno != ENOENT) {
+            hook_action_error = errno ? errno : EIO;
+            return -1;
+        }
+        errno = 0;
+    }
     hook_armed = false;
     hook_action_observed = true;
+    hook_action_count++;
     if (hook_action == HOOK_SYNC_THEN_FAIL &&
         fsync(descriptor) != 0) {
         return -1;
@@ -569,8 +676,29 @@ static int guard_fault_hook(
             descriptor, GUARD_NAME, hook_replacement,
             hook_replacement_length);
     }
+    if (hook_action == HOOK_REPLACE_COMPLETION) {
+        return guard_atomic_replace_at(
+            descriptor, COMPLETE_NAME, hook_replacement,
+            hook_replacement_length);
+    }
+    if (hook_action == HOOK_REPLACE_STAGE) {
+        return guard_atomic_replace_at(
+            descriptor, STAGE_NAME, hook_replacement,
+            hook_replacement_length);
+    }
+    if (hook_action == HOOK_REPLACE_NAMED) {
+        return guard_atomic_replace_at(
+            descriptor, marker_name, hook_replacement,
+            hook_replacement_length);
+    }
+    if (hook_action == HOOK_REPLACE_LOCK) {
+        return guard_atomic_replace_at(
+            descriptor, LOCK_NAME, hook_replacement,
+            hook_replacement_length);
+    }
     if (hook_action == HOOK_CTIME_AT_INSTALL_SYNC ||
-        hook_action == HOOK_CTIME_AFTER_FRESH_READ) {
+        hook_action == HOOK_CTIME_AFTER_FRESH_READ ||
+        hook_action == HOOK_CTIME_AFTER_STAGE_REMOVAL) {
         if (guard_force_ctime_only_drift_at(
                 descriptor, marker_name, &hook_identity_before,
                 &hook_identity_after) != 0) {
@@ -598,7 +726,8 @@ static int guard_fault_hook(
         }
         return 0;
     }
-    if (hook_action == HOOK_CHANGED_BYTES_RESTORED_MTIME) {
+    if (hook_action == HOOK_CHANGED_BYTES_RESTORED_MTIME ||
+        hook_action == HOOK_CHANGED_BYTES_AFTER_STAGE_REMOVAL) {
         if (guard_change_bytes_restore_mtime_at(
                 descriptor, marker_name, hook_original, hook_replacement,
                 &hook_replacement_length, &hook_identity_before,
@@ -621,6 +750,7 @@ static void guard_arm_hook(
     hook_fresh_publish_seen = false;
     hook_action_observed = false;
     hook_action_error = 0;
+    hook_action_count = 0U;
     memset(&hook_identity_before, 0, sizeof(hook_identity_before));
     memset(&hook_identity_after, 0, sizeof(hook_identity_after));
     (void)gitswitch_test_set_retirement_guard_clear_hook(
@@ -631,6 +761,126 @@ static bool guard_probe(const guard_fixture_t *fixture, bool *blocked) {
     return fixture && blocked &&
            config_retirement_guard_probe(
                fixture->config_path, blocked) == 0;
+}
+
+static unsigned int barrier_call_count;
+static int barrier_failure_errno;
+static error_context_t barrier_failure_error;
+
+static int guard_commit_barrier(void *context) {
+    const char *diagnostic = context;
+
+    barrier_call_count++;
+    if (barrier_failure_errno == 0) return 0;
+    errno = barrier_failure_errno;
+    set_system_error(
+        ERR_SYSTEM_CALL, "%s",
+        diagnostic ? diagnostic : "retirement barrier failure");
+    barrier_failure_error = *get_last_error();
+    return -1;
+}
+
+static void guard_arm_barrier(int failure_errno) {
+    barrier_call_count = 0U;
+    barrier_failure_errno = failure_errno;
+    memset(&barrier_failure_error, 0, sizeof(barrier_failure_error));
+}
+
+static bool guard_error_context_same(
+    const error_context_t *left, const error_context_t *right) {
+    return left && right && left->code == right->code &&
+           strcmp(left->message, right->message) == 0 &&
+           left->message_truncated == right->message_truncated &&
+           strcmp(left->details, right->details) == 0 &&
+           left->details_truncated == right->details_truncated &&
+           strcmp(left->file, right->file) == 0 &&
+           left->line == right->line &&
+           strcmp(left->function, right->function) == 0 &&
+           left->system_errno == right->system_errno;
+}
+
+static int guard_pipe_barrier(void *context) {
+    int descriptor = context ? *(int *)context : -1;
+    const unsigned char invoked = 1U;
+
+    barrier_call_count++;
+    return descriptor >= 0 &&
+                   write(descriptor, &invoked, sizeof(invoked)) ==
+                       (ssize_t)sizeof(invoked)
+               ? 0
+               : -1;
+}
+
+typedef struct {
+    config_retirement_guard_t **guard;
+    int recursive_result;
+    bool abandon_retained;
+} guard_reentrant_barrier_context_t;
+
+static int guard_reentrant_barrier(void *context) {
+    guard_reentrant_barrier_context_t *state = context;
+    config_retirement_guard_t *before =
+        state && state->guard ? *state->guard : NULL;
+
+    barrier_call_count++;
+    state->recursive_result =
+        config_retirement_guard_clear(state->guard);
+    config_retirement_guard_abandon(state->guard);
+    state->abandon_retained =
+        state->guard && *state->guard == before;
+    return 0;
+}
+
+typedef struct {
+    config_retirement_guard_t **guard;
+    const char *config_path;
+    const config_retirement_owner_t *owner;
+    int child_status;
+} guard_fork_barrier_context_t;
+
+static int guard_fork_abandon_barrier(void *context) {
+    guard_fork_barrier_context_t *state = context;
+    pid_t child;
+    pid_t waited;
+
+    barrier_call_count++;
+    if (!state || !state->guard || !*state->guard ||
+        !state->config_path || !state->owner) {
+        errno = EINVAL;
+        return -1;
+    }
+    child = fork();
+    if (child < 0) return -1;
+    if (child == 0) {
+        config_retirement_guard_t *independent = NULL;
+
+        config_retirement_guard_abandon(state->guard);
+        errno = 0;
+        if (*state->guard != NULL ||
+            config_retirement_guard_install_or_adopt(
+                state->config_path, CONFIG_RETIREMENT_RESET,
+                state->owner, 1U, &independent) != -1 ||
+            independent != NULL || errno != EWOULDBLOCK) {
+            config_retirement_guard_abandon(&independent);
+            _exit(1);
+        }
+        _exit(0);
+    }
+    state->child_status = -1;
+    do {
+        waited = waitpid(child, &state->child_status, 0);
+    } while (waited < 0 && errno == EINTR);
+    if (waited != child) return -1;
+    errno = EAGAIN;
+    return -1;
+}
+
+static int guard_arm_observation_barrier(void *context) {
+    (void)context;
+    barrier_call_count++;
+    guard_arm_hook(
+        RETIREMENT_GUARD_CLEAR_AFTER_PUBLISH, HOOK_FAIL);
+    return 0;
 }
 
 TEST(completion_keeps_canonical_generation_and_unblocks) {
@@ -658,6 +908,1044 @@ TEST(completion_keeps_canonical_generation_and_unblocks) {
     CHECK_EQ_INT(guard_count_retirement_entries(
                      fixture.directory, &unexpected), 3);
     CHECK_EQ_INT(unexpected, 0);
+    guard_fixture_cleanup(&fixture);
+}
+
+TEST(prepared_clear_is_durable_blocking_and_commits_without_ack_hooks) {
+    guard_fixture_t fixture;
+    bool blocked = false;
+
+    CHECK_EQ_INT(guard_fixture_init(&fixture), 0);
+    CHECK_EQ_INT(
+        config_retirement_guard_prepare_clear(fixture.guard), 0);
+    CHECK(fixture.guard != NULL);
+    CHECK_EQ_INT(config_retirement_guard_revalidate(fixture.guard), 0);
+    CHECK_EQ_INT(access(fixture.stage_path, F_OK), 0);
+    CHECK(guard_files_equal(
+        fixture.marker_path, fixture.stage_path));
+    CHECK(guard_probe(&fixture, &blocked));
+    CHECK(blocked);
+
+    guard_arm_hook(
+        RETIREMENT_GUARD_CLEAR_AFTER_PUBLISH, HOOK_FAIL);
+    CHECK_EQ_INT(config_retirement_guard_clear(&fixture.guard), 0);
+    CHECK(fixture.guard == NULL);
+    CHECK(hook_armed);
+    CHECK(!hook_action_observed);
+    (void)gitswitch_test_set_retirement_guard_clear_hook(NULL);
+    CHECK(access(fixture.stage_path, F_OK) != 0 && errno == ENOENT);
+    CHECK(guard_files_equal(
+        fixture.marker_path, fixture.completion_path));
+    blocked = true;
+    CHECK(guard_probe(&fixture, &blocked));
+    CHECK(!blocked);
+    guard_fixture_cleanup(&fixture);
+}
+
+TEST(prepared_clear_skips_directory_sync_hooks) {
+    guard_fixture_t fixture;
+
+    CHECK_EQ_INT(guard_fixture_init(&fixture), 0);
+    CHECK_EQ_INT(
+        config_retirement_guard_prepare_clear(fixture.guard), 0);
+    guard_arm_hook(
+        RETIREMENT_GUARD_CLEAR_BEFORE_DIR_SYNC, HOOK_FAIL);
+    CHECK_EQ_INT(config_retirement_guard_clear(&fixture.guard), 0);
+    CHECK(fixture.guard == NULL);
+    CHECK(hook_armed);
+    CHECK(!hook_action_observed);
+    (void)gitswitch_test_set_retirement_guard_clear_hook(NULL);
+    CHECK(guard_files_equal(
+        fixture.marker_path, fixture.completion_path));
+    guard_fixture_cleanup(&fixture);
+}
+
+TEST(prepared_clear_replaces_a_prior_completion_generation) {
+    guard_fixture_t fixture;
+    bool blocked = true;
+
+    CHECK_EQ_INT(guard_fixture_init(&fixture), 0);
+    CHECK_EQ_INT(config_retirement_guard_clear(&fixture.guard), 0);
+    CHECK(fixture.guard == NULL);
+    CHECK(guard_files_equal(
+        fixture.marker_path, fixture.completion_path));
+
+    CHECK_EQ_INT(config_retirement_guard_install_or_adopt(
+                     fixture.config_path, CONFIG_RETIREMENT_RESET,
+                     &fixture.owner, 1U, &fixture.guard), 0);
+    CHECK(config_retirement_guard_was_created(fixture.guard));
+    CHECK(!guard_files_equal(
+        fixture.marker_path, fixture.completion_path));
+    CHECK(guard_probe(&fixture, &blocked));
+    CHECK(blocked);
+    CHECK_EQ_INT(config_retirement_guard_revalidate(fixture.guard), 0);
+
+    CHECK_EQ_INT(
+        config_retirement_guard_prepare_clear(fixture.guard), 0);
+    CHECK_EQ_INT(access(fixture.stage_path, F_OK), 0);
+    CHECK_EQ_INT(access(fixture.completion_path, F_OK), 0);
+    CHECK(guard_probe(&fixture, &blocked));
+    CHECK(blocked);
+
+    CHECK_EQ_INT(config_retirement_guard_clear(&fixture.guard), 0);
+    CHECK(fixture.guard == NULL);
+    CHECK(access(fixture.stage_path, F_OK) != 0 && errno == ENOENT);
+    CHECK(guard_files_equal(
+        fixture.marker_path, fixture.completion_path));
+    blocked = true;
+    CHECK(guard_probe(&fixture, &blocked));
+    CHECK(!blocked);
+    guard_fixture_cleanup(&fixture);
+}
+
+TEST(prepare_clear_rejects_foreign_stage_without_deleting_it) {
+    guard_fixture_t fixture;
+    unsigned char observed[GUARD_MAX_BYTES];
+    struct stat before;
+    struct stat after;
+    bool blocked = false;
+    int directory_fd;
+
+    CHECK_EQ_INT(guard_fixture_init(&fixture), 0);
+    CHECK(guard_mutate_token(
+        fixture.marker_data, fixture.marker_length,
+        hook_replacement));
+    directory_fd = open(
+        fixture.directory,
+        O_RDONLY | O_CLOEXEC | O_DIRECTORY | O_NOFOLLOW);
+    CHECK(directory_fd >= 0);
+    if (directory_fd >= 0) {
+        CHECK_EQ_INT(guard_atomic_replace_at(
+                         directory_fd, STAGE_NAME,
+                         hook_replacement,
+                         fixture.marker_length), 0);
+        CHECK_EQ_INT(fstatat(
+                         directory_fd, STAGE_NAME, &before,
+                         AT_SYMLINK_NOFOLLOW), 0);
+        CHECK_EQ_INT(close(directory_fd), 0);
+    }
+
+    CHECK_EQ_INT(
+        config_retirement_guard_prepare_clear(fixture.guard), -1);
+    CHECK(fixture.guard != NULL);
+    CHECK_EQ_INT(config_retirement_guard_clear(&fixture.guard), -1);
+    CHECK(fixture.guard != NULL);
+    CHECK_EQ_INT(stat(fixture.stage_path, &after), 0);
+    CHECK(ts_same_identity(&before, &after));
+    CHECK_EQ_INT((long)guard_read_file(
+                     fixture.stage_path, observed, sizeof(observed)),
+                 (long)fixture.marker_length);
+    CHECK(memcmp(observed, hook_replacement,
+                 fixture.marker_length) == 0);
+    CHECK(guard_probe(&fixture, &blocked));
+    CHECK(blocked);
+    guard_fixture_cleanup(&fixture);
+}
+
+TEST(prepared_handle_rejects_completion_inserted_after_prepare) {
+    guard_fixture_t fixture;
+    bool blocked = false;
+    int directory_fd;
+
+    CHECK_EQ_INT(guard_fixture_init(&fixture), 0);
+    CHECK_EQ_INT(
+        config_retirement_guard_prepare_clear(fixture.guard), 0);
+    directory_fd = open(
+        fixture.directory,
+        O_RDONLY | O_CLOEXEC | O_DIRECTORY | O_NOFOLLOW);
+    CHECK(directory_fd >= 0);
+    if (directory_fd >= 0) {
+        CHECK_EQ_INT(guard_atomic_replace_at(
+                         directory_fd, COMPLETE_NAME,
+                         fixture.marker_data,
+                         fixture.marker_length), 0);
+        CHECK_EQ_INT(close(directory_fd), 0);
+    }
+
+    CHECK_EQ_INT(config_retirement_guard_revalidate(fixture.guard), -1);
+    CHECK_EQ_INT(config_retirement_guard_clear(&fixture.guard), -1);
+    CHECK(fixture.guard != NULL);
+    CHECK_EQ_INT(access(fixture.stage_path, F_OK), 0);
+    CHECK(guard_files_equal(
+        fixture.marker_path, fixture.stage_path));
+    CHECK(guard_files_equal(
+        fixture.marker_path, fixture.completion_path));
+    CHECK(guard_probe(&fixture, &blocked));
+    CHECK(blocked);
+    guard_fixture_cleanup(&fixture);
+}
+
+TEST(prepared_handle_rejects_prior_completion_inode_replacement) {
+    guard_fixture_t fixture;
+    struct stat before;
+    struct stat after;
+    bool blocked = false;
+    int directory_fd;
+
+    CHECK_EQ_INT(guard_fixture_init(&fixture), 0);
+    CHECK_EQ_INT(config_retirement_guard_clear(&fixture.guard), 0);
+    CHECK_EQ_INT(config_retirement_guard_install_or_adopt(
+                     fixture.config_path, CONFIG_RETIREMENT_RESET,
+                     &fixture.owner, 1U, &fixture.guard), 0);
+    CHECK_EQ_INT(config_retirement_guard_revalidate(fixture.guard), 0);
+    CHECK_EQ_INT(
+        config_retirement_guard_prepare_clear(fixture.guard), 0);
+    CHECK_EQ_INT(stat(fixture.completion_path, &before), 0);
+    directory_fd = open(
+        fixture.directory,
+        O_RDONLY | O_CLOEXEC | O_DIRECTORY | O_NOFOLLOW);
+    CHECK(directory_fd >= 0);
+    if (directory_fd >= 0) {
+        CHECK_EQ_INT(guard_atomic_replace_at(
+                         directory_fd, COMPLETE_NAME,
+                         fixture.marker_data,
+                         fixture.marker_length), 0);
+        CHECK_EQ_INT(close(directory_fd), 0);
+    }
+    CHECK_EQ_INT(stat(fixture.completion_path, &after), 0);
+    CHECK(!ts_same_identity(&before, &after));
+
+    CHECK_EQ_INT(config_retirement_guard_revalidate(fixture.guard), -1);
+    CHECK_EQ_INT(config_retirement_guard_clear(&fixture.guard), -1);
+    CHECK(fixture.guard != NULL);
+    CHECK_EQ_INT(access(fixture.stage_path, F_OK), 0);
+    CHECK(guard_probe(&fixture, &blocked));
+    CHECK(blocked);
+    guard_fixture_cleanup(&fixture);
+}
+
+TEST(prepared_handle_accepts_prior_completion_ctime_only_drift) {
+    guard_fixture_t fixture;
+    struct stat before;
+    struct stat after;
+    bool blocked = true;
+    int directory_fd;
+
+    CHECK_EQ_INT(guard_fixture_init(&fixture), 0);
+    CHECK_EQ_INT(config_retirement_guard_clear(&fixture.guard), 0);
+    CHECK_EQ_INT(config_retirement_guard_install_or_adopt(
+                     fixture.config_path, CONFIG_RETIREMENT_RESET,
+                     &fixture.owner, 1U, &fixture.guard), 0);
+    CHECK_EQ_INT(
+        config_retirement_guard_prepare_clear(fixture.guard), 0);
+    directory_fd = open(
+        fixture.directory,
+        O_RDONLY | O_CLOEXEC | O_DIRECTORY | O_NOFOLLOW);
+    CHECK(directory_fd >= 0);
+    if (directory_fd >= 0) {
+        CHECK_EQ_INT(guard_force_ctime_only_drift_at(
+                         directory_fd, COMPLETE_NAME,
+                         &before, &after), 0);
+        CHECK_EQ_INT(close(directory_fd), 0);
+    }
+    CHECK(guard_same_except_ctime(&before, &after));
+    CHECK(!guard_same_ctime(&before, &after));
+
+    CHECK_EQ_INT(config_retirement_guard_revalidate(fixture.guard), 0);
+    CHECK_EQ_INT(config_retirement_guard_clear(&fixture.guard), 0);
+    CHECK(fixture.guard == NULL);
+    CHECK(guard_files_equal(
+        fixture.marker_path, fixture.completion_path));
+    CHECK(guard_probe(&fixture, &blocked));
+    CHECK(!blocked);
+    guard_fixture_cleanup(&fixture);
+}
+
+TEST(prepared_handle_rejects_prior_completion_content_change) {
+    guard_fixture_t fixture;
+    struct stat before;
+    struct stat after;
+    bool blocked = false;
+    int directory_fd;
+
+    CHECK_EQ_INT(guard_fixture_init(&fixture), 0);
+    CHECK_EQ_INT(config_retirement_guard_clear(&fixture.guard), 0);
+    CHECK_EQ_INT(config_retirement_guard_install_or_adopt(
+                     fixture.config_path, CONFIG_RETIREMENT_RESET,
+                     &fixture.owner, 1U, &fixture.guard), 0);
+    CHECK_EQ_INT(
+        config_retirement_guard_prepare_clear(fixture.guard), 0);
+    directory_fd = open(
+        fixture.directory,
+        O_RDONLY | O_CLOEXEC | O_DIRECTORY | O_NOFOLLOW);
+    CHECK(directory_fd >= 0);
+    if (directory_fd >= 0) {
+        CHECK_EQ_INT(guard_change_bytes_restore_mtime_at(
+                         directory_fd, COMPLETE_NAME,
+                         hook_original, hook_replacement,
+                         &hook_replacement_length,
+                         &before, &after), 0);
+        CHECK_EQ_INT(close(directory_fd), 0);
+    }
+    CHECK(guard_same_except_ctime(&before, &after));
+    CHECK(!guard_same_ctime(&before, &after));
+
+    CHECK_EQ_INT(config_retirement_guard_revalidate(fixture.guard), -1);
+    CHECK_EQ_INT(config_retirement_guard_clear(&fixture.guard), -1);
+    CHECK(fixture.guard != NULL);
+    CHECK_EQ_INT(access(fixture.stage_path, F_OK), 0);
+    CHECK(guard_probe(&fixture, &blocked));
+    CHECK(blocked);
+    guard_fixture_cleanup(&fixture);
+}
+
+TEST(prepared_clear_failure_before_rename_retains_blocking_stage) {
+    guard_fixture_t fixture;
+    bool blocked = false;
+
+    CHECK_EQ_INT(guard_fixture_init(&fixture), 0);
+    CHECK_EQ_INT(
+        config_retirement_guard_prepare_clear(fixture.guard), 0);
+    guard_arm_hook(
+        RETIREMENT_GUARD_CLEAR_BEFORE_PUBLISH, HOOK_FAIL);
+    CHECK_EQ_INT(config_retirement_guard_clear(&fixture.guard), -1);
+    (void)gitswitch_test_set_retirement_guard_clear_hook(NULL);
+    CHECK(fixture.guard != NULL);
+    CHECK(!hook_armed);
+    CHECK(hook_action_observed);
+    CHECK_EQ_INT((long)hook_action_count, 1);
+    CHECK_EQ_INT(access(fixture.stage_path, F_OK), 0);
+    CHECK(guard_files_equal(
+        fixture.marker_path, fixture.stage_path));
+    CHECK(access(fixture.completion_path, F_OK) != 0 &&
+          errno == ENOENT);
+    CHECK(guard_probe(&fixture, &blocked));
+    CHECK(blocked);
+
+    CHECK_EQ_INT(config_retirement_guard_clear(&fixture.guard), 0);
+    CHECK(fixture.guard == NULL);
+    guard_fixture_cleanup(&fixture);
+}
+
+TEST(prepared_barrier_eagain_retains_capability_and_retry_commits) {
+    static char diagnostic[] =
+        "synthetic retryable retirement barrier";
+    guard_fixture_t fixture;
+    bool blocked = false;
+
+    CHECK_EQ_INT(guard_fixture_init(&fixture), 0);
+    CHECK_EQ_INT(
+        config_retirement_guard_prepare_clear(fixture.guard), 0);
+    guard_arm_barrier(EAGAIN);
+    errno = 0;
+    CHECK_EQ_INT(config_retirement_guard_clear_with_barrier(
+                     &fixture.guard, guard_commit_barrier,
+                     diagnostic), -1);
+    CHECK_EQ_INT(errno, EAGAIN);
+    CHECK(guard_error_context_same(
+        get_last_error(), &barrier_failure_error));
+    CHECK_EQ_INT((long)barrier_call_count, 1);
+    CHECK(fixture.guard != NULL);
+    CHECK_EQ_INT(access(fixture.stage_path, F_OK), 0);
+    CHECK(guard_files_equal(
+        fixture.marker_path, fixture.stage_path));
+    CHECK(access(fixture.completion_path, F_OK) != 0 &&
+          errno == ENOENT);
+    CHECK(guard_probe(&fixture, &blocked));
+    CHECK(blocked);
+
+    barrier_failure_errno = 0;
+    CHECK_EQ_INT(config_retirement_guard_clear_with_barrier(
+                     &fixture.guard, guard_commit_barrier,
+                     diagnostic), 0);
+    CHECK_EQ_INT((long)barrier_call_count, 2);
+    CHECK(fixture.guard == NULL);
+    CHECK(access(fixture.stage_path, F_OK) != 0 && errno == ENOENT);
+    CHECK(guard_files_equal(
+        fixture.marker_path, fixture.completion_path));
+    blocked = true;
+    CHECK(guard_probe(&fixture, &blocked));
+    CHECK(!blocked);
+    guard_fixture_cleanup(&fixture);
+}
+
+TEST(prepared_guard_mismatch_prevents_barrier_invocation) {
+    guard_fixture_t fixture;
+    bool blocked = false;
+    int directory_fd;
+
+    CHECK_EQ_INT(guard_fixture_init(&fixture), 0);
+    CHECK_EQ_INT(
+        config_retirement_guard_prepare_clear(fixture.guard), 0);
+    CHECK(guard_mutate_token(
+        fixture.marker_data, fixture.marker_length,
+        hook_replacement));
+    directory_fd = open(
+        fixture.directory,
+        O_RDONLY | O_CLOEXEC | O_DIRECTORY | O_NOFOLLOW);
+    CHECK(directory_fd >= 0);
+    if (directory_fd >= 0) {
+        CHECK_EQ_INT(guard_atomic_replace_at(
+                         directory_fd, GUARD_NAME,
+                         hook_replacement,
+                         fixture.marker_length), 0);
+        CHECK_EQ_INT(close(directory_fd), 0);
+    }
+    guard_arm_barrier(0);
+
+    CHECK_EQ_INT(config_retirement_guard_clear_with_barrier(
+                     &fixture.guard, guard_commit_barrier, NULL), -1);
+    CHECK_EQ_INT((long)barrier_call_count, 0);
+    CHECK(fixture.guard != NULL);
+    CHECK_EQ_INT(access(fixture.stage_path, F_OK), 0);
+    CHECK(access(fixture.completion_path, F_OK) != 0 &&
+          errno == ENOENT);
+    CHECK(guard_probe(&fixture, &blocked));
+    CHECK(blocked);
+    guard_fixture_cleanup(&fixture);
+}
+
+TEST(prepared_barrier_hard_failure_retains_blocking_state) {
+    static char diagnostic[] =
+        "synthetic hard retirement barrier failure";
+    guard_fixture_t fixture;
+    bool blocked = false;
+
+    CHECK_EQ_INT(guard_fixture_init(&fixture), 0);
+    CHECK_EQ_INT(
+        config_retirement_guard_prepare_clear(fixture.guard), 0);
+    guard_arm_barrier(EPERM);
+    errno = 0;
+    CHECK_EQ_INT(config_retirement_guard_clear_with_barrier(
+                     &fixture.guard, guard_commit_barrier,
+                     diagnostic), -1);
+    CHECK_EQ_INT(errno, EPERM);
+    CHECK(guard_error_context_same(
+        get_last_error(), &barrier_failure_error));
+    CHECK_EQ_INT((long)barrier_call_count, 1);
+    CHECK(fixture.guard != NULL);
+    CHECK_EQ_INT(access(fixture.stage_path, F_OK), 0);
+    CHECK(guard_files_equal(
+        fixture.marker_path, fixture.stage_path));
+    CHECK(access(fixture.completion_path, F_OK) != 0 &&
+          errno == ENOENT);
+    CHECK(guard_probe(&fixture, &blocked));
+    CHECK(blocked);
+    guard_fixture_cleanup(&fixture);
+}
+
+TEST(fork_child_cannot_invoke_barrier_and_parent_can_retry) {
+    guard_fixture_t fixture;
+    unsigned char observed = 0U;
+    int invocation_pipe[2] = {-1, -1};
+    int status = 0;
+    pid_t child;
+
+    CHECK_EQ_INT(guard_fixture_init(&fixture), 0);
+    CHECK_EQ_INT(
+        config_retirement_guard_prepare_clear(fixture.guard), 0);
+    CHECK_EQ_INT(pipe(invocation_pipe), 0);
+    if (invocation_pipe[0] >= 0) {
+        CHECK(fcntl(
+                  invocation_pipe[0], F_SETFL,
+                  fcntl(invocation_pipe[0], F_GETFL) | O_NONBLOCK) >= 0);
+    }
+    child = fork();
+    CHECK(child >= 0);
+    if (child == 0) {
+        config_retirement_guard_t *independent = NULL;
+        int result;
+
+        close(invocation_pipe[0]);
+        result = config_retirement_guard_clear_with_barrier(
+            &fixture.guard, guard_pipe_barrier,
+            &invocation_pipe[1]);
+        config_retirement_guard_abandon(&fixture.guard);
+        errno = 0;
+        if (result != -1 || fixture.guard != NULL ||
+            config_retirement_guard_install_or_adopt(
+                fixture.config_path, CONFIG_RETIREMENT_RESET,
+                &fixture.owner, 1U, &independent) != -1 ||
+            independent != NULL || errno != EWOULDBLOCK) {
+            config_retirement_guard_abandon(&independent);
+            _exit(1);
+        }
+        _exit(0);
+    }
+    if (child > 0) {
+        int competing_lock;
+
+        close(invocation_pipe[1]);
+        invocation_pipe[1] = -1;
+        while (waitpid(child, &status, 0) < 0 && errno == EINTR) {
+        }
+        CHECK(WIFEXITED(status) && WEXITSTATUS(status) == 0);
+        errno = 0;
+        CHECK_EQ_INT(
+            read(invocation_pipe[0], &observed, sizeof(observed)), 0);
+        competing_lock = open(
+            fixture.lock_path, O_RDWR | O_CLOEXEC | O_NOFOLLOW);
+        CHECK(competing_lock >= 0);
+        if (competing_lock >= 0) {
+            errno = 0;
+            CHECK(flock(
+                      competing_lock,
+                      LOCK_EX | LOCK_NB) != 0 &&
+                  (errno == EWOULDBLOCK || errno == EAGAIN));
+            CHECK_EQ_INT(close(competing_lock), 0);
+        }
+    }
+    if (invocation_pipe[0] >= 0) close(invocation_pipe[0]);
+    invocation_pipe[0] = -1;
+
+    CHECK_EQ_INT(pipe(invocation_pipe), 0);
+    guard_arm_barrier(0);
+    CHECK_EQ_INT(config_retirement_guard_clear_with_barrier(
+                     &fixture.guard, guard_pipe_barrier,
+                     &invocation_pipe[1]), 0);
+    CHECK_EQ_INT((long)barrier_call_count, 1);
+    CHECK_EQ_INT(
+        read(invocation_pipe[0], &observed, sizeof(observed)),
+        (long)sizeof(observed));
+    CHECK_EQ_INT((long)observed, 1);
+    close(invocation_pipe[0]);
+    close(invocation_pipe[1]);
+    guard_fixture_cleanup(&fixture);
+}
+
+TEST(fork_inside_barrier_child_abandons_without_releasing_parent) {
+    guard_fixture_t fixture;
+    guard_fork_barrier_context_t barrier_state;
+    bool blocked = false;
+    int competing_lock;
+
+    CHECK_EQ_INT(guard_fixture_init(&fixture), 0);
+    CHECK_EQ_INT(
+        config_retirement_guard_prepare_clear(fixture.guard), 0);
+    memset(&barrier_state, 0, sizeof(barrier_state));
+    barrier_state.guard = &fixture.guard;
+    barrier_state.config_path = fixture.config_path;
+    barrier_state.owner = &fixture.owner;
+    guard_arm_barrier(0);
+    errno = 0;
+    CHECK_EQ_INT(
+        config_retirement_guard_clear_with_barrier(
+            &fixture.guard, guard_fork_abandon_barrier,
+            &barrier_state),
+        -1);
+    CHECK_EQ_INT(errno, EAGAIN);
+    CHECK_EQ_INT((long)barrier_call_count, 1);
+    CHECK(WIFEXITED(barrier_state.child_status));
+    if (WIFEXITED(barrier_state.child_status)) {
+        CHECK_EQ_INT(WEXITSTATUS(barrier_state.child_status), 0);
+    }
+    CHECK(fixture.guard != NULL);
+    CHECK(guard_probe(&fixture, &blocked));
+    CHECK(blocked);
+
+    competing_lock = open(
+        fixture.lock_path, O_RDWR | O_CLOEXEC | O_NOFOLLOW);
+    CHECK(competing_lock >= 0);
+    if (competing_lock >= 0) {
+        errno = 0;
+        CHECK(flock(competing_lock, LOCK_EX | LOCK_NB) != 0 &&
+              (errno == EWOULDBLOCK || errno == EAGAIN));
+        CHECK_EQ_INT(close(competing_lock), 0);
+    }
+    CHECK_EQ_INT(config_retirement_guard_clear(&fixture.guard), 0);
+    CHECK(fixture.guard == NULL);
+    CHECK(guard_probe(&fixture, &blocked));
+    CHECK(!blocked);
+    guard_fixture_cleanup(&fixture);
+}
+
+TEST(lock_name_replacement_suppresses_barrier) {
+    guard_fixture_t fixture;
+    bool blocked = false;
+
+    CHECK_EQ_INT(guard_fixture_init(&fixture), 0);
+    CHECK_EQ_INT(
+        config_retirement_guard_prepare_clear(fixture.guard), 0);
+    hook_replacement[0] = 0x5aU;
+    hook_replacement_length = 1U;
+    guard_arm_hook(
+        RETIREMENT_GUARD_CLEAR_BEFORE_PUBLISH, HOOK_REPLACE_LOCK);
+    guard_arm_barrier(0);
+
+    CHECK_EQ_INT(config_retirement_guard_clear_with_barrier(
+                     &fixture.guard, guard_commit_barrier, NULL), -1);
+    (void)gitswitch_test_set_retirement_guard_clear_hook(NULL);
+    CHECK_EQ_INT((long)barrier_call_count, 0);
+    CHECK(hook_action_observed);
+    CHECK(fixture.guard != NULL);
+    CHECK(guard_probe(&fixture, &blocked));
+    CHECK(blocked);
+    guard_fixture_cleanup(&fixture);
+}
+
+TEST(unprepared_clear_revalidates_named_lock_before_publish) {
+    guard_fixture_t fixture;
+    bool blocked = false;
+
+    CHECK_EQ_INT(guard_fixture_init(&fixture), 0);
+    hook_replacement[0] = 0x5aU;
+    hook_replacement_length = 1U;
+    guard_arm_hook(
+        RETIREMENT_GUARD_CLEAR_BEFORE_PUBLISH, HOOK_REPLACE_LOCK);
+
+    CHECK_EQ_INT(config_retirement_guard_clear(&fixture.guard), -1);
+    (void)gitswitch_test_set_retirement_guard_clear_hook(NULL);
+    CHECK(hook_action_observed);
+    CHECK(fixture.guard != NULL);
+    CHECK_EQ_INT(access(fixture.stage_path, F_OK), 0);
+    CHECK(access(fixture.completion_path, F_OK) != 0 &&
+          errno == ENOENT);
+    CHECK(guard_probe(&fixture, &blocked));
+    CHECK(blocked);
+    guard_fixture_cleanup(&fixture);
+}
+
+TEST(successful_barrier_is_reinvoked_after_pre_rename_failure) {
+    guard_fixture_t fixture;
+    bool blocked = false;
+
+    CHECK_EQ_INT(guard_fixture_init(&fixture), 0);
+    CHECK_EQ_INT(
+        config_retirement_guard_prepare_clear(fixture.guard), 0);
+    guard_arm_hook(
+        RETIREMENT_GUARD_CLEAR_AFTER_BARRIER_BEFORE_RENAME,
+        HOOK_FAIL);
+    guard_arm_barrier(0);
+
+    CHECK_EQ_INT(config_retirement_guard_clear_with_barrier(
+                     &fixture.guard, guard_commit_barrier, NULL), -1);
+    (void)gitswitch_test_set_retirement_guard_clear_hook(NULL);
+    CHECK_EQ_INT((long)barrier_call_count, 1);
+    CHECK(fixture.guard != NULL);
+    CHECK_EQ_INT(access(fixture.stage_path, F_OK), 0);
+    CHECK(guard_probe(&fixture, &blocked));
+    CHECK(blocked);
+
+    CHECK_EQ_INT(config_retirement_guard_clear_with_barrier(
+                     &fixture.guard, guard_commit_barrier, NULL), 0);
+    CHECK_EQ_INT((long)barrier_call_count, 2);
+    CHECK(fixture.guard == NULL);
+    guard_fixture_cleanup(&fixture);
+}
+
+TEST(barrier_cannot_reenter_or_abandon_its_handle) {
+    guard_fixture_t fixture;
+    guard_reentrant_barrier_context_t context;
+
+    CHECK_EQ_INT(guard_fixture_init(&fixture), 0);
+    CHECK_EQ_INT(
+        config_retirement_guard_prepare_clear(fixture.guard), 0);
+    memset(&context, 0, sizeof(context));
+    context.guard = &fixture.guard;
+    context.recursive_result = 1;
+    guard_arm_barrier(0);
+
+    CHECK_EQ_INT(config_retirement_guard_clear_with_barrier(
+                     &fixture.guard, guard_reentrant_barrier,
+                     &context), 0);
+    CHECK_EQ_INT((long)barrier_call_count, 1);
+    CHECK_EQ_INT(context.recursive_result, -1);
+    CHECK(context.abandon_retained);
+    CHECK(fixture.guard == NULL);
+    guard_fixture_cleanup(&fixture);
+}
+
+TEST(callback_armed_post_publish_hook_observes_no_later_checkpoint) {
+    guard_fixture_t fixture;
+
+    CHECK_EQ_INT(guard_fixture_init(&fixture), 0);
+    CHECK_EQ_INT(
+        config_retirement_guard_prepare_clear(fixture.guard), 0);
+    guard_arm_barrier(0);
+    CHECK_EQ_INT(config_retirement_guard_clear_with_barrier(
+                     &fixture.guard, guard_arm_observation_barrier,
+                     NULL), 0);
+    CHECK_EQ_INT((long)barrier_call_count, 1);
+    CHECK(fixture.guard == NULL);
+    CHECK(hook_armed);
+    CHECK(!hook_action_observed);
+    (void)gitswitch_test_set_retirement_guard_clear_hook(NULL);
+    guard_fixture_cleanup(&fixture);
+}
+
+TEST(prepared_publish_preserves_stage_replaced_after_barrier) {
+    guard_fixture_t fixture;
+    unsigned char observed[GUARD_MAX_BYTES];
+    size_t observed_length;
+
+    CHECK_EQ_INT(guard_fixture_init(&fixture), 0);
+    CHECK_EQ_INT(
+        config_retirement_guard_prepare_clear(fixture.guard), 0);
+    CHECK(guard_mutate_token(
+        fixture.marker_data, fixture.marker_length,
+        hook_replacement));
+    hook_replacement_length = fixture.marker_length;
+    guard_arm_hook(
+        RETIREMENT_GUARD_CLEAR_AFTER_BARRIER_BEFORE_RENAME,
+        HOOK_REPLACE_STAGE);
+    guard_arm_barrier(0);
+
+    CHECK_EQ_INT(config_retirement_guard_clear_with_barrier(
+                     &fixture.guard, guard_commit_barrier, NULL), -1);
+    (void)gitswitch_test_set_retirement_guard_clear_hook(NULL);
+    CHECK_EQ_INT((long)barrier_call_count, 1);
+    CHECK(fixture.guard != NULL);
+    CHECK(!hook_armed);
+    CHECK(hook_action_observed);
+    CHECK_EQ_INT((long)hook_action_count, 1);
+    observed_length = guard_read_file(
+        fixture.stage_path, observed, sizeof(observed));
+    CHECK_EQ_INT(
+        (long)observed_length, (long)hook_replacement_length);
+    CHECK(memcmp(
+        observed, hook_replacement, hook_replacement_length) == 0);
+    CHECK(access(fixture.completion_path, F_OK) != 0 &&
+          errno == ENOENT);
+    guard_fixture_cleanup(&fixture);
+}
+
+TEST(prepared_publish_preserves_completion_replaced_after_barrier) {
+    guard_fixture_t fixture;
+    unsigned char observed[GUARD_MAX_BYTES];
+    size_t observed_length;
+
+    CHECK_EQ_INT(guard_fixture_init(&fixture), 0);
+    CHECK_EQ_INT(
+        config_retirement_guard_prepare_clear(fixture.guard), 0);
+    CHECK(guard_mutate_token(
+        fixture.marker_data, fixture.marker_length,
+        hook_replacement));
+    hook_replacement_length = fixture.marker_length;
+    guard_arm_hook(
+        RETIREMENT_GUARD_CLEAR_AFTER_BARRIER_BEFORE_RENAME,
+        HOOK_REPLACE_COMPLETION);
+    guard_arm_barrier(0);
+
+    CHECK_EQ_INT(config_retirement_guard_clear_with_barrier(
+                     &fixture.guard, guard_commit_barrier, NULL), -1);
+    (void)gitswitch_test_set_retirement_guard_clear_hook(NULL);
+    CHECK_EQ_INT((long)barrier_call_count, 1);
+    CHECK(fixture.guard != NULL);
+    CHECK(!hook_armed);
+    CHECK(hook_action_observed);
+    CHECK_EQ_INT((long)hook_action_count, 1);
+    CHECK(guard_files_equal(
+        fixture.marker_path, fixture.stage_path));
+    observed_length = guard_read_file(
+        fixture.completion_path, observed, sizeof(observed));
+    CHECK_EQ_INT(
+        (long)observed_length, (long)hook_replacement_length);
+    CHECK(memcmp(
+        observed, hook_replacement, hook_replacement_length) == 0);
+    guard_fixture_cleanup(&fixture);
+}
+
+TEST(prepared_commit_consumes_exact_certificate_with_later_blocker) {
+    guard_fixture_t fixture;
+    unsigned char observed[GUARD_MAX_BYTES];
+    size_t observed_length;
+    bool blocked = false;
+
+    CHECK_EQ_INT(guard_fixture_init(&fixture), 0);
+    CHECK_EQ_INT(
+        config_retirement_guard_prepare_clear(fixture.guard), 0);
+    CHECK(guard_mutate_token(
+        fixture.marker_data, fixture.marker_length,
+        hook_replacement));
+    hook_replacement_length = fixture.marker_length;
+    guard_arm_hook(
+        RETIREMENT_GUARD_CLEAR_AFTER_PREPARED_PUBLISH,
+        HOOK_REPLACE_CANONICAL);
+    guard_arm_barrier(0);
+
+    CHECK_EQ_INT(config_retirement_guard_clear_with_barrier(
+                     &fixture.guard, guard_commit_barrier, NULL), 0);
+    (void)gitswitch_test_set_retirement_guard_clear_hook(NULL);
+    CHECK(fixture.guard == NULL);
+    CHECK_EQ_INT((long)barrier_call_count, 1);
+    CHECK(!hook_armed);
+    CHECK(hook_action_observed);
+    observed_length = guard_read_file(
+        fixture.marker_path, observed, sizeof(observed));
+    CHECK_EQ_INT(
+        (long)observed_length, (long)hook_replacement_length);
+    CHECK(memcmp(
+        observed, hook_replacement, hook_replacement_length) == 0);
+    CHECK_EQ_INT(
+        (long)guard_read_file(
+            fixture.completion_path, observed, sizeof(observed)),
+        (long)fixture.marker_length);
+    CHECK(memcmp(
+        observed, fixture.marker_data, fixture.marker_length) == 0);
+    CHECK(guard_probe(&fixture, &blocked));
+    CHECK(blocked);
+    guard_fixture_cleanup(&fixture);
+}
+
+TEST(prepared_commit_consumes_handle_when_first_namespace_reproof_fails) {
+    guard_fixture_t fixture;
+    unsigned char observed[GUARD_MAX_BYTES];
+
+    CHECK_EQ_INT(guard_fixture_init(&fixture), 0);
+    CHECK_EQ_INT(config_retirement_guard_clear(&fixture.guard), 0);
+    CHECK_EQ_INT(config_retirement_guard_install_or_adopt(
+                     fixture.config_path, CONFIG_RETIREMENT_RESET,
+                     &fixture.owner, 1U, &fixture.guard), 0);
+    fixture.marker_length = guard_read_file(
+        fixture.marker_path, fixture.marker_data,
+        sizeof(fixture.marker_data));
+    CHECK(fixture.marker_length > 0U);
+    CHECK_EQ_INT(stat(
+                     fixture.marker_path,
+                     &fixture.marker_identity), 0);
+    CHECK_EQ_INT(
+        config_retirement_guard_prepare_clear(fixture.guard), 0);
+    guard_arm_hook(
+        RETIREMENT_GUARD_CLEAR_AFTER_NAMESPACE_COMMIT,
+        HOOK_FAIL);
+    guard_arm_barrier(0);
+
+    CHECK_EQ_INT(config_retirement_guard_clear_with_barrier(
+                     &fixture.guard, guard_commit_barrier, NULL), 0);
+    (void)gitswitch_test_set_retirement_guard_clear_hook(NULL);
+    CHECK(fixture.guard == NULL);
+    CHECK_EQ_INT((long)barrier_call_count, 1);
+    CHECK(hook_action_observed);
+    CHECK_EQ_INT((long)hook_action_count, 1);
+    CHECK_EQ_INT(
+        (long)guard_read_file(
+            fixture.completion_path, observed, sizeof(observed)),
+        (long)fixture.marker_length);
+    CHECK(memcmp(
+        observed, fixture.marker_data, fixture.marker_length) == 0);
+    guard_fixture_cleanup(&fixture);
+}
+
+#if !defined(__FreeBSD__)
+TEST(prepared_settled_arena_exhaustion_fails_before_stage) {
+    guard_fixture_t fixture;
+    int directory_fd;
+
+    CHECK_EQ_INT(guard_fixture_init(&fixture), 0);
+    CHECK_EQ_INT(guard_fixture_rotate_active(&fixture), 0);
+    (void)gitswitch_test_set_retirement_settled_slot_limit(2U);
+    directory_fd = open(
+        fixture.directory,
+        O_RDONLY | O_CLOEXEC | O_DIRECTORY | O_NOFOLLOW);
+    CHECK(directory_fd >= 0);
+    if (directory_fd >= 0) {
+        CHECK_EQ_INT(guard_atomic_replace_at(
+                         directory_fd,
+                         SETTLED_PREFIX "0",
+                         fixture.marker_data,
+                         fixture.marker_length), 0);
+        CHECK_EQ_INT(guard_atomic_replace_at(
+                         directory_fd,
+                         SETTLED_PREFIX "1",
+                         fixture.marker_data,
+                         fixture.marker_length), 0);
+        CHECK_EQ_INT(close(directory_fd), 0);
+    }
+    CHECK_EQ_INT(
+        config_retirement_guard_prepare_clear(fixture.guard), -1);
+    CHECK_EQ_INT(errno, ENOSPC);
+    CHECK(strstr(
+        get_last_error()->message, "offline quiescent cleanup") != NULL);
+    CHECK(access(fixture.stage_path, F_OK) != 0 && errno == ENOENT);
+    (void)gitswitch_test_set_retirement_settled_slot_limit(0U);
+    guard_fixture_cleanup(&fixture);
+}
+
+TEST(prepared_slot_replacement_after_move_is_preserved) {
+    guard_fixture_t fixture;
+    unsigned char observed[GUARD_MAX_BYTES];
+    char slot_path[256];
+    size_t observed_length;
+
+    CHECK_EQ_INT(guard_fixture_init(&fixture), 0);
+    CHECK_EQ_INT(guard_fixture_rotate_active(&fixture), 0);
+    CHECK_EQ_INT(
+        config_retirement_guard_prepare_clear(fixture.guard), 0);
+    CHECK(guard_mutate_token(
+        fixture.marker_data, fixture.marker_length,
+        hook_replacement));
+    hook_replacement_length = fixture.marker_length;
+    guard_arm_hook(
+        RETIREMENT_GUARD_CLEAR_AFTER_SETTLED_SLOT_MOVE,
+        HOOK_REPLACE_NAMED);
+    guard_arm_barrier(0);
+    CHECK_EQ_INT(config_retirement_guard_clear_with_barrier(
+                     &fixture.guard, guard_commit_barrier, NULL), -1);
+    (void)gitswitch_test_set_retirement_guard_clear_hook(NULL);
+    CHECK((size_t)snprintf(
+              slot_path, sizeof(slot_path), "%s/%s1",
+              fixture.directory, SETTLED_PREFIX) < sizeof(slot_path));
+    observed_length = guard_read_file(
+        slot_path, observed, sizeof(observed));
+    CHECK_EQ_INT(
+        (long)observed_length, (long)hook_replacement_length);
+    CHECK(memcmp(
+        observed, hook_replacement, hook_replacement_length) == 0);
+    CHECK(access(fixture.stage_path, F_OK) != 0 && errno == ENOENT);
+    guard_fixture_cleanup(&fixture);
+}
+
+TEST(interrupted_slot_move_consumes_slot_and_retry_uses_next) {
+    guard_fixture_t fixture;
+    char first_slot[256];
+    char second_slot[256];
+
+    CHECK_EQ_INT(guard_fixture_init(&fixture), 0);
+    CHECK_EQ_INT(guard_fixture_rotate_active(&fixture), 0);
+    CHECK_EQ_INT(
+        config_retirement_guard_prepare_clear(fixture.guard), 0);
+    guard_arm_hook(
+        RETIREMENT_GUARD_CLEAR_AFTER_SETTLED_SLOT_MOVE, HOOK_FAIL);
+    CHECK_EQ_INT(config_retirement_guard_clear(&fixture.guard), -1);
+    (void)gitswitch_test_set_retirement_guard_clear_hook(NULL);
+    config_retirement_guard_abandon(&fixture.guard);
+    CHECK_EQ_INT(config_retirement_guard_adopt(
+                     fixture.config_path, CONFIG_RETIREMENT_RESET,
+                     &fixture.owner, 1U, &fixture.guard), 0);
+    CHECK_EQ_INT(
+        config_retirement_guard_prepare_clear(fixture.guard), 0);
+    CHECK_EQ_INT(config_retirement_guard_clear(&fixture.guard), 0);
+    CHECK((size_t)snprintf(
+              first_slot, sizeof(first_slot), "%s/%s0",
+              fixture.directory, SETTLED_PREFIX) < sizeof(first_slot));
+    CHECK((size_t)snprintf(
+              second_slot, sizeof(second_slot), "%s/%s1",
+              fixture.directory, SETTLED_PREFIX) < sizeof(second_slot));
+    CHECK_EQ_INT(access(first_slot, F_OK), 0);
+    CHECK_EQ_INT(access(second_slot, F_OK), 0);
+    guard_fixture_cleanup(&fixture);
+}
+#endif
+
+TEST(prepare_clear_sync_failure_retains_blocking_stage_and_retries) {
+    guard_fixture_t fixture;
+    bool blocked = false;
+
+    CHECK_EQ_INT(guard_fixture_init(&fixture), 0);
+    guard_arm_hook(
+        RETIREMENT_GUARD_CLEAR_BEFORE_DIR_SYNC, HOOK_FAIL);
+    CHECK_EQ_INT(
+        config_retirement_guard_prepare_clear(fixture.guard), -1);
+    (void)gitswitch_test_set_retirement_guard_clear_hook(NULL);
+    CHECK(fixture.guard != NULL);
+    CHECK(!hook_armed);
+    CHECK(hook_action_observed);
+    CHECK_EQ_INT((long)hook_action_count, 1);
+    CHECK_EQ_INT(access(fixture.stage_path, F_OK), 0);
+    CHECK(guard_files_equal(
+        fixture.marker_path, fixture.stage_path));
+    CHECK(access(fixture.completion_path, F_OK) != 0 &&
+          errno == ENOENT);
+    CHECK(guard_probe(&fixture, &blocked));
+    CHECK(blocked);
+
+    CHECK_EQ_INT(
+        config_retirement_guard_prepare_clear(fixture.guard), 0);
+    CHECK_EQ_INT(config_retirement_guard_clear(&fixture.guard), 0);
+    CHECK(fixture.guard == NULL);
+    CHECK(access(fixture.stage_path, F_OK) != 0 && errno == ENOENT);
+    CHECK(guard_files_equal(
+        fixture.marker_path, fixture.completion_path));
+    blocked = true;
+    CHECK(guard_probe(&fixture, &blocked));
+    CHECK(!blocked);
+    guard_fixture_cleanup(&fixture);
+}
+
+TEST(prepared_clear_reproof_rejects_checkpoint_marker_replacement) {
+    guard_fixture_t fixture;
+    unsigned char observed[GUARD_MAX_BYTES];
+    size_t observed_length;
+    bool blocked = false;
+
+    CHECK_EQ_INT(guard_fixture_init(&fixture), 0);
+    CHECK_EQ_INT(
+        config_retirement_guard_prepare_clear(fixture.guard), 0);
+    CHECK(guard_mutate_token(
+        fixture.marker_data, fixture.marker_length,
+        hook_replacement));
+    hook_replacement_length = fixture.marker_length;
+    guard_arm_hook(
+        RETIREMENT_GUARD_CLEAR_BEFORE_PUBLISH,
+        HOOK_REPLACE_CANONICAL);
+
+    CHECK_EQ_INT(config_retirement_guard_clear(&fixture.guard), -1);
+    (void)gitswitch_test_set_retirement_guard_clear_hook(NULL);
+    CHECK(fixture.guard != NULL);
+    CHECK(!hook_armed);
+    CHECK(hook_action_observed);
+    CHECK_EQ_INT(access(fixture.stage_path, F_OK), 0);
+    CHECK(access(fixture.completion_path, F_OK) != 0 &&
+          errno == ENOENT);
+    CHECK(guard_probe(&fixture, &blocked));
+    CHECK(blocked);
+    observed_length = guard_read_file(
+        fixture.marker_path, observed, sizeof(observed));
+    CHECK_EQ_INT((long)observed_length,
+                 (long)hook_replacement_length);
+    CHECK(memcmp(observed, hook_replacement,
+                 hook_replacement_length) == 0);
+    guard_fixture_cleanup(&fixture);
+}
+
+TEST(prepared_handle_revalidation_rejects_stage_replacement) {
+    guard_fixture_t fixture;
+    bool blocked = false;
+    int directory_fd;
+
+    CHECK_EQ_INT(guard_fixture_init(&fixture), 0);
+    CHECK_EQ_INT(
+        config_retirement_guard_prepare_clear(fixture.guard), 0);
+    CHECK(guard_mutate_token(
+        fixture.marker_data, fixture.marker_length,
+        hook_replacement));
+    directory_fd = open(
+        fixture.directory,
+        O_RDONLY | O_CLOEXEC | O_DIRECTORY | O_NOFOLLOW);
+    CHECK(directory_fd >= 0);
+    if (directory_fd >= 0) {
+        CHECK_EQ_INT(guard_atomic_replace_at(
+                         directory_fd, STAGE_NAME,
+                         hook_replacement,
+                         fixture.marker_length), 0);
+        CHECK_EQ_INT(close(directory_fd), 0);
+    }
+
+    CHECK_EQ_INT(config_retirement_guard_revalidate(fixture.guard), -1);
+    CHECK(fixture.guard != NULL);
+    CHECK(guard_probe(&fixture, &blocked));
+    CHECK(blocked);
+    guard_fixture_cleanup(&fixture);
+}
+
+TEST(interrupted_prepared_stage_is_adopted_and_settled) {
+    guard_fixture_t fixture;
+    config_retirement_recovery_t recovery;
+    config_retirement_guard_t *adopted = NULL;
+    bool blocked = false;
+
+    CHECK_EQ_INT(guard_fixture_init(&fixture), 0);
+    CHECK_EQ_INT(
+        config_retirement_guard_prepare_clear(fixture.guard), 0);
+    config_retirement_guard_abandon(&fixture.guard);
+    CHECK(fixture.guard == NULL);
+    CHECK(guard_probe(&fixture, &blocked));
+    CHECK(blocked);
+
+    memset(&recovery, 0, sizeof(recovery));
+    CHECK_EQ_INT(config_retirement_guard_recovery_probe(
+                     fixture.config_path, &recovery), 0);
+    CHECK(recovery.valid);
+    CHECK_EQ_INT(config_retirement_guard_adopt(
+                     fixture.config_path, recovery.kind,
+                     recovery.owners, recovery.owner_count, &adopted), 0);
+    CHECK(adopted != NULL);
+    CHECK(access(fixture.stage_path, F_OK) != 0 && errno == ENOENT);
+    CHECK_EQ_INT(config_retirement_guard_clear(&adopted), 0);
+    CHECK(adopted == NULL);
+    blocked = true;
+    CHECK(guard_probe(&fixture, &blocked));
+    CHECK(!blocked);
     guard_fixture_cleanup(&fixture);
 }
 
@@ -836,8 +2124,10 @@ TEST(canonical_replacement_before_publication_fails_closed) {
     guard_fixture_t fixture;
     config_retirement_guard_t *recovery = NULL;
     unsigned char observed[GUARD_MAX_BYTES];
+    unsigned char stage_observed[GUARD_MAX_BYTES];
     bool blocked = false;
     size_t observed_length;
+    size_t stage_observed_length;
 
     CHECK_EQ_INT(guard_fixture_init(&fixture), 0);
     CHECK(guard_mutate_token(
@@ -850,6 +2140,9 @@ TEST(canonical_replacement_before_publication_fails_closed) {
     CHECK_EQ_INT(config_retirement_guard_clear(&fixture.guard), -1);
     (void)gitswitch_test_set_retirement_guard_clear_hook(NULL);
     CHECK(fixture.guard != NULL);
+    CHECK(!hook_armed);
+    CHECK(hook_action_observed);
+    CHECK_EQ_INT((long)hook_action_count, 1);
     CHECK(guard_probe(&fixture, &blocked));
     CHECK(blocked);
     observed_length = guard_read_file(
@@ -858,15 +2151,61 @@ TEST(canonical_replacement_before_publication_fails_closed) {
                  (long)hook_replacement_length);
     CHECK(memcmp(observed, hook_replacement,
                  hook_replacement_length) == 0);
+    stage_observed_length = guard_read_file(
+        fixture.stage_path, stage_observed, sizeof(stage_observed));
+    CHECK_EQ_INT((long)stage_observed_length,
+                 (long)fixture.marker_length);
+    CHECK(memcmp(stage_observed, fixture.marker_data,
+                 fixture.marker_length) == 0);
 
     config_retirement_guard_abandon(&fixture.guard);
     CHECK_EQ_INT(config_retirement_guard_install_or_adopt(
                      fixture.config_path, CONFIG_RETIREMENT_RESET,
-                     &fixture.owner, 1U, &recovery), 0);
-    CHECK_EQ_INT(config_retirement_guard_clear(&recovery), 0);
-    blocked = true;
+                     &fixture.owner, 1U, &recovery), -1);
+    CHECK(recovery == NULL);
+    observed_length = guard_read_file(
+        fixture.marker_path, observed, sizeof(observed));
+    CHECK_EQ_INT((long)observed_length,
+                 (long)hook_replacement_length);
+    CHECK(memcmp(observed, hook_replacement,
+                 hook_replacement_length) == 0);
+    stage_observed_length = guard_read_file(
+        fixture.stage_path, stage_observed, sizeof(stage_observed));
+    CHECK_EQ_INT((long)stage_observed_length,
+                 (long)fixture.marker_length);
+    CHECK(memcmp(stage_observed, fixture.marker_data,
+                 fixture.marker_length) == 0);
+    blocked = false;
     CHECK(guard_probe(&fixture, &blocked));
-    CHECK(!blocked);
+    CHECK(blocked);
+    guard_fixture_cleanup(&fixture);
+}
+
+TEST(completion_insertion_before_publication_fails_closed) {
+    guard_fixture_t fixture;
+    bool blocked = false;
+
+    CHECK_EQ_INT(guard_fixture_init(&fixture), 0);
+    memcpy(hook_replacement, fixture.marker_data,
+           fixture.marker_length);
+    hook_replacement_length = fixture.marker_length;
+    guard_arm_hook(
+        RETIREMENT_GUARD_CLEAR_BEFORE_PUBLISH,
+        HOOK_REPLACE_COMPLETION);
+
+    CHECK_EQ_INT(config_retirement_guard_clear(&fixture.guard), -1);
+    (void)gitswitch_test_set_retirement_guard_clear_hook(NULL);
+    CHECK(fixture.guard != NULL);
+    CHECK(!hook_armed);
+    CHECK(hook_action_observed);
+    CHECK_EQ_INT((long)hook_action_count, 1);
+    CHECK_EQ_INT(access(fixture.stage_path, F_OK), 0);
+    CHECK(guard_files_equal(
+        fixture.marker_path, fixture.stage_path));
+    CHECK(guard_files_equal(
+        fixture.marker_path, fixture.completion_path));
+    CHECK(guard_probe(&fixture, &blocked));
+    CHECK(blocked);
     guard_fixture_cleanup(&fixture);
 }
 
@@ -1309,8 +2648,7 @@ TEST(recovery_projection_adopts_only_the_exact_active_owner_set) {
 
     CHECK_EQ_INT(config_retirement_guard_adopt(
                      fixture.config_path, recovery.kind,
-                     recovery.owners, recovery.owner_count,
-                     &adopted), 0);
+                     recovery.owners, recovery.owner_count, &adopted), 0);
     CHECK(adopted != NULL);
     CHECK(!config_retirement_guard_was_created(adopted));
     CHECK_EQ_INT(stat(fixture.marker_path, &after), 0);
@@ -1609,8 +2947,20 @@ TEST(handle_revalidation_accepts_only_its_exact_active_generation) {
     unsigned char observed[GUARD_MAX_BYTES];
 
     CHECK_EQ_INT(guard_fixture_init(&fixture), 0);
+    guard_arm_hook(
+        RETIREMENT_GUARD_READ_BEFORE_FINAL_METADATA_CHECK,
+        HOOK_CTIME_AT_INSTALL_SYNC);
     CHECK_EQ_INT(config_retirement_guard_revalidate(fixture.guard), 0);
+    (void)gitswitch_test_set_retirement_guard_clear_hook(NULL);
     CHECK(fixture.guard != NULL);
+    CHECK(!hook_armed);
+    CHECK(hook_action_observed);
+    CHECK_EQ_INT((long)hook_action_count, 1);
+    CHECK_EQ_INT(hook_action_error, 0);
+    CHECK(guard_same_except_ctime(
+        &hook_identity_before, &hook_identity_after));
+    CHECK(!guard_same_ctime(
+        &hook_identity_before, &hook_identity_after));
     CHECK_EQ_INT((long)guard_read_file(
                      fixture.marker_path, observed, sizeof(observed)),
                  (long)fixture.marker_length);
@@ -1839,8 +3189,7 @@ TEST(exact_staged_clear_is_projected_adopted_and_settled) {
     CHECK_EQ_INT((long)recovery.owner_count, 1);
     CHECK_EQ_INT(config_retirement_guard_adopt(
                      fixture.config_path, recovery.kind,
-                     recovery.owners, recovery.owner_count,
-                     &adopted), 0);
+                     recovery.owners, recovery.owner_count, &adopted), 0);
     CHECK(adopted != NULL);
     CHECK(!config_retirement_guard_was_created(adopted));
     CHECK(access(fixture.stage_path, F_OK) != 0 && errno == ENOENT);
@@ -1856,6 +3205,78 @@ TEST(exact_staged_clear_is_projected_adopted_and_settled) {
     CHECK(!blocked);
     CHECK(guard_files_equal(
         fixture.marker_path, fixture.completion_path));
+    guard_fixture_cleanup(&fixture);
+}
+
+TEST(exact_stage_cleanup_reproves_one_ctime_only_reader_race) {
+    guard_fixture_t fixture;
+    config_retirement_recovery_t recovery;
+    config_retirement_guard_t *adopted = NULL;
+
+    CHECK_EQ_INT(guard_fixture_init(&fixture), 0);
+    guard_arm_hook(
+        RETIREMENT_GUARD_CLEAR_BEFORE_PUBLISH, HOOK_FAIL);
+    CHECK_EQ_INT(config_retirement_guard_clear(&fixture.guard), -1);
+    (void)gitswitch_test_set_retirement_guard_clear_hook(NULL);
+    config_retirement_guard_abandon(&fixture.guard);
+
+    memset(&recovery, 0, sizeof(recovery));
+    CHECK_EQ_INT(config_retirement_guard_recovery_probe(
+                     fixture.config_path, &recovery), 0);
+    CHECK(recovery.valid);
+    guard_arm_hook(
+        RETIREMENT_GUARD_READ_BEFORE_FINAL_METADATA_CHECK,
+        HOOK_CTIME_AFTER_STAGE_REMOVAL);
+    CHECK_EQ_INT(config_retirement_guard_adopt(
+                     fixture.config_path, recovery.kind,
+                     recovery.owners, recovery.owner_count,
+                     &adopted), 0);
+    (void)gitswitch_test_set_retirement_guard_clear_hook(NULL);
+    CHECK(adopted != NULL);
+    CHECK(!hook_armed);
+    CHECK(hook_action_observed);
+    CHECK_EQ_INT((long)hook_action_count, 1);
+    CHECK_EQ_INT(hook_action_error, 0);
+    CHECK(access(fixture.stage_path, F_OK) != 0 && errno == ENOENT);
+    CHECK_EQ_INT(config_retirement_guard_clear(&adopted), 0);
+    guard_fixture_cleanup(&fixture);
+}
+
+TEST(exact_stage_cleanup_rejects_changed_bytes_after_reader_race) {
+    guard_fixture_t fixture;
+    config_retirement_recovery_t recovery;
+    config_retirement_guard_t *adopted = NULL;
+    bool blocked = false;
+
+    CHECK_EQ_INT(guard_fixture_init(&fixture), 0);
+    guard_arm_hook(
+        RETIREMENT_GUARD_CLEAR_BEFORE_PUBLISH, HOOK_FAIL);
+    CHECK_EQ_INT(config_retirement_guard_clear(&fixture.guard), -1);
+    (void)gitswitch_test_set_retirement_guard_clear_hook(NULL);
+    config_retirement_guard_abandon(&fixture.guard);
+
+    memset(&recovery, 0, sizeof(recovery));
+    CHECK_EQ_INT(config_retirement_guard_recovery_probe(
+                     fixture.config_path, &recovery), 0);
+    CHECK(recovery.valid);
+    guard_arm_hook(
+        RETIREMENT_GUARD_READ_BEFORE_FINAL_METADATA_CHECK,
+        HOOK_CHANGED_BYTES_AFTER_STAGE_REMOVAL);
+    errno = 0;
+    CHECK_EQ_INT(config_retirement_guard_adopt(
+                     fixture.config_path, recovery.kind,
+                     recovery.owners, recovery.owner_count,
+                     &adopted), -1);
+    CHECK_EQ_INT(errno, ESTALE);
+    (void)gitswitch_test_set_retirement_guard_clear_hook(NULL);
+    CHECK(adopted == NULL);
+    CHECK(!hook_armed);
+    CHECK(hook_action_observed);
+    CHECK_EQ_INT((long)hook_action_count, 1);
+    CHECK_EQ_INT(hook_action_error, 0);
+    CHECK(access(fixture.stage_path, F_OK) != 0 && errno == ENOENT);
+    CHECK(guard_probe(&fixture, &blocked));
+    CHECK(blocked);
     guard_fixture_cleanup(&fixture);
 }
 
@@ -1892,6 +3313,10 @@ TEST(foreign_staged_generation_remains_fail_closed_and_untouched) {
                      fixture.config_path, CONFIG_RETIREMENT_RESET,
                      &fixture.owner, 1U, &adopted), -1);
     CHECK(adopted == NULL);
+    CHECK_EQ_INT(config_retirement_guard_install_or_adopt(
+                     fixture.config_path, CONFIG_RETIREMENT_RESET,
+                     &fixture.owner, 1U, &fixture.guard), -1);
+    CHECK(fixture.guard == NULL);
     CHECK_EQ_INT((long)guard_read_file(
                      fixture.stage_path, observed, sizeof(observed)),
                  (long)hook_replacement_length);
@@ -1902,7 +3327,57 @@ TEST(foreign_staged_generation_remains_fail_closed_and_untouched) {
 
 TEST_MAIN_BEGIN()
     error_init(LOG_LEVEL_ERROR, NULL);
+    RUN_TEST(
+        fork_child_abandon_preserves_reused_retirement_guard_directory_fd);
     RUN_TEST(completion_keeps_canonical_generation_and_unblocks);
+    RUN_TEST(
+        prepared_clear_is_durable_blocking_and_commits_without_ack_hooks);
+    RUN_TEST(prepared_clear_skips_directory_sync_hooks);
+    RUN_TEST(prepared_clear_replaces_a_prior_completion_generation);
+    RUN_TEST(
+        prepare_clear_rejects_foreign_stage_without_deleting_it);
+    RUN_TEST(
+        prepared_handle_rejects_completion_inserted_after_prepare);
+    RUN_TEST(
+        prepared_handle_rejects_prior_completion_inode_replacement);
+    RUN_TEST(
+        prepared_handle_accepts_prior_completion_ctime_only_drift);
+    RUN_TEST(
+        prepared_handle_rejects_prior_completion_content_change);
+    RUN_TEST(
+        prepared_clear_failure_before_rename_retains_blocking_stage);
+    RUN_TEST(
+        prepared_barrier_eagain_retains_capability_and_retry_commits);
+    RUN_TEST(prepared_guard_mismatch_prevents_barrier_invocation);
+    RUN_TEST(prepared_barrier_hard_failure_retains_blocking_state);
+    RUN_TEST(fork_child_cannot_invoke_barrier_and_parent_can_retry);
+    RUN_TEST(
+        fork_inside_barrier_child_abandons_without_releasing_parent);
+    RUN_TEST(lock_name_replacement_suppresses_barrier);
+    RUN_TEST(unprepared_clear_revalidates_named_lock_before_publish);
+    RUN_TEST(successful_barrier_is_reinvoked_after_pre_rename_failure);
+    RUN_TEST(barrier_cannot_reenter_or_abandon_its_handle);
+    RUN_TEST(
+        callback_armed_post_publish_hook_observes_no_later_checkpoint);
+    RUN_TEST(
+        prepared_publish_preserves_stage_replaced_after_barrier);
+    RUN_TEST(
+        prepared_publish_preserves_completion_replaced_after_barrier);
+    RUN_TEST(
+        prepared_commit_consumes_exact_certificate_with_later_blocker);
+    RUN_TEST(
+        prepared_commit_consumes_handle_when_first_namespace_reproof_fails);
+#if !defined(__FreeBSD__)
+    RUN_TEST(prepared_settled_arena_exhaustion_fails_before_stage);
+    RUN_TEST(prepared_slot_replacement_after_move_is_preserved);
+    RUN_TEST(interrupted_slot_move_consumes_slot_and_retry_uses_next);
+#endif
+    RUN_TEST(
+        prepare_clear_sync_failure_retains_blocking_stage_and_retries);
+    RUN_TEST(
+        prepared_clear_reproof_rejects_checkpoint_marker_replacement);
+    RUN_TEST(prepared_handle_revalidation_rejects_stage_replacement);
+    RUN_TEST(interrupted_prepared_stage_is_adopted_and_settled);
     RUN_TEST(
         completion_accepts_ctime_only_drift_before_pair_final_reproof);
     RUN_TEST(
@@ -1911,6 +3386,7 @@ TEST_MAIN_BEGIN()
     RUN_TEST(postpublication_sync_failures_are_committed);
     RUN_TEST(mixed_generation_probe_never_unblocks);
     RUN_TEST(canonical_replacement_before_publication_fails_closed);
+    RUN_TEST(completion_insertion_before_publication_fails_closed);
     RUN_TEST(settled_pair_rotates_fresh_and_residue_is_bounded);
     RUN_TEST(lone_and_mismatched_certificates_block);
     RUN_TEST(lifecycle_lock_serializes_guard_owners);
@@ -1938,5 +3414,7 @@ TEST_MAIN_BEGIN()
     RUN_TEST(handle_revalidation_rejects_directory_namespace_replacement);
     RUN_TEST(adopt_only_never_creates_or_rotates_a_marker);
     RUN_TEST(exact_staged_clear_is_projected_adopted_and_settled);
+    RUN_TEST(exact_stage_cleanup_reproves_one_ctime_only_reader_race);
+    RUN_TEST(exact_stage_cleanup_rejects_changed_bytes_after_reader_race);
     RUN_TEST(foreign_staged_generation_remains_fail_closed_and_untouched);
 TEST_MAIN_END()

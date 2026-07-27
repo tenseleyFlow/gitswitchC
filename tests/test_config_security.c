@@ -862,20 +862,29 @@ TEST(config_lock_rejects_symlink_fifo_and_unsafe_mode) {
 }
 
 TEST(config_lock_startup_cleans_only_proven_resume_hint_temp_residue) {
+    static const char settled_prefix[] =
+        ".gitswitch-resume-hint-settled-";
     char home[128], saved_home[512], dotconfig[256], config_dir[512];
-    char stale[640], symlink_decoy[640], mode_decoy[640];
+    char hint[640], stale[640], foreign[640];
+    char symlink_decoy[640], mode_decoy[640];
     char unmatched_decoy[640], linked_decoy[640], linked_peer[640];
     char victim[640], text[64];
     struct stat st;
     gitswitch_ctx_t ctx;
+    DIR *stream = NULL;
+    struct dirent *entry;
+    size_t settled_count = 0U;
     int token = -1;
 
     save_home_env(saved_home, sizeof(saved_home));
     CHECK_EQ_INT(make_scratch_dir(home, sizeof(home)), 0);
     snprintf(dotconfig, sizeof(dotconfig), "%s/.config", home);
     snprintf(config_dir, sizeof(config_dir), "%s/gitswitch", dotconfig);
+    snprintf(hint, sizeof(hint), "%s/.resume-hint", config_dir);
     snprintf(stale, sizeof(stale),
              "%s/.resume-hint.tmp.aB3xY9", config_dir);
+    snprintf(foreign, sizeof(foreign),
+             "%s/.resume-hint.tmp.Frg123", config_dir);
     snprintf(symlink_decoy, sizeof(symlink_decoy),
              "%s/.resume-hint.tmp.Sym123", config_dir);
     snprintf(mode_decoy, sizeof(mode_decoy),
@@ -890,7 +899,9 @@ TEST(config_lock_startup_cleans_only_proven_resume_hint_temp_residue) {
 
     CHECK_EQ_INT(mkdir(dotconfig, 0700), 0);
     CHECK_EQ_INT(mkdir(config_dir, 0700), 0);
-    CHECK_EQ_INT(write_config(stale, "stale\n", 6U), 0);
+    CHECK_EQ_INT(write_config(hint, "none\ninactive=v1\n", 17U), 0);
+    CHECK_EQ_INT(link(hint, stale), 0);
+    CHECK_EQ_INT(write_config(foreign, "foreign\n", 8U), 0);
     CHECK_EQ_INT(write_config(victim, "victim\n", 7U), 0);
     CHECK_EQ_INT(symlink(victim, symlink_decoy), 0);
     CHECK_EQ_INT(write_config(mode_decoy, "mode\n", 5U), 0);
@@ -913,6 +924,16 @@ TEST(config_lock_startup_cleans_only_proven_resume_hint_temp_residue) {
 
     errno = 0;
     CHECK(lstat(stale, &st) != 0 && errno == ENOENT);
+    CHECK_EQ_INT(lstat(hint, &st), 0);
+    CHECK(S_ISREG(st.st_mode));
+    CHECK(st.st_nlink >= 1 && st.st_nlink <= 2);
+    CHECK(slurp(hint, text, sizeof(text)) > 0);
+    CHECK_STR_EQ(text, "none\ninactive=v1\n");
+    CHECK_EQ_INT(lstat(foreign, &st), 0);
+    CHECK(S_ISREG(st.st_mode));
+    CHECK_EQ_INT((long)st.st_nlink, 1);
+    CHECK(slurp(foreign, text, sizeof(text)) > 0);
+    CHECK_STR_EQ(text, "foreign\n");
     CHECK_EQ_INT(lstat(symlink_decoy, &st), 0);
     CHECK(S_ISLNK(st.st_mode));
     CHECK_EQ_INT(lstat(mode_decoy, &st), 0);
@@ -925,6 +946,21 @@ TEST(config_lock_startup_cleans_only_proven_resume_hint_temp_residue) {
     CHECK_EQ_INT((long)st.st_nlink, 2);
     CHECK(slurp(victim, text, sizeof(text)) > 0);
     CHECK_STR_EQ(text, "victim\n");
+
+    stream = opendir(config_dir);
+    CHECK(stream != NULL);
+    if (stream) {
+        while ((entry = readdir(stream)) != NULL) {
+            if (strncmp(entry->d_name,
+                        settled_prefix,
+                        sizeof(settled_prefix) - 1U) == 0) {
+                settled_count++;
+            }
+        }
+        CHECK_EQ_INT(closedir(stream), 0);
+        stream = NULL;
+    }
+    CHECK(settled_count <= 1U);
 
     if (token >= 0) config_write_unlock(token);
     restore_home_env(saved_home);

@@ -18,6 +18,12 @@
 typedef void (*resume_hint_test_hook_fn)(int stage);
 resume_hint_test_hook_fn gitswitch_test_set_resume_hint_hook(
     resume_hint_test_hook_fn hook);
+unsigned int gitswitch_test_set_retirement_settled_slot_limit(
+    unsigned int limit);
+typedef int (*config_replace_test_hook_fn)(
+    int stage, int directory_fd, const char *destination);
+config_replace_test_hook_fn gitswitch_test_set_config_replace_hook(
+    config_replace_test_hook_fn hook);
 
 enum {
     HINT_TEST_BEFORE_OPEN = 1,
@@ -47,6 +53,40 @@ static int g_pause_ready_fd = -1;
 static int g_pause_resume_fd = -1;
 static int g_io_rewrite_error;
 static int g_rollback_dirsync_faults;
+static int g_replace_stage;
+static int g_replace_error;
+static bool g_replace_fail_only;
+
+static int replace_canonical_at_checkpoint(
+    int stage, int directory_fd, const char *destination) {
+    static const char raced[] = "none\nactive=racer\n";
+    int fd;
+
+    if (stage != g_replace_stage) return 0;
+    g_replace_stage = 0;
+    if (g_replace_fail_only) {
+        g_replace_fail_only = false;
+        errno = EIO;
+        return -1;
+    }
+    if (renameat(
+            directory_fd, destination, directory_fd,
+            ".resume-hint-race-saved") != 0) {
+        g_replace_error = errno;
+        return 0;
+    }
+    fd = openat(
+        directory_fd, destination,
+        O_WRONLY | O_CREAT | O_EXCL | O_CLOEXEC, 0600);
+    if (fd < 0 ||
+        write(fd, raced, sizeof(raced) - 1U) !=
+            (ssize_t)(sizeof(raced) - 1U) ||
+        close(fd) != 0) {
+        g_replace_error = errno ? errno : EIO;
+        if (fd >= 0) (void)close(fd);
+    }
+    return 0;
+}
 
 static int append_bytes(const char *path, size_t length) {
     char bytes[512];
@@ -119,6 +159,32 @@ static size_t count_hint_temps(const char *prefix) {
     }
     closedir(stream);
     return count;
+}
+
+static int remove_hint_temps(const char *prefix) {
+    char directory[PATH_MAX];
+    char path[PATH_MAX];
+    DIR *stream;
+    struct dirent *entry;
+    int result = 0;
+
+    if ((size_t)snprintf(directory, sizeof(directory),
+                         "%s/.config/gitswitch", g_home) >=
+        sizeof(directory)) {
+        return -1;
+    }
+    stream = opendir(directory);
+    if (!stream) return -1;
+    while ((entry = readdir(stream)) != NULL) {
+        if (strncmp(entry->d_name, prefix, strlen(prefix)) != 0) continue;
+        if ((size_t)snprintf(path, sizeof(path), "%s/%s",
+                             directory, entry->d_name) >= sizeof(path) ||
+            unlink(path) != 0) {
+            result = -1;
+        }
+    }
+    closedir(stream);
+    return result;
 }
 
 static int rewrite_same_inode_and_size(const char *path,
@@ -902,6 +968,161 @@ TEST(guarded_noop_save_does_not_claim_a_state_generation) {
     config_resume_hint_snapshot_clear(&saved);
 }
 
+TEST(legacy_settled_slot_does_not_block_locked_replacement) {
+    static const char config_body[] =
+        "[settings]\n"
+        "default_scope=\"local\"\n"
+        "[accounts.1]\n"
+        "name=\"alice\"\n"
+        "email=\"alice@example.com\"\n";
+    config_resume_hint_snapshot_t saved = {0};
+    char config_path[PATH_MAX];
+    char occupied[PATH_MAX];
+    char text[64];
+    gitswitch_ctx_t ctx;
+    unsigned int previous_limit;
+    bool installed = true;
+
+    CHECK((size_t)snprintf(config_path, sizeof(config_path),
+                           "%s/.config/gitswitch/accounts.toml", g_home) <
+          sizeof(config_path));
+    CHECK((size_t)snprintf(
+              occupied, sizeof(occupied),
+              "%s/.config/gitswitch/.gitswitch-resume-hint-settled-0",
+              g_home) < sizeof(occupied));
+    CHECK_EQ_INT(write_private(config_path, config_body), 0);
+    CHECK_EQ_INT(write_private(g_hint, "none\ninactive=v1\n"), 0);
+    CHECK_EQ_INT(write_private(occupied, "occupied\n"), 0);
+    memset(&ctx, 0, sizeof(ctx));
+    CHECK_EQ_INT(config_load(&ctx, config_path), 0);
+    snprintf(ctx.config.active_account, sizeof(ctx.config.active_account),
+             "%s", "alice");
+    CHECK_EQ_INT(config_resume_hint_snapshot_capture(&saved), 0);
+
+    previous_limit = gitswitch_test_set_retirement_settled_slot_limit(1U);
+    CHECK_EQ_INT(config_save_active_account_transactional_guarded(
+                     &ctx, config_path, &installed, &saved), 0);
+    gitswitch_test_set_retirement_settled_slot_limit(previous_limit);
+
+    CHECK(installed);
+    CHECK(read_private(g_hint, text, sizeof(text)) > 0);
+    CHECK_STR_EQ(text, "none\nactive=alice\n");
+    CHECK(read_private(occupied, text, sizeof(text)) > 0);
+    CHECK_STR_EQ(text, "occupied\n");
+    CHECK_EQ_INT(unlink(occupied), 0);
+    config_resume_hint_snapshot_clear(&saved);
+}
+
+TEST(detectable_forward_and_post_exchange_substitutions_are_preserved) {
+    static const char config_body[] =
+        "[settings]\n"
+        "default_scope=\"local\"\n"
+        "[accounts.1]\n"
+        "name=\"alice\"\n"
+        "email=\"alice@example.com\"\n";
+    char config_path[PATH_MAX];
+    char saved_path[PATH_MAX];
+    char text[64];
+    gitswitch_ctx_t ctx;
+
+    CHECK((size_t)snprintf(config_path, sizeof(config_path),
+                           "%s/.config/gitswitch/accounts.toml", g_home) <
+          sizeof(config_path));
+    CHECK((size_t)snprintf(
+              saved_path, sizeof(saved_path),
+              "%s/.config/gitswitch/.resume-hint-race-saved",
+              g_home) < sizeof(saved_path));
+    CHECK_EQ_INT(write_private(config_path, config_body), 0);
+    memset(&ctx, 0, sizeof(ctx));
+    CHECK_EQ_INT(config_load(&ctx, config_path), 0);
+    snprintf(ctx.config.active_account, sizeof(ctx.config.active_account),
+             "%s", "alice");
+
+    for (int stage = 1; stage <= 2; stage++) {
+        CHECK_EQ_INT(write_private(g_hint, "none\ninactive=v1\n"), 0);
+        (void)unlink(saved_path);
+        g_replace_stage = stage;
+        g_replace_error = 0;
+        (void)gitswitch_test_set_config_replace_hook(
+            replace_canonical_at_checkpoint);
+        clear_error();
+        CHECK_EQ_INT(config_save_active_account(&ctx, config_path), -1);
+        (void)gitswitch_test_set_config_replace_hook(NULL);
+        CHECK_EQ_INT(g_replace_error, 0);
+        CHECK(read_private(g_hint, text, sizeof(text)) > 0);
+        CHECK_STR_EQ(text, "none\nactive=racer\n");
+        CHECK_EQ_INT(unlink(saved_path), 0);
+    }
+    CHECK_EQ_INT(
+        remove_hint_temps(
+            ".gitswitch-resume-hint-settled-"),
+        0);
+}
+
+TEST(repeated_resume_hint_replacements_reclaim_settled_slots) {
+    static const char config_body[] =
+        "[settings]\n"
+        "default_scope=\"local\"\n"
+        "[accounts.1]\n"
+        "name=\"alice\"\n"
+        "email=\"alice@example.com\"\n";
+    char config_path[PATH_MAX];
+    gitswitch_ctx_t ctx;
+
+    CHECK((size_t)snprintf(config_path, sizeof(config_path),
+                           "%s/.config/gitswitch/accounts.toml", g_home) <
+          sizeof(config_path));
+    CHECK_EQ_INT(write_private(config_path, config_body), 0);
+    CHECK_EQ_INT(write_private(g_hint, "none\ninactive=v1\n"), 0);
+    memset(&ctx, 0, sizeof(ctx));
+    CHECK_EQ_INT(config_load(&ctx, config_path), 0);
+    for (int iteration = 0; iteration < 8; iteration++) {
+        snprintf(
+            ctx.config.active_account,
+            sizeof(ctx.config.active_account), "%s",
+            iteration % 2 == 0 ? "alice" : "");
+        CHECK_EQ_INT(config_save_active_account(&ctx, config_path), 0);
+        CHECK_EQ_INT(
+            count_hint_temps(
+                ".gitswitch-resume-hint-settled-"),
+            0);
+    }
+}
+
+TEST(exact_post_exchange_install_is_adopted_after_proof_fault) {
+    static const char config_body[] =
+        "[settings]\n"
+        "default_scope=\"local\"\n"
+        "[accounts.1]\n"
+        "name=\"alice\"\n"
+        "email=\"alice@example.com\"\n";
+    char config_path[PATH_MAX];
+    char text[64];
+    gitswitch_ctx_t ctx;
+
+    CHECK((size_t)snprintf(config_path, sizeof(config_path),
+                           "%s/.config/gitswitch/accounts.toml", g_home) <
+          sizeof(config_path));
+    CHECK_EQ_INT(write_private(config_path, config_body), 0);
+    CHECK_EQ_INT(write_private(g_hint, "none\ninactive=v1\n"), 0);
+    memset(&ctx, 0, sizeof(ctx));
+    CHECK_EQ_INT(config_load(&ctx, config_path), 0);
+    snprintf(ctx.config.active_account, sizeof(ctx.config.active_account),
+             "%s", "alice");
+    g_replace_stage = 2;
+    g_replace_fail_only = true;
+    (void)gitswitch_test_set_config_replace_hook(
+        replace_canonical_at_checkpoint);
+    CHECK_EQ_INT(config_save_active_account(&ctx, config_path), 0);
+    (void)gitswitch_test_set_config_replace_hook(NULL);
+    CHECK(read_private(g_hint, text, sizeof(text)) > 0);
+    CHECK_STR_EQ(text, "none\nactive=alice\n");
+    CHECK_EQ_INT(
+        count_hint_temps(
+            ".gitswitch-resume-hint-settled-"),
+        0);
+}
+
 int main(void) {
     if (error_init(LOG_LEVEL_ERROR, NULL) != 0 || fixture_setup() != 0) {
         fprintf(stderr, "test_ar08_resume_hint_race: fixture setup failed\n");
@@ -924,6 +1145,10 @@ int main(void) {
     RUN_TEST(guarded_save_does_not_adopt_an_in_place_rewrite);
     RUN_TEST(public_restore_serializes_its_final_compare_and_rename);
     RUN_TEST(guarded_noop_save_does_not_claim_a_state_generation);
+    RUN_TEST(legacy_settled_slot_does_not_block_locked_replacement);
+    RUN_TEST(detectable_forward_and_post_exchange_substitutions_are_preserved);
+    RUN_TEST(repeated_resume_hint_replacements_reclaim_settled_slots);
+    RUN_TEST(exact_post_exchange_install_is_adopted_after_proof_fault);
 
     ts_rm_rf(g_root);
     error_cleanup();

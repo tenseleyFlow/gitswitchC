@@ -128,7 +128,9 @@ TEST(all_retained_public_apis_compile_and_link) {
     REQUIRE_PUBLIC_API(config_retirement_guard_adopt);
     REQUIRE_PUBLIC_API(config_retirement_guard_adopt_with_ssh_alias_obligation);
     REQUIRE_PUBLIC_API(config_retirement_guard_revalidate);
+    REQUIRE_PUBLIC_API(config_retirement_guard_prepare_clear);
     REQUIRE_PUBLIC_API(config_retirement_guard_clear);
+    REQUIRE_PUBLIC_API(config_retirement_guard_clear_with_barrier);
     REQUIRE_PUBLIC_API(config_retirement_guard_install_or_adopt);
     REQUIRE_PUBLIC_API(config_retirement_guard_install_or_adopt_with_ssh_alias_obligation);
     REQUIRE_PUBLIC_API(config_retirement_guard_probe);

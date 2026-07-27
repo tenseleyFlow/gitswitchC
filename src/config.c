@@ -2,6 +2,10 @@
  * Implements secure TOML-based configuration for gitswitch-c
  */
 
+#if defined(__APPLE__)
+#define _DARWIN_C_SOURCE 1
+#endif
+
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -15,6 +19,7 @@
 #include <errno.h>
 #include <ctype.h>
 #include <stdarg.h>
+#include <limits.h>
 #if defined(__linux__)
 #include <sys/syscall.h>
 #endif
@@ -43,6 +48,7 @@
 
 #include "accounts.h"
 #include "config.h"
+#include "freebsd_compat.h"
 #include "toml_parser.h"
 #include "error.h"
 #include "utils.h"
@@ -50,12 +56,76 @@
 #include "signals.h"
 #include "ssh_manager.h"
 
+#define CONFIG_RETIREMENT_SETTLED_SLOTS 4096U
+#define CONFIG_SWITCH_SETTLED_PREFIX ".gitswitch-switch-settled-"
+#define CONFIG_RESUME_HINT_SETTLED_PREFIX \
+    ".gitswitch-resume-hint-settled-"
+#define CONFIG_DOCUMENT_SETTLED_PREFIX ".gitswitch-config-temp-settled-"
+#define CONFIG_BACKUP_SETTLED_PREFIX ".gitswitch-backup-settled-"
+#define CONFIG_REPLACE_BEFORE_FINAL_PROOF 1
+#define CONFIG_REPLACE_AFTER_EXCHANGE 2
+
 #ifdef GITSWITCH_TESTING
 typedef void (*resume_hint_test_hook_fn)(int stage);
 resume_hint_test_hook_fn gitswitch_test_set_resume_hint_hook(
     resume_hint_test_hook_fn hook);
+int gitswitch_test_retirement_guard_directory_fd(
+    const config_retirement_guard_t *guard);
+int gitswitch_test_switch_guard_directory_fd(
+    const config_switch_guard_t *guard);
 
 static resume_hint_test_hook_fn g_resume_hint_test_hook;
+
+typedef int (*config_replace_test_hook_fn)(
+    int stage, int directory_fd, const char *destination);
+config_replace_test_hook_fn gitswitch_test_set_config_replace_hook(
+    config_replace_test_hook_fn hook);
+static config_replace_test_hook_fn g_config_replace_test_hook;
+
+config_replace_test_hook_fn gitswitch_test_set_config_replace_hook(
+    config_replace_test_hook_fn hook) {
+    config_replace_test_hook_fn previous = g_config_replace_test_hook;
+
+    g_config_replace_test_hook = hook;
+    return previous;
+}
+
+#define CONFIG_REPLACE_TEST_CHECKPOINT(stage, fd, destination) \
+    (g_config_replace_test_hook                                \
+         ? g_config_replace_test_hook((stage), (fd), (destination)) \
+         : 0)
+
+typedef enum {
+    CONFIG_PUBLISH_TEST_SOURCE_UNLINK = 0,
+    CONFIG_PUBLISH_TEST_ROLLBACK_UNLINK,
+    CONFIG_PUBLISH_TEST_AFTER_ROLLBACK_FAILURE,
+    CONFIG_PUBLISH_TEST_RETAINED_SOURCE_RETIRE,
+    CONFIG_PUBLISH_TEST_BEFORE_FIXED_LINK,
+    CONFIG_PUBLISH_TEST_AFTER_FIXED_LINK,
+    CONFIG_PUBLISH_TEST_AFTER_FIXED_SYNC,
+    CONFIG_PUBLISH_TEST_BEFORE_FIXED_RETIRE,
+    CONFIG_PUBLISH_TEST_BEFORE_SOURCE_PIN
+} config_publish_test_stage_t;
+typedef int (*config_publish_test_hook_fn)(
+    config_publish_test_stage_t stage, int directory_fd,
+    const char *source, const char *destination);
+config_publish_test_hook_fn gitswitch_test_set_config_publish_hook(
+    config_publish_test_hook_fn hook);
+static config_publish_test_hook_fn g_config_publish_test_hook;
+
+config_publish_test_hook_fn gitswitch_test_set_config_publish_hook(
+    config_publish_test_hook_fn hook) {
+    config_publish_test_hook_fn previous = g_config_publish_test_hook;
+
+    g_config_publish_test_hook = hook;
+    return previous;
+}
+
+#define CONFIG_PUBLISH_TEST_CHECKPOINT(stage, fd, source, destination) \
+    (g_config_publish_test_hook                                      \
+         ? g_config_publish_test_hook(                              \
+               (stage), (fd), (source), (destination))              \
+         : 0)
 
 resume_hint_test_hook_fn gitswitch_test_set_resume_hint_hook(
     resume_hint_test_hook_fn hook) {
@@ -85,7 +155,12 @@ typedef enum {
     RETIREMENT_GUARD_INSTALL_BEFORE_DIR_SYNC,
     RETIREMENT_GUARD_READ_AFTER_CLOSE,
     RETIREMENT_GUARD_PAIR_AFTER_COMPLETION_READ,
-    RETIREMENT_GUARD_STAGE_AFTER_CLOSE
+    RETIREMENT_GUARD_STAGE_AFTER_CLOSE,
+    RETIREMENT_GUARD_READ_BEFORE_FINAL_METADATA_CHECK,
+    RETIREMENT_GUARD_CLEAR_AFTER_BARRIER_BEFORE_RENAME,
+    RETIREMENT_GUARD_CLEAR_AFTER_SETTLED_SLOT_MOVE,
+    RETIREMENT_GUARD_CLEAR_AFTER_NAMESPACE_COMMIT,
+    RETIREMENT_GUARD_CLEAR_AFTER_PREPARED_PUBLISH
 } retirement_guard_clear_test_stage_t;
 typedef int (*retirement_guard_clear_test_hook_fn)(
     retirement_guard_clear_test_stage_t stage, int directory_fd,
@@ -93,8 +168,23 @@ typedef int (*retirement_guard_clear_test_hook_fn)(
 retirement_guard_clear_test_hook_fn
 gitswitch_test_set_retirement_guard_clear_hook(
     retirement_guard_clear_test_hook_fn hook);
+unsigned int gitswitch_test_set_retirement_settled_slot_limit(
+    unsigned int limit);
 static retirement_guard_clear_test_hook_fn
     g_retirement_guard_clear_test_hook;
+static unsigned int g_retirement_settled_slot_limit =
+    CONFIG_RETIREMENT_SETTLED_SLOTS;
+
+unsigned int gitswitch_test_set_retirement_settled_slot_limit(
+    unsigned int limit) {
+    unsigned int previous = g_retirement_settled_slot_limit;
+
+    g_retirement_settled_slot_limit =
+        limit > 0U && limit <= CONFIG_RETIREMENT_SETTLED_SLOTS
+            ? limit
+            : CONFIG_RETIREMENT_SETTLED_SLOTS;
+    return previous;
+}
 
 retirement_guard_clear_test_hook_fn
 gitswitch_test_set_retirement_guard_clear_hook(
@@ -119,7 +209,25 @@ static int config_retirement_guard_clear_test_checkpoint(
 
 #define RETIREMENT_GUARD_CLEAR_TEST_CHECKPOINT(stage, fd, name)             \
     config_retirement_guard_clear_test_checkpoint((stage), (fd), (name))
+#define CONFIG_RETIREMENT_SETTLED_SLOT_LIMIT() \
+    g_retirement_settled_slot_limit
 #else
+#define CONFIG_REPLACE_TEST_CHECKPOINT(stage, fd, destination) \
+    ((void)(stage), (void)(fd), (void)(destination), 0)
+enum {
+    CONFIG_PUBLISH_TEST_SOURCE_UNLINK = 0,
+    CONFIG_PUBLISH_TEST_ROLLBACK_UNLINK,
+    CONFIG_PUBLISH_TEST_AFTER_ROLLBACK_FAILURE,
+    CONFIG_PUBLISH_TEST_RETAINED_SOURCE_RETIRE,
+    CONFIG_PUBLISH_TEST_BEFORE_FIXED_LINK,
+    CONFIG_PUBLISH_TEST_AFTER_FIXED_LINK,
+    CONFIG_PUBLISH_TEST_AFTER_FIXED_SYNC,
+    CONFIG_PUBLISH_TEST_BEFORE_FIXED_RETIRE,
+    CONFIG_PUBLISH_TEST_BEFORE_SOURCE_PIN
+};
+#define CONFIG_PUBLISH_TEST_CHECKPOINT(stage, fd, source, destination) \
+    ((void)(stage), (void)(fd), (void)(source),                       \
+     (void)(destination), 0)
 enum {
     RETIREMENT_GUARD_CLEAR_BEFORE_STAGE_CREATE = 0,
     RETIREMENT_GUARD_CLEAR_AFTER_STAGE_WRITE,
@@ -132,10 +240,17 @@ enum {
     RETIREMENT_GUARD_INSTALL_BEFORE_DIR_SYNC,
     RETIREMENT_GUARD_READ_AFTER_CLOSE,
     RETIREMENT_GUARD_PAIR_AFTER_COMPLETION_READ,
-    RETIREMENT_GUARD_STAGE_AFTER_CLOSE
+    RETIREMENT_GUARD_STAGE_AFTER_CLOSE,
+    RETIREMENT_GUARD_READ_BEFORE_FINAL_METADATA_CHECK,
+    RETIREMENT_GUARD_CLEAR_AFTER_BARRIER_BEFORE_RENAME,
+    RETIREMENT_GUARD_CLEAR_AFTER_SETTLED_SLOT_MOVE,
+    RETIREMENT_GUARD_CLEAR_AFTER_NAMESPACE_COMMIT,
+    RETIREMENT_GUARD_CLEAR_AFTER_PREPARED_PUBLISH
 };
 #define RETIREMENT_GUARD_CLEAR_TEST_CHECKPOINT(stage, fd, name)             \
     ((void)(stage), (void)(fd), (void)(name), 0)
+#define CONFIG_RETIREMENT_SETTLED_SLOT_LIMIT() \
+    CONFIG_RETIREMENT_SETTLED_SLOTS
 #endif
 
 #ifdef GITSWITCH_TESTING
@@ -143,7 +258,10 @@ typedef enum {
     SWITCH_GUARD_INSTALL_BEFORE_INITIAL_FSTAT = 0,
     SWITCH_GUARD_INSTALL_AFTER_STAGE_SYNC,
     SWITCH_GUARD_CLEAR_AFTER_UNLINK,
-    SWITCH_GUARD_SNAPSHOT_AFTER_MARKER_READ
+    SWITCH_GUARD_SNAPSHOT_AFTER_MARKER_READ,
+    SWITCH_GUARD_RECONCILE_AFTER_NORMALIZE_SYNC,
+    SWITCH_GUARD_RETAIN_AFTER_MARKER_SYNC,
+    SWITCH_GUARD_READ_AFTER_EXACT_DESCRIPTOR_PROOF
 } switch_guard_test_stage_t;
 typedef int (*switch_guard_test_hook_fn)(
     switch_guard_test_stage_t stage, int directory_fd);
@@ -179,7 +297,10 @@ enum {
     SWITCH_GUARD_INSTALL_BEFORE_INITIAL_FSTAT = 0,
     SWITCH_GUARD_INSTALL_AFTER_STAGE_SYNC,
     SWITCH_GUARD_CLEAR_AFTER_UNLINK,
-    SWITCH_GUARD_SNAPSHOT_AFTER_MARKER_READ
+    SWITCH_GUARD_SNAPSHOT_AFTER_MARKER_READ,
+    SWITCH_GUARD_RECONCILE_AFTER_NORMALIZE_SYNC,
+    SWITCH_GUARD_RETAIN_AFTER_MARKER_SYNC,
+    SWITCH_GUARD_READ_AFTER_EXACT_DESCRIPTOR_PROOF
 };
 #define SWITCH_GUARD_TEST_CHECKPOINT(stage, fd) \
     ((void)(stage), (void)(fd), 0)
@@ -328,8 +449,34 @@ static bool config_named_directory_matches(const char *path,
 static int config_create_private_temp_at(int dir_fd, const char *target_name,
                                          char *temp_name,
                                          size_t temp_name_size);
-static int config_publish_noreplace_at(int dir_fd, const char *source,
-                                       const char *destination);
+typedef enum {
+    CONFIG_PUBLISH_MOVED = 0,
+    CONFIG_PUBLISH_INSTALLED_SOURCE_RETAINED = 1,
+    CONFIG_PUBLISH_OUTCOME_UNCERTAIN = 2
+} config_publish_outcome_t;
+static int config_publish_noreplace_at(
+    int dir_fd, const char *source, const char *destination,
+    const struct stat *expected_source,
+    struct stat *retained_source);
+static int config_reprove_published_file_at(
+    int directory_fd, const char *name,
+    const struct stat *expected_identity,
+    const unsigned char *expected_data, size_t expected_length,
+    struct stat *accepted_identity);
+static int config_reprove_existing_file_at(
+    int directory_fd, const char *name,
+    const struct stat *expected_identity,
+    const unsigned char *expected_data, size_t expected_length,
+    struct stat *accepted_identity);
+static bool config_alias_metadata_is_safe(const struct stat *st);
+static bool config_reconcile_target_is_safe(const struct stat *st);
+static int config_reprove_private_alias_at(
+    int directory_fd, const char *name,
+    const struct stat *expected_identity,
+    const unsigned char *expected_data, size_t expected_length,
+    struct stat *accepted_identity);
+static bool config_pread_full(int fd, unsigned char *buffer, size_t length,
+                              off_t offset);
 
 typedef struct {
     bool exists;
@@ -425,6 +572,674 @@ static int config_init_mode(gitswitch_ctx_t *ctx, config_init_kind_t kind) {
         /* File creation remains deferred to a command that actually needs it. */
         return 0;
     }
+}
+
+#if !defined(__FreeBSD__)
+static int config_select_settled_name_at(
+    int dir_fd, const char *prefix, unsigned int slots,
+    char *selected, size_t selected_size) {
+    if (dir_fd < 0 || !prefix || !selected || selected_size == 0U ||
+        slots == 0U) {
+        errno = EINVAL;
+        return -1;
+    }
+    selected[0] = '\0';
+    for (unsigned int slot = 0U; slot < slots; slot++) {
+        struct stat named;
+        int written = snprintf(
+            selected, selected_size, "%s%u", prefix, slot);
+
+        if (written < 0 || (size_t)written >= selected_size) {
+            errno = ENAMETOOLONG;
+            return -1;
+        }
+        errno = 0;
+        if (fstatat(
+                dir_fd, selected, &named,
+                AT_SYMLINK_NOFOLLOW) != 0) {
+            if (errno == ENOENT) return 0;
+            return -1;
+        }
+    }
+    selected[0] = '\0';
+    errno = ENOSPC;
+    return -1;
+}
+#endif
+
+/* Retire one exact pathname generation without ever deleting a later
+ * replacement. FreeBSD can remove the vnode named by a pinned descriptor.
+ * Linux and Darwin instead move the candidate into a finite inert arena and
+ * reprove what moved; a raced replacement is restored no-replace when the
+ * canonical name remains absent, and otherwise remains preserved in the
+ * arena while the new canonical generation continues to block. */
+static int config_retire_exact_name_at(
+    int dir_fd, const char *source, const struct stat *expected,
+    const unsigned char *expected_data, size_t expected_length,
+    const char *settled_prefix) {
+#if defined(__FreeBSD__)
+    struct stat pinned;
+    int fd;
+    int saved_errno;
+
+    (void)settled_prefix;
+    (void)expected_data;
+    (void)expected_length;
+    fd = openat(
+        dir_fd, source, O_PATH | O_CLOEXEC | O_NOFOLLOW);
+    if (fd < 0 || fstat(fd, &pinned) != 0 ||
+        !config_metadata_snapshot_same(expected, &pinned) ||
+        funlinkat(dir_fd, source, fd, 0) != 0) {
+        saved_errno = errno ? errno : ESTALE;
+        if (fd >= 0) (void)close(fd);
+        errno = saved_errno;
+        return -1;
+    }
+    (void)close(fd);
+    return 0;
+#else
+    char settled[96];
+    struct stat moved;
+
+    if (config_select_settled_name_at(
+            dir_fd, settled_prefix,
+            CONFIG_RETIREMENT_SETTLED_SLOT_LIMIT(),
+            settled, sizeof(settled)) != 0 ||
+        config_publish_noreplace_at(
+            dir_fd, source, settled, expected, NULL) !=
+            CONFIG_PUBLISH_MOVED ||
+        fstatat(
+            dir_fd, settled, &moved,
+            AT_SYMLINK_NOFOLLOW) != 0) {
+        return -1;
+    }
+    if (expected_data && expected_length > 0U) {
+        int proof_result =
+            (expected->st_mode & 0777) == PERM_USER_RW
+                ? config_reprove_published_file_at(
+                      dir_fd, settled, expected, expected_data,
+                      expected_length, &moved)
+                : config_reprove_existing_file_at(
+                      dir_fd, settled, expected, expected_data,
+                      expected_length, &moved);
+
+        if (proof_result == 0) {
+            return 0;
+        }
+    } else if (config_metadata_same_file(expected, &moved) &&
+               ((expected->st_nlink == 1 &&
+                 config_metadata_file_is_safe(&moved, true)) ||
+                (expected->st_nlink >= 2 && expected->st_nlink <= 3 &&
+                 moved.st_nlink == expected->st_nlink &&
+                 config_alias_metadata_is_safe(&moved) &&
+                 (config_metadata_snapshot_same(expected, &moved) ||
+                  config_metadata_ctime_only_change(expected, &moved))))) {
+        return 0;
+    }
+    {
+        int saved_errno = ESTALE;
+
+        (void)config_publish_noreplace_at(
+            dir_fd, settled, source, &moved, NULL);
+        errno = saved_errno;
+        return -1;
+    }
+#endif
+}
+
+static int config_retire_exact_path(
+    const char *path, const struct stat *created,
+    const unsigned char *expected_data, size_t expected_length,
+    const char *settled_prefix) {
+    char directory[MAX_PATH_LEN];
+    char leaf[MAX_PATH_LEN];
+    struct stat named;
+    const char *slash;
+    size_t directory_length;
+    int directory_fd;
+    int result;
+    int saved_errno;
+
+    if (!path || !created || !settled_prefix || path[0] == '\0') {
+        errno = EINVAL;
+        return -1;
+    }
+    slash = strrchr(path, '/');
+    if (!slash) {
+        if (safe_strncpy(directory, ".", sizeof(directory)) != 0 ||
+            safe_strncpy(leaf, path, sizeof(leaf)) != 0) {
+            return -1;
+        }
+    } else {
+        if (slash[1] == '\0') {
+            errno = EINVAL;
+            return -1;
+        }
+        directory_length = slash == path ? 1U : (size_t)(slash - path);
+        if (directory_length >= sizeof(directory) ||
+            safe_strncpy(leaf, slash + 1, sizeof(leaf)) != 0) {
+            errno = ENAMETOOLONG;
+            return -1;
+        }
+        memcpy(directory, path, directory_length);
+        directory[directory_length] = '\0';
+    }
+    directory_fd = open(
+        directory, O_RDONLY | O_CLOEXEC | O_DIRECTORY | O_NOFOLLOW);
+    if (directory_fd < 0) return -1;
+    if (fstatat(
+            directory_fd, leaf, &named,
+            AT_SYMLINK_NOFOLLOW) != 0 ||
+        !config_metadata_file_is_safe(&named, false) ||
+        !config_metadata_same_file(created, &named)) {
+        saved_errno = errno ? errno : ESTALE;
+        (void)close(directory_fd);
+        errno = saved_errno;
+        return -1;
+    }
+    result = config_retire_exact_name_at(
+        directory_fd, leaf, &named, expected_data, expected_length,
+        settled_prefix);
+    saved_errno = errno;
+    (void)close(directory_fd);
+    errno = saved_errno;
+    return result;
+}
+
+static int config_reprove_pinned_private_fd(
+    int fd, const struct stat *expected_identity,
+    const unsigned char *expected_data, size_t expected_length,
+    struct stat *accepted_identity) {
+    unsigned char observed[4096];
+    struct stat before;
+    struct stat after;
+    size_t offset = 0U;
+
+    if (fd < 0 || !expected_identity ||
+        (!expected_data && expected_length != 0U)) {
+        errno = EINVAL;
+        goto fail;
+    }
+    if (fstat(fd, &before) != 0) goto fail;
+    if (!S_ISREG(before.st_mode) || before.st_uid != getuid() ||
+        (before.st_mode & 0777) != PERM_USER_RW ||
+        before.st_nlink > 3 ||
+        !config_metadata_same_file(expected_identity, &before) ||
+        (expected_data &&
+         (before.st_size < 0 ||
+          (uintmax_t)before.st_size != expected_length))) {
+        errno = ESTALE;
+        goto fail;
+    }
+    while (expected_data && offset < expected_length) {
+        size_t chunk = expected_length - offset;
+
+        if (chunk > sizeof(observed)) chunk = sizeof(observed);
+        if (!config_pread_full(
+                fd, observed, chunk, (off_t)offset)) {
+            goto fail;
+        }
+        if (memcmp(
+                observed, expected_data + offset, chunk) != 0) {
+            errno = ESTALE;
+            goto fail;
+        }
+        offset += chunk;
+    }
+    if (fstat(fd, &after) != 0) goto fail;
+    if (!config_metadata_snapshot_same(&before, &after)) {
+        errno = ESTALE;
+        goto fail;
+    }
+    if (accepted_identity) *accepted_identity = after;
+    secure_zero_memory(observed, sizeof(observed));
+    return 0;
+
+fail:
+    {
+        int saved_errno = errno;
+
+        secure_zero_memory(observed, sizeof(observed));
+        errno = saved_errno;
+    }
+    return -1;
+}
+
+/* A no-replace publication can commit the canonical name while retaining the
+ * random source alias. Retire that exact post-link generation while the
+ * caller still owns the directory writer boundary. If direct retirement is
+ * transiently unavailable, atomically upgrade the legacy signal scratch slot
+ * to identity-bound tracking and make one serialized cleanup attempt. Before
+ * the link count changes, a failed cleanup remains identity-tracked. Once a
+ * fixed recovery hardlink is established, cleanup authority transfers to that
+ * restart-visible name and the stale random-path registry record is withdrawn;
+ * a later writer reconciles the exact fixed/random pair under its lock. */
+static int config_retire_or_track_scratch_at(
+    int dir_fd, const char *dir_path, const char *source_name,
+    const char *source_path, const char *target_name,
+    const struct stat *retained_source,
+    const unsigned char *expected_data, size_t expected_length,
+    const char *settled_prefix) {
+    char settled_name[96];
+    struct stat source_now;
+    struct stat source_pinned;
+    struct stat settled_now;
+    struct stat target_now;
+    int settlement_errno;
+    int source_pin = -1;
+    bool fixed_linked = false;
+
+    if (dir_fd < 0 || !dir_path || !source_name || !source_path ||
+        !target_name || !retained_source || !settled_prefix) {
+        errno = EINVAL;
+        return -1;
+    }
+    if (CONFIG_PUBLISH_TEST_CHECKPOINT(
+            CONFIG_PUBLISH_TEST_RETAINED_SOURCE_RETIRE,
+            dir_fd, source_name, target_name) == 0 &&
+        config_retire_exact_name_at(
+            dir_fd, source_name, retained_source,
+            expected_data, expected_length, settled_prefix) == 0) {
+        signals_scratch_unregister(source_path);
+        return 0;
+    }
+    settlement_errno = errno ? errno : EIO;
+    if (signals_scratch_register_identity(
+            source_path, retained_source) != 0) {
+        errno = settlement_errno;
+        return -1;
+    }
+    if (signals_scratch_cleanup_identities_at(
+            dir_fd, dir_path) == 0) {
+        return 0;
+    }
+    /* A fixed authority is valid only for a source already published as the
+     * current canonical generation. Prove that before creating another link;
+     * pre-publication cleanup failures and uncertain foreign destinations must
+     * never manufacture an unreconcilable random+fixed pair. */
+    if (fstatat(
+            dir_fd, source_name, &source_now,
+            AT_SYMLINK_NOFOLLOW) != 0 ||
+        fstatat(
+            dir_fd, target_name, &target_now,
+            AT_SYMLINK_NOFOLLOW) != 0 ||
+        !config_metadata_same_file(&source_now, &target_now) ||
+        config_reprove_private_alias_at(
+            dir_fd, source_name, &source_now,
+            expected_data, expected_length, NULL) != 0 ||
+        config_reprove_private_alias_at(
+            dir_fd, target_name, &target_now,
+            expected_data, expected_length, NULL) != 0) {
+        return -1;
+    }
+    /* Leave an unambiguous restart-visible authority without ever replacing a
+     * collided slot. The random alias remains in place until the fixed link is
+     * durable, closing the crash window in which moving it could lose the only
+     * cleanup name. */
+    for (unsigned int slot = 0U;
+         slot < CONFIG_RETIREMENT_SETTLED_SLOT_LIMIT(); slot++) {
+        int written = snprintf(
+            settled_name, sizeof(settled_name),
+            "%s%u", settled_prefix, slot);
+
+        if (written < 0 || (size_t)written >= sizeof(settled_name)) {
+            errno = ENAMETOOLONG;
+            return -1;
+        }
+        if (CONFIG_PUBLISH_TEST_CHECKPOINT(
+                CONFIG_PUBLISH_TEST_BEFORE_FIXED_LINK,
+                dir_fd, source_name, target_name) != 0) {
+            return -1;
+        }
+        if (linkat(
+                dir_fd, source_name, dir_fd, settled_name, 0) == 0) {
+            /* linkat() ran inside the exclusive directory-writer boundary,
+             * after both the random source and canonical target were proved
+             * to name the same owned generation. The new fixed name is now
+             * the restart-visible cleanup authority. Drop the random path's
+             * old nlink=2 registry record before any later checkpoint can
+             * return: the successful hardlink changed that generation to
+             * nlink=3, so retaining the old record would make the next
+             * same-process writer fail ESTALE before its fixed-name
+             * reconciliation can run. This only withdraws unlink authority;
+             * it never authorizes removal of either pathname. */
+            signals_scratch_unregister(source_path);
+            fixed_linked = true;
+            break;
+        }
+        if (errno != EEXIST) return -1;
+    }
+    if (!fixed_linked) {
+        errno = ENOSPC;
+        return -1;
+    }
+    if (CONFIG_PUBLISH_TEST_CHECKPOINT(
+            CONFIG_PUBLISH_TEST_AFTER_FIXED_LINK,
+            dir_fd, source_name, target_name) != 0) {
+        return -1;
+    }
+    if (fstatat(
+            dir_fd, source_name, &source_now,
+            AT_SYMLINK_NOFOLLOW) != 0 ||
+        fstatat(
+            dir_fd, settled_name, &settled_now,
+            AT_SYMLINK_NOFOLLOW) != 0 ||
+        fstatat(
+            dir_fd, target_name, &target_now,
+            AT_SYMLINK_NOFOLLOW) != 0 ||
+        !config_metadata_same_file(&source_now, &settled_now) ||
+        !config_metadata_same_file(&source_now, &target_now) ||
+        config_reprove_private_alias_at(
+            dir_fd, source_name, &source_now,
+            expected_data, expected_length, NULL) != 0 ||
+        config_reprove_private_alias_at(
+            dir_fd, settled_name, &settled_now,
+            expected_data, expected_length, NULL) != 0 ||
+        config_reprove_private_alias_at(
+            dir_fd, target_name, &target_now,
+            expected_data, expected_length, NULL) != 0) {
+        return -1;
+    }
+    if (fsync(dir_fd) != 0) return -1;
+    if (CONFIG_PUBLISH_TEST_CHECKPOINT(
+            CONFIG_PUBLISH_TEST_AFTER_FIXED_SYNC,
+            dir_fd, source_name, target_name) != 0) {
+        return -1;
+    }
+    if (fstatat(
+            dir_fd, source_name, &source_now,
+            AT_SYMLINK_NOFOLLOW) != 0 ||
+        fstatat(
+            dir_fd, settled_name, &settled_now,
+            AT_SYMLINK_NOFOLLOW) != 0 ||
+        fstatat(
+            dir_fd, target_name, &target_now,
+            AT_SYMLINK_NOFOLLOW) != 0 ||
+        !config_metadata_same_file(&source_now, &settled_now) ||
+        !config_metadata_same_file(&source_now, &target_now) ||
+        config_reprove_private_alias_at(
+            dir_fd, source_name, &source_now,
+            expected_data, expected_length, NULL) != 0 ||
+        config_reprove_private_alias_at(
+            dir_fd, target_name, &target_now,
+            expected_data, expected_length, NULL) != 0) {
+        return -1;
+    }
+
+    /* Once the fixed authority is durable, pin the exact owned source vnode
+     * before retiring its random name. The descriptor keeps that inode alive
+     * across the test seam and final namespace proofs, so a same-UID actor
+     * cannot recycle dev/ino and turn a fresh byte-identical target+fixed pair
+     * into cleanup authority. If retirement still fails, preserve that errno
+     * and the remaining names for the next writer's causal scan. */
+    if (CONFIG_PUBLISH_TEST_CHECKPOINT(
+            CONFIG_PUBLISH_TEST_BEFORE_SOURCE_PIN,
+            dir_fd, source_name, target_name) != 0) {
+        return -1;
+    }
+    source_pin = openat(
+        dir_fd, source_name,
+        O_RDONLY | O_CLOEXEC | O_NOFOLLOW | O_NONBLOCK);
+    if (source_pin < 0 ||
+        config_reprove_pinned_private_fd(
+            source_pin, &source_now,
+            expected_data, expected_length,
+            &source_pinned) != 0) {
+        int pin_errno = errno ? errno : ESTALE;
+
+        if (source_pin >= 0) (void)close(source_pin);
+        errno = pin_errno;
+        return -1;
+    }
+    if (config_retire_exact_name_at(
+            dir_fd, source_name, &source_now,
+            expected_data, expected_length, settled_prefix) != 0) {
+        goto pinned_fail;
+    }
+    signals_scratch_unregister(source_path);
+    if (fsync(dir_fd) != 0) goto pinned_fail;
+    if (CONFIG_PUBLISH_TEST_CHECKPOINT(
+            CONFIG_PUBLISH_TEST_BEFORE_FIXED_RETIRE,
+            dir_fd, source_name, target_name) != 0) {
+        goto pinned_fail;
+    }
+    if (config_reprove_pinned_private_fd(
+            source_pin, &source_pinned,
+            expected_data, expected_length,
+            &source_pinned) != 0) {
+        goto pinned_fail;
+    }
+    if (fstatat(
+            dir_fd, target_name, &target_now,
+            AT_SYMLINK_NOFOLLOW) != 0 ||
+        fstatat(
+            dir_fd, settled_name, &settled_now,
+            AT_SYMLINK_NOFOLLOW) != 0) {
+        goto pinned_fail;
+    }
+    if (!config_metadata_same_file(&source_pinned, &target_now) ||
+        !config_metadata_same_file(&source_pinned, &settled_now) ||
+        !config_metadata_same_file(&target_now, &settled_now)) {
+        errno = ESTALE;
+        goto pinned_fail;
+    }
+    if (config_reprove_private_alias_at(
+            dir_fd, target_name, &target_now,
+            expected_data, expected_length, NULL) != 0 ||
+        config_reprove_private_alias_at(
+            dir_fd, settled_name, &settled_now,
+            expected_data, expected_length, NULL) != 0 ||
+        config_retire_exact_name_at(
+            dir_fd, settled_name, &settled_now,
+            expected_data, expected_length, settled_prefix) != 0) {
+        goto pinned_fail;
+    }
+    if (fsync(dir_fd) != 0 ||
+        config_reprove_pinned_private_fd(
+            source_pin, &source_pinned,
+            expected_data, expected_length, NULL) != 0) {
+        goto pinned_fail;
+    }
+    if (close(source_pin) != 0) return -1;
+    return 0;
+
+pinned_fail:
+    {
+        int pinned_errno = errno ? errno : ESTALE;
+
+        (void)close(source_pin);
+        errno = pinned_errno;
+        return -1;
+    }
+}
+
+static bool config_retained_temp_name_is_exact(
+    const char *name, const char *prefix, size_t fixed_suffix_length) {
+    size_t prefix_length;
+    size_t suffix_length;
+
+    if (!name || !prefix) return false;
+    prefix_length = strlen(prefix);
+    if (strncmp(name, prefix, prefix_length) != 0) return false;
+    suffix_length = strlen(name + prefix_length);
+    if (suffix_length == 0U ||
+        (fixed_suffix_length != 0U &&
+         suffix_length != fixed_suffix_length)) {
+        return false;
+    }
+    for (size_t i = 0U; i < suffix_length; i++) {
+        unsigned char c =
+            (unsigned char)name[prefix_length + i];
+
+        if (fixed_suffix_length != 0U) {
+            if (!((c >= (unsigned char)'0' &&
+                   c <= (unsigned char)'9') ||
+                  (c >= (unsigned char)'A' &&
+                   c <= (unsigned char)'Z') ||
+                  (c >= (unsigned char)'a' &&
+                   c <= (unsigned char)'z'))) {
+                return false;
+            }
+        } else if (c < (unsigned char)'0' ||
+                   c > (unsigned char)'9') {
+            return false;
+        }
+    }
+    return true;
+}
+
+/* Reconcile random and fixed aliases left by a prior process. The random scan
+ * is unconditional so it also closes a crash before the fixed link's directory
+ * fsync. Enumeration completes within fixed bounds before any deletion. Only
+ * safe reserved names hard-linked to the current canonical generation are
+ * cleanup authority; foreign generations and collided fixed slots stay inert. */
+static int config_reconcile_settled_aliases_at(
+    int dir_fd, const char *target_name, const char *settled_prefix,
+    const char *temp_prefix, size_t fixed_suffix_length) {
+    enum {
+        CONFIG_ALIAS_SCAN_MAX_ENTRIES = 4096,
+        CONFIG_ALIAS_SCAN_MAX_CANDIDATES = 64
+    };
+    char candidates[CONFIG_ALIAS_SCAN_MAX_CANDIDATES][NAME_MAX + 1U];
+    struct stat target;
+    DIR *stream = NULL;
+    struct dirent *entry;
+    size_t entry_count = 0U;
+    size_t candidate_count = 0U;
+    bool removed_random = false;
+    bool target_exists = false;
+    int scan_fd;
+    int scan_errno;
+    int close_result;
+
+    errno = 0;
+    if (fstatat(
+            dir_fd, target_name, &target,
+            AT_SYMLINK_NOFOLLOW) != 0) {
+        if (errno != ENOENT) return -1;
+    } else if (!config_reconcile_target_is_safe(&target)) {
+        errno = ESTALE;
+        return -1;
+    } else {
+        target_exists = true;
+    }
+
+    scan_fd = openat(
+        dir_fd, ".",
+        O_RDONLY | O_CLOEXEC | O_DIRECTORY | O_NOFOLLOW);
+    if (scan_fd < 0) return -1;
+    stream = fdopendir(scan_fd);
+    if (!stream) {
+        scan_errno = errno ? errno : EIO;
+        close(scan_fd);
+        errno = scan_errno;
+        return -1;
+    }
+    errno = 0;
+    while ((entry = readdir(stream)) != NULL) {
+        entry_count++;
+        if (entry_count > CONFIG_ALIAS_SCAN_MAX_ENTRIES) {
+            scan_errno = E2BIG;
+            goto scan_done;
+        }
+        if (!config_retained_temp_name_is_exact(
+                entry->d_name, temp_prefix,
+                fixed_suffix_length)) {
+            continue;
+        }
+        if (candidate_count >=
+            CONFIG_ALIAS_SCAN_MAX_CANDIDATES) {
+            scan_errno = E2BIG;
+            goto scan_done;
+        }
+        if (safe_strncpy(
+                candidates[candidate_count], entry->d_name,
+                sizeof(candidates[candidate_count])) != 0) {
+            scan_errno = errno ? errno : ENAMETOOLONG;
+            goto scan_done;
+        }
+        candidate_count++;
+    }
+    scan_errno = errno;
+
+scan_done:
+    close_result = closedir(stream);
+    stream = NULL;
+    if (scan_errno != 0 || close_result != 0) {
+        errno = scan_errno != 0 ? scan_errno : (errno ? errno : EIO);
+        return -1;
+    }
+    for (size_t i = 0U; i < candidate_count; i++) {
+        struct stat candidate;
+
+        if (fstatat(
+                dir_fd, candidates[i], &candidate,
+                AT_SYMLINK_NOFOLLOW) != 0) {
+            if (errno == ENOENT) continue;
+            return -1;
+        }
+        if (!config_alias_metadata_is_safe(&candidate)) {
+            continue;
+        }
+        if (!target_exists ||
+            !config_metadata_same_file(&target, &candidate)) {
+            continue;
+        }
+        if (config_retire_exact_name_at(
+                dir_fd, candidates[i], &candidate,
+                NULL, 0U, settled_prefix) != 0) {
+            return -1;
+        }
+        removed_random = true;
+        if (target_exists) {
+            if (fstatat(
+                    dir_fd, target_name, &target,
+                    AT_SYMLINK_NOFOLLOW) != 0 ||
+                !config_reconcile_target_is_safe(&target)) {
+                return -1;
+            }
+        }
+    }
+    if (removed_random && fsync(dir_fd) != 0) return -1;
+    if (!target_exists) return 0;
+
+#if defined(__FreeBSD__)
+    for (unsigned int slot = 0U;
+         slot < CONFIG_RETIREMENT_SETTLED_SLOT_LIMIT();
+         slot++) {
+        char settled_name[96];
+        struct stat settled;
+        int written = snprintf(
+            settled_name, sizeof(settled_name),
+            "%s%u", settled_prefix, slot);
+
+        if (written < 0 || (size_t)written >= sizeof(settled_name)) {
+            errno = ENAMETOOLONG;
+            return -1;
+        }
+        errno = 0;
+        if (fstatat(
+                dir_fd, settled_name, &settled,
+                AT_SYMLINK_NOFOLLOW) != 0) {
+            if (errno == ENOENT) continue;
+            return -1;
+        }
+        if (!config_metadata_same_file(&target, &settled)) continue;
+        if (config_retire_exact_name_at(
+                dir_fd, settled_name, &settled,
+                NULL, 0U, settled_prefix) != 0) {
+            return -1;
+        }
+        if (fsync(dir_fd) != 0) return -1;
+        if (fstatat(
+                dir_fd, target_name, &target,
+                AT_SYMLINK_NOFOLLOW) != 0 ||
+            !config_reconcile_target_is_safe(&target)) {
+            return -1;
+        }
+    }
+#endif
+    return 0;
 }
 
 /* Initialize configuration system for an ordinary command. */
@@ -1403,14 +2218,9 @@ static bool config_metadata_same_file(const struct stat *a, const struct stat *b
 static void config_unlink_created_temp(const char *path,
                                        const struct stat *created,
                                        bool have_created_identity) {
-    struct stat named;
-
     if (!path || !created || !have_created_identity) return;
-    if (lstat(path, &named) == 0 &&
-        config_metadata_file_is_safe(&named, false) &&
-        config_metadata_same_file(created, &named)) {
-        (void)unlink(path);
-    }
+    (void)config_retire_exact_path(
+        path, created, NULL, 0U, CONFIG_DOCUMENT_SETTLED_PREFIX);
 }
 
 /* A stable descriptor generation requires more than an unchanged inode: an
@@ -1705,6 +2515,95 @@ static bool config_pread_full(int fd, unsigned char *buffer, size_t length,
     return true;
 }
 
+static bool config_alias_metadata_is_safe(const struct stat *st) {
+    return st && S_ISREG(st->st_mode) && st->st_uid == getuid() &&
+           (st->st_mode & 0777) == PERM_USER_RW &&
+           st->st_nlink >= 1 && st->st_nlink <= 3;
+}
+
+static bool config_reconcile_target_is_safe(const struct stat *st) {
+    return config_metadata_file_is_safe(st, false) ||
+           config_alias_metadata_is_safe(st);
+}
+
+/* Exact proof for the short interval where a successfully published private
+ * file intentionally has two or three names. The ordinary publication proof
+ * correctly requires nlink==1 and therefore cannot authorize cleanup here. */
+static int config_reprove_private_alias_at(
+    int dir_fd, const char *name, const struct stat *expected,
+    const unsigned char *expected_data, size_t expected_length,
+    struct stat *accepted) {
+    unsigned char observed[4096];
+    struct stat named_before;
+    struct stat opened;
+    struct stat descriptor_after;
+    struct stat named_after;
+    size_t offset = 0U;
+    int fd = -1;
+    int failure_errno = ESTALE;
+
+    if (dir_fd < 0 || !name || !expected ||
+        (!expected_data && expected_length != 0U)) {
+        errno = EINVAL;
+        return -1;
+    }
+    if (fstatat(
+            dir_fd, name, &named_before,
+            AT_SYMLINK_NOFOLLOW) != 0 ||
+        !config_alias_metadata_is_safe(&named_before) ||
+        !config_metadata_same_file(expected, &named_before) ||
+        (expected_data &&
+         (named_before.st_size < 0 ||
+          (uintmax_t)named_before.st_size != expected_length))) {
+        failure_errno = errno ? errno : ESTALE;
+        goto alias_fail;
+    }
+    fd = openat(
+        dir_fd, name,
+        O_RDONLY | O_CLOEXEC | O_NOFOLLOW | O_NONBLOCK);
+    if (fd < 0 || fstat(fd, &opened) != 0 ||
+        !config_alias_metadata_is_safe(&opened) ||
+        !config_metadata_snapshot_same(&named_before, &opened)) {
+        failure_errno = errno ? errno : ESTALE;
+        goto alias_fail;
+    }
+    while (expected_data && offset < expected_length) {
+        size_t chunk = expected_length - offset;
+
+        if (chunk > sizeof(observed)) chunk = sizeof(observed);
+        if (!config_pread_full(
+                fd, observed, chunk, (off_t)offset) ||
+            memcmp(observed, expected_data + offset, chunk) != 0) {
+            failure_errno = errno ? errno : ESTALE;
+            goto alias_fail;
+        }
+        offset += chunk;
+    }
+    if (fstat(fd, &descriptor_after) != 0 ||
+        fstatat(
+            dir_fd, name, &named_after,
+            AT_SYMLINK_NOFOLLOW) != 0 ||
+        !config_alias_metadata_is_safe(&descriptor_after) ||
+        !config_alias_metadata_is_safe(&named_after) ||
+        !config_metadata_snapshot_same(&opened, &descriptor_after) ||
+        !config_metadata_snapshot_same(
+            &descriptor_after, &named_after)) {
+        failure_errno = errno ? errno : ESTALE;
+        goto alias_fail;
+    }
+    if (close(fd) != 0) {
+        fd = -1;
+        return -1;
+    }
+    if (accepted) *accepted = named_after;
+    return 0;
+
+alias_fail:
+    if (fd >= 0) (void)close(fd);
+    errno = failure_errno;
+    return -1;
+}
+
 /* A no-follow lookup reports namespace replacement differently across the
  * supported platforms: Linux/macOS commonly use ELOOP or ENOTDIR, while
  * FreeBSD may report EMLINK for the terminal symlink. These all mean that the
@@ -1810,12 +2709,6 @@ static int config_reprove_published_file_at(
         goto proof_fail;
     }
 
-    if (config_io_fault(CONFIG_IO_DOCUMENT_REPROOF_AFTER_BYTES,
-                        "config document exact-byte reproof")) {
-        failure_errno = errno ? errno : EIO;
-        goto proof_fail;
-    }
-
     errno = 0;
     if (fstat(fd, &descriptor_after) != 0) {
         failure_errno = errno ? errno : EIO;
@@ -1862,6 +2755,90 @@ proof_fail:
     if (fd >= 0) close(fd);
     secure_zero_memory(observed, sizeof(observed));
     errno = failure_errno;
+    return -1;
+}
+
+/* Re-prove an admitted before-image without imposing the 0600 requirement
+ * used for newly published files. Historical resume hints may legitimately
+ * retain a stricter group-readable mode that rollback must preserve. */
+static int config_reprove_existing_file_at(
+    int dir_fd, const char *name, const struct stat *expected,
+    const unsigned char *expected_data, size_t expected_length,
+    struct stat *current_generation) {
+    unsigned char observed[4096];
+    struct stat named_before;
+    struct stat opened;
+    struct stat after;
+    struct stat named_after;
+    unsigned char trailing;
+    ssize_t trailing_count;
+    size_t offset = 0U;
+    int fd = -1;
+    int saved_errno = ESTALE;
+
+    if (dir_fd < 0 || !name || !expected ||
+        (!expected_data && expected_length != 0U) ||
+        !current_generation) {
+        errno = EINVAL;
+        return -1;
+    }
+    if (fstatat(
+            dir_fd, name, &named_before,
+            AT_SYMLINK_NOFOLLOW) != 0 ||
+        !config_metadata_file_is_safe(&named_before, false) ||
+        named_before.st_size < 0 ||
+        (uintmax_t)named_before.st_size != expected_length ||
+        (!config_metadata_snapshot_same(expected, &named_before) &&
+         !config_metadata_ctime_only_change(expected, &named_before))) {
+        goto existing_fail;
+    }
+    fd = openat(
+        dir_fd, name,
+        O_RDONLY | O_CLOEXEC | O_NOFOLLOW | O_NONBLOCK);
+    if (fd < 0 || fstat(fd, &opened) != 0 ||
+        !config_metadata_file_is_safe(&opened, false) ||
+        (!config_metadata_snapshot_same(&named_before, &opened) &&
+         !config_metadata_ctime_only_change(&named_before, &opened))) {
+        goto existing_fail;
+    }
+    while (offset < expected_length) {
+        size_t remaining = expected_length - offset;
+        size_t chunk =
+            remaining < sizeof(observed) ? remaining : sizeof(observed);
+
+        if (!config_pread_full(
+                fd, observed, chunk, (off_t)offset) ||
+            memcmp(observed, expected_data + offset, chunk) != 0) {
+            goto existing_fail;
+        }
+        offset += chunk;
+    }
+    do {
+        errno = 0;
+        trailing_count =
+            pread(fd, &trailing, 1, (off_t)expected_length);
+    } while (trailing_count < 0 && errno == EINTR);
+    if (trailing_count != 0 ||
+        fstat(fd, &after) != 0 ||
+        fstatat(
+            dir_fd, name, &named_after,
+            AT_SYMLINK_NOFOLLOW) != 0 ||
+        (!config_metadata_snapshot_same(&opened, &after) &&
+         !config_metadata_ctime_only_change(&opened, &after)) ||
+        (!config_metadata_snapshot_same(&after, &named_after) &&
+         !config_metadata_ctime_only_change(&after, &named_after))) {
+        goto existing_fail;
+    }
+    *current_generation = named_after;
+    (void)close(fd);
+    secure_zero_memory(observed, sizeof(observed));
+    return 0;
+
+existing_fail:
+    saved_errno = errno ? errno : ESTALE;
+    if (fd >= 0) (void)close(fd);
+    secure_zero_memory(observed, sizeof(observed));
+    errno = saved_errno;
     return -1;
 }
 
@@ -2334,12 +3311,23 @@ static int config_create_private_temp_at(int dir_fd, const char *target_name,
     return -1;
 }
 
-/* Atomically publish source only if destination is absent. Linux's native
- * renameat2 operation gives a one-step move. linkat+unlinkat is the portable
- * same-directory fallback: link creation itself is atomic and no-replace, so
- * a competing destination is never overwritten. */
-static int config_publish_noreplace_at(int dir_fd, const char *source,
-                                       const char *destination) {
+/* Atomically publish one proved source generation only if destination is
+ * absent. Every supported platform either provides a one-step no-replace move
+ * or a descriptor-conditioned way to retire the exact source and rollback
+ * alias. Unsupported platforms fail before changing the namespace. */
+static int config_publish_noreplace_at(
+    int dir_fd, const char *source, const char *destination,
+    const struct stat *expected_source,
+    struct stat *retained_source) {
+    struct stat source_now;
+
+    if (retained_source) memset(retained_source, 0, sizeof(*retained_source));
+    if (dir_fd < 0 || !source || !destination || !expected_source ||
+        fstatat(dir_fd, source, &source_now, AT_SYMLINK_NOFOLLOW) != 0 ||
+        !config_metadata_snapshot_same(expected_source, &source_now)) {
+        errno = errno ? errno : ESTALE;
+        return -1;
+    }
 #if defined(__linux__) && defined(SYS_renameat2)
 #ifndef RENAME_NOREPLACE
 #define RENAME_NOREPLACE (1U << 0)
@@ -2348,34 +3336,143 @@ static int config_publish_noreplace_at(int dir_fd, const char *source,
                 RENAME_NOREPLACE) == 0) {
         return 0;
     }
-    if (errno != ENOSYS && errno != EINVAL && errno != EOPNOTSUPP) {
-        return -1;
+    if (errno == ENOSYS || errno == EINVAL || errno == EOPNOTSUPP) {
+        errno = ENOTSUP;
     }
-#endif
+    return -1;
+#elif defined(__APPLE__) && defined(RENAME_EXCL)
+    return renameatx_np(
+        dir_fd, source, dir_fd, destination, RENAME_EXCL);
+#elif defined(__FreeBSD__)
+    {
+        struct stat pinned;
+        struct stat destination_now;
+        int source_fd = openat(
+            dir_fd, source,
+            O_PATH | O_CLOEXEC | O_NOFOLLOW);
+        int saved_errno;
 
-    if (linkat(dir_fd, source, dir_fd, destination, 0) != 0) {
-        return -1;
-    }
-    if (unlinkat(dir_fd, source, 0) != 0) {
-        int saved_errno = errno;
-        struct stat source_identity;
-        struct stat destination_identity;
-
-        /* Roll back only when the destination still names the exact hard link
-         * we just created. Never delete a concurrently substituted name. */
-        if (fstatat(dir_fd, source, &source_identity,
-                    AT_SYMLINK_NOFOLLOW) == 0 &&
-            fstatat(dir_fd, destination, &destination_identity,
-                    AT_SYMLINK_NOFOLLOW) == 0 &&
-            config_metadata_same_file(&source_identity,
-                                      &destination_identity)) {
-            (void)unlinkat(dir_fd, destination, 0);
+        if (source_fd < 0 || fstat(source_fd, &pinned) != 0 ||
+            !config_metadata_snapshot_same(expected_source, &pinned)) {
+            saved_errno = errno ? errno : ESTALE;
+            if (source_fd >= 0) (void)close(source_fd);
+            errno = saved_errno;
+            return -1;
         }
-        errno = saved_errno;
-        return -1;
+        if (linkat(dir_fd, source, dir_fd, destination, 0) != 0) {
+            saved_errno = errno;
+            (void)close(source_fd);
+            errno = saved_errno;
+            return -1;
+        }
+        if (fstatat(
+                dir_fd, destination, &destination_now,
+                AT_SYMLINK_NOFOLLOW) != 0 ||
+            !config_metadata_same_file(&pinned, &destination_now)) {
+            saved_errno = errno ? errno : ESTALE;
+            /* Remove only the alias to the pinned intended source. If either
+             * source or destination was replaced after linkat(), preserve the
+             * occupant rather than authorizing it through a fresh open. */
+            (void)funlinkat(
+                dir_fd, destination, source_fd, 0);
+            (void)close(source_fd);
+            errno = saved_errno;
+            return -1;
+        }
+        if (CONFIG_PUBLISH_TEST_CHECKPOINT(
+                CONFIG_PUBLISH_TEST_SOURCE_UNLINK,
+                dir_fd, source, destination) != 0 ||
+            funlinkat(dir_fd, source, source_fd, 0) != 0) {
+            saved_errno = errno ? errno : EIO;
+            if (CONFIG_PUBLISH_TEST_CHECKPOINT(
+                    CONFIG_PUBLISH_TEST_ROLLBACK_UNLINK,
+                    dir_fd, source, destination) != 0 ||
+                funlinkat(
+                    dir_fd, destination, source_fd, 0) != 0) {
+                struct stat source_retained;
+                struct stat destination_retained;
+
+                (void)CONFIG_PUBLISH_TEST_CHECKPOINT(
+                    CONFIG_PUBLISH_TEST_AFTER_ROLLBACK_FAILURE,
+                    dir_fd, source, destination);
+                /* The canonical destination is now committed. Never report
+                 * this as a pre-publication failure merely because both
+                 * descriptor-conditioned cleanup attempts failed. Reprove
+                 * both aliases against the pinned inode and return the
+                 * distinct positive outcome; callers treat it as installed
+                 * and later fixed-name reconciliation can retire the source.
+                 */
+                bool source_is_retained =
+                    fstatat(
+                        dir_fd, source, &source_retained,
+                        AT_SYMLINK_NOFOLLOW) == 0 &&
+                    config_metadata_same_file(
+                        &pinned, &source_retained);
+
+                if (source_is_retained && retained_source) {
+                    *retained_source = source_retained;
+                }
+                if (source_is_retained &&
+                    fstatat(
+                        dir_fd, destination, &destination_retained,
+                        AT_SYMLINK_NOFOLLOW) == 0 &&
+                    config_metadata_same_file(
+                        &pinned, &destination_retained)) {
+                    (void)close(source_fd);
+                    errno = 0;
+                    return CONFIG_PUBLISH_INSTALLED_SOURCE_RETAINED;
+                }
+                (void)close(source_fd);
+                errno = EINPROGRESS;
+                return CONFIG_PUBLISH_OUTCOME_UNCERTAIN;
+            }
+            (void)close(source_fd);
+            errno = saved_errno;
+            return -1;
+        }
+        (void)close(source_fd);
+        return 0;
     }
-    return 0;
+#else
+    errno = ENOTSUP;
+    return -1;
+#endif
 }
+
+#if !defined(__FreeBSD__)
+typedef enum {
+    CONFIG_EXCHANGE_ERROR = -1,
+    CONFIG_EXCHANGE_OK = 0,
+    CONFIG_EXCHANGE_UNSUPPORTED = 1
+} config_exchange_result_t;
+
+static config_exchange_result_t config_exchange_names_at(
+    int dir_fd, const char *left, const char *right) {
+    int result = -1;
+
+#if defined(__linux__) && defined(SYS_renameat2)
+#ifndef RENAME_EXCHANGE
+#define RENAME_EXCHANGE (1U << 1)
+#endif
+    result = (int)syscall(SYS_renameat2, dir_fd, left, dir_fd, right,
+                          RENAME_EXCHANGE);
+#elif defined(__APPLE__) && defined(RENAME_SWAP)
+    result = renameatx_np(dir_fd, left, dir_fd, right, RENAME_SWAP);
+#else
+    (void)dir_fd;
+    (void)left;
+    (void)right;
+    errno = ENOTSUP;
+    return CONFIG_EXCHANGE_UNSUPPORTED;
+#endif
+    if (result == 0) return CONFIG_EXCHANGE_OK;
+    if (errno == ENOSYS || errno == EINVAL || errno == ENOTSUP ||
+        errno == EOPNOTSUPP) {
+        return CONFIG_EXCHANGE_UNSUPPORTED;
+    }
+    return CONFIG_EXCHANGE_ERROR;
+}
+#endif
 
 static int config_lock_reject(int token_fd, const char *lockpath) {
     if (token_fd >= 0) unlock_private_file(token_fd);
@@ -2416,6 +3513,8 @@ static int config_directory_for_path(const char *config_path, char *dir,
 #define CONFIG_RETIREMENT_COMPLETE_NAME ".retirement-complete"
 #define CONFIG_RETIREMENT_STAGE_NAME ".retirement-transition"
 #define CONFIG_RETIREMENT_LOCK_NAME ".retirement.lock"
+#define CONFIG_RETIREMENT_SETTLED_PREFIX \
+    ".gitswitch-retirement-settled-"
 #define CONFIG_RETIREMENT_GUARD_HEADER_V1 \
     "gitswitch-retirement-incomplete-v1"
 #define CONFIG_RETIREMENT_GUARD_HEADER_V2 \
@@ -2437,18 +3536,39 @@ static int config_switch_parse_identity(
 static int config_switch_decode_hex(
     const unsigned char *value, size_t length, char *out,
     size_t out_size);
+static int config_retirement_guard_move_noreplace_at(
+    int directory_fd, const char *source, const char *destination,
+    const struct stat *expected_identity,
+    const unsigned char *expected_data, size_t expected_length,
+    struct stat *published_identity, bool *committed);
 
 struct config_retirement_guard {
     int directory_fd;
     int lock_fd;
+    pid_t owner_pid;
     char directory[MAX_PATH_LEN];
     struct stat directory_identity;
     struct stat marker_identity;
+    struct stat prepared_stage_identity;
     unsigned char *marker_data;
     size_t marker_length;
+    struct stat completion_identity;
+    unsigned char *completion_data;
+    size_t completion_length;
+    char prepared_slot_name[64];
     char token[ACCOUNT_INCARNATION_LEN];
+    bool completion_absent;
     bool created;
+    bool prepared;
+    bool barrier_active;
 };
+
+#ifdef GITSWITCH_TESTING
+int gitswitch_test_retirement_guard_directory_fd(
+    const config_retirement_guard_t *guard) {
+    return guard ? guard->directory_fd : -1;
+}
+#endif
 
 /* The application is single-threaded and owns at most one outer retirement
  * transaction. The filesystem lock serializes independent processes; this
@@ -3092,11 +4212,13 @@ static int config_retirement_guard_read_named_at(
     struct stat descriptor_after;
     struct stat named_after;
     struct stat named_closed;
+    struct stat reproved;
     unsigned char *buffer = NULL;
     unsigned char extra;
     ssize_t extra_count;
     int fd = -1;
     int failure_errno = EIO;
+    bool exact_reproof_required = false;
 
     if (directory_fd < 0 || !name || name[0] == '\0' || !absent || !data ||
         !length || !identity || !model) {
@@ -3135,11 +4257,18 @@ static int config_retirement_guard_read_named_at(
         goto read_fail;
     }
     if (!config_metadata_file_is_safe(&opened, true) ||
-        !config_metadata_snapshot_same(&named_before, &opened) ||
         opened.st_size <= 0 ||
         (uintmax_t)opened.st_size > CONFIG_RETIREMENT_GUARD_MAX_BYTES) {
         failure_errno = ESTALE;
         goto read_fail;
+    }
+    if (!config_metadata_snapshot_same(&named_before, &opened)) {
+        if (!config_metadata_ctime_only_change(
+                &named_before, &opened)) {
+            failure_errno = ESTALE;
+            goto read_fail;
+        }
+        exact_reproof_required = true;
     }
     *length = (size_t)opened.st_size;
     buffer = malloc(*length);
@@ -3157,18 +4286,36 @@ static int config_retirement_guard_read_named_at(
         errno = 0;
         extra_count = pread(fd, &extra, 1, (off_t)*length);
     } while (extra_count < 0 && errno == EINTR);
-    if (extra_count != 0 || fstat(fd, &descriptor_after) != 0 ||
+    if (extra_count != 0 ||
+        RETIREMENT_GUARD_CLEAR_TEST_CHECKPOINT(
+            RETIREMENT_GUARD_READ_BEFORE_FINAL_METADATA_CHECK,
+            directory_fd, name) != 0 ||
+        fstat(fd, &descriptor_after) != 0 ||
         fstatat(directory_fd, name, &named_after,
                 AT_SYMLINK_NOFOLLOW) != 0) {
         failure_errno = errno ? errno : ESTALE;
         goto read_fail;
     }
     if (!config_metadata_file_is_safe(&descriptor_after, true) ||
-        !config_metadata_file_is_safe(&named_after, true) ||
-        !config_metadata_snapshot_same(&opened, &descriptor_after) ||
-        !config_metadata_snapshot_same(&opened, &named_after)) {
+        !config_metadata_file_is_safe(&named_after, true)) {
         failure_errno = ESTALE;
         goto read_fail;
+    }
+    if (!config_metadata_snapshot_same(&opened, &descriptor_after)) {
+        if (!config_metadata_ctime_only_change(
+                &opened, &descriptor_after)) {
+            failure_errno = ESTALE;
+            goto read_fail;
+        }
+        exact_reproof_required = true;
+    }
+    if (!config_metadata_snapshot_same(&opened, &named_after)) {
+        if (!config_metadata_ctime_only_change(
+                &opened, &named_after)) {
+            failure_errno = ESTALE;
+            goto read_fail;
+        }
+        exact_reproof_required = true;
     }
     if (config_retirement_guard_parse(buffer, *length, model) != 0) {
         failure_errno = errno ? errno : EINVAL;
@@ -3207,6 +4354,14 @@ static int config_retirement_guard_read_named_at(
         failure_errno = ESTALE;
         goto read_fail;
     }
+    if (exact_reproof_required &&
+        config_reprove_published_file_at(
+            directory_fd, name, &named_closed, buffer, *length,
+            &reproved) != 0) {
+        failure_errno = errno ? errno : ESTALE;
+        goto read_fail;
+    }
+    if (exact_reproof_required) named_closed = reproved;
     *identity = named_closed;
     *data = buffer;
     return 0;
@@ -3546,6 +4701,96 @@ stage_done:
     return result;
 }
 
+static int config_retirement_guard_settled_slot_name(
+    unsigned int slot, char *name, size_t name_size) {
+    int written;
+
+    if (!name || slot >= CONFIG_RETIREMENT_SETTLED_SLOTS) {
+        errno = EINVAL;
+        return -1;
+    }
+    written = snprintf(
+        name, name_size, "%s%u",
+        CONFIG_RETIREMENT_SETTLED_PREFIX, slot);
+    if (written < 0 || (size_t)written >= name_size) {
+        errno = ENAMETOOLONG;
+        return -1;
+    }
+    return 0;
+}
+
+static int config_retirement_guard_prepare_settled_slot_at(
+    config_retirement_guard_t *guard,
+    config_retirement_guard_pair_t *pair) {
+    if (!guard || !pair || pair->marker_absent ||
+        !pair->marker_data || guard->completion_absent) {
+        errno = EINVAL;
+        return -1;
+    }
+    guard->prepared_slot_name[0] = '\0';
+    for (unsigned int slot = 0U;
+         slot < CONFIG_RETIREMENT_SETTLED_SLOT_LIMIT(); slot++) {
+        char name[sizeof(guard->prepared_slot_name)];
+        struct stat named;
+
+        if (config_retirement_guard_settled_slot_name(
+                slot, name, sizeof(name)) != 0) {
+            return -1;
+        }
+        errno = 0;
+        if (fstatat(
+                guard->directory_fd, name, &named,
+                AT_SYMLINK_NOFOLLOW) != 0) {
+            if (errno != ENOENT) return -1;
+            memcpy(
+                guard->prepared_slot_name, name,
+                strlen(name) + 1U);
+            return 0;
+        }
+    }
+    errno = ENOSPC;
+    set_error(
+        ERR_FILE_IO,
+        "Retirement settled arena is full; perform offline quiescent cleanup before retrying");
+    return -1;
+}
+
+static int config_retirement_guard_select_settled_slot_at(
+    int directory_fd, char *selected, size_t selected_size) {
+    if (directory_fd < 0 || !selected || selected_size == 0U) {
+        errno = EINVAL;
+        return -1;
+    }
+    selected[0] = '\0';
+    for (unsigned int slot = 0U;
+         slot < CONFIG_RETIREMENT_SETTLED_SLOT_LIMIT(); slot++) {
+        char name[64];
+        struct stat named;
+
+        if (config_retirement_guard_settled_slot_name(
+                slot, name, sizeof(name)) != 0) {
+            return -1;
+        }
+        if (strlen(name) + 1U > selected_size) {
+            errno = ENAMETOOLONG;
+            return -1;
+        }
+        errno = 0;
+        if (fstatat(
+                directory_fd, name, &named,
+                AT_SYMLINK_NOFOLLOW) != 0) {
+            if (errno != ENOENT) return -1;
+            memcpy(selected, name, strlen(name) + 1U);
+            return 0;
+        }
+    }
+    errno = ENOSPC;
+    set_error(
+        ERR_FILE_IO,
+        "Retirement settled arena is full; perform offline quiescent cleanup before retrying");
+    return -1;
+}
+
 /* Remove only a jointly revalidated exact marker copy. This is the sole
  * mutation admitted by adopt-only recovery: it cannot create or rotate a
  * generation and leaves foreign/malformed stage residue untouched. */
@@ -3586,7 +4831,11 @@ static int config_retirement_guard_reconcile_exact_stage_at(
             directory_fd, CONFIG_RETIREMENT_STAGE_NAME,
             &stage_identity, observed->marker_data,
             observed->marker_length, &stage_identity) != 0 ||
-        unlinkat(directory_fd, CONFIG_RETIREMENT_STAGE_NAME, 0) != 0 ||
+        config_retire_exact_name_at(
+            directory_fd, CONFIG_RETIREMENT_STAGE_NAME,
+            &stage_identity, observed->marker_data,
+            observed->marker_length,
+            CONFIG_RETIREMENT_SETTLED_PREFIX) != 0 ||
         fsync(directory_fd) != 0) {
         saved_errno = errno ? errno : EIO;
         set_system_error(
@@ -3666,54 +4915,6 @@ static int config_retirement_guard_revalidate_adoption_at(
         set_system_error(
             ERR_FILE_IO,
             "Retained retirement guard changed during durability proof");
-        return -1;
-    }
-    return 0;
-}
-
-static int config_retirement_guard_stage_remove_at(int directory_fd) {
-    struct stat before;
-    struct stat opened;
-    struct stat named;
-    bool present = false;
-    int fd = -1;
-    int saved_errno;
-
-    if (config_retirement_guard_stage_state_at(
-            directory_fd, &present, &before) != 0) {
-        set_system_error(ERR_FILE_IO,
-                         "Cannot inspect retirement transition stage");
-        return -1;
-    }
-    if (!present) return 0;
-    fd = openat(directory_fd, CONFIG_RETIREMENT_STAGE_NAME,
-                O_RDONLY | O_CLOEXEC | O_NOFOLLOW | O_NONBLOCK);
-    if (fd < 0 || fstat(fd, &opened) != 0 ||
-        !config_metadata_file_is_safe(&opened, true) ||
-        !config_metadata_snapshot_same(&before, &opened) ||
-        fstatat(directory_fd, CONFIG_RETIREMENT_STAGE_NAME, &named,
-                AT_SYMLINK_NOFOLLOW) != 0 ||
-        !config_metadata_snapshot_same(&opened, &named)) {
-        saved_errno = errno ? errno : ESTALE;
-        if (fd >= 0) close(fd);
-        errno = saved_errno;
-        set_system_error(ERR_FILE_IO,
-                         "Retirement transition stage changed during recovery");
-        return -1;
-    }
-    if (unlinkat(directory_fd, CONFIG_RETIREMENT_STAGE_NAME, 0) != 0) {
-        saved_errno = errno ? errno : EIO;
-        close(fd);
-        errno = saved_errno;
-        set_system_error(ERR_FILE_IO,
-                         "Cannot remove retained retirement transition stage");
-        return -1;
-    }
-    if (close(fd) != 0 || fsync(directory_fd) != 0) {
-        saved_errno = errno ? errno : EIO;
-        errno = saved_errno;
-        set_system_error(ERR_FILE_IO,
-                         "Cannot durably remove retirement transition stage");
         return -1;
     }
     return 0;
@@ -3832,16 +5033,38 @@ static int config_retirement_guard_stage_write_at(
 
 static int config_retirement_guard_stage_publish_at(
     int directory_fd, const char *destination,
-    const struct stat *stage_identity, struct stat *published_identity) {
-    struct stat named;
+    const struct stat *stage_identity,
+    const unsigned char *stage_data, size_t stage_length,
+    struct stat *published_identity) {
+    struct stat named = {0};
+    struct stat retained_source;
+    int publish_outcome;
 
     if (directory_fd < 0 || !destination || !stage_identity ||
+        (!stage_data && stage_length != 0U) ||
         !published_identity) {
         errno = EINVAL;
         return -1;
     }
-    if (renameat(directory_fd, CONFIG_RETIREMENT_STAGE_NAME,
-                 directory_fd, destination) != 0 ||
+    publish_outcome = config_publish_noreplace_at(
+        directory_fd, CONFIG_RETIREMENT_STAGE_NAME,
+        destination, stage_identity, &retained_source);
+    if (publish_outcome == CONFIG_PUBLISH_OUTCOME_UNCERTAIN) {
+        errno = EINPROGRESS;
+        set_system_error(
+            ERR_FILE_IO,
+            "Retirement guard publication outcome is uncertain");
+        return -1;
+    }
+    if (publish_outcome ==
+        CONFIG_PUBLISH_INSTALLED_SOURCE_RETAINED) {
+        errno = EINPROGRESS;
+        set_system_error(
+            ERR_FILE_IO,
+            "Retirement guard was installed with its exact fixed recovery stage retained");
+        return -1;
+    }
+    if (publish_outcome < 0 ||
         fstatat(directory_fd, destination, &named,
                 AT_SYMLINK_NOFOLLOW) != 0 ||
         !config_metadata_file_is_safe(&named, true) ||
@@ -3853,30 +5076,626 @@ static int config_retirement_guard_stage_publish_at(
     return 0;
 }
 
+#if defined(__FreeBSD__)
+static bool config_retirement_guard_exact_hardlink_at(
+    int directory_fd, const char *name, int fd,
+    const unsigned char *expected, size_t expected_length) {
+    unsigned char observed[CONFIG_RETIREMENT_GUARD_MAX_BYTES];
+    unsigned char extra;
+    struct stat opened;
+    struct stat named;
+    struct stat after;
+    struct stat named_after;
+    ssize_t extra_count;
+
+    if (directory_fd < 0 || !name || fd < 0 || !expected ||
+        expected_length == 0U ||
+        expected_length > sizeof(observed) ||
+        fstat(fd, &opened) != 0 ||
+        fstatat(directory_fd, name, &named, AT_SYMLINK_NOFOLLOW) != 0 ||
+        !S_ISREG(opened.st_mode) || opened.st_uid != getuid() ||
+        (opened.st_mode & 0777) != PERM_USER_RW ||
+        opened.st_nlink != 2 ||
+        opened.st_size < 0 ||
+        (uintmax_t)opened.st_size != expected_length ||
+        !config_metadata_snapshot_same(&opened, &named) ||
+        !config_pread_full(fd, observed, expected_length, 0) ||
+        memcmp(observed, expected, expected_length) != 0) {
+        return false;
+    }
+    do {
+        errno = 0;
+        extra_count = pread(fd, &extra, 1, (off_t)expected_length);
+    } while (extra_count < 0 && errno == EINTR);
+    return extra_count == 0 &&
+           fstat(fd, &after) == 0 &&
+           fstatat(directory_fd, name, &named_after,
+                   AT_SYMLINK_NOFOLLOW) == 0 &&
+           config_metadata_snapshot_same(&opened, &after) &&
+           config_metadata_snapshot_same(&opened, &named_after);
+}
+#endif
+
+static int config_retirement_guard_move_noreplace_at(
+    int directory_fd, const char *source, const char *destination,
+    const struct stat *expected_identity,
+    const unsigned char *expected_data, size_t expected_length,
+    struct stat *published_identity, bool *committed) {
+    struct stat source_now;
+
+    if (committed) *committed = false;
+    if (directory_fd < 0 || !source || !destination ||
+        !expected_identity || !expected_data ||
+        expected_length == 0U || !published_identity ||
+        config_reprove_published_file_at(
+            directory_fd, source, expected_identity, expected_data,
+            expected_length, &source_now) != 0) {
+        errno = errno ? errno : ESTALE;
+        return -1;
+    }
+#if defined(__linux__) && defined(SYS_renameat2)
+#ifndef RENAME_NOREPLACE
+#define RENAME_NOREPLACE (1U)
+#endif
+    if (syscall(
+            SYS_renameat2, directory_fd, source, directory_fd,
+            destination, RENAME_NOREPLACE) != 0) {
+        return -1;
+    }
+    if (committed) *committed = true;
+#elif defined(__APPLE__) && defined(RENAME_EXCL)
+    if (renameatx_np(
+            directory_fd, source, directory_fd, destination,
+            RENAME_EXCL) != 0) {
+        return -1;
+    }
+    if (committed) *committed = true;
+#elif defined(__FreeBSD__)
+    {
+        struct stat opened;
+        int source_fd = openat(
+            directory_fd, source,
+            O_RDONLY | O_CLOEXEC | O_NOFOLLOW | O_NONBLOCK);
+        int saved_errno;
+
+        if (source_fd < 0 || fstat(source_fd, &opened) != 0 ||
+            !config_metadata_matches_after_exact_content_proof(
+                &source_now, &opened) ||
+            linkat(
+                directory_fd, source, directory_fd,
+                destination, 0) != 0 ||
+            !config_retirement_guard_exact_hardlink_at(
+                directory_fd, destination, source_fd,
+                expected_data, expected_length)) {
+            saved_errno = errno ? errno : ESTALE;
+            if (source_fd >= 0) {
+                (void)funlinkat(
+                    directory_fd, destination, source_fd, 0);
+                (void)close(source_fd);
+            }
+            errno = saved_errno;
+            return -1;
+        }
+        if (funlinkat(
+                directory_fd, source, source_fd, 0) != 0 ||
+            fstat(source_fd, &source_now) != 0) {
+            saved_errno = errno ? errno : EIO;
+            (void)funlinkat(
+                directory_fd, destination, source_fd, 0);
+            (void)close(source_fd);
+            errno = saved_errno;
+            return -1;
+        }
+        if (committed) *committed = true;
+        (void)close(source_fd);
+    }
+#else
+    errno = ENOTSUP;
+    return -1;
+#endif
+    if (strcmp(destination, CONFIG_RETIREMENT_COMPLETE_NAME) == 0 &&
+        RETIREMENT_GUARD_CLEAR_TEST_CHECKPOINT(
+            RETIREMENT_GUARD_CLEAR_AFTER_NAMESPACE_COMMIT,
+            directory_fd, destination) != 0) {
+        errno = errno ? errno : EIO;
+        return -1;
+    }
+    if (config_reprove_published_file_at(
+            directory_fd, destination, &source_now, expected_data,
+            expected_length, published_identity) != 0) {
+        errno = errno ? errno : ESTALE;
+        return -1;
+    }
+    return 0;
+}
+
+/* Existing-destination publication is serialized by the authoritative
+ * config API lock. POSIX rename is the only cross-platform atomic replacement
+ * primitive; Linux/Darwin provide no inode-conditioned CAS form. The syscall
+ * is therefore the commit boundary for cooperating writers. Once it succeeds,
+ * `committed` remains true even if an independent post-commit proof faults or
+ * a same-UID process outside the supported writer protocol supersedes it. */
+static int config_replace_exact_name_at(
+    int directory_fd, const char *source,
+    const struct stat *source_identity,
+    const unsigned char *source_data, size_t source_length,
+    const char *destination,
+    const struct stat *destination_identity,
+    const unsigned char *destination_data, size_t destination_length,
+    const char *settled_prefix, struct stat *published_identity,
+    bool *committed) {
+    struct stat source_now;
+    struct stat destination_now;
+    int checkpoint_result;
+
+    (void)settled_prefix;
+    if (committed) *committed = false;
+    if (directory_fd < 0 || !source || !source_identity ||
+        !source_data || !destination || !destination_identity ||
+        !published_identity || !committed ||
+        (((source_identity->st_mode & 0777) == PERM_USER_RW)
+             ? config_reprove_published_file_at(
+                   directory_fd, source, source_identity, source_data,
+                   source_length, &source_now)
+             : config_reprove_existing_file_at(
+                   directory_fd, source, source_identity, source_data,
+                   source_length, &source_now)) != 0) {
+        errno = errno ? errno : ESTALE;
+        return -1;
+    }
+    if (destination_data) {
+        if (config_reprove_existing_file_at(
+                directory_fd, destination, destination_identity,
+                destination_data, destination_length,
+                &destination_now) != 0) {
+            return -1;
+        }
+    } else if (fstatat(
+                   directory_fd, destination, &destination_now,
+                   AT_SYMLINK_NOFOLLOW) != 0 ||
+               !config_metadata_file_is_safe(&destination_now, false) ||
+               !config_metadata_snapshot_same(
+                   destination_identity, &destination_now)) {
+        errno = errno ? errno : ESTALE;
+        return -1;
+    }
+    if (CONFIG_REPLACE_TEST_CHECKPOINT(
+            CONFIG_REPLACE_BEFORE_FINAL_PROOF,
+            directory_fd, destination) != 0) {
+        errno = errno ? errno : ESTALE;
+        return -1;
+    }
+    if (destination_data) {
+        if (config_reprove_existing_file_at(
+                directory_fd, destination, &destination_now,
+                destination_data, destination_length,
+                &destination_now) != 0) {
+            return -1;
+        }
+    } else if (fstatat(
+                   directory_fd, destination, &destination_now,
+                   AT_SYMLINK_NOFOLLOW) != 0 ||
+               !config_metadata_snapshot_same(
+                   destination_identity, &destination_now)) {
+        errno = errno ? errno : ESTALE;
+        return -1;
+    }
+    if (renameat(
+            directory_fd, source,
+            directory_fd, destination) != 0) {
+        return -1;
+    }
+    *committed = true;
+    checkpoint_result = CONFIG_REPLACE_TEST_CHECKPOINT(
+        CONFIG_REPLACE_AFTER_EXCHANGE,
+        directory_fd, destination);
+    if (((source_now.st_mode & 0777) == PERM_USER_RW
+             ? config_reprove_published_file_at(
+                   directory_fd, destination, &source_now,
+                   source_data, source_length, published_identity)
+             : config_reprove_existing_file_at(
+                   directory_fd, destination, &source_now,
+                   source_data, source_length, published_identity)) == 0 ||
+        config_reprove_existing_file_at(
+            directory_fd, destination, &source_now,
+            source_data, source_length, published_identity) == 0) {
+        return 0;
+    }
+    errno = checkpoint_result != 0 && errno == 0 ? EIO : ESTALE;
+    return -1;
+}
+
+
+/* Publish a prepared terminal stage without overwriting an unproved pathname
+ * generation. The namespace syscall is the terminal commit point: after the
+ * business barrier has run, a lost proof or bypass-writer supersession must
+ * consume the guard instead of granting retry authority. */
+static int config_retirement_guard_publish_prepared_at(
+    config_retirement_guard_t *guard,
+    struct stat *published_identity, bool *committed) {
+    struct stat stage_now;
+    struct stat published_now;
+    const char *source_name = CONFIG_RETIREMENT_STAGE_NAME;
+
+    if (committed) *committed = false;
+    if (!guard || !published_identity || !committed ||
+        !guard->prepared || !guard->marker_data) {
+        errno = EINVAL;
+        return -1;
+    }
+    if (config_reprove_published_file_at(
+            guard->directory_fd, CONFIG_RETIREMENT_STAGE_NAME,
+            &guard->prepared_stage_identity, guard->marker_data,
+            guard->marker_length, &stage_now) != 0) {
+#if !defined(__FreeBSD__)
+        if (guard->completion_absent ||
+            guard->prepared_slot_name[0] == '\0' ||
+            config_reprove_published_file_at(
+                guard->directory_fd, guard->prepared_slot_name,
+                &guard->prepared_stage_identity, guard->marker_data,
+                guard->marker_length, &stage_now) != 0) {
+            errno = errno ? errno : ESTALE;
+            return -1;
+        }
+        source_name = guard->prepared_slot_name;
+#else
+        errno = errno ? errno : ESTALE;
+        return -1;
+#endif
+    }
+    if (guard->completion_absent) {
+        if (config_retirement_guard_move_noreplace_at(
+                guard->directory_fd, source_name,
+                CONFIG_RETIREMENT_COMPLETE_NAME, &stage_now,
+                guard->marker_data, guard->marker_length,
+                &published_now, committed) != 0) {
+            return -1;
+        }
+        *published_identity = published_now;
+        return 0;
+    }
+
+    if (!guard->completion_data ||
+        config_reprove_published_file_at(
+            guard->directory_fd, CONFIG_RETIREMENT_COMPLETE_NAME,
+            &guard->completion_identity, guard->completion_data,
+            guard->completion_length, &published_now) != 0) {
+        errno = errno ? errno : ESTALE;
+        return -1;
+    }
+
+#if defined(__FreeBSD__)
+    {
+        struct stat backup_identity;
+        struct stat marker_now;
+        int completion_fd = -1;
+        int saved_errno = ESTALE;
+        bool backup_created = false;
+        bool completion_removed = false;
+        bool marker_published = false;
+        bool marker_committed = false;
+
+        if (guard->prepared_slot_name[0] == '\0') {
+            errno = ENOSPC;
+            return -1;
+        }
+        completion_fd = openat(
+            guard->directory_fd, CONFIG_RETIREMENT_COMPLETE_NAME,
+            O_RDONLY | O_CLOEXEC | O_NOFOLLOW | O_NONBLOCK);
+        if (completion_fd < 0 ||
+            fstat(completion_fd, &backup_identity) != 0 ||
+            !config_metadata_matches_after_exact_content_proof(
+                &guard->completion_identity, &backup_identity)) {
+            goto freebsd_fail;
+        }
+        if (linkat(
+                guard->directory_fd,
+                CONFIG_RETIREMENT_COMPLETE_NAME,
+                guard->directory_fd,
+                guard->prepared_slot_name, 0) != 0) {
+            goto freebsd_fail;
+        }
+        backup_created = true;
+        if (RETIREMENT_GUARD_CLEAR_TEST_CHECKPOINT(
+                RETIREMENT_GUARD_CLEAR_AFTER_SETTLED_SLOT_MOVE,
+                guard->directory_fd,
+                guard->prepared_slot_name) != 0) {
+            goto freebsd_fail;
+        }
+        if (!config_retirement_guard_exact_hardlink_at(
+                guard->directory_fd, guard->prepared_slot_name,
+                completion_fd,
+                guard->completion_data, guard->completion_length) ||
+            funlinkat(
+                guard->directory_fd, CONFIG_RETIREMENT_COMPLETE_NAME,
+                completion_fd, 0) != 0) {
+            goto freebsd_fail;
+        }
+        completion_removed = true;
+        if (fstat(completion_fd, &backup_identity) != 0 ||
+            config_retirement_guard_move_noreplace_at(
+                guard->directory_fd, CONFIG_RETIREMENT_STAGE_NAME,
+                CONFIG_RETIREMENT_COMPLETE_NAME,
+                &stage_now, guard->marker_data, guard->marker_length,
+                &published_now, &marker_committed) != 0) {
+            saved_errno = errno ? errno : ESTALE;
+            if (marker_committed) *committed = true;
+            goto freebsd_fail_saved;
+        }
+        marker_published = true;
+        *committed = true;
+        if (config_reprove_published_file_at(
+                guard->directory_fd,
+                CONFIG_RETIREMENT_GUARD_NAME,
+                &guard->marker_identity, guard->marker_data,
+                guard->marker_length, &marker_now) != 0 ||
+            config_reprove_published_file_at(
+                guard->directory_fd,
+                CONFIG_RETIREMENT_COMPLETE_NAME, &stage_now,
+                guard->marker_data, guard->marker_length,
+                &published_now) != 0 ||
+            !config_named_directory_matches(
+                guard->directory, &guard->directory_identity) ||
+            verify_private_lock_file_at(
+                guard->lock_fd, guard->directory_fd,
+                CONFIG_RETIREMENT_LOCK_NAME) != 0) {
+            saved_errno = errno ? errno : ESTALE;
+            goto freebsd_fail_saved;
+        }
+        if (funlinkat(
+                guard->directory_fd, guard->prepared_slot_name,
+                completion_fd, 0) != 0) {
+            log_warning(
+                "Retirement completion committed but prior-certificate slot cleanup failed: %s",
+                strerror(errno ? errno : EIO));
+        }
+        (void)close(completion_fd);
+        *published_identity = published_now;
+        return 0;
+
+freebsd_fail:
+        saved_errno = errno ? errno : ESTALE;
+freebsd_fail_saved:
+        if ((marker_published || marker_committed) &&
+            config_reprove_existing_file_at(
+                guard->directory_fd,
+                CONFIG_RETIREMENT_COMPLETE_NAME, &stage_now,
+                guard->marker_data, guard->marker_length,
+                &published_now) == 0) {
+            if (funlinkat(
+                    guard->directory_fd, guard->prepared_slot_name,
+                    completion_fd, 0) != 0) {
+                log_warning(
+                    "Retirement completion committed but prior-certificate slot cleanup failed: %s",
+                    strerror(errno ? errno : EIO));
+            }
+            (void)close(completion_fd);
+            *published_identity = published_now;
+            return 0;
+        }
+        if (completion_removed &&
+            fstat(completion_fd, &backup_identity) == 0) {
+            (void)config_retirement_guard_move_noreplace_at(
+                guard->directory_fd, guard->prepared_slot_name,
+                CONFIG_RETIREMENT_COMPLETE_NAME, &backup_identity,
+                guard->completion_data, guard->completion_length,
+                &backup_identity, NULL);
+        } else if (backup_created && completion_fd >= 0) {
+            (void)funlinkat(
+                guard->directory_fd, guard->prepared_slot_name,
+                completion_fd, 0);
+        }
+        if (completion_fd >= 0) (void)close(completion_fd);
+        errno = saved_errno;
+        return -1;
+    }
+#else
+    {
+        config_exchange_result_t exchanged;
+        struct stat displaced_now;
+        struct stat slot_now;
+        bool published_exact;
+        bool displaced_exact;
+
+        if (guard->prepared_slot_name[0] == '\0') {
+            errno = ENOSPC;
+            return -1;
+        }
+        if (strcmp(source_name, guard->prepared_slot_name) != 0 &&
+            config_retirement_guard_move_noreplace_at(
+                guard->directory_fd, source_name,
+                guard->prepared_slot_name, &stage_now,
+                guard->marker_data, guard->marker_length,
+                &slot_now, NULL) != 0) {
+            return -1;
+        }
+        if (strcmp(source_name, guard->prepared_slot_name) == 0) {
+            slot_now = stage_now;
+        }
+        guard->prepared_stage_identity = slot_now;
+        if (RETIREMENT_GUARD_CLEAR_TEST_CHECKPOINT(
+                RETIREMENT_GUARD_CLEAR_AFTER_SETTLED_SLOT_MOVE,
+                guard->directory_fd,
+                guard->prepared_slot_name) != 0 ||
+            config_reprove_published_file_at(
+                guard->directory_fd, guard->prepared_slot_name,
+                &slot_now, guard->marker_data, guard->marker_length,
+                &slot_now) != 0 ||
+            config_reprove_published_file_at(
+                guard->directory_fd, CONFIG_RETIREMENT_COMPLETE_NAME,
+                &guard->completion_identity, guard->completion_data,
+                guard->completion_length, &published_now) != 0) {
+            errno = errno ? errno : ESTALE;
+            return -1;
+        }
+        exchanged = config_exchange_names_at(
+            guard->directory_fd, guard->prepared_slot_name,
+            CONFIG_RETIREMENT_COMPLETE_NAME);
+        if (exchanged != CONFIG_EXCHANGE_OK) {
+            errno = exchanged == CONFIG_EXCHANGE_UNSUPPORTED
+                        ? ENOTSUP
+                        : (errno ? errno : EIO);
+            return -1;
+        }
+        *committed = true;
+        if (RETIREMENT_GUARD_CLEAR_TEST_CHECKPOINT(
+                RETIREMENT_GUARD_CLEAR_AFTER_NAMESPACE_COMMIT,
+                guard->directory_fd,
+                CONFIG_RETIREMENT_COMPLETE_NAME) != 0) {
+            errno = errno ? errno : EIO;
+            return -1;
+        }
+        published_exact =
+            config_reprove_published_file_at(
+                guard->directory_fd, CONFIG_RETIREMENT_COMPLETE_NAME,
+                &stage_now, guard->marker_data, guard->marker_length,
+                &published_now) == 0;
+        if (!published_exact) {
+            published_exact =
+                config_reprove_existing_file_at(
+                    guard->directory_fd,
+                    CONFIG_RETIREMENT_COMPLETE_NAME,
+                    &stage_now, guard->marker_data,
+                    guard->marker_length, &published_now) == 0;
+        }
+        displaced_exact =
+            config_reprove_published_file_at(
+                guard->directory_fd, guard->prepared_slot_name,
+                &guard->completion_identity, guard->completion_data,
+                guard->completion_length, &displaced_now) == 0;
+        if (!published_exact) {
+            /* Never exchange on rollback after losing exact authority over
+             * the canonical side. A cooperating writer cannot enter here;
+             * preserving a detectable bypass-writer substitution is safer
+             * than moving it through an unconditional SWAP. */
+            errno = ESTALE;
+            return -1;
+        }
+        if (!displaced_exact) {
+            log_warning(
+                "Retirement completion committed while its prior-certificate slot changed");
+        }
+        *published_identity = published_now;
+        return 0;
+    }
+#endif
+}
+
 static void config_retirement_guard_free(
     config_retirement_guard_t *guard) {
+    bool owned_here;
+
     if (!guard) return;
-    if (g_retirement_guard_owner_pid == getpid()) {
+    owned_here = guard->owner_pid == getpid() &&
+                 g_retirement_guard_owner_pid == getpid();
+    if (owned_here) {
+        g_retirement_guard_owner_pid = 0;
+    } else if (g_retirement_guard_owner_pid != getpid()) {
+        /* Discard the fork child's inherited process-local ownership token;
+         * only the parent's copy remains authoritative. */
         g_retirement_guard_owner_pid = 0;
     }
-    if (guard->lock_fd >= 0) unlock_private_file(guard->lock_fd);
-    if (guard->directory_fd >= 0) close(guard->directory_fd);
+    /* The opaque token is not the descriptor that carries flock: the private
+     * lock registry retains that inode descriptor. In a fork child, discard
+     * the entire inherited registry epoch without LOCK_UN, then never close
+     * the stale numeric token separately (the reset may already have closed
+     * it, and its number can subsequently be reused). */
+    if (guard->lock_fd >= 0) {
+        if (owned_here) {
+            unlock_private_file(guard->lock_fd);
+        } else {
+            runtime_state_lock_abandon_inherited();
+        }
+    }
+    /* A foreign process cannot prove that this number still denotes the
+     * inherited open file description, even when fstat reports the same
+     * directory inode after close/reopen ABA. Forget it without closing. */
+    if (owned_here && guard->directory_fd >= 0) {
+        close(guard->directory_fd);
+    }
     if (guard->marker_data) {
         secure_zero_memory(guard->marker_data, guard->marker_length);
         free(guard->marker_data);
     }
+    if (guard->completion_data) {
+        secure_zero_memory(
+            guard->completion_data, guard->completion_length);
+        free(guard->completion_data);
+    }
     secure_zero_memory(guard, sizeof(*guard));
     free(guard);
+}
+
+static bool config_retirement_guard_handle_is_structurally_valid(
+    const config_retirement_guard_t *guard) {
+    return guard && guard->directory_fd >= 0 && guard->lock_fd >= 0 &&
+           guard->directory_fd != guard->lock_fd &&
+           guard->owner_pid == getpid() &&
+           g_retirement_guard_owner_pid == getpid() &&
+           memchr(guard->directory, '\0', sizeof(guard->directory)) &&
+           guard->directory[0] == '/' &&
+           config_metadata_dir_is_safe(&guard->directory_identity) &&
+           guard->marker_data && guard->marker_length > 0U &&
+           guard->marker_length <= CONFIG_RETIREMENT_GUARD_MAX_BYTES &&
+           config_metadata_file_is_safe(&guard->marker_identity, true) &&
+           account_incarnation_is_valid(guard->token) &&
+           ((guard->completion_absent && !guard->completion_data &&
+             guard->completion_length == 0U) ||
+            (!guard->completion_absent && guard->completion_data &&
+             guard->completion_length > 0U &&
+             guard->completion_length <=
+                 CONFIG_RETIREMENT_GUARD_MAX_BYTES &&
+             config_metadata_file_is_safe(
+                 &guard->completion_identity, true))) &&
+           (!guard->prepared ||
+            config_metadata_file_is_safe(
+                &guard->prepared_stage_identity, true));
+}
+
+static int config_retirement_guard_require_live_handle(
+    const config_retirement_guard_t *guard, const char *operation) {
+    if (!config_retirement_guard_handle_is_structurally_valid(guard) ||
+        guard->barrier_active) {
+        errno = EINVAL;
+        set_error(ERR_INVALID_ARGS,
+                  "Invalid or re-entrant retirement guard %s handle",
+                  operation);
+        return -1;
+    }
+    if (verify_private_lock_file_at(
+            guard->lock_fd, guard->directory_fd,
+            CONFIG_RETIREMENT_LOCK_NAME) != 0) {
+        errno = ESTALE;
+        set_system_error(
+            ERR_FILE_IO,
+            "Retirement lifecycle lock changed before %s",
+            operation);
+        return -1;
+    }
+    return 0;
 }
 
 static int config_retirement_guard_make_handle(
     int directory_fd, int lock_fd, const char *directory,
     const struct stat *directory_identity, const struct stat *marker_identity,
     unsigned char *marker_data, size_t marker_length,
+    bool completion_absent, const struct stat *completion_identity,
+    unsigned char *completion_data, size_t completion_length,
     const char token[ACCOUNT_INCARNATION_LEN], bool created,
     config_retirement_guard_t **out) {
-    config_retirement_guard_t *guard = calloc(1, sizeof(*guard));
+    config_retirement_guard_t *guard;
 
+    if ((!completion_absent &&
+         (!completion_identity || !completion_data ||
+          completion_length == 0U)) ||
+        (completion_absent &&
+         (completion_data || completion_length != 0U))) {
+        errno = EINVAL;
+        set_error(ERR_INVALID_ARGS,
+                  "Invalid retirement guard completion generation");
+        return -1;
+    }
+    guard = calloc(1, sizeof(*guard));
     if (!guard) {
         set_error(ERR_MEMORY_ALLOCATION,
                   "Cannot allocate retirement guard handle");
@@ -3884,10 +5703,17 @@ static int config_retirement_guard_make_handle(
     }
     guard->directory_fd = directory_fd;
     guard->lock_fd = lock_fd;
+    guard->owner_pid = getpid();
     guard->directory_identity = *directory_identity;
     guard->marker_identity = *marker_identity;
     guard->marker_data = marker_data;
     guard->marker_length = marker_length;
+    guard->completion_absent = completion_absent;
+    if (!completion_absent) {
+        guard->completion_identity = *completion_identity;
+        guard->completion_data = completion_data;
+        guard->completion_length = completion_length;
+    }
     memcpy(guard->token, token, sizeof(guard->token));
     guard->created = created;
     if (safe_strncpy(guard->directory, directory,
@@ -3896,6 +5722,7 @@ static int config_retirement_guard_make_handle(
         guard->directory_fd = -1;
         guard->lock_fd = -1;
         guard->marker_data = NULL;
+        guard->completion_data = NULL;
         free(guard);
         return -1;
     }
@@ -3914,9 +5741,11 @@ int config_retirement_guard_install_or_adopt_with_ssh_alias_obligation(
     config_retirement_guard_pair_t pair;
     config_retirement_guard_pair_t revalidated_pair;
     char directory[MAX_PATH_LEN];
+    char settled_slot[64] = "";
     char token[ACCOUNT_INCARNATION_LEN];
     struct stat directory_identity;
     struct stat published_identity;
+    struct stat prior_settled_identity;
     struct stat stage_identity;
     unsigned char *marker_data = NULL;
     size_t marker_length = 0U;
@@ -3925,6 +5754,7 @@ int config_retirement_guard_install_or_adopt_with_ssh_alias_obligation(
     int result = -1;
     int saved_errno = EIO;
     bool legacy_residue = false;
+    bool prior_marker_moved = false;
 
     if (!guard || *guard || !config_path ||
         !config_retirement_kind_name(kind) ||
@@ -3982,13 +5812,22 @@ int config_retirement_guard_install_or_adopt_with_ssh_alias_obligation(
             "A retained retirement guard clear witness blocks configuration mutation");
         goto install_done;
     }
-    if (config_retirement_guard_stage_remove_at(directory_fd) != 0 ||
-        config_retirement_guard_pair_read_at(
+    if (config_retirement_guard_pair_read_at(
             directory_fd, &pair) != 0 ||
         !config_named_directory_matches(
             directory, &directory_identity)) {
         if (errno == 0) errno = ESTALE;
         goto install_done;
+    }
+    if (pair.stage_present) {
+        if (config_retirement_guard_reconcile_exact_stage_at(
+                directory_fd, directory, &directory_identity,
+                &pair, &revalidated_pair) != 0) {
+            goto install_done;
+        }
+        config_retirement_guard_pair_clear(&pair);
+        pair = revalidated_pair;
+        memset(&revalidated_pair, 0, sizeof(revalidated_pair));
     }
 
     if (!pair.marker_absent &&
@@ -4014,11 +5853,17 @@ int config_retirement_guard_install_or_adopt_with_ssh_alias_obligation(
                 &revalidated_pair.marker_identity,
                 revalidated_pair.marker_data,
                 revalidated_pair.marker_length,
+                revalidated_pair.completion_absent,
+                &revalidated_pair.completion_identity,
+                revalidated_pair.completion_data,
+                revalidated_pair.completion_length,
                 token, false, guard) != 0) {
             goto install_done;
         }
         revalidated_pair.marker_data = NULL;
         revalidated_pair.marker_length = 0U;
+        revalidated_pair.completion_data = NULL;
+        revalidated_pair.completion_length = 0U;
         directory_fd = -1;
         lock_fd = -1;
         result = 0;
@@ -4029,6 +5874,12 @@ int config_retirement_guard_install_or_adopt_with_ssh_alias_obligation(
         set_error(
             ERR_CONFIG_INVALID,
             "A lone retirement completion certificate blocks configuration mutation");
+        goto install_done;
+    }
+    if (config_retirement_guard_pair_exact(&pair) &&
+        config_retirement_guard_select_settled_slot_at(
+            directory_fd, settled_slot,
+            sizeof(settled_slot)) != 0) {
         goto install_done;
     }
 
@@ -4069,9 +5920,37 @@ int config_retirement_guard_install_or_adopt_with_ssh_alias_obligation(
         if (errno == 0) errno = ESTALE;
         goto install_done;
     }
+    if (config_retirement_guard_pair_exact(&pair)) {
+        if (config_retirement_guard_move_noreplace_at(
+                directory_fd, CONFIG_RETIREMENT_GUARD_NAME,
+                settled_slot, &pair.marker_identity,
+                pair.marker_data, pair.marker_length,
+                &prior_settled_identity, NULL) != 0) {
+            set_system_error(
+                ERR_FILE_IO,
+                "Cannot preserve the prior retirement guard generation");
+            goto install_done;
+        }
+        prior_marker_moved = true;
+    }
     if (config_retirement_guard_stage_publish_at(
             directory_fd, CONFIG_RETIREMENT_GUARD_NAME,
-            &stage_identity, &published_identity) != 0) {
+            &stage_identity, marker_data, marker_length,
+            &published_identity) != 0) {
+        if (prior_marker_moved) {
+            struct stat settled_identity;
+
+            if (config_reprove_published_file_at(
+                    directory_fd, settled_slot,
+                    &pair.marker_identity, pair.marker_data,
+                    pair.marker_length, &settled_identity) == 0) {
+                (void)config_retirement_guard_move_noreplace_at(
+                    directory_fd, settled_slot,
+                    CONFIG_RETIREMENT_GUARD_NAME,
+                    &settled_identity, pair.marker_data,
+                    pair.marker_length, &settled_identity, NULL);
+            }
+        }
         set_system_error(
             ERR_FILE_IO,
             "Cannot publish the fresh retirement guard generation");
@@ -4114,14 +5993,30 @@ int config_retirement_guard_install_or_adopt_with_ssh_alias_obligation(
             "Fresh retirement guard is not a stable blocking generation");
         goto install_done;
     }
+#if defined(__FreeBSD__)
+    if (prior_marker_moved &&
+        config_retire_exact_name_at(
+            directory_fd, settled_slot, &prior_settled_identity,
+            pair.completion_data, pair.completion_length,
+            CONFIG_RETIREMENT_SETTLED_PREFIX) != 0) {
+        set_system_error(
+            ERR_FILE_IO,
+            "Cannot retire the prior FreeBSD guard generation");
+        goto install_done;
+    }
+#endif
     if (config_retirement_guard_make_handle(
             directory_fd, lock_fd, directory, &directory_identity,
             &pair.marker_identity, marker_data, marker_length,
+            pair.completion_absent, &pair.completion_identity,
+            pair.completion_data, pair.completion_length,
             token, true, guard) != 0) {
         goto install_done;
     }
     marker_data = NULL;
     marker_length = 0U;
+    pair.completion_data = NULL;
+    pair.completion_length = 0U;
     directory_fd = -1;
     lock_fd = -1;
     result = 0;
@@ -4397,11 +6292,17 @@ int config_retirement_guard_adopt_with_ssh_alias_obligation(
             &adopted_pair->marker_identity,
             adopted_pair->marker_data,
             adopted_pair->marker_length,
+            adopted_pair->completion_absent,
+            &adopted_pair->completion_identity,
+            adopted_pair->completion_data,
+            adopted_pair->completion_length,
             token, false, guard) != 0) {
         goto adopt_done;
     }
     adopted_pair->marker_data = NULL;
     adopted_pair->marker_length = 0U;
+    adopted_pair->completion_data = NULL;
+    adopted_pair->completion_length = 0U;
     directory_fd = -1;
     lock_fd = -1;
     result = 0;
@@ -4498,31 +6399,89 @@ static bool config_retirement_guard_pair_matches_handle(
            strcmp(guard->token, pair->marker_model.token) == 0;
 }
 
+/* A handle authorizes replacement only of the completion namespace generation
+ * it originally observed. Exact bytes permit a ctime-only UFS successor, but
+ * insertion, removal, inode replacement, or content change fails closed. */
+static bool config_retirement_guard_completion_matches_handle(
+    const config_retirement_guard_t *guard,
+    const config_retirement_guard_pair_t *pair) {
+    return guard && pair &&
+           config_retirement_guard_record_same(
+               guard->completion_absent, &guard->completion_identity,
+               guard->completion_data, guard->completion_length,
+               pair->completion_absent, &pair->completion_identity,
+               pair->completion_data, pair->completion_length);
+}
+
+static int config_retirement_guard_prepared_source_exact_at(
+    const config_retirement_guard_t *guard,
+    const config_retirement_guard_pair_t *pair,
+    struct stat *identity) {
+    if (!guard || !pair || !identity) {
+        errno = EINVAL;
+        return -1;
+    }
+    if (pair->stage_present) {
+        if (config_retirement_guard_exact_stage_at(
+                guard->directory_fd, pair, identity) != 0) {
+            return -1;
+        }
+    } else {
+#if !defined(__FreeBSD__)
+        if (guard->prepared_slot_name[0] == '\0' ||
+            config_reprove_published_file_at(
+                guard->directory_fd, guard->prepared_slot_name,
+                &guard->prepared_stage_identity, guard->marker_data,
+                guard->marker_length, identity) != 0) {
+            errno = errno ? errno : ESTALE;
+            return -1;
+        }
+#else
+        errno = ESTALE;
+        return -1;
+#endif
+    }
+    return config_metadata_matches_after_exact_content_proof(
+               &guard->prepared_stage_identity, identity)
+               ? 0
+               : (errno = ESTALE, -1);
+}
+
 int config_retirement_guard_revalidate(
     const config_retirement_guard_t *guard) {
     config_retirement_guard_pair_t pair;
+    struct stat stage_identity;
     int result = -1;
     int saved_errno = EIO;
 
-    if (!guard || guard->directory_fd < 0 || guard->lock_fd < 0 ||
-        !guard->marker_data || guard->marker_length == 0U ||
-        g_retirement_guard_owner_pid != getpid()) {
-        errno = EINVAL;
-        set_error(ERR_INVALID_ARGS,
-                  "Invalid retirement guard revalidation handle");
+    if (config_retirement_guard_require_live_handle(
+            guard, "revalidation") != 0) {
         return -1;
     }
     memset(&pair, 0, sizeof(pair));
+    memset(&stage_identity, 0, sizeof(stage_identity));
     errno = 0;
     if (config_retirement_guard_pair_read_at(
             guard->directory_fd, &pair) != 0) {
         saved_errno = errno ? errno : EIO;
         goto revalidate_done;
     }
-    if (pair.stage_present || !pair.completion_absent ||
-        !config_retirement_guard_pair_matches_handle(guard, &pair) ||
+    if ((guard->prepared &&
+         (!config_retirement_guard_pair_matches_handle(guard, &pair) ||
+          !config_retirement_guard_completion_matches_handle(
+              guard, &pair) ||
+          config_retirement_guard_prepared_source_exact_at(
+              guard, &pair, &stage_identity) != 0)) ||
+        (!guard->prepared &&
+         (pair.stage_present ||
+          !config_retirement_guard_completion_matches_handle(
+              guard, &pair) ||
+          !config_retirement_guard_pair_matches_handle(guard, &pair))) ||
         !config_named_directory_matches(
-            guard->directory, &guard->directory_identity)) {
+            guard->directory, &guard->directory_identity) ||
+        verify_private_lock_file_at(
+            guard->lock_fd, guard->directory_fd,
+            CONFIG_RETIREMENT_LOCK_NAME) != 0) {
         saved_errno = ESTALE;
         errno = saved_errno;
         set_error(
@@ -4541,16 +6500,175 @@ revalidate_done:
     return result;
 }
 
-int config_retirement_guard_clear(
+int config_retirement_guard_prepare_clear(
+    config_retirement_guard_t *guard) {
+    config_retirement_guard_pair_t pair;
+    config_retirement_guard_pair_t reconciled_pair;
+    struct stat stage_identity;
+    int saved_errno = EIO;
+
+    if (config_retirement_guard_require_live_handle(
+            guard, "clear preparation") != 0) {
+        return -1;
+    }
+    if (guard->prepared) {
+        errno = EINVAL;
+        set_error(ERR_INVALID_ARGS,
+                  "Invalid retirement guard clear preparation handle");
+        return -1;
+    }
+    memset(&pair, 0, sizeof(pair));
+    memset(&reconciled_pair, 0, sizeof(reconciled_pair));
+    memset(&stage_identity, 0, sizeof(stage_identity));
+
+    if (!config_named_directory_matches(
+            guard->directory, &guard->directory_identity) ||
+        config_retirement_guard_pair_read_at(
+            guard->directory_fd, &pair) != 0 ||
+        !config_retirement_guard_pair_matches_handle(guard, &pair) ||
+        !config_retirement_guard_completion_matches_handle(
+            guard, &pair) ||
+        !config_named_directory_matches(
+            guard->directory, &guard->directory_identity)) {
+        saved_errno = errno ? errno : ESTALE;
+        if (get_last_error()->message[0] == '\0') {
+            set_system_error(
+                ERR_FILE_IO,
+                "Retirement guard generation changed before clear preparation");
+        }
+        goto prepare_fail;
+    }
+    if (!guard->completion_absent &&
+        config_retirement_guard_prepare_settled_slot_at(
+            guard, &pair) != 0) {
+        saved_errno = errno ? errno : ENOSPC;
+        goto prepare_fail;
+    }
+    if (pair.stage_present) {
+        if (config_retirement_guard_reconcile_exact_stage_at(
+                guard->directory_fd, guard->directory,
+                &guard->directory_identity, &pair,
+                &reconciled_pair) != 0) {
+            saved_errno = errno ? errno : ESTALE;
+            goto prepare_fail;
+        }
+        config_retirement_guard_pair_clear(&pair);
+        pair = reconciled_pair;
+        memset(&reconciled_pair, 0, sizeof(reconciled_pair));
+        if (pair.stage_present ||
+            !config_retirement_guard_pair_matches_handle(
+                guard, &pair) ||
+            !config_retirement_guard_completion_matches_handle(
+                guard, &pair)) {
+            saved_errno = ESTALE;
+            errno = saved_errno;
+            set_error(
+                ERR_CONFIG_INVALID,
+                "Retirement transition cleanup changed the owned generation");
+            goto prepare_fail;
+        }
+    }
+    config_retirement_guard_pair_clear(&pair);
+
+    if (config_retirement_guard_stage_write_at(
+            guard->directory_fd, guard->marker_data,
+            guard->marker_length, true, &stage_identity) != 0 ||
+        RETIREMENT_GUARD_CLEAR_TEST_CHECKPOINT(
+            RETIREMENT_GUARD_CLEAR_BEFORE_DIR_SYNC,
+            guard->directory_fd, CONFIG_RETIREMENT_STAGE_NAME) != 0 ||
+        fsync(guard->directory_fd) != 0) {
+        saved_errno = errno ? errno : EIO;
+        if (get_last_error()->message[0] == '\0') {
+            set_system_error(
+                ERR_FILE_IO,
+                "Cannot durably prepare retirement completion stage");
+        }
+        goto prepare_fail;
+    }
+    if (config_retirement_guard_pair_read_at(
+            guard->directory_fd, &pair) != 0 ||
+        !pair.stage_present ||
+        !config_retirement_guard_pair_matches_handle(guard, &pair) ||
+        !config_retirement_guard_completion_matches_handle(
+            guard, &pair) ||
+        config_retirement_guard_exact_stage_at(
+            guard->directory_fd, &pair, &stage_identity) != 0 ||
+        !config_named_directory_matches(
+            guard->directory, &guard->directory_identity) ||
+        verify_private_lock_file_at(
+            guard->lock_fd, guard->directory_fd,
+            CONFIG_RETIREMENT_LOCK_NAME) != 0) {
+        saved_errno = errno ? errno : ESTALE;
+        if (get_last_error()->message[0] == '\0') {
+            set_system_error(
+                ERR_FILE_IO,
+                "Prepared retirement completion stage changed during durability proof");
+        }
+        goto prepare_fail;
+    }
+
+    guard->prepared_stage_identity = stage_identity;
+    if (!guard->completion_absent) {
+        guard->completion_identity = pair.completion_identity;
+    }
+    guard->prepared = true;
+    config_retirement_guard_pair_clear(&pair);
+    config_retirement_guard_pair_clear(&reconciled_pair);
+    clear_error();
+    errno = 0;
+    return 0;
+
+prepare_fail:
+    config_retirement_guard_pair_clear(&pair);
+    config_retirement_guard_pair_clear(&reconciled_pair);
+    errno = saved_errno;
+    return -1;
+}
+
+/* Once the prepared stage rename succeeds, no filesystem observation may
+ * intervene before the in-memory capability is destroyed. Descriptor cleanup
+ * follows only after the handle and its marker copy no longer exist. */
+static void config_retirement_guard_finish_prepared_commit(
     config_retirement_guard_t **guard_ptr) {
+    config_retirement_guard_t *guard = *guard_ptr;
+    unsigned char *marker_data = guard->marker_data;
+    size_t marker_length = guard->marker_length;
+    unsigned char *completion_data = guard->completion_data;
+    size_t completion_length = guard->completion_length;
+    int directory_fd = guard->directory_fd;
+    int lock_fd = guard->lock_fd;
+
+    if (g_retirement_guard_owner_pid == getpid()) {
+        g_retirement_guard_owner_pid = 0;
+    }
+    *guard_ptr = NULL;
+    secure_zero_memory(marker_data, marker_length);
+    free(marker_data);
+    if (completion_data) {
+        secure_zero_memory(completion_data, completion_length);
+        free(completion_data);
+    }
+    secure_zero_memory(guard, sizeof(*guard));
+    free(guard);
+
+    if (lock_fd >= 0) unlock_private_file(lock_fd);
+    if (directory_fd >= 0) close(directory_fd);
+}
+
+int config_retirement_guard_clear_with_barrier(
+    config_retirement_guard_t **guard_ptr,
+    config_retirement_guard_precommit_fn barrier, void *context) {
     config_retirement_guard_t *guard;
     config_retirement_guard_pair_t pair;
+    config_retirement_guard_pair_t reconciled_pair;
     struct stat published_identity;
     struct stat stage_identity;
+    struct stat revalidated_stage_identity;
     error_context_t primary_error;
     int primary_errno = 0;
     bool have_primary = false;
     bool publication_attempted = false;
+    bool publication_committed = false;
 
     if (!guard_ptr || !*guard_ptr) {
         errno = EINVAL;
@@ -4559,8 +6677,141 @@ int config_retirement_guard_clear(
         return -1;
     }
     guard = *guard_ptr;
+    if (config_retirement_guard_require_live_handle(
+            guard, "clear") != 0) {
+        return -1;
+    }
+    if (barrier && !guard->prepared) {
+        errno = EINVAL;
+        set_error(
+            ERR_INVALID_ARGS,
+            "Retirement guard commit barrier requires a prepared handle");
+        return -1;
+    }
     memset(&pair, 0, sizeof(pair));
+    memset(&reconciled_pair, 0, sizeof(reconciled_pair));
+    memset(&revalidated_stage_identity, 0,
+           sizeof(revalidated_stage_identity));
     memset(&primary_error, 0, sizeof(primary_error));
+
+    if (guard->prepared) {
+        if (RETIREMENT_GUARD_CLEAR_TEST_CHECKPOINT(
+                RETIREMENT_GUARD_CLEAR_BEFORE_PUBLISH,
+                guard->directory_fd,
+                CONFIG_RETIREMENT_COMPLETE_NAME) != 0) {
+            set_system_error(
+                ERR_FILE_IO,
+                "Prepared retirement completion failed before commit");
+            goto clear_fail;
+        }
+        if (config_retirement_guard_pair_read_at(
+                guard->directory_fd, &pair) != 0 ||
+            !config_retirement_guard_pair_matches_handle(guard, &pair) ||
+            !config_retirement_guard_completion_matches_handle(
+                guard, &pair) ||
+            config_retirement_guard_prepared_source_exact_at(
+                guard, &pair, &stage_identity) != 0 ||
+            !config_named_directory_matches(
+                guard->directory, &guard->directory_identity) ||
+            verify_private_lock_file_at(
+                guard->lock_fd, guard->directory_fd,
+                CONFIG_RETIREMENT_LOCK_NAME) != 0) {
+            if (errno == 0) errno = ESTALE;
+            if (get_last_error()->message[0] == '\0') {
+                set_system_error(
+                    ERR_FILE_IO,
+                    "Prepared retirement completion generation changed before commit");
+            }
+            goto clear_fail;
+        }
+        config_retirement_guard_pair_clear(&pair);
+        if (barrier) {
+            int barrier_result;
+
+            guard->barrier_active = true;
+            barrier_result = barrier(context);
+            guard->barrier_active = false;
+            if (barrier_result != 0) {
+                error_context_t barrier_error = *get_last_error();
+                int barrier_errno = errno;
+
+                g_last_error = barrier_error;
+                errno = barrier_errno;
+                goto clear_fail;
+            }
+        }
+        if (RETIREMENT_GUARD_CLEAR_TEST_CHECKPOINT(
+                RETIREMENT_GUARD_CLEAR_AFTER_BARRIER_BEFORE_RENAME,
+                guard->directory_fd,
+                CONFIG_RETIREMENT_COMPLETE_NAME) != 0) {
+            set_system_error(
+                ERR_FILE_IO,
+                "Prepared retirement completion failed after commit barrier");
+            goto clear_fail;
+        }
+        /* The barrier may execute arbitrary retirement bookkeeping and is
+         * therefore a proof-separation boundary. Revalidate every capability
+         * immediately afterward: canonical marker, prior completion,
+         * prepared source, pinned directory, and named lifecycle lock. */
+        if (config_retirement_guard_revalidate(guard) != 0) {
+            if (errno == 0) errno = ESTALE;
+            set_system_error(
+                ERR_FILE_IO,
+                "Prepared retirement completion changed after commit barrier");
+            goto clear_fail;
+        }
+        if (config_retirement_guard_publish_prepared_at(
+                guard, &published_identity,
+                &publication_committed) != 0) {
+            if (publication_committed) {
+                log_warning(
+                    "Retirement completion committed after the barrier but its acknowledgement was lost");
+                config_retirement_guard_finish_prepared_commit(
+                    guard_ptr);
+                clear_error();
+                errno = 0;
+                return 0;
+            }
+            set_system_error(
+                ERR_FILE_IO,
+                "Cannot commit prepared retirement completion");
+            goto clear_fail;
+        }
+        if (RETIREMENT_GUARD_CLEAR_TEST_CHECKPOINT(
+                RETIREMENT_GUARD_CLEAR_AFTER_PREPARED_PUBLISH,
+                guard->directory_fd,
+                CONFIG_RETIREMENT_COMPLETE_NAME) != 0) {
+            log_warning(
+                "Retirement completion post-publication acknowledgement was lost");
+        }
+        if (config_retirement_guard_pair_read_at(
+                guard->directory_fd, &pair) != 0 ||
+            pair.stage_present ||
+            !config_retirement_guard_pair_matches_handle(
+                guard, &pair) ||
+            !config_retirement_guard_pair_exact(&pair) ||
+            !config_metadata_same_file(
+                &published_identity, &pair.completion_identity) ||
+            !config_named_directory_matches(
+                guard->directory, &guard->directory_identity) ||
+            verify_private_lock_file_at(
+                guard->lock_fd, guard->directory_fd,
+                CONFIG_RETIREMENT_LOCK_NAME) != 0) {
+            config_retirement_guard_pair_clear(&pair);
+            log_warning(
+                "Retirement completion committed while its final canonical proof was superseded or unavailable");
+            config_retirement_guard_finish_prepared_commit(
+                guard_ptr);
+            clear_error();
+            errno = 0;
+            return 0;
+        }
+        config_retirement_guard_pair_clear(&pair);
+        config_retirement_guard_finish_prepared_commit(guard_ptr);
+        clear_error();
+        errno = 0;
+        return 0;
+    }
 
     if (!config_named_directory_matches(
             guard->directory, &guard->directory_identity)) {
@@ -4571,16 +6822,11 @@ int config_retirement_guard_clear(
         goto clear_fail;
     }
 
-    if (config_retirement_guard_stage_remove_at(
-            guard->directory_fd) != 0) {
-        primary_error = *get_last_error();
-        primary_errno = errno ? errno : EIO;
-        have_primary = true;
-        goto classify_commit;
-    }
     if (config_retirement_guard_pair_read_at(
             guard->directory_fd, &pair) != 0 ||
         !config_retirement_guard_pair_matches_handle(
+            guard, &pair) ||
+        !config_retirement_guard_completion_matches_handle(
             guard, &pair) ||
         !config_named_directory_matches(
             guard->directory, &guard->directory_identity)) {
@@ -4592,8 +6838,47 @@ int config_retirement_guard_clear(
         }
         goto clear_fail;
     }
+    if (pair.stage_present) {
+        if (config_retirement_guard_reconcile_exact_stage_at(
+                guard->directory_fd, guard->directory,
+                &guard->directory_identity, &pair,
+                &reconciled_pair) != 0) {
+            primary_error = *get_last_error();
+            primary_errno = errno ? errno : EIO;
+            have_primary = true;
+            goto classify_commit;
+        }
+        config_retirement_guard_pair_clear(&pair);
+        pair = reconciled_pair;
+        memset(&reconciled_pair, 0, sizeof(reconciled_pair));
+        if (pair.stage_present ||
+            !config_retirement_guard_pair_matches_handle(
+                guard, &pair) ||
+            !config_retirement_guard_completion_matches_handle(
+                guard, &pair)) {
+            errno = ESTALE;
+            set_error(
+                ERR_CONFIG_INVALID,
+                "Retirement transition cleanup changed the owned generation");
+            goto clear_fail;
+        }
+    }
     if (config_retirement_guard_pair_exact(&pair)) {
+        if (verify_private_lock_file_at(
+                guard->lock_fd, guard->directory_fd,
+                CONFIG_RETIREMENT_LOCK_NAME) != 0) {
+            errno = ESTALE;
+            set_system_error(
+                ERR_FILE_IO,
+                "Retirement lifecycle lock changed before completion");
+            goto clear_fail;
+        }
         goto clear_success;
+    }
+    if (!guard->completion_absent &&
+        config_retirement_guard_prepare_settled_slot_at(
+            guard, &pair) != 0) {
+        goto clear_fail;
     }
     config_retirement_guard_pair_clear(&pair);
 
@@ -4610,11 +6895,50 @@ int config_retirement_guard_clear(
             "Retirement completion failed before certificate publication");
         goto clear_fail;
     }
+    if (config_retirement_guard_pair_read_at(
+            guard->directory_fd, &pair) != 0 ||
+        !pair.stage_present ||
+        !config_retirement_guard_pair_matches_handle(guard, &pair) ||
+        !config_retirement_guard_completion_matches_handle(
+            guard, &pair) ||
+        config_retirement_guard_exact_stage_at(
+            guard->directory_fd, &pair,
+            &revalidated_stage_identity) != 0 ||
+        !config_metadata_matches_after_exact_content_proof(
+            &stage_identity, &revalidated_stage_identity) ||
+        !config_named_directory_matches(
+            guard->directory, &guard->directory_identity)) {
+        if (errno == 0) errno = ESTALE;
+        if (get_last_error()->message[0] == '\0') {
+            set_system_error(
+                ERR_FILE_IO,
+                "Retirement completion generation changed before publication");
+        }
+        goto clear_fail;
+    }
+    stage_identity = revalidated_stage_identity;
+    config_retirement_guard_pair_clear(&pair);
 
+    if (verify_private_lock_file_at(
+            guard->lock_fd, guard->directory_fd,
+            CONFIG_RETIREMENT_LOCK_NAME) != 0) {
+        errno = ESTALE;
+        set_system_error(
+            ERR_FILE_IO,
+            "Retirement lifecycle lock changed before certificate publication");
+        goto clear_fail;
+    }
+    guard->prepared_stage_identity = stage_identity;
+    guard->prepared = true;
     publication_attempted = true;
-    if (config_retirement_guard_stage_publish_at(
-            guard->directory_fd, CONFIG_RETIREMENT_COMPLETE_NAME,
-            &stage_identity, &published_identity) != 0) {
+    if (config_retirement_guard_publish_prepared_at(
+            guard, &published_identity,
+            &publication_committed) != 0) {
+        if (publication_committed) {
+            log_warning(
+                "Retirement completion committed but its acknowledgement was lost");
+            goto clear_success;
+        }
         primary_error = *get_last_error();
         primary_errno = errno ? errno : EIO;
         if (primary_error.message[0] == '\0') {
@@ -4701,6 +7025,7 @@ classify_commit:
 
 clear_success:
     config_retirement_guard_pair_clear(&pair);
+    config_retirement_guard_pair_clear(&reconciled_pair);
     config_retirement_guard_free(guard);
     *guard_ptr = NULL;
     clear_error();
@@ -4709,12 +7034,32 @@ clear_success:
 
 clear_fail:
     config_retirement_guard_pair_clear(&pair);
+    config_retirement_guard_pair_clear(&reconciled_pair);
     return -1;
+}
+
+int config_retirement_guard_clear(
+    config_retirement_guard_t **guard_ptr) {
+    return config_retirement_guard_clear_with_barrier(
+        guard_ptr, NULL, NULL);
 }
 
 void config_retirement_guard_abandon(
     config_retirement_guard_t **guard) {
     if (!guard || !*guard) return;
+    if ((*guard)->barrier_active &&
+        (*guard)->owner_pid == getpid()) {
+        errno = EBUSY;
+        set_error(
+            ERR_INVALID_ARGS,
+            "Cannot abandon a retirement guard from its commit barrier");
+        return;
+    }
+    /* A fork taken inside the barrier inherits barrier_active but never
+     * inherits its creator's authority. The child must still be able to
+     * discard that copied handle: free() closes only its descriptor copies
+     * for a foreign owner and clears the child-local singleton without
+     * unlocking or mutating the parent's namespace. */
     /* clear() never removes or renames the canonical blocker. A failed
      * transition may retain the one fixed stage, which probe also classifies
      * as blocked; releasing the lifecycle lock cannot reopen mutation. */
@@ -4724,9 +7069,12 @@ void config_retirement_guard_abandon(
 
 #define CONFIG_SWITCH_GUARD_NAME ".switch-incomplete"
 #define CONFIG_SWITCH_STAGE_NAME ".switch-transition"
+#define CONFIG_SWITCH_NORMALIZE_NAME ".switch-normalize"
 #define CONFIG_SWITCH_LOCK_NAME ".switch.lock"
-#define CONFIG_SWITCH_GUARD_HEADER "gitswitch-switch-incomplete-v2"
-#define CONFIG_SWITCH_GUARD_MAX_BYTES (64U * 1024U)
+#define CONFIG_SWITCH_GUARD_HEADER "gitswitch-switch-incomplete-v3"
+#define CONFIG_SWITCH_GUARD_METADATA_MAX_BYTES (64U * 1024U)
+#define CONFIG_SWITCH_GUARD_MAX_BYTES \
+    (CONFIG_SWITCH_GUARD_METADATA_MAX_BYTES + CONFIG_DOCUMENT_MAX_SIZE)
 #define CONFIG_SWITCH_SOURCE_CONVERGENCE_MAX 3U
 
 typedef struct {
@@ -4751,13 +7099,16 @@ typedef struct {
     struct stat marker_identity;
     unsigned char *marker_data;
     size_t marker_length;
+    unsigned char *source_witness;
+    size_t source_witness_length;
     config_switch_guard_model_t marker_model;
 } config_switch_guard_snapshot_t;
 
 typedef enum {
     CONFIG_SWITCH_PREINTENT_NONE = 0,
     CONFIG_SWITCH_PREINTENT_STAGE_ONLY,
-    CONFIG_SWITCH_PREINTENT_EXACT_PAIR
+    CONFIG_SWITCH_PREINTENT_EXACT_PAIR,
+    CONFIG_SWITCH_PREINTENT_NORMALIZED_PAIR
 } config_switch_preintent_kind_t;
 
 typedef struct {
@@ -4769,19 +7120,43 @@ typedef struct {
 struct config_switch_guard {
     int directory_fd;
     int lock_fd;
+    pid_t owner_pid;
     char directory[MAX_PATH_LEN];
     char config_name[MAX_PATH_LEN];
     struct stat directory_identity;
     struct stat marker_identity;
     unsigned char *marker_data;
     size_t marker_length;
+    unsigned char *source_witness;
+    size_t source_witness_length;
     config_switch_guard_model_t model;
     char token[ACCOUNT_INCARNATION_LEN];
     bool created;
     bool marker_unlinked;
 };
 
+#ifdef GITSWITCH_TESTING
+int gitswitch_test_switch_guard_directory_fd(
+    const config_switch_guard_t *guard) {
+    return guard ? guard->directory_fd : -1;
+}
+#endif
+
 static pid_t g_switch_guard_owner_pid;
+
+static int config_switch_guard_stage_write_at(
+    int directory_fd, const unsigned char *data, size_t length,
+    struct stat *stage_identity, bool *stage_created,
+    bool *stage_identity_known);
+static int config_switch_guard_named_write_at(
+    int directory_fd, const char *name,
+    const unsigned char *data, size_t length,
+    struct stat *identity, bool *created,
+    bool *identity_known);
+static int config_switch_guard_cleanup_owned_stage_at(
+    int directory_fd, int lock_fd, const char *directory,
+    const struct stat *directory_identity,
+    const struct stat *stage_identity, bool *stage_created);
 
 static bool config_switch_string_terminated(const char *value, size_t size) {
     return value && memchr(value, '\0', size) != NULL;
@@ -5227,15 +7602,19 @@ static int config_switch_writer_named_identity(
 }
 
 static int config_switch_guard_serialize(
-    const config_switch_guard_model_t *model, unsigned char **serialized,
-    size_t *serialized_length) {
+    const config_switch_guard_model_t *model,
+    const unsigned char *source_witness, size_t source_witness_length,
+    unsigned char **serialized, size_t *serialized_length) {
     config_switch_guard_writer_t writer;
     unsigned char *data;
     const char *preferred_scope;
     const char *effective_scope;
 
-    if (!serialized || !serialized_length ||
-        !config_switch_guard_model_valid(model)) {
+    if (!serialized || !serialized_length || !source_witness ||
+        source_witness_length == 0U ||
+        source_witness_length > CONFIG_DOCUMENT_MAX_SIZE ||
+        !config_switch_guard_model_valid(model) ||
+        model->source_generation.size != source_witness_length) {
         errno = EINVAL;
         set_error(ERR_INVALID_ARGS,
                   "Invalid switch guard serialization arguments");
@@ -5352,6 +7731,17 @@ static int config_switch_guard_serialize(
             free(data);
             return -1;
         }
+    }
+    if (writer.length > CONFIG_SWITCH_GUARD_METADATA_MAX_BYTES ||
+        config_switch_writer_printf(
+            &writer, "source_witness_length=%zu\n",
+            source_witness_length) != 0 ||
+        writer.length > CONFIG_SWITCH_GUARD_METADATA_MAX_BYTES ||
+        config_switch_writer_append(
+            &writer, source_witness, source_witness_length) != 0) {
+        secure_zero_memory(data, CONFIG_SWITCH_GUARD_MAX_BYTES);
+        free(data);
+        return -1;
     }
     *serialized = data;
     *serialized_length = writer.length;
@@ -5660,7 +8050,8 @@ static int config_switch_parse_bool(
 
 static int config_switch_guard_parse(
     const unsigned char *data, size_t length,
-    config_switch_guard_model_t *model) {
+    config_switch_guard_model_t *model,
+    unsigned char **source_witness, size_t *source_witness_length) {
     const unsigned char *cursor = data;
     const unsigned char *end;
     const unsigned char *line;
@@ -5669,13 +8060,17 @@ static int config_switch_guard_parse(
     size_t value_length;
     uintmax_t account_id;
     uintmax_t destination_count;
+    uintmax_t witness_length;
     unsigned char *canonical = NULL;
     size_t canonical_length = 0U;
 
     if (!data || length == 0U ||
-        length > CONFIG_SWITCH_GUARD_MAX_BYTES || !model) {
+        length > CONFIG_SWITCH_GUARD_MAX_BYTES || !model ||
+        !source_witness || !source_witness_length) {
         return config_switch_guard_malformed("invalid marker size");
     }
+    *source_witness = NULL;
+    *source_witness_length = 0U;
     memset(model, 0, sizeof(*model));
     end = data + length;
     if (!config_retirement_next_line(
@@ -5832,22 +8227,53 @@ static int config_switch_guard_parse(
                 "noncanonical or incomplete destination fields");
         }
     }
-    if (cursor != end) {
+    if (config_switch_read_field(
+            &cursor, end, "source_witness_length",
+            &value, &value_length) != 0 ||
+        config_switch_parse_uintmax(
+            value, value_length, CONFIG_DOCUMENT_MAX_SIZE,
+            &witness_length) != 0 ||
+        witness_length == 0U ||
+        witness_length != model->source_generation.size ||
+        witness_length > (uintmax_t)(end - cursor)) {
         secure_zero_memory(model, sizeof(*model));
         return config_switch_guard_malformed(
-            "noncanonical or trailing fields");
+            "invalid source witness length");
     }
+    *source_witness_length = (size_t)witness_length;
+    if ((size_t)(end - cursor) != *source_witness_length) {
+        secure_zero_memory(model, sizeof(*model));
+        *source_witness_length = 0U;
+        return config_switch_guard_malformed(
+            "noncanonical or trailing source witness");
+    }
+    *source_witness = malloc(*source_witness_length);
+    if (!*source_witness) {
+        secure_zero_memory(model, sizeof(*model));
+        *source_witness_length = 0U;
+        set_error(
+            ERR_MEMORY_ALLOCATION,
+            "Cannot allocate switch guard source witness");
+        return -1;
+    }
+    memcpy(*source_witness, cursor, *source_witness_length);
     model->target.id = (uint32_t)account_id;
     model->target.incarnation_persisted = true;
     if (!config_switch_guard_model_valid(model) ||
         config_switch_guard_serialize(
-            model, &canonical, &canonical_length) != 0 ||
+            model, *source_witness, *source_witness_length,
+            &canonical, &canonical_length) != 0 ||
         canonical_length != length ||
         memcmp(canonical, data, length) != 0) {
         if (canonical) {
             secure_zero_memory(canonical, canonical_length);
             free(canonical);
         }
+        secure_zero_memory(
+            *source_witness, *source_witness_length);
+        free(*source_witness);
+        *source_witness = NULL;
+        *source_witness_length = 0U;
         secure_zero_memory(model, sizeof(*model));
         return config_switch_guard_malformed(
             "noncanonical field value");
@@ -6246,16 +8672,29 @@ static int config_switch_guard_preintent_snapshot_at(
         snapshot->stage_identity = stage_before;
         return 0;
     }
-    if (!config_switch_guard_file_has_link_count(
-            &stage_before, (nlink_t)2) ||
-        !config_switch_guard_file_has_link_count(
-            &marker_before, (nlink_t)2) ||
-        !config_metadata_same_file(
+    if (config_switch_guard_file_has_link_count(
+            &stage_before, (nlink_t)2) &&
+        config_switch_guard_file_has_link_count(
+            &marker_before, (nlink_t)2) &&
+        config_metadata_same_file(
             &stage_before, &marker_before)) {
+        snapshot->kind = CONFIG_SWITCH_PREINTENT_EXACT_PAIR;
+    } else if (config_switch_guard_file_has_link_count(
+                   &stage_before, (nlink_t)1) &&
+               config_switch_guard_file_has_link_count(
+                   &marker_before, (nlink_t)1) &&
+               !config_metadata_same_file(
+                   &stage_before, &marker_before)) {
+        /* Crash-safe portable normalization replaces the canonical marker
+         * before retiring the old linked stage. The resulting distinct,
+         * private one-link pair is admitted only as a candidate; reconciliation
+         * still proves the complete byte image equal before deleting stage. */
+        snapshot->kind =
+            CONFIG_SWITCH_PREINTENT_NORMALIZED_PAIR;
+    } else {
         errno = EACCES;
         goto preintent_fail;
     }
-    snapshot->kind = CONFIG_SWITCH_PREINTENT_EXACT_PAIR;
     snapshot->stage_identity = stage_before;
     snapshot->marker_identity = marker_before;
     return 0;
@@ -6267,6 +8706,123 @@ preintent_fail:
         "Switch transition namespace is unsafe or changed");
     return -1;
 }
+
+#if !defined(__FreeBSD__)
+/* Linux and Darwin cannot unlink one pathname through a pinned descriptor.
+ * Before replacing the portable linkat() interruption pair, copy only a
+ * stable, exact two-link marker generation. The lifecycle lock excludes
+ * cooperating writers; repeated pathname proofs reject namespace
+ * substitution by a bypassing writer. */
+static int config_switch_guard_read_exact_pair_at(
+    int directory_fd,
+    const config_switch_preintent_snapshot_t *expected,
+    unsigned char **data, size_t *length) {
+    config_switch_guard_model_t model;
+    struct stat opened;
+    struct stat descriptor_after;
+    struct stat stage_after;
+    struct stat marker_after;
+    unsigned char *buffer = NULL;
+    unsigned char *source_witness = NULL;
+    size_t source_witness_length = 0U;
+    unsigned char trailing;
+    ssize_t trailing_count;
+    int fd = -1;
+    int failure_errno = ESTALE;
+
+    if (directory_fd < 0 || !expected ||
+        expected->kind != CONFIG_SWITCH_PREINTENT_EXACT_PAIR ||
+        !data || !length) {
+        errno = EINVAL;
+        return -1;
+    }
+    *data = NULL;
+    *length = 0U;
+    memset(&model, 0, sizeof(model));
+    if (expected->marker_identity.st_size <= 0 ||
+        (uintmax_t)expected->marker_identity.st_size >
+            CONFIG_SWITCH_GUARD_MAX_BYTES) {
+        failure_errno = EACCES;
+        goto pair_fail;
+    }
+    *length = (size_t)expected->marker_identity.st_size;
+    buffer = malloc(*length);
+    if (!buffer) {
+        failure_errno = ENOMEM;
+        set_error(
+            ERR_MEMORY_ALLOCATION,
+            "Cannot allocate switch pre-intent recovery buffer");
+        goto pair_fail_preserve_error;
+    }
+    fd = openat(
+        directory_fd, CONFIG_SWITCH_GUARD_NAME,
+        O_RDONLY | O_CLOEXEC | O_NOFOLLOW | O_NONBLOCK);
+    if (fd < 0 || fstat(fd, &opened) != 0 ||
+        !config_switch_guard_file_has_link_count(
+            &opened, (nlink_t)2) ||
+        !config_metadata_snapshot_same(
+            &expected->marker_identity, &opened) ||
+        !config_pread_full(fd, buffer, *length, 0)) {
+        failure_errno = errno ? errno : ESTALE;
+        goto pair_fail;
+    }
+    do {
+        errno = 0;
+        trailing_count = pread(fd, &trailing, 1, (off_t)*length);
+    } while (trailing_count < 0 && errno == EINTR);
+    if (trailing_count != 0 ||
+        fstat(fd, &descriptor_after) != 0 ||
+        fstatat(
+            directory_fd, CONFIG_SWITCH_STAGE_NAME, &stage_after,
+            AT_SYMLINK_NOFOLLOW) != 0 ||
+        fstatat(
+            directory_fd, CONFIG_SWITCH_GUARD_NAME, &marker_after,
+            AT_SYMLINK_NOFOLLOW) != 0 ||
+        !config_metadata_snapshot_same(&opened, &descriptor_after) ||
+        !config_metadata_snapshot_same(&opened, &stage_after) ||
+        !config_metadata_snapshot_same(&opened, &marker_after) ||
+        config_switch_guard_parse(
+            buffer, *length, &model, &source_witness,
+            &source_witness_length) != 0) {
+        failure_errno = errno ? errno : ESTALE;
+        goto pair_fail_preserve_error;
+    }
+    if (close(fd) != 0) {
+        fd = -1;
+        failure_errno = errno ? errno : EIO;
+        goto pair_fail;
+    }
+    fd = -1;
+    secure_zero_memory(source_witness, source_witness_length);
+    free(source_witness);
+    source_witness = NULL;
+    source_witness_length = 0U;
+    *data = buffer;
+    secure_zero_memory(&model, sizeof(model));
+    return 0;
+
+pair_fail:
+    set_system_error(
+        ERR_FILE_IO,
+        "Cannot read the exact switch pre-intent recovery pair");
+pair_fail_preserve_error:
+    if (fd >= 0) (void)close(fd);
+    if (buffer) {
+        secure_zero_memory(buffer, *length);
+        free(buffer);
+    }
+    if (source_witness) {
+        secure_zero_memory(source_witness, source_witness_length);
+        free(source_witness);
+    }
+    *data = NULL;
+    *length = 0U;
+    secure_zero_memory(&model, sizeof(model));
+    errno = failure_errno;
+    return -1;
+}
+
+#endif
 
 static int config_switch_guard_name_stable_at(
     int directory_fd, const char *name, bool absent,
@@ -6306,22 +8862,26 @@ static int config_switch_guard_name_stable_at(
 }
 
 static int config_switch_guard_read_named_at(
-    int directory_fd, bool *absent, unsigned char **data,
-    size_t *length, struct stat *identity,
-    config_switch_guard_model_t *model) {
-    struct stat named_before;
+    int directory_fd, const char *name, bool *absent,
+    unsigned char **data, size_t *length, struct stat *identity,
+    config_switch_guard_model_t *model,
+    unsigned char **source_witness, size_t *source_witness_length) {
     struct stat opened;
     struct stat descriptor_after;
     struct stat named_after;
-    struct stat named_closed;
+    struct stat proof_expected;
+    struct stat reproved;
     unsigned char *buffer = NULL;
     unsigned char trailing;
     ssize_t trailing_count;
     int fd = -1;
     int failure_errno = ESTALE;
+    bool proof_converged = false;
 
-    if (directory_fd < 0 || !absent || !data || !length ||
-        !identity || !model) {
+    if (directory_fd < 0 || !name || name[0] == '\0' ||
+        strchr(name, '/') || !absent || !data || !length ||
+        !identity || !model || !source_witness ||
+        !source_witness_length) {
         errno = EINVAL;
         set_error(ERR_INVALID_ARGS,
                   "Invalid switch guard read arguments");
@@ -6330,13 +8890,15 @@ static int config_switch_guard_read_named_at(
     *absent = false;
     *data = NULL;
     *length = 0U;
+    *source_witness = NULL;
+    *source_witness_length = 0U;
     memset(identity, 0, sizeof(*identity));
     memset(model, 0, sizeof(*model));
 
-    errno = 0;
-    if (fstatat(
-            directory_fd, CONFIG_SWITCH_GUARD_NAME, &named_before,
-            AT_SYMLINK_NOFOLLOW) != 0) {
+    fd = openat(
+        directory_fd, name,
+        O_RDONLY | O_CLOEXEC | O_NOFOLLOW | O_NONBLOCK);
+    if (fd < 0) {
         if (errno == ENOENT) {
             *absent = true;
             return 0;
@@ -6344,22 +8906,11 @@ static int config_switch_guard_read_named_at(
         failure_errno = errno ? errno : EIO;
         goto read_fail;
     }
-    if (!config_metadata_file_is_safe(&named_before, true) ||
-        named_before.st_size <= 0 ||
-        (uintmax_t)named_before.st_size >
-            CONFIG_SWITCH_GUARD_MAX_BYTES) {
-        failure_errno = EACCES;
-        goto read_fail;
-    }
-    fd = openat(
-        directory_fd, CONFIG_SWITCH_GUARD_NAME,
-        O_RDONLY | O_CLOEXEC | O_NOFOLLOW | O_NONBLOCK);
-    if (fd < 0 || fstat(fd, &opened) != 0) {
+    if (fstat(fd, &opened) != 0) {
         failure_errno = errno ? errno : EIO;
         goto read_fail;
     }
     if (!config_metadata_file_is_safe(&opened, true) ||
-        !config_metadata_snapshot_same(&named_before, &opened) ||
         opened.st_size <= 0 ||
         (uintmax_t)opened.st_size >
             CONFIG_SWITCH_GUARD_MAX_BYTES) {
@@ -6385,7 +8936,7 @@ static int config_switch_guard_read_named_at(
     if (trailing_count != 0 ||
         fstat(fd, &descriptor_after) != 0 ||
         fstatat(
-            directory_fd, CONFIG_SWITCH_GUARD_NAME, &named_after,
+            directory_fd, name, &named_after,
             AT_SYMLINK_NOFOLLOW) != 0) {
         failure_errno = errno ? errno : ESTALE;
         goto read_fail;
@@ -6393,14 +8944,22 @@ static int config_switch_guard_read_named_at(
     if (!config_metadata_file_is_safe(&descriptor_after, true) ||
         !config_metadata_file_is_safe(&named_after, true) ||
         !config_metadata_snapshot_same(&opened, &descriptor_after) ||
-        !config_metadata_snapshot_same(&opened, &named_after)) {
+        !config_metadata_snapshot_same(
+            &descriptor_after, &named_after)) {
         failure_errno = ESTALE;
         goto read_fail;
     }
     if (config_switch_guard_parse(
-            buffer, *length, model) != 0) {
+            buffer, *length, model, source_witness,
+            source_witness_length) != 0) {
         failure_errno = errno ? errno : EINVAL;
         goto read_fail_preserve_error;
+    }
+    if (SWITCH_GUARD_TEST_CHECKPOINT(
+            SWITCH_GUARD_READ_AFTER_EXACT_DESCRIPTOR_PROOF,
+            directory_fd) != 0) {
+        failure_errno = errno ? errno : EIO;
+        goto read_fail;
     }
     if (close(fd) != 0) {
         fd = -1;
@@ -6409,26 +8968,37 @@ static int config_switch_guard_read_named_at(
     }
     fd = -1;
 
-    /* FreeBSD UFS may materialize a reader-induced ctime update only after
-     * close. The complete marker bytes and canonical model were just proved
-     * through this descriptor, so refresh the pathname generation while
-     * admitting only that narrow metadata transition. */
-    errno = 0;
-    if (fstatat(
-            directory_fd, CONFIG_SWITCH_GUARD_NAME, &named_closed,
-            AT_SYMLINK_NOFOLLOW) != 0) {
-        failure_errno = config_is_namespace_change_errno(errno)
-                            ? ESTALE
-                            : (errno ? errno : EIO);
-        goto read_fail;
+    /* Anchor every post-close refresh to the exact bytes read through the
+     * original descriptor. FreeBSD UFS may reveal ctime in more than one
+     * delayed step, so converge only across ctime-only successors and repeat
+     * the complete byte proof at each step. */
+    proof_expected = descriptor_after;
+    for (size_t attempt = 0U;
+         attempt < CONFIG_SWITCH_SOURCE_CONVERGENCE_MAX;
+         attempt++) {
+        if (config_reprove_published_file_at(
+                directory_fd, name, &proof_expected,
+                buffer, *length, &reproved) != 0) {
+            failure_errno = errno ? errno : ESTALE;
+            goto read_fail;
+        }
+        if (config_metadata_snapshot_same(
+                &proof_expected, &reproved)) {
+            proof_converged = true;
+            break;
+        }
+        if (!config_metadata_ctime_only_change(
+                &proof_expected, &reproved)) {
+            failure_errno = ESTALE;
+            goto read_fail;
+        }
+        proof_expected = reproved;
     }
-    if (!config_metadata_file_is_safe(&named_closed, true) ||
-        !config_metadata_matches_after_exact_content_proof(
-            &descriptor_after, &named_closed)) {
+    if (!proof_converged) {
         failure_errno = ESTALE;
         goto read_fail;
     }
-    *identity = named_closed;
+    *identity = reproved;
     *data = buffer;
     return 0;
 
@@ -6436,13 +9006,21 @@ read_fail:
     errno = failure_errno;
     set_system_error(
         ERR_FILE_IO,
-        "Cannot read a stable private switch-incomplete marker");
+        "Cannot read a stable private switch recovery name: %s",
+        name);
 read_fail_preserve_error:
     if (fd >= 0) close(fd);
     if (buffer) {
         secure_zero_memory(buffer, *length);
         free(buffer);
     }
+    if (*source_witness) {
+        secure_zero_memory(
+            *source_witness, *source_witness_length);
+        free(*source_witness);
+    }
+    *source_witness = NULL;
+    *source_witness_length = 0U;
     *data = NULL;
     *length = 0U;
     secure_zero_memory(model, sizeof(*model));
@@ -6457,6 +9035,12 @@ static void config_switch_guard_snapshot_clear(
         secure_zero_memory(
             snapshot->marker_data, snapshot->marker_length);
         free(snapshot->marker_data);
+    }
+    if (snapshot->source_witness) {
+        secure_zero_memory(
+            snapshot->source_witness,
+            snapshot->source_witness_length);
+        free(snapshot->source_witness);
     }
     secure_zero_memory(snapshot, sizeof(*snapshot));
 }
@@ -6475,10 +9059,13 @@ static int config_switch_guard_snapshot_read_at(
             directory_fd, &snapshot->stage_present,
             &snapshot->stage_identity) != 0 ||
         config_switch_guard_read_named_at(
-            directory_fd, &snapshot->marker_absent,
+            directory_fd, CONFIG_SWITCH_GUARD_NAME,
+            &snapshot->marker_absent,
             &snapshot->marker_data, &snapshot->marker_length,
             &snapshot->marker_identity,
-            &snapshot->marker_model) != 0 ||
+            &snapshot->marker_model,
+            &snapshot->source_witness,
+            &snapshot->source_witness_length) != 0 ||
         SWITCH_GUARD_TEST_CHECKPOINT(
             SWITCH_GUARD_SNAPSHOT_AFTER_MARKER_READ,
             directory_fd) != 0 ||
@@ -6509,12 +9096,210 @@ snapshot_fail:
     return -1;
 }
 
+static int config_switch_guard_normalized_pair_equal_at(
+    int directory_fd,
+    const config_switch_preintent_snapshot_t *expected,
+    bool *equal) {
+    config_switch_guard_model_t *stage_model = NULL;
+    config_switch_guard_model_t *marker_model = NULL;
+    struct stat stage_identity;
+    struct stat marker_identity;
+    unsigned char *stage_data = NULL;
+    unsigned char *marker_data = NULL;
+    unsigned char *stage_witness = NULL;
+    unsigned char *marker_witness = NULL;
+    size_t stage_length = 0U;
+    size_t marker_length = 0U;
+    size_t stage_witness_length = 0U;
+    size_t marker_witness_length = 0U;
+    bool stage_absent = false;
+    bool marker_absent = false;
+    int result = -1;
+
+    if (directory_fd < 0 || !expected || !equal ||
+        expected->kind != CONFIG_SWITCH_PREINTENT_NORMALIZED_PAIR) {
+        errno = EINVAL;
+        return -1;
+    }
+    *equal = false;
+    stage_model = calloc(1U, sizeof(*stage_model));
+    marker_model = calloc(1U, sizeof(*marker_model));
+    if (!stage_model || !marker_model) {
+        set_error(
+            ERR_MEMORY_ALLOCATION,
+            "Cannot allocate switch normalization proof state");
+        goto pair_done;
+    }
+    if (config_switch_guard_read_named_at(
+            directory_fd, CONFIG_SWITCH_STAGE_NAME,
+            &stage_absent, &stage_data, &stage_length,
+            &stage_identity, stage_model,
+            &stage_witness, &stage_witness_length) != 0 ||
+        config_switch_guard_read_named_at(
+            directory_fd, CONFIG_SWITCH_GUARD_NAME,
+            &marker_absent, &marker_data, &marker_length,
+            &marker_identity, marker_model,
+            &marker_witness, &marker_witness_length) != 0 ||
+        stage_absent || marker_absent ||
+        !config_metadata_matches_after_exact_content_proof(
+            &expected->stage_identity, &stage_identity) ||
+        !config_metadata_matches_after_exact_content_proof(
+            &expected->marker_identity, &marker_identity)) {
+        if (errno == 0) errno = ESTALE;
+        goto pair_done;
+    }
+    *equal = stage_length == marker_length &&
+             memcmp(stage_data, marker_data, stage_length) == 0;
+    result = 0;
+
+pair_done:
+    if (stage_data) {
+        secure_zero_memory(stage_data, stage_length);
+        free(stage_data);
+    }
+    if (marker_data) {
+        secure_zero_memory(marker_data, marker_length);
+        free(marker_data);
+    }
+    if (stage_witness) {
+        secure_zero_memory(stage_witness, stage_witness_length);
+        free(stage_witness);
+    }
+    if (marker_witness) {
+        secure_zero_memory(marker_witness, marker_witness_length);
+        free(marker_witness);
+    }
+    if (stage_model) {
+        secure_zero_memory(stage_model, sizeof(*stage_model));
+        free(stage_model);
+    }
+    if (marker_model) {
+        secure_zero_memory(marker_model, sizeof(*marker_model));
+        free(marker_model);
+    }
+    return result;
+}
+
+static int config_switch_guard_reconcile_distinct_pair_at(
+    int directory_fd,
+    const config_switch_preintent_snapshot_t *expected,
+    struct stat *marker_identity) {
+    config_switch_guard_model_t *stage_model = NULL;
+    config_switch_guard_model_t *marker_model = NULL;
+    struct stat stage_identity;
+    struct stat current_marker_identity;
+    unsigned char *stage_data = NULL;
+    unsigned char *marker_data = NULL;
+    unsigned char *stage_witness = NULL;
+    unsigned char *marker_witness = NULL;
+    size_t stage_length = 0U;
+    size_t marker_length = 0U;
+    size_t stage_witness_length = 0U;
+    size_t marker_witness_length = 0U;
+    bool stage_absent = false;
+    bool marker_absent = false;
+    int failure_errno = ESTALE;
+    int result = -1;
+
+    if (directory_fd < 0 || !expected ||
+        expected->kind != CONFIG_SWITCH_PREINTENT_NORMALIZED_PAIR ||
+        !marker_identity) {
+        errno = EINVAL;
+        return -1;
+    }
+    stage_model = calloc(1U, sizeof(*stage_model));
+    marker_model = calloc(1U, sizeof(*marker_model));
+    if (!stage_model || !marker_model) {
+        failure_errno = ENOMEM;
+        set_error(
+            ERR_MEMORY_ALLOCATION,
+            "Cannot allocate switch pre-intent reconciliation state");
+        goto distinct_done;
+    }
+    memset(&stage_identity, 0, sizeof(stage_identity));
+    memset(&current_marker_identity, 0, sizeof(current_marker_identity));
+    if (config_switch_guard_read_named_at(
+            directory_fd, CONFIG_SWITCH_STAGE_NAME,
+            &stage_absent, &stage_data, &stage_length,
+            &stage_identity, stage_model,
+            &stage_witness, &stage_witness_length) != 0 ||
+        config_switch_guard_read_named_at(
+            directory_fd, CONFIG_SWITCH_GUARD_NAME,
+            &marker_absent, &marker_data, &marker_length,
+            &current_marker_identity, marker_model,
+            &marker_witness, &marker_witness_length) != 0 ||
+        stage_absent || marker_absent ||
+        !config_metadata_matches_after_exact_content_proof(
+            &expected->stage_identity, &stage_identity) ||
+        !config_metadata_matches_after_exact_content_proof(
+            &expected->marker_identity,
+            &current_marker_identity) ||
+        stage_length != marker_length ||
+        memcmp(stage_data, marker_data, stage_length) != 0) {
+        goto distinct_fail;
+    }
+
+    if (config_retire_exact_name_at(
+            directory_fd, CONFIG_SWITCH_STAGE_NAME,
+            &stage_identity, stage_data, stage_length,
+            CONFIG_SWITCH_SETTLED_PREFIX) != 0) {
+        goto distinct_fail;
+    }
+    *marker_identity = current_marker_identity;
+    result = 0;
+    goto distinct_done;
+
+distinct_fail:
+    failure_errno = errno ? errno : ESTALE;
+    errno = failure_errno;
+    set_system_error(
+        ERR_FILE_IO,
+        "Cannot reconcile the exact switch normalization pair");
+
+distinct_done:
+    if (stage_data) {
+        secure_zero_memory(stage_data, stage_length);
+        free(stage_data);
+    }
+    if (marker_data) {
+        secure_zero_memory(marker_data, marker_length);
+        free(marker_data);
+    }
+    if (stage_witness) {
+        secure_zero_memory(stage_witness, stage_witness_length);
+        free(stage_witness);
+    }
+    if (marker_witness) {
+        secure_zero_memory(marker_witness, marker_witness_length);
+        free(marker_witness);
+    }
+    if (stage_model) {
+        secure_zero_memory(stage_model, sizeof(*stage_model));
+        free(stage_model);
+    }
+    if (marker_model) {
+        secure_zero_memory(marker_model, sizeof(*marker_model));
+        free(marker_model);
+    }
+    if (result != 0) errno = failure_errno;
+    return result;
+}
+
 static int config_switch_guard_reconcile_preintent_at(
     int directory_fd, int lock_fd, const char *directory,
     const struct stat *directory_identity) {
     config_switch_preintent_snapshot_t before;
     config_switch_preintent_snapshot_t after;
     struct stat marker_after;
+#if !defined(__FreeBSD__)
+    struct stat normalize_identity;
+    struct stat normalize_named;
+    unsigned char *pair_data = NULL;
+    size_t pair_length = 0U;
+    bool normalize_present = false;
+    bool normalize_created = false;
+    bool normalize_identity_known = false;
+#endif
     bool marker_after_present = false;
     int failure_errno = ESTALE;
 
@@ -6539,10 +9324,87 @@ static int config_switch_guard_reconcile_preintent_at(
             "Cannot prove switch pre-intent cleanup authority");
         return -1;
     }
-    if (unlinkat(
-            directory_fd, CONFIG_SWITCH_STAGE_NAME, 0) != 0) {
-        failure_errno = errno ? errno : EIO;
-        goto reconcile_fail;
+#if !defined(__FreeBSD__)
+    if (before.kind == CONFIG_SWITCH_PREINTENT_EXACT_PAIR &&
+        config_switch_guard_read_exact_pair_at(
+            directory_fd, &before, &pair_data, &pair_length) != 0) {
+        return -1;
+    }
+#endif
+#if !defined(__FreeBSD__)
+    if (before.kind == CONFIG_SWITCH_PREINTENT_EXACT_PAIR) {
+        if (config_switch_guard_optional_stat_at(
+                directory_fd, CONFIG_SWITCH_NORMALIZE_NAME,
+                &normalize_present, &normalize_named) != 0) {
+            failure_errno = errno ? errno : EIO;
+            goto reconcile_fail;
+        }
+        if (!normalize_present) {
+            if (config_switch_guard_named_write_at(
+                    directory_fd, CONFIG_SWITCH_NORMALIZE_NAME,
+                    pair_data, pair_length, &normalize_identity,
+                    &normalize_created,
+                    &normalize_identity_known) != 0 ||
+                !normalize_identity_known) {
+                failure_errno = errno ? errno : EIO;
+                goto reconcile_fail;
+            }
+        } else {
+            normalize_identity = normalize_named;
+            normalize_identity_known = true;
+            if (!config_switch_guard_file_has_link_count(
+                    &normalize_identity, (nlink_t)1) ||
+                config_reprove_published_file_at(
+                    directory_fd, CONFIG_SWITCH_NORMALIZE_NAME,
+                    &normalize_identity, pair_data, pair_length,
+                    &normalize_identity) != 0) {
+                failure_errno = errno ? errno : ESTALE;
+                goto reconcile_fail;
+            }
+        }
+        if (fsync(directory_fd) != 0 ||
+            SWITCH_GUARD_TEST_CHECKPOINT(
+                SWITCH_GUARD_RECONCILE_AFTER_NORMALIZE_SYNC,
+                directory_fd) != 0 ||
+            config_switch_guard_preintent_snapshot_at(
+                directory_fd, &after) != 0 ||
+            after.kind != CONFIG_SWITCH_PREINTENT_EXACT_PAIR ||
+            !config_metadata_same_file(
+                &before.stage_identity, &after.stage_identity) ||
+            !config_metadata_same_file(
+                &before.marker_identity, &after.marker_identity) ||
+            renameat(
+                directory_fd, CONFIG_SWITCH_NORMALIZE_NAME,
+                directory_fd, CONFIG_SWITCH_GUARD_NAME) != 0) {
+            failure_errno = errno ? errno : ESTALE;
+            goto reconcile_fail;
+        }
+        normalize_created = false;
+        if (fsync(directory_fd) != 0 ||
+            config_switch_guard_preintent_snapshot_at(
+                directory_fd, &after) != 0 ||
+            after.kind != CONFIG_SWITCH_PREINTENT_NORMALIZED_PAIR ||
+            config_switch_guard_reconcile_distinct_pair_at(
+                directory_fd, &after, &marker_after) != 0) {
+            failure_errno = errno ? errno : ESTALE;
+            goto reconcile_fail;
+        }
+    } else
+#endif
+    if (before.kind == CONFIG_SWITCH_PREINTENT_NORMALIZED_PAIR) {
+        if (config_switch_guard_reconcile_distinct_pair_at(
+                directory_fd, &before, &marker_after) != 0) {
+            failure_errno = errno ? errno : ESTALE;
+            goto reconcile_fail;
+        }
+    } else {
+        if (config_retire_exact_name_at(
+                directory_fd, CONFIG_SWITCH_STAGE_NAME,
+                &before.stage_identity, NULL, 0U,
+                CONFIG_SWITCH_SETTLED_PREFIX) != 0) {
+            failure_errno = errno ? errno : EIO;
+            goto reconcile_fail;
+        }
     }
     if (fsync(directory_fd) != 0 ||
         config_switch_guard_preintent_snapshot_at(
@@ -6565,18 +9427,47 @@ static int config_switch_guard_reconcile_preintent_at(
             goto reconcile_fail;
         }
     } else {
+        bool marker_matches;
+
+        if (before.kind == CONFIG_SWITCH_PREINTENT_EXACT_PAIR) {
+#if !defined(__FreeBSD__)
+            marker_matches = config_metadata_same_file(
+                &normalize_identity, &marker_after);
+#else
+            marker_matches = config_metadata_same_file(
+                &before.marker_identity, &marker_after);
+#endif
+        } else {
+            marker_matches = config_metadata_same_file(
+                &before.marker_identity, &marker_after);
+        }
+
         if (!marker_after_present ||
             !config_switch_guard_file_has_link_count(
                 &marker_after, (nlink_t)1) ||
-            !config_metadata_same_file(
-                &before.marker_identity, &marker_after)) {
+            !marker_matches) {
             failure_errno = ESTALE;
             goto reconcile_fail;
         }
     }
+#if !defined(__FreeBSD__)
+    if (pair_data) {
+        secure_zero_memory(pair_data, pair_length);
+        free(pair_data);
+    }
+#endif
     return 0;
 
 reconcile_fail:
+#if !defined(__FreeBSD__)
+    /* A durable normalize file is intentional retry state. If failure occurs
+     * before rename, the original linked pair remains untouched and the next
+     * lock holder reproves and reuses this exact byte image. */
+    if (pair_data) {
+        secure_zero_memory(pair_data, pair_length);
+        free(pair_data);
+    }
+#endif
     errno = failure_errno;
     set_system_error(
         ERR_FILE_IO,
@@ -6779,18 +9670,43 @@ static bool config_switch_guard_matches_handle(
 }
 
 static void config_switch_guard_free(config_switch_guard_t *guard) {
+    bool owned_here;
+
     if (!guard) return;
-    if (g_switch_guard_owner_pid == getpid()) {
+    owned_here = guard->owner_pid == getpid() &&
+                 g_switch_guard_owner_pid == getpid();
+    if (owned_here) {
+        g_switch_guard_owner_pid = 0;
+    } else if (g_switch_guard_owner_pid != getpid()) {
+        /* A fork child must retire its inherited process-local owner token so
+         * it can later acquire an independent guard. */
         g_switch_guard_owner_pid = 0;
     }
+    /* The private-lock registry, not this opaque token alone, retains the
+     * flock-bearing descriptor. A foreign-PID disposal resets that complete
+     * inherited registry epoch without LOCK_UN and must not raw-close the
+     * now-stale numeric token afterward. */
     if (guard->lock_fd >= 0) {
-        unlock_private_file(guard->lock_fd);
+        if (owned_here) {
+            unlock_private_file(guard->lock_fd);
+        } else {
+            runtime_state_lock_abandon_inherited();
+        }
     }
-    if (guard->directory_fd >= 0) close(guard->directory_fd);
+    /* A same-directory reopen has identical inode metadata but is already
+     * child-owned state. Only the creator process may raw-close this number. */
+    if (owned_here && guard->directory_fd >= 0) {
+        close(guard->directory_fd);
+    }
     if (guard->marker_data) {
         secure_zero_memory(
             guard->marker_data, guard->marker_length);
         free(guard->marker_data);
+    }
+    if (guard->source_witness) {
+        secure_zero_memory(
+            guard->source_witness, guard->source_witness_length);
+        free(guard->source_witness);
     }
     secure_zero_memory(guard, sizeof(*guard));
     free(guard);
@@ -6802,6 +9718,7 @@ static int config_switch_guard_make_handle(
     const struct stat *directory_identity,
     const struct stat *marker_identity,
     unsigned char *marker_data, size_t marker_length,
+    const unsigned char *source_witness, size_t source_witness_length,
     const config_switch_guard_model_t *model,
     const char token[ACCOUNT_INCARNATION_LEN], bool created,
     config_switch_guard_t **out) {
@@ -6809,7 +9726,10 @@ static int config_switch_guard_make_handle(
 
     if (directory_fd < 0 || lock_fd < 0 || !directory || !config_name ||
         !directory_identity || !marker_identity || !marker_data ||
-        marker_length == 0U || !model ||
+        marker_length == 0U || !source_witness ||
+        source_witness_length == 0U ||
+        source_witness_length > CONFIG_DOCUMENT_MAX_SIZE || !model ||
+        model->source_generation.size != source_witness_length ||
         !account_incarnation_is_valid(token) ||
         !out || *out) {
         errno = EINVAL;
@@ -6823,17 +9743,33 @@ static int config_switch_guard_make_handle(
     }
     guard->directory_fd = -1;
     guard->lock_fd = -1;
+    guard->source_witness = malloc(source_witness_length);
+    if (!guard->source_witness) {
+        free(guard);
+        set_error(
+            ERR_MEMORY_ALLOCATION,
+            "Cannot retain switch guard source witness");
+        return -1;
+    }
+    memcpy(
+        guard->source_witness, source_witness,
+        source_witness_length);
+    guard->source_witness_length = source_witness_length;
     if (safe_strncpy(
             guard->directory, directory,
             sizeof(guard->directory)) != 0 ||
         safe_strncpy(
             guard->config_name, config_name,
             sizeof(guard->config_name)) != 0) {
+        secure_zero_memory(
+            guard->source_witness, guard->source_witness_length);
+        free(guard->source_witness);
         free(guard);
         return -1;
     }
     guard->directory_fd = directory_fd;
     guard->lock_fd = lock_fd;
+    guard->owner_pid = getpid();
     guard->directory_identity = *directory_identity;
     guard->marker_identity = *marker_identity;
     guard->marker_data = marker_data;
@@ -6846,8 +9782,9 @@ static int config_switch_guard_make_handle(
     return 0;
 }
 
-static int config_switch_guard_stage_write_at(
-    int directory_fd, const unsigned char *data, size_t length,
+static int config_switch_guard_named_write_at(
+    int directory_fd, const char *name,
+    const unsigned char *data, size_t length,
     struct stat *stage_identity, bool *stage_created,
     bool *stage_identity_known) {
     struct stat opened;
@@ -6857,7 +9794,8 @@ static int config_switch_guard_stage_write_at(
     int fd = -1;
     int saved_errno;
 
-    if (directory_fd < 0 || !data || length == 0U ||
+    if (directory_fd < 0 || !name || name[0] == '\0' ||
+        strchr(name, '/') != NULL || !data || length == 0U ||
         length > CONFIG_SWITCH_GUARD_MAX_BYTES || !stage_identity ||
         !stage_created || !stage_identity_known) {
         errno = EINVAL;
@@ -6867,7 +9805,7 @@ static int config_switch_guard_stage_write_at(
     *stage_created = false;
     *stage_identity_known = false;
     fd = openat(
-        directory_fd, CONFIG_SWITCH_STAGE_NAME,
+        directory_fd, name,
         O_WRONLY | O_CREAT | O_EXCL | O_CLOEXEC | O_NOFOLLOW,
         PERM_USER_RW);
     if (fd < 0) {
@@ -6947,7 +9885,7 @@ static int config_switch_guard_stage_write_at(
         return -1;
     }
     if (fstatat(
-            directory_fd, CONFIG_SWITCH_STAGE_NAME, &named,
+            directory_fd, name, &named,
             AT_SYMLINK_NOFOLLOW) != 0 ||
         !config_metadata_file_is_safe(&named, true) ||
         (!config_metadata_snapshot_same(&after_write, &named) &&
@@ -6961,6 +9899,15 @@ static int config_switch_guard_stage_write_at(
     }
     *stage_identity = named;
     return 0;
+}
+
+static int config_switch_guard_stage_write_at(
+    int directory_fd, const unsigned char *data, size_t length,
+    struct stat *stage_identity, bool *stage_created,
+    bool *stage_identity_known) {
+    return config_switch_guard_named_write_at(
+        directory_fd, CONFIG_SWITCH_STAGE_NAME, data, length,
+        stage_identity, stage_created, stage_identity_known);
 }
 
 /* A switch stage is strictly pre-mutation: the caller cannot receive a live
@@ -7011,8 +9958,10 @@ static int config_switch_guard_cleanup_owned_stage_at(
         failure_errno = ESTALE;
         goto cleanup_fail;
     }
-    if (unlinkat(
-            directory_fd, CONFIG_SWITCH_STAGE_NAME, 0) != 0) {
+    if (config_retire_exact_name_at(
+            directory_fd, CONFIG_SWITCH_STAGE_NAME, &named,
+            NULL, 0U,
+            CONFIG_SWITCH_SETTLED_PREFIX) != 0) {
         failure_errno = errno ? errno : EIO;
         goto cleanup_fail;
     }
@@ -7041,17 +9990,38 @@ cleanup_fail:
 
 static int config_switch_guard_publish_stage_at(
     int directory_fd, const struct stat *stage_identity,
+    const unsigned char *stage_data, size_t stage_length,
     struct stat *published_identity) {
-    struct stat named;
+    struct stat named = {0};
+    struct stat retained_source;
+    int publish_outcome;
 
     if (directory_fd < 0 || !stage_identity ||
+        (!stage_data && stage_length != 0U) ||
         !published_identity) {
         errno = EINVAL;
         return -1;
     }
-    if (config_publish_noreplace_at(
-            directory_fd, CONFIG_SWITCH_STAGE_NAME,
-            CONFIG_SWITCH_GUARD_NAME) != 0 ||
+    publish_outcome = config_publish_noreplace_at(
+        directory_fd, CONFIG_SWITCH_STAGE_NAME,
+        CONFIG_SWITCH_GUARD_NAME, stage_identity,
+        &retained_source);
+    if (publish_outcome == CONFIG_PUBLISH_OUTCOME_UNCERTAIN) {
+        errno = EINPROGRESS;
+        set_system_error(
+            ERR_FILE_IO,
+            "Switch guard publication outcome is uncertain");
+        return -1;
+    }
+    if (publish_outcome ==
+        CONFIG_PUBLISH_INSTALLED_SOURCE_RETAINED) {
+        errno = EINPROGRESS;
+        set_system_error(
+            ERR_FILE_IO,
+            "Switch guard was installed with its exact fixed recovery stage retained");
+        return -1;
+    }
+    if (publish_outcome < 0 ||
         fstatat(
             directory_fd, CONFIG_SWITCH_GUARD_NAME, &named,
             AT_SYMLINK_NOFOLLOW) != 0 ||
@@ -7186,9 +10156,24 @@ int config_switch_guard_install_or_adopt(
         memcpy(
             expected->token, snapshot->marker_model.token,
             sizeof(expected->token));
+        if (config_switch_guard_source_matches_at(
+                directory_fd, config_name,
+                &snapshot->marker_model.source_generation,
+                snapshot->source_witness,
+                snapshot->source_witness_length,
+                &accepted_source) != 0) {
+            goto install_done;
+        }
+        expected->source_generation =
+            snapshot->marker_model.source_generation;
         if (config_switch_guard_serialize(
-                expected, &expected_data,
-                &expected_length) != 0 ||
+                expected, snapshot->source_witness,
+                snapshot->source_witness_length,
+                &expected_data, &expected_length) != 0) {
+            goto install_done;
+        }
+        expected->source_generation = accepted_source;
+        if (
             expected_length != snapshot->marker_length ||
             memcmp(
                 expected_data, snapshot->marker_data,
@@ -7213,8 +10198,10 @@ int config_switch_guard_install_or_adopt(
                 &revalidated->marker_identity) ||
             config_switch_guard_source_matches_at(
                 directory_fd, config_name,
-                &expected->source_generation,
-                NULL, 0U, NULL) != 0 ||
+                &snapshot->marker_model.source_generation,
+                snapshot->source_witness,
+                snapshot->source_witness_length,
+                &accepted_source) != 0 ||
             config_switch_destinations_live(
                 expected->destinations,
                 expected->destination_count) != 0 ||
@@ -7229,12 +10216,15 @@ int config_switch_guard_install_or_adopt(
                 "Retained switch guard changed during adoption");
             goto install_done;
         }
+        expected->source_generation = accepted_source;
         if (config_switch_guard_make_handle(
                 directory_fd, lock_fd, directory, config_name,
                 &directory_identity,
                 &revalidated->marker_identity,
                 revalidated->marker_data,
                 revalidated->marker_length,
+                revalidated->source_witness,
+                revalidated->source_witness_length,
                 expected,
                 expected->token, false,
                 guard) != 0) {
@@ -7268,8 +10258,9 @@ int config_switch_guard_install_or_adopt(
          convergence_attempt < CONFIG_SWITCH_SOURCE_CONVERGENCE_MAX;
          convergence_attempt++) {
         if (config_switch_guard_serialize(
-                expected, &expected_data,
-                &expected_length) != 0 ||
+                expected, ctx->config.source_witness,
+                ctx->config.source_witness_length,
+                &expected_data, &expected_length) != 0 ||
             config_switch_guard_stage_write_at(
                 directory_fd, expected_data, expected_length,
                 &stage_identity, &stage_created,
@@ -7336,6 +10327,7 @@ int config_switch_guard_install_or_adopt(
     }
     if (config_switch_guard_publish_stage_at(
             directory_fd, &stage_identity,
+            expected_data, expected_length,
             &published_identity) != 0) {
         set_system_error(
             ERR_FILE_IO,
@@ -7362,7 +10354,9 @@ int config_switch_guard_install_or_adopt(
         config_switch_guard_source_matches_at(
             directory_fd, config_name,
             &expected->source_generation,
-            NULL, 0U, NULL) != 0 ||
+            revalidated->source_witness,
+            revalidated->source_witness_length,
+            &accepted_source) != 0 ||
         config_switch_destinations_live(
             expected->destinations,
             expected->destination_count) != 0 ||
@@ -7377,10 +10371,13 @@ int config_switch_guard_install_or_adopt(
             "Fresh switch guard is not one durable stable generation");
         goto install_done;
     }
+    expected->source_generation = accepted_source;
     if (config_switch_guard_make_handle(
             directory_fd, lock_fd, directory, config_name,
             &directory_identity, &revalidated->marker_identity,
             revalidated->marker_data, revalidated->marker_length,
+            revalidated->source_witness,
+            revalidated->source_witness_length,
             expected, expected->token, true, guard) != 0) {
         goto install_done;
     }
@@ -7455,13 +10452,16 @@ install_done:
 
 bool config_switch_guard_was_created(
     const config_switch_guard_t *guard) {
-    return guard && guard->created;
+    return guard && guard->owner_pid == getpid() &&
+           g_switch_guard_owner_pid == getpid() &&
+           guard->created;
 }
 
 int config_switch_guard_reconcile_preintent(
     const char *config_path) {
     config_switch_preintent_snapshot_t snapshot;
     char directory[MAX_PATH_LEN];
+    const char *config_name = NULL;
     struct stat directory_identity;
     int directory_fd = -1;
     int lock_fd = -1;
@@ -7480,6 +10480,10 @@ int config_switch_guard_reconcile_preintent(
         set_error(
             ERR_CONFIG_INVALID,
             "This process already owns a switch recovery transaction");
+        return -1;
+    }
+    if (config_switch_guard_config_name(
+            config_path, &config_name) != 0) {
         return -1;
     }
     result = config_switch_guard_open_directory(
@@ -7529,6 +10533,7 @@ int config_switch_guard_probe(
     struct stat directory_identity;
     int directory_fd = -1;
     int result;
+    bool normalized_pair_equal = false;
 
     if (!config_path || !blocked || !recovery) {
         errno = EINVAL;
@@ -7561,7 +10566,18 @@ int config_switch_guard_probe(
          * strictly before live mutation. Let a real mutating entry acquire
          * `.config.lock`, reconcile it under `.switch.lock`, and probe again.
          * The stage itself never authorizes resume. */
-        *blocked = false;
+        if (preintent.kind ==
+                CONFIG_SWITCH_PREINTENT_NORMALIZED_PAIR &&
+            config_switch_guard_normalized_pair_equal_at(
+                directory_fd, &preintent,
+                &normalized_pair_equal) != 0) {
+            result = -1;
+            goto probe_done;
+        }
+        *blocked =
+            preintent.kind ==
+                CONFIG_SWITCH_PREINTENT_NORMALIZED_PAIR &&
+            !normalized_pair_equal;
         result = 0;
         goto probe_done;
     }
@@ -7585,7 +10601,8 @@ int config_switch_guard_probe(
     if (config_switch_guard_source_matches_at(
             directory_fd, config_name,
             &snapshot.marker_model.source_generation,
-            NULL, 0U, NULL) != 0 ||
+            snapshot.source_witness,
+            snapshot.source_witness_length, NULL) != 0 ||
         config_switch_destinations_live(
             snapshot.marker_model.destinations,
             snapshot.marker_model.destination_count) != 0 ||
@@ -7644,7 +10661,8 @@ int config_switch_guard_clear(config_switch_guard_t **guard_ptr) {
             "Cannot allocate switch guard clear verification state");
         return -1;
     }
-    if (g_switch_guard_owner_pid != getpid() ||
+    if (guard->owner_pid != getpid() ||
+        g_switch_guard_owner_pid != getpid() ||
         !config_named_directory_matches(
             guard->directory, &guard->directory_identity) ||
         verify_private_lock_file_at(
@@ -7655,7 +10673,8 @@ int config_switch_guard_clear(config_switch_guard_t **guard_ptr) {
         config_switch_guard_source_matches_at(
             guard->directory_fd, guard->config_name,
             &guard->model.source_generation,
-            NULL, 0U, NULL) != 0 ||
+            guard->source_witness, guard->source_witness_length,
+            NULL) != 0 ||
         config_switch_destinations_live(
             guard->model.destinations,
             guard->model.destination_count) != 0 ||
@@ -7671,9 +10690,13 @@ int config_switch_guard_clear(config_switch_guard_t **guard_ptr) {
         goto clear_fail;
     }
     if (!guard->marker_unlinked) {
-        if (unlinkat(
+        if (config_retire_exact_name_at(
                 guard->directory_fd,
-                CONFIG_SWITCH_GUARD_NAME, 0) != 0) {
+                CONFIG_SWITCH_GUARD_NAME,
+                &snapshot->marker_identity,
+                snapshot->marker_data,
+                snapshot->marker_length,
+                CONFIG_SWITCH_SETTLED_PREFIX) != 0) {
             set_system_error(
                 ERR_FILE_IO,
                 "Cannot remove the owned switch guard generation");
@@ -7735,6 +10758,7 @@ int config_switch_guard_retain(
     config_switch_guard_snapshot_t *after = NULL;
     struct stat stage_identity;
     struct stat published_identity;
+    publication_identity_t accepted_source;
     error_accumulator_t failures;
     error_context_t primary_error;
     int primary_errno = 0;
@@ -7765,7 +10789,8 @@ int config_switch_guard_retain(
     memset(&published_identity, 0, sizeof(published_identity));
     error_accumulator_init(&failures);
 
-    if (g_switch_guard_owner_pid != getpid() ||
+    if (guard->owner_pid != getpid() ||
+        g_switch_guard_owner_pid != getpid() ||
         !config_named_directory_matches(
             guard->directory, &guard->directory_identity) ||
         verify_private_lock_file_at(
@@ -7774,7 +10799,8 @@ int config_switch_guard_retain(
         config_switch_guard_source_matches_at(
             guard->directory_fd, guard->config_name,
             &guard->model.source_generation,
-            NULL, 0U, NULL) != 0 ||
+            guard->source_witness, guard->source_witness_length,
+            &accepted_source) != 0 ||
         config_switch_destinations_live(
             guard->model.destinations,
             guard->model.destination_count) != 0 ||
@@ -7787,6 +10813,7 @@ int config_switch_guard_retain(
         goto retain_fail;
     }
 
+    guard->model.source_generation = accepted_source;
     if (guard->marker_unlinked) {
         if (snapshot->stage_present || !snapshot->marker_absent) {
             errno = ESTALE;
@@ -7795,12 +10822,37 @@ int config_switch_guard_retain(
                 "Cannot republish switch recovery over a changed guard namespace");
             goto retain_fail;
         }
+    } else {
+        if (!config_switch_guard_matches_handle(guard, snapshot)) {
+            errno = ESTALE;
+            set_error(
+                ERR_CONFIG_INVALID,
+                "Owned switch recovery marker changed before retention");
+            goto retain_fail;
+        }
+    }
+
+    if (guard->marker_unlinked) {
         if (config_switch_guard_stage_write_at(
                 guard->directory_fd, guard->marker_data,
                 guard->marker_length, &stage_identity,
                 &stage_created, &stage_identity_known) != 0 ||
-            config_switch_guard_publish_stage_at(
+            fsync(guard->directory_fd) != 0 ||
+            config_switch_guard_source_matches_at(
+                guard->directory_fd, guard->config_name,
+                &guard->model.source_generation,
+                guard->source_witness,
+                guard->source_witness_length,
+                &accepted_source) != 0) {
+            primary_failure = true;
+            primary_error = *get_last_error();
+            primary_errno = errno ? errno : EIO;
+            goto retain_fail;
+        }
+        guard->model.source_generation = accepted_source;
+        if (config_switch_guard_publish_stage_at(
                 guard->directory_fd, &stage_identity,
+                guard->marker_data, guard->marker_length,
                 &published_identity) != 0) {
             primary_failure = true;
             primary_error = *get_last_error();
@@ -7810,13 +10862,6 @@ int config_switch_guard_retain(
         stage_created = false;
         guard->marker_identity = published_identity;
         guard->marker_unlinked = false;
-    } else if (!config_switch_guard_matches_handle(
-                   guard, snapshot)) {
-        errno = ESTALE;
-        set_error(
-            ERR_CONFIG_INVALID,
-            "Owned switch recovery marker changed before retention");
-        goto retain_fail;
     }
 
 retain_recheck:
@@ -7842,7 +10887,10 @@ retain_recheck:
     }
     if (guard->marker_unlinked || after->stage_present ||
         !config_switch_guard_matches_handle(guard, after) ||
-        fsync(guard->directory_fd) != 0) {
+        fsync(guard->directory_fd) != 0 ||
+        SWITCH_GUARD_TEST_CHECKPOINT(
+            SWITCH_GUARD_RETAIN_AFTER_MARKER_SYNC,
+            guard->directory_fd) != 0) {
         if (errno == 0) errno = ESTALE;
         if (get_last_error()->code == ERR_SUCCESS) {
             set_system_error(
@@ -7864,7 +10912,9 @@ retain_recheck:
         config_switch_guard_source_matches_at(
             guard->directory_fd, guard->config_name,
             &guard->model.source_generation,
-            NULL, 0U, NULL) != 0 ||
+            guard->source_witness,
+            guard->source_witness_length,
+            &accepted_source) != 0 ||
         config_switch_destinations_live(
             guard->model.destinations,
             guard->model.destination_count) != 0) {
@@ -7935,178 +10985,6 @@ void config_switch_guard_abandon(
 
 #define CONFIG_RESUME_HINT_TEMP_PREFIX ".resume-hint.tmp."
 #define CONFIG_RESUME_HINT_TEMP_SUFFIX_LENGTH 6U
-#define CONFIG_RESUME_HINT_TEMP_SCAN_MAX_ENTRIES 4096U
-#define CONFIG_RESUME_HINT_TEMP_SCAN_MAX_CANDIDATES 64U
-
-static bool config_resume_hint_temp_name_is_exact(const char *name) {
-    static const char prefix[] = CONFIG_RESUME_HINT_TEMP_PREFIX;
-    size_t prefix_length = sizeof(prefix) - 1U;
-
-    if (!name ||
-        strlen(name) != prefix_length +
-                            CONFIG_RESUME_HINT_TEMP_SUFFIX_LENGTH ||
-        memcmp(name, prefix, prefix_length) != 0) {
-        return false;
-    }
-    for (size_t i = 0U; i < CONFIG_RESUME_HINT_TEMP_SUFFIX_LENGTH; i++) {
-        unsigned char c = (unsigned char)name[prefix_length + i];
-
-        if (!((c >= (unsigned char)'0' && c <= (unsigned char)'9') ||
-              (c >= (unsigned char)'A' && c <= (unsigned char)'Z') ||
-              (c >= (unsigned char)'a' && c <= (unsigned char)'z'))) {
-            return false;
-        }
-    }
-    return true;
-}
-
-static int config_cleanup_resume_hint_temp_candidate_at(
-    int directory_fd, const char *name, bool *removed) {
-    struct stat named_before;
-    struct stat opened;
-    struct stat descriptor_after;
-    struct stat named_after;
-    int fd = -1;
-    int failure_errno = ESTALE;
-
-    *removed = false;
-    errno = 0;
-    if (fstatat(directory_fd, name, &named_before,
-                AT_SYMLINK_NOFOLLOW) != 0) {
-        failure_errno = errno ? errno : ESTALE;
-        goto candidate_fail;
-    }
-    /* Recognized but unsafe leaves are decoys, not cleanup authority. Keep
-     * symlinks, foreign ownership, non-regular nodes, non-0600 modes, and
-     * multiply-linked files untouched. */
-    if (!config_metadata_file_is_safe(&named_before, true)) return 0;
-
-    fd = openat(directory_fd, name,
-                O_RDONLY | O_CLOEXEC | O_NOFOLLOW | O_NONBLOCK);
-    if (fd < 0 || fstat(fd, &opened) != 0) {
-        failure_errno = errno ? errno : ESTALE;
-        goto candidate_fail;
-    }
-    if (!config_metadata_file_is_safe(&opened, true) ||
-        !config_metadata_snapshot_same(&named_before, &opened) ||
-        fstatat(directory_fd, name, &named_after,
-                AT_SYMLINK_NOFOLLOW) != 0 ||
-        fstat(fd, &descriptor_after) != 0 ||
-        !config_metadata_file_is_safe(&named_after, true) ||
-        !config_metadata_file_is_safe(&descriptor_after, true) ||
-        !config_metadata_snapshot_same(&opened, &named_after) ||
-        !config_metadata_snapshot_same(&opened, &descriptor_after)) {
-        failure_errno = errno ? errno : ESTALE;
-        goto candidate_fail;
-    }
-    if (unlinkat(directory_fd, name, 0) != 0) {
-        failure_errno = errno ? errno : ESTALE;
-        goto candidate_fail;
-    }
-    errno = 0;
-    if (fstatat(directory_fd, name, &named_after,
-                AT_SYMLINK_NOFOLLOW) == 0 ||
-        errno != ENOENT) {
-        failure_errno = errno ? errno : ESTALE;
-        goto candidate_fail;
-    }
-    if (close(fd) != 0) {
-        fd = -1;
-        failure_errno = errno ? errno : EIO;
-        goto candidate_fail;
-    }
-    fd = -1;
-    *removed = true;
-    return 0;
-
-candidate_fail:
-    if (fd >= 0) close(fd);
-    errno = failure_errno;
-    set_system_error(
-        ERR_CONFIG_WRITE_FAILED,
-        "Cannot safely clean stale resume-hint temporary file: %s", name);
-    return -1;
-}
-
-/* Called only after the cooperating config write lock has been acquired and
- * before that lock is returned to its caller. Therefore no live cooperating
- * writer can own one of these mkstemp names: a same-process CLI startup also
- * reaches this boundary before config_init and before its first state temp is
- * created. The scan is completed before deletion, so an incomplete or
- * over-limit enumeration leaves every candidate untouched. */
-static int config_cleanup_stale_resume_hint_temps_at(int directory_fd) {
-    static const char prefix[] = CONFIG_RESUME_HINT_TEMP_PREFIX;
-    char candidates[CONFIG_RESUME_HINT_TEMP_SCAN_MAX_CANDIDATES]
-                   [sizeof(prefix) + CONFIG_RESUME_HINT_TEMP_SUFFIX_LENGTH];
-    DIR *stream = NULL;
-    struct dirent *entry;
-    size_t entry_count = 0U;
-    size_t candidate_count = 0U;
-    bool removed_any = false;
-    int scan_fd;
-    int scan_errno;
-    int close_result;
-
-    scan_fd = openat(directory_fd, ".",
-                     O_RDONLY | O_CLOEXEC | O_DIRECTORY | O_NOFOLLOW);
-    if (scan_fd < 0) goto scan_fail;
-    stream = fdopendir(scan_fd);
-    if (!stream) {
-        scan_errno = errno ? errno : EIO;
-        close(scan_fd);
-        errno = scan_errno;
-        goto scan_fail;
-    }
-    errno = 0;
-    while ((entry = readdir(stream)) != NULL) {
-        entry_count++;
-        if (entry_count > CONFIG_RESUME_HINT_TEMP_SCAN_MAX_ENTRIES) {
-            scan_errno = E2BIG;
-            goto scan_done;
-        }
-        if (!config_resume_hint_temp_name_is_exact(entry->d_name)) continue;
-        if (candidate_count >=
-            CONFIG_RESUME_HINT_TEMP_SCAN_MAX_CANDIDATES) {
-            scan_errno = E2BIG;
-            goto scan_done;
-        }
-        memcpy(candidates[candidate_count], entry->d_name,
-               sizeof(candidates[candidate_count]));
-        candidate_count++;
-    }
-    scan_errno = errno;
-
-scan_done:
-    close_result = closedir(stream);
-    stream = NULL;
-    if (scan_errno != 0 || close_result != 0) {
-        errno = scan_errno != 0 ? scan_errno : (errno ? errno : EIO);
-        goto scan_fail;
-    }
-
-    for (size_t i = 0U; i < candidate_count; i++) {
-        bool removed = false;
-
-        if (config_cleanup_resume_hint_temp_candidate_at(
-                directory_fd, candidates[i], &removed) != 0) {
-            return -1;
-        }
-        removed_any = removed_any || removed;
-    }
-    if (removed_any && fsync(directory_fd) != 0) {
-        set_system_error(
-            ERR_CONFIG_WRITE_FAILED,
-            "Cannot durably clean stale resume-hint temporary files");
-        return -1;
-    }
-    return 0;
-
-scan_fail:
-    set_system_error(
-        ERR_CONFIG_WRITE_FAILED,
-        "Cannot completely scan stale resume-hint temporary files");
-    return -1;
-}
 
 static int config_write_lock_directory(const char *dir) {
     char lockpath[MAX_PATH_LEN];
@@ -8158,7 +11036,11 @@ static int config_write_lock_directory(const char *dir) {
         return -1;
     }
 
-    if (config_cleanup_stale_resume_hint_temps_at(dir_fd) != 0) {
+    if (config_reconcile_settled_aliases_at(
+            dir_fd, ".resume-hint",
+            CONFIG_RESUME_HINT_SETTLED_PREFIX,
+            CONFIG_RESUME_HINT_TEMP_PREFIX,
+            CONFIG_RESUME_HINT_TEMP_SUFFIX_LENGTH) != 0) {
         int saved_errno = errno ? errno : EIO;
 
         close(dir_fd);
@@ -8604,6 +11486,7 @@ static int config_resume_hint_snapshot_restore_at(
     int fd = -1;
     bool have_temp_identity = false;
     bool temp_registered = false;
+    bool replacement_committed = false;
 
     if (!config_path || !snapshot || !snapshot->valid ||
         !snapshot->post_image_bound ||
@@ -8668,7 +11551,10 @@ static int config_resume_hint_snapshot_restore_at(
     }
 
     if (!snapshot->existed) {
-        if (unlink(hint) != 0 && errno != ENOENT) {
+        if (config_retire_exact_path(
+                hint, &snapshot->post_image, NULL, 0U,
+                CONFIG_RESUME_HINT_SETTLED_PREFIX) != 0 &&
+            errno != ENOENT) {
             close(dir_fd);
             set_system_error(ERR_FILE_IO,
                              "Cannot restore prior resume-hint absence: %s",
@@ -8761,16 +11647,27 @@ static int config_resume_hint_snapshot_restore_at(
         goto restore_fail;
     }
     fd = -1;
-    /* Recheck after preparing and syncing the before-image. The public save
-     * lock makes this check plus rename one protocol for cooperating writers;
-     * bypassing same-uid writers retain only the documented final interval.
-     * Unlike the entry proof above, a failure here is a namespace change
-     * during this call, not evidence that a prior retry already completed. */
+    /* Recheck after preparing and syncing the before-image. Unlike the entry
+     * proof above, a failure here is a namespace change during this call, not
+     * evidence that a prior retry already completed. */
     if (config_resume_hint_snapshot_require_post_image(hint, snapshot) != 0) {
         goto restore_fail;
     }
     RESUME_HINT_TEST_CHECKPOINT(5);
-    if (rename(temp, hint) != 0) {
+    if (lstat(temp, &temp_identity) != 0 ||
+        !config_metadata_file_is_safe(&temp_identity, false) ||
+        config_replace_exact_name_at(
+            dir_fd, strrchr(temp, '/') ? strrchr(temp, '/') + 1 : temp,
+            &temp_identity, snapshot->data, snapshot->length,
+            strrchr(hint, '/') ? strrchr(hint, '/') + 1 : hint,
+            &snapshot->post_image, snapshot->post_image_data,
+            snapshot->post_image_length,
+            CONFIG_RESUME_HINT_SETTLED_PREFIX, &installed,
+            &replacement_committed) != 0) {
+        if (replacement_committed && temp_registered) {
+            signals_scratch_unregister(temp);
+            temp_registered = false;
+        }
         set_system_error(ERR_FILE_IO,
                          "Cannot install restored resume hint: %s", hint);
         goto restore_fail;
@@ -9163,9 +12060,23 @@ static bool config_retirement_refresh_owns_record(
     return false;
 }
 
+static bool config_retirement_identity_is_canonical_absence(
+    const publication_identity_t *identity) {
+    return identity && !identity->present &&
+           identity->device == 0U && identity->inode == 0U &&
+           identity->mode == 0U && identity->uid == 0U &&
+           identity->gid == 0U && identity->link_count == 0U &&
+           identity->size == 0U && identity->mtime_seconds == 0 &&
+           identity->mtime_nanoseconds == 0U &&
+           identity->ctime_seconds == 0 &&
+           identity->ctime_nanoseconds == 0U;
+}
+
 /* A reverse retirement publish can restore the exact prior Git bytes through
- * a newly materialized inode generation. Refresh only that generation field;
- * the owner/destination witnesses and every unrelated record remain intact.
+ * a newly materialized inode generation. Refresh only that generation field.
+ * A canonical absent input is an exact-set witness rather than a serializable
+ * generation; preserve each matching record's prior post_config identity.
+ * The owner/destination witnesses and every unrelated record remain intact.
  * Inputs are treated as an exact set so a truncated caller result cannot make
  * a partially refreshed ledger look complete. */
 static int config_apply_retirement_publication_refresh(
@@ -9192,6 +12103,16 @@ static int config_apply_retirement_publication_refresh(
             set_error(ERR_INVALID_ARGS,
                       "Retirement publication destination %zu has an invalid config path",
                       i);
+            return -1;
+        }
+        if (!request->destinations[i].post_config.present &&
+            !config_retirement_identity_is_canonical_absence(
+                &request->destinations[i].post_config)) {
+            errno = EINVAL;
+            set_error(
+                ERR_INVALID_ARGS,
+                "Retirement publication destination %zu has a noncanonical absent identity",
+                i);
             return -1;
         }
         for (size_t j = 0; j < i; j++) {
@@ -9228,8 +12149,12 @@ static int config_apply_retirement_publication_refresh(
                       record->config_path);
             return -1;
         }
-        record->post_config =
-            request->destinations[destination_index].post_config;
+        if (request->destinations[
+                destination_index].post_config.present) {
+            record->post_config =
+                request->destinations[
+                    destination_index].post_config;
+        }
         if (publication_record_validate(record) != 0) {
             return -1;
         }
@@ -9377,6 +12302,31 @@ static int config_update_resume_hint(const gitswitch_ctx_t *ctx,
         set_error(ERR_PERMISSION_DENIED,
                   "Cannot safely update the resume hint: config directory is unavailable");
         return -1;
+    }
+    {
+        const char *cleanup_target =
+            strrchr(hint, '/') ? strrchr(hint, '/') + 1 : hint;
+        int cleanup_fd = open(
+            dir, O_RDONLY | O_CLOEXEC | O_DIRECTORY | O_NOFOLLOW);
+        int cleanup_errno;
+
+        if (cleanup_fd < 0 ||
+            signals_scratch_cleanup_identities_at(
+                cleanup_fd, dir) != 0 ||
+            config_reconcile_settled_aliases_at(
+                cleanup_fd, cleanup_target,
+                CONFIG_RESUME_HINT_SETTLED_PREFIX,
+                CONFIG_RESUME_HINT_TEMP_PREFIX,
+                CONFIG_RESUME_HINT_TEMP_SUFFIX_LENGTH) != 0) {
+            cleanup_errno = errno ? errno : EIO;
+            if (cleanup_fd >= 0) (void)close(cleanup_fd);
+            errno = cleanup_errno;
+            set_system_error(
+                ERR_FILE_IO,
+                "Cannot settle tracked config temporary aliases");
+            return -1;
+        }
+        (void)close(cleanup_fd);
     }
     if (config_read_active_state(config_path, &existing_state, false,
                                  &state_before, &publications) != 0) {
@@ -9701,16 +12651,99 @@ static int config_update_resume_hint(const gitswitch_ctx_t *ctx,
             &state_before) != 0) {
         goto hint_fail;
     }
-    /* Every public config/state save holds the destination's internal lock
-     * from API entry through this rename. Cooperating CLI and direct-API
-     * writers therefore cannot enter the final check/replace gap. A same-uid
-     * writer that bypasses these APIs is outside that protocol; strict
-     * metadata checks detect it through the checkpoint immediately above,
-     * bounding the unsupported race to this single rename interval. */
-    if (rename(temp, hint) != 0) {
-        set_system_error(ERR_FILE_IO,
-                         "Cannot install resume hint atomically: %s", hint);
-        goto hint_fail;
+    {
+        const char *temp_name =
+            strrchr(temp, '/') ? strrchr(temp, '/') + 1 : temp;
+        const char *hint_name =
+            strrchr(hint, '/') ? strrchr(hint, '/') + 1 : hint;
+        int directory_fd = open(
+            dir, O_RDONLY | O_CLOEXEC | O_DIRECTORY | O_NOFOLLOW);
+        int publish_result = -1;
+        struct stat retained_source = {0};
+        bool publish_committed = false;
+
+        if (directory_fd >= 0 &&
+            fstatat(
+                directory_fd, temp_name, &temp_identity,
+                AT_SYMLINK_NOFOLLOW) == 0 &&
+            config_metadata_file_is_safe(&temp_identity, true)) {
+            if (state_before.existed) {
+                publish_result = config_replace_exact_name_at(
+                    directory_fd, temp_name, &temp_identity,
+                    content, length, hint_name,
+                    &state_before.metadata, state_before.data,
+                    state_before.length,
+                    CONFIG_RESUME_HINT_SETTLED_PREFIX, &after,
+                    &publish_committed);
+            } else {
+                publish_result = config_publish_noreplace_at(
+                    directory_fd, temp_name, hint_name,
+                    &temp_identity, &retained_source);
+                if ((publish_result ==
+                         CONFIG_PUBLISH_INSTALLED_SOURCE_RETAINED ||
+                     publish_result ==
+                         CONFIG_PUBLISH_OUTCOME_UNCERTAIN) &&
+                    retained_source.st_nlink != 0 &&
+                    config_retire_or_track_scratch_at(
+                        directory_fd, dir, temp_name, temp,
+                        hint_name, &retained_source, content, length,
+                        CONFIG_RESUME_HINT_SETTLED_PREFIX) != 0) {
+                    int retirement_errno = errno ? errno : EIO;
+
+                    publish_committed = true;
+                    if (directory_fd >= 0) (void)close(directory_fd);
+                    if (state_installed) *state_installed = true;
+                    if (rollback_snapshot) {
+                        rollback_snapshot->post_image_installed = true;
+                    }
+                    errno = retirement_errno;
+                    set_system_error(
+                        ERR_FILE_IO,
+                        "Resume hint was installed but its exact temporary alias could not be retired: %s",
+                        temp);
+                    /* Identity-bound cleanup remains registered if the
+                     * serialized retry also failed. */
+                    goto state_cleanup;
+                }
+                if (publish_result ==
+                        CONFIG_PUBLISH_INSTALLED_SOURCE_RETAINED ||
+                    (publish_result ==
+                         CONFIG_PUBLISH_OUTCOME_UNCERTAIN &&
+                     retained_source.st_nlink != 0)) {
+                    temp_registered = false;
+                }
+            }
+        }
+        {
+            int publish_errno = errno;
+
+            if (directory_fd >= 0) (void)close(directory_fd);
+            errno = publish_errno;
+        }
+        if (publish_result == CONFIG_PUBLISH_OUTCOME_UNCERTAIN) {
+            publish_committed = true;
+            errno = EINPROGRESS;
+            if (temp_registered) {
+                /* No exact source alias survived publication. A substituted
+                 * random pathname is not cleanup authority. */
+                signals_scratch_unregister(temp);
+                temp_registered = false;
+            }
+        }
+        if (publish_result < 0 ||
+            publish_result == CONFIG_PUBLISH_OUTCOME_UNCERTAIN) {
+            if (publish_committed) {
+                if (state_installed) *state_installed = true;
+                if (rollback_snapshot) {
+                    rollback_snapshot->post_image_installed = true;
+                }
+            }
+            set_system_error(
+                ERR_FILE_IO,
+                "Cannot install resume hint atomically: %s", hint);
+            if (publish_committed) goto state_cleanup;
+            goto hint_fail;
+        }
     }
     signals_scratch_unregister(temp);
     temp_registered = false;
@@ -9794,6 +12827,8 @@ static int config_write_document_atomic(gitswitch_ctx_t *ctx,
     char dir_path[MAX_PATH_LEN];
     char temp_path[MAX_PATH_LEN];
     char temp_name[MAX_PATH_LEN];
+    char temp_prefix[MAX_PATH_LEN];
+    char create_prefix[MAX_PATH_LEN];
     const char *slash;
     const char *target_name;
     struct stat pinned_dir;
@@ -9803,6 +12838,7 @@ static int config_write_document_atomic(gitswitch_ctx_t *ctx,
     struct stat temp_identity;
     struct stat temp_generation;
     struct stat temp_now;
+    struct stat retained_source;
     unsigned char *document_bytes = NULL;
     size_t document_length = 0;
     bool destination_existed = false;
@@ -9810,6 +12846,8 @@ static int config_write_document_atomic(gitswitch_ctx_t *ctx,
     bool temp_registered = false;
     bool have_temp_identity = false;
     bool directory_sync_failed = false;
+    bool document_committed = false;
+    int publish_result = CONFIG_PUBLISH_MOVED;
     int directory_sync_errno = 0;
     int dir_fd = -1;
     int temp_fd = -1;
@@ -9834,6 +12872,24 @@ static int config_write_document_atomic(gitswitch_ctx_t *ctx,
     target_name = slash ? slash + 1 : config_path;
     if (target_name[0] == '\0') {
         set_error(ERR_INVALID_PATH, "Config destination has no file name");
+        return -1;
+    }
+    if ((size_t)snprintf(
+            temp_prefix, sizeof(temp_prefix), "%s.tmp.",
+            target_name) >= sizeof(temp_prefix)) {
+        errno = ENAMETOOLONG;
+        set_error(
+            ERR_INVALID_PATH,
+            "Config temporary prefix is too long");
+        return -1;
+    }
+    if ((size_t)snprintf(
+            create_prefix, sizeof(create_prefix), "%s.create.",
+            target_name) >= sizeof(create_prefix)) {
+        errno = ENAMETOOLONG;
+        set_error(
+            ERR_INVALID_PATH,
+            "Config creation prefix is too long");
         return -1;
     }
     if (!slash) {
@@ -9873,6 +12929,25 @@ static int config_write_document_atomic(gitswitch_ctx_t *ctx,
                              dir_path);
             return -1;
         }
+    }
+    if (signals_scratch_cleanup_identities_at(
+            dir_fd, dir_path) != 0 ||
+        config_reconcile_settled_aliases_at(
+            dir_fd, target_name,
+            CONFIG_DOCUMENT_SETTLED_PREFIX,
+            temp_prefix, 0U) != 0 ||
+        config_reconcile_settled_aliases_at(
+            dir_fd, target_name,
+            CONFIG_DOCUMENT_SETTLED_PREFIX,
+            create_prefix, 16U) != 0) {
+        int saved_errno = errno ? errno : EIO;
+
+        close(dir_fd);
+        errno = saved_errno;
+        set_system_error(
+            ERR_CONFIG_WRITE_FAILED,
+            "Cannot settle tracked config document aliases");
+        return -1;
     }
     errno = 0;
     if (fstatat(dir_fd, target_name, &destination_before,
@@ -9933,7 +13008,10 @@ static int config_write_document_atomic(gitswitch_ctx_t *ctx,
     errno = 0;
     if (fstatat(dir_fd, temp_name, &temp_now, AT_SYMLINK_NOFOLLOW) == 0) {
         if (!config_metadata_file_is_safe(&temp_now, true) ||
-            unlinkat(dir_fd, temp_name, 0) != 0) {
+            config_retire_exact_name_at(
+                dir_fd, temp_name, &temp_now,
+                NULL, 0U,
+                CONFIG_DOCUMENT_SETTLED_PREFIX) != 0) {
             set_error(ERR_PERMISSION_DENIED,
                       "Refusing unsafe stale config temporary file: %s",
                       temp_path);
@@ -10070,22 +13148,63 @@ static int config_write_document_atomic(gitswitch_ctx_t *ctx,
         goto document_fail;
     }
 
-    /* Atomic move from temp to final location. The public save's internal
-     * destination lock spans the final generation check above and this
-     * replacement, so cooperating and direct-API writers cannot commit in
-     * between. Uncooperative same-uid pathname writers are detected through
-     * the check above; only this final check-to-rename interval is outside the
-     * documented writer protocol. */
+    /* The internal destination lock serializes every supported writer. After
+     * the final exact before-image proof, renameat is the cross-platform
+     * commit point. Its success is latched separately from later proof and
+     * durability state so a completed install is never reported as absent. */
     if (config_io_fault(CONFIG_IO_DOCUMENT_BEFORE_RENAME,
                         "config document rename")) {
         goto document_fail;
     }
-    if ((destination_existed &&
-         renameat(dir_fd, temp_name, dir_fd, target_name) != 0) ||
-        (!destination_existed &&
-         config_publish_noreplace_at(dir_fd, temp_name, target_name) != 0)) {
+    if (destination_existed) {
+        publish_result = config_replace_exact_name_at(
+            dir_fd, temp_name, &temp_generation,
+            document_bytes, document_length, target_name,
+            &destination_before, NULL, 0U,
+            CONFIG_DOCUMENT_SETTLED_PREFIX,
+            &destination_now, &document_committed);
+    } else {
+        publish_result = config_publish_noreplace_at(
+            dir_fd, temp_name, target_name, &temp_generation,
+            &retained_source);
+        if (publish_result == CONFIG_PUBLISH_OUTCOME_UNCERTAIN) {
+            document_committed = true;
+            errno = EINPROGRESS;
+        }
+    }
+    if ((publish_result ==
+             CONFIG_PUBLISH_INSTALLED_SOURCE_RETAINED ||
+         publish_result == CONFIG_PUBLISH_OUTCOME_UNCERTAIN) &&
+        retained_source.st_nlink != 0 &&
+        config_retire_or_track_scratch_at(
+            dir_fd, dir_path, temp_name, temp_path,
+            target_name, &retained_source,
+            document_bytes, document_length,
+            CONFIG_DOCUMENT_SETTLED_PREFIX) != 0) {
+        document_committed = true;
+        if (config_installed) *config_installed = true;
+        set_system_error(
+            ERR_CONFIG_WRITE_FAILED,
+            "Config document was installed but its exact temporary alias could not be retired");
+        /* temp_exists and temp_registered deliberately remain true. The
+         * failure path retries exact retirement and otherwise preserves
+         * tracked cleanup ownership for the installed random alias. */
+        goto document_fail;
+    }
+    if (publish_result ==
+            CONFIG_PUBLISH_INSTALLED_SOURCE_RETAINED ||
+        (publish_result == CONFIG_PUBLISH_OUTCOME_UNCERTAIN &&
+         retained_source.st_nlink != 0)) {
+        temp_exists = false;
+        temp_registered = false;
+    }
+    if (publish_result < 0 ||
+        publish_result == CONFIG_PUBLISH_OUTCOME_UNCERTAIN) {
         set_system_error(ERR_CONFIG_WRITE_FAILED,
                         "Failed to move temporary config file to final location");
+        if (document_committed) {
+            if (config_installed) *config_installed = true;
+        }
         goto document_fail;
     }
     temp_exists = false;
@@ -10103,9 +13222,6 @@ static int config_write_document_atomic(gitswitch_ctx_t *ctx,
         int proof_errno = errno ? errno : ESTALE;
         if (config_is_namespace_change_errno(proof_errno)) {
             proof_errno = ESTALE;
-        }
-        if (proof_errno == ESTALE && config_installed) {
-            *config_installed = false;
         }
         errno = proof_errno;
         set_system_error(ERR_CONFIG_WRITE_FAILED,
@@ -10131,17 +13247,24 @@ static int config_write_document_atomic(gitswitch_ctx_t *ctx,
 
     /* The original descriptor may now name a detached directory. Re-open the
      * canonical parent and prove that it still selects the pinned parent and
-     * the exact installed file generation. A proved namespace mismatch means
-     * this invocation did not install config_path, even though renameat()
-     * succeeded in the detached directory. */
+     * the exact installed file generation. A later namespace mismatch means
+     * the committed generation is no longer current; it does not undo the
+     * rename commit or authorize outer rollback. */
+    if (config_io_fault(
+            CONFIG_IO_DOCUMENT_REPROOF_AFTER_BYTES,
+            "config document exact-byte reproof")) {
+        errno = errno ? errno : EIO;
+        set_system_error(
+            ERR_CONFIG_WRITE_FAILED,
+            "Canonical config generation could not be re-proved: %s",
+            config_path);
+        goto document_fail;
+    }
     errno = 0;
     if (config_reprove_canonical_publication(
             dir_path, &pinned_dir, target_name, &installed_generation,
             document_bytes, document_length, &destination_now) != 0) {
         int proof_errno = errno ? errno : EIO;
-        /* ESTALE proves that this generation is not the canonical install.
-         * Other proof I/O leaves the post-rename disposition uncertain, so
-         * outer settlement must conservatively retain installed=true. */
         if (proof_errno == ESTALE && config_installed) {
             *config_installed = false;
         }
@@ -10165,10 +13288,10 @@ static int config_write_document_atomic(gitswitch_ctx_t *ctx,
     }
 
     /* Capture the context's next admission generation only after the payload
-     * and directory entry are both durable and canonically selected. A pure
-     * sync failure remains installed-but-uncertain; a canonical mismatch
-     * clears that disposition. Either failure deliberately leaves the caller
-     * bound to its old generation until it reloads. */
+     * and directory entry are both durable and canonically selected. A sync
+     * failure or later canonical mismatch preserves the latched install
+     * disposition but deliberately leaves the caller bound to its old
+     * generation until it reloads. */
     if (committed_generation) {
         *committed_generation = destination_now;
     }
@@ -10203,7 +13326,10 @@ document_fail:
                 config_metadata_same_file(&temp_identity,
                                           &cleanup_identity) &&
                 config_metadata_file_is_safe(&cleanup_identity, true)) {
-                if (unlinkat(dir_fd, temp_name, 0) == 0) {
+                if (config_retire_exact_name_at(
+                        dir_fd, temp_name, &cleanup_identity,
+                        NULL, 0U,
+                        CONFIG_DOCUMENT_SETTLED_PREFIX) == 0) {
                     temp_exists = false;
                 }
             } else if (temp_registered) {
@@ -10837,15 +13963,21 @@ int config_create_default(const char *config_path) {
     char config_dir[MAX_PATH_LEN];
     char temp_path[MAX_PATH_LEN] = "";
     char temp_name[MAX_PATH_LEN] = "";
+    char temp_prefix[MAX_PATH_LEN] = "";
+    char document_temp_prefix[MAX_PATH_LEN] = "";
     const char *last_slash;
     const char *target_name;
     struct stat dir_identity;
     struct stat temp_identity;
+    struct stat temp_generation;
+    struct stat retained_source = {0};
     struct stat installed;
     size_t total = 0;
     size_t length = strlen(default_config_template);
     int dir_fd = -1;
     int fd = -1;
+    int lock_fd = -1;
+    int publish_result = CONFIG_PUBLISH_MOVED;
     bool registered = false;
     bool temp_exists = false;
     bool have_temp_identity = false;
@@ -10880,22 +14012,18 @@ int config_create_default(const char *config_path) {
     if (create_config_directory_secure(config_dir) != 0) {
         return -1;
     }
+    lock_fd = config_write_lock_directory(config_dir);
+    if (lock_fd < 0) return -1;
 
     if (validate_config_write_destination(config_path) != 0) {
-        return -1;
+        goto default_fail;
     }
-    if (lstat(config_path, &installed) == 0) {
-        errno = EEXIST;
-        set_system_error(ERR_CONFIG_WRITE_FAILED,
-                         "Configuration file already exists: %s", config_path);
-        return -1;
-    }
-    if (errno != ENOENT || lstat(config_dir, &dir_identity) != 0 ||
+    if (lstat(config_dir, &dir_identity) != 0 ||
         !config_metadata_dir_is_safe(&dir_identity)) {
         set_error(ERR_PERMISSION_DENIED,
                   "Default config parent is not a stable private directory: %s",
                   config_dir);
-        return -1;
+        goto default_fail;
     }
     dir_fd = open(config_dir,
                   O_RDONLY | O_CLOEXEC | O_DIRECTORY | O_NOFOLLOW);
@@ -10905,7 +14033,7 @@ int config_create_default(const char *config_path) {
         errno = saved_errno;
         set_system_error(ERR_PERMISSION_DENIED,
                          "Cannot pin default config parent: %s", config_dir);
-        return -1;
+        goto default_fail;
     }
     {
         bool forced_mismatch =
@@ -10919,8 +14047,49 @@ int config_create_default(const char *config_path) {
             set_system_error(ERR_PERMISSION_DENIED,
                              "Cannot pin default config parent: %s",
                              config_dir);
-            return -1;
+            dir_fd = -1;
+            goto default_fail;
         }
+    }
+    if ((size_t)snprintf(
+            temp_prefix, sizeof(temp_prefix), "%s.create.",
+            target_name) >= sizeof(temp_prefix) ||
+        (size_t)snprintf(
+            document_temp_prefix, sizeof(document_temp_prefix),
+            "%s.tmp.", target_name) >=
+            sizeof(document_temp_prefix) ||
+        signals_scratch_cleanup_identities_at(
+            dir_fd, config_dir) != 0 ||
+        config_reconcile_settled_aliases_at(
+            dir_fd, target_name,
+            CONFIG_DOCUMENT_SETTLED_PREFIX,
+            temp_prefix, 16U) != 0 ||
+        config_reconcile_settled_aliases_at(
+            dir_fd, target_name,
+            CONFIG_DOCUMENT_SETTLED_PREFIX,
+            document_temp_prefix, 0U) != 0) {
+        set_system_error(
+            ERR_CONFIG_WRITE_FAILED,
+            "Cannot settle tracked default config aliases");
+        goto default_fail;
+    }
+    errno = 0;
+    if (fstatat(
+            dir_fd, target_name, &installed,
+            AT_SYMLINK_NOFOLLOW) == 0) {
+        errno = EEXIST;
+        set_system_error(
+            ERR_CONFIG_WRITE_FAILED,
+            "Configuration file already exists: %s",
+            config_path);
+        goto default_fail;
+    }
+    if (errno != ENOENT) {
+        set_system_error(
+            ERR_CONFIG_WRITE_FAILED,
+            "Cannot inspect default config destination: %s",
+            config_path);
+        goto default_fail;
     }
     fd = config_create_private_temp_at(dir_fd, target_name, temp_name,
                                        sizeof(temp_name));
@@ -10996,18 +14165,43 @@ int config_create_default(const char *config_path) {
                   "Default config destination changed before installation");
         goto default_fail;
     }
+    temp_generation = installed;
     if (config_io_fault(CONFIG_IO_DEFAULT_BEFORE_RENAME,
                         "default config no-replace publication")) {
         goto default_fail;
     }
-    if (config_publish_noreplace_at(dir_fd, temp_name, target_name) != 0) {
+    publish_result = config_publish_noreplace_at(
+        dir_fd, temp_name, target_name, &temp_generation,
+        &retained_source);
+    if (publish_result < 0) {
         set_system_error(ERR_CONFIG_WRITE_FAILED,
                          "Failed to install default config without replacement");
+        goto default_fail;
+    }
+    if ((publish_result ==
+             CONFIG_PUBLISH_INSTALLED_SOURCE_RETAINED ||
+         publish_result == CONFIG_PUBLISH_OUTCOME_UNCERTAIN) &&
+        retained_source.st_nlink != 0 &&
+        config_retire_or_track_scratch_at(
+            dir_fd, config_dir, temp_name, temp_path,
+            target_name, &retained_source,
+            (const unsigned char *)default_config_template, length,
+            CONFIG_DOCUMENT_SETTLED_PREFIX) != 0) {
+        set_system_error(
+            ERR_CONFIG_WRITE_FAILED,
+            "Default config was installed but its exact temporary alias could not be retired");
         goto default_fail;
     }
     temp_exists = false;
     signals_scratch_unregister(temp_path);
     registered = false;
+    if (publish_result == CONFIG_PUBLISH_OUTCOME_UNCERTAIN) {
+        errno = EINPROGRESS;
+        set_system_error(
+            ERR_CONFIG_WRITE_FAILED,
+            "Default config publication outcome is uncertain");
+        goto default_fail;
+    }
 
     if (fstatat(dir_fd, target_name, &installed, AT_SYMLINK_NOFOLLOW) != 0 ||
         !config_metadata_file_is_safe(&installed, true) ||
@@ -11027,10 +14221,12 @@ int config_create_default(const char *config_path) {
         errno = saved_errno;
         set_system_error(ERR_CONFIG_WRITE_FAILED,
                          "Failed to sync default config directory");
-        return -1;
+        goto default_fail;
     }
     close(dir_fd);
     dir_fd = -1;
+    config_write_unlock(lock_fd);
+    lock_fd = -1;
 
     log_info("Created default configuration file: %s", config_path);
     return 0;
@@ -11048,12 +14244,32 @@ default_fail:
             if (fstatat(dir_fd, temp_name, &current_temp,
                         AT_SYMLINK_NOFOLLOW) == 0 &&
                 config_metadata_file_is_safe(&current_temp, true) &&
-                config_metadata_same_file(&temp_identity, &current_temp)) {
-                (void)unlinkat(dir_fd, temp_name, 0);
+                ((retained_source.st_nlink != 0 &&
+                  config_metadata_same_file(
+                      &retained_source, &current_temp)) ||
+                 config_metadata_same_file(
+                     &temp_identity, &current_temp))) {
+                const struct stat *cleanup_identity =
+                    retained_source.st_nlink != 0
+                        ? &retained_source
+                        : &current_temp;
+                if (config_retire_or_track_scratch_at(
+                        dir_fd, config_dir, temp_name, temp_path,
+                        target_name, cleanup_identity, NULL, 0U,
+                        CONFIG_DOCUMENT_SETTLED_PREFIX) == 0) {
+                    temp_exists = false;
+                    registered = false;
+                }
+            } else if (registered) {
+                signals_scratch_unregister(temp_path);
+                registered = false;
             }
         }
-        if (registered) signals_scratch_unregister(temp_path);
+        if (registered && !temp_exists) {
+            signals_scratch_unregister(temp_path);
+        }
         if (dir_fd >= 0) close(dir_fd);
+        if (lock_fd >= 0) config_write_unlock(lock_fd);
         errno = saved_errno;
     }
     return -1;
@@ -12074,7 +15290,10 @@ static int config_backup_prune(const char *config_path, size_t keep,
         struct stat st;
         if (fstatat(dir_fd, entries[i].name, &st, AT_SYMLINK_NOFOLLOW) != 0 ||
             !config_metadata_file_is_safe(&st, true) ||
-            unlinkat(dir_fd, entries[i].name, 0) != 0) {
+            config_retire_exact_name_at(
+                dir_fd, entries[i].name, &st,
+                NULL, 0U,
+                CONFIG_BACKUP_SETTLED_PREFIX) != 0) {
             close(dir_fd);
             set_error(ERR_FILE_IO,
                       "Cannot safely prune old config backup: %s",
@@ -12291,7 +15510,9 @@ backup_fail:
         if (backup_created && !backup_pruned &&
             lstat(backup_path, &named_backup) == 0 &&
             config_metadata_snapshot_same(&backup_identity, &named_backup) &&
-            unlink(backup_path) == 0) {
+            config_retire_exact_path(
+                backup_path, &named_backup, NULL, 0U,
+                CONFIG_BACKUP_SETTLED_PREFIX) == 0) {
             int cleanup_fd = open(
                 dir, O_RDONLY | O_CLOEXEC | O_DIRECTORY | O_NOFOLLOW);
             if (cleanup_fd >= 0) {
@@ -12739,12 +15960,9 @@ fail:
         }
         if (dfd >= 0) close(dfd);
         if (destination_created && have_destination_identity) {
-            struct stat current_destination;
-            if (lstat(dst_path, &current_destination) == 0 &&
-                config_metadata_same_file(&destination_identity,
-                                          &current_destination)) {
-                (void)unlink(dst_path);
-            }
+            (void)config_retire_exact_path(
+                dst_path, &destination_identity, NULL, 0U,
+                CONFIG_BACKUP_SETTLED_PREFIX);
         }
         secure_zero_memory(buf, sizeof(buf));
         secure_zero_memory(source_verify, sizeof(source_verify));
