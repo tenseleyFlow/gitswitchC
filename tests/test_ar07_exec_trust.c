@@ -797,6 +797,7 @@ static void check_fatal_path_candidate_errno(int injected_errno) {
 TEST(path_candidate_operational_failures_are_fatal) {
     check_fatal_path_candidate_errno(EIO);
     check_fatal_path_candidate_errno(EMFILE);
+    check_fatal_path_candidate_errno(ESTALE);
 }
 
 TEST(inner_directory_open_failure_survives_successful_policy_probe) {

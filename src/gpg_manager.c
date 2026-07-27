@@ -11199,6 +11199,12 @@ static int setup_gpg_agent_config(const gpg_config_t *gpg_config,
                 }
                 break;
             }
+            if (errno != ENOENT) {
+                set_system_error(
+                    ERR_SYSTEM_COMMAND_FAILED,
+                    "Failed to resolve trusted pinentry executable");
+                goto fail;
+            }
         }
     }
 

@@ -397,6 +397,22 @@ static bool make_program_fixture(char *root, size_t root_size,
     return mkdir(bin, 0700) == 0;
 }
 
+static bool directory_is_empty(const char *path) {
+    DIR *directory = opendir(path);
+    struct dirent *entry;
+
+    if (!directory) return false;
+    while ((entry = readdir(directory)) != NULL) {
+        if (strcmp(entry->d_name, ".") != 0 &&
+            strcmp(entry->d_name, "..") != 0) {
+            closedir(directory);
+            return false;
+        }
+    }
+    closedir(directory);
+    return true;
+}
+
 static int install_program(const char *bin, const char *name,
                            char *path, size_t path_size) {
     int written;
@@ -602,6 +618,58 @@ TEST(fatal_gpg_probe_does_not_fall_back_to_gpg2) {
     CHECK_EQ_INT(get_last_error()->code, ERR_GPG_NOT_FOUND);
     CHECK_EQ_INT(get_last_error()->system_errno, EIO);
     CHECK_EQ_INT(restore_environment("PATH", &path_environment), 0);
+}
+
+TEST(pinentry_identity_race_is_not_treated_as_absence) {
+    m15_fixture_t fixture;
+    char isolated_home[MAX_PATH_LEN];
+    char installed[MAX_PATH_LEN];
+    error_context_t failure;
+    int failure_errno;
+    int setup_rc;
+    int home_fd = -1;
+
+    if (!m15_fixture_setup(&fixture, "gitswitch-ar14-pinentry-race")) {
+        CHECK(!"failed to prepare pinentry identity-race fixture");
+        return;
+    }
+    if (safe_snprintf(isolated_home, sizeof(isolated_home), "%s/isolated",
+                      fixture.root) != 0 ||
+        safe_snprintf(installed, sizeof(installed), "%s/gpg-agent.conf",
+                      isolated_home) != 0 ||
+        mkdir(isolated_home, 0700) != 0) {
+        CHECK(!"failed to prepare isolated pinentry target");
+        m15_fixture_cleanup(&fixture);
+        return;
+    }
+    home_fd = open(isolated_home,
+                   O_RDONLY | O_CLOEXEC | O_DIRECTORY | O_NOFOLLOW);
+    if (home_fd < 0) {
+        CHECK(!"failed to open isolated pinentry target");
+        m15_fixture_cleanup(&fixture);
+        return;
+    }
+
+    run_test_set_path_candidate_failure(1, ESTALE);
+    clear_error();
+    errno = 0;
+    setup_rc =
+        gpg_manager_setup_agent_config_for_test(home_fd, isolated_home);
+    failure_errno = errno;
+    failure = *get_last_error();
+    run_test_set_path_candidate_failure(0, 0);
+
+    CHECK_EQ_INT(setup_rc, -1);
+    CHECK_EQ_INT(failure_errno, ESTALE);
+    CHECK_EQ_INT(failure.code, ERR_SYSTEM_COMMAND_FAILED);
+    CHECK_EQ_INT(failure.system_errno, ESTALE);
+    CHECK(strstr(failure.message,
+                 "trusted pinentry executable") != NULL);
+    CHECK(access(installed, F_OK) != 0 && errno == ENOENT);
+    CHECK(directory_is_empty(isolated_home));
+
+    CHECK_EQ_INT(close(home_fd), 0);
+    m15_fixture_cleanup(&fixture);
 }
 
 TEST(manager_uses_retained_program_after_path_changes) {
@@ -1378,6 +1446,7 @@ int main(int argc, char *argv[]) {
     RUN_TEST(resolver_skips_launch_ineligible_gpg_for_gpg2);
     RUN_TEST(system_key_rejects_invalid_selector_before_dependency_lookup);
     RUN_TEST(fatal_gpg_probe_does_not_fall_back_to_gpg2);
+    RUN_TEST(pinentry_identity_race_is_not_treated_as_absence);
     RUN_TEST(manager_uses_retained_program_after_path_changes);
     RUN_TEST(proof_cache_reuses_unchanged_real_listing);
     RUN_TEST(proof_cache_rejects_same_path_program_replacement);

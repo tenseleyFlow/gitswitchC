@@ -6749,7 +6749,7 @@ static int exec_open_directory_at(int parent_fd, const char *component,
     }
     if (!exec_stat_identity_matches(opened, &sealed)) {
         close(fd);
-        errno = EACCES;
+        errno = ESTALE;
         return -1;
     }
 #ifndef O_CLOEXEC
@@ -6987,7 +6987,7 @@ static int exec_open_canonical(const char *canonical,
             close(fd);
             close(metadata_fd);
             close(dir_fd);
-            errno = EACCES;
+            errno = ESTALE;
             return -1;
         }
         if (!exec_command_acl_is_trusted(fd, EXEC_ACL_TARGET_LEAF)) {
@@ -7030,7 +7030,7 @@ static int exec_open_canonical(const char *canonical,
             close(fd);
             close(metadata_fd);
             close(dir_fd);
-            errno = EACCES;
+            errno = ESTALE;
             return -1;
         }
         close(metadata_fd);
