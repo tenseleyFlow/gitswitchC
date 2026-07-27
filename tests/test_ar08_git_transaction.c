@@ -2276,6 +2276,8 @@ TEST(conflict_retry_never_rebases_onto_unrelated_same_path_generation) {
     char conflicted_config[MAX_PATH_LEN];
     char replacement_config[MAX_PATH_LEN];
     char actual[256];
+    int retry_result;
+    int retry_errno;
 
     if (!fixture_init(&fixture)) {
         CHECK(false);
@@ -2323,7 +2325,14 @@ TEST(conflict_retry_never_rebases_onto_unrelated_same_path_generation) {
 
     CHECK_EQ_INT(rename(config, replacement_config), 0);
     CHECK_EQ_INT(rename(retained_config, config), 0);
-    CHECK_EQ_INT(git_config_restore(), 0);
+    retry_result = git_config_restore();
+    retry_errno = errno;
+    if (retry_result != 0) {
+        fprintf(stderr,
+                "exact-generation retry failed (errno=%d): %s\n",
+                retry_errno, get_last_error()->message);
+    }
+    CHECK_EQ_INT(retry_result, 0);
     CHECK_EQ_INT(git_get_all("--local", "user.name", actual,
                              sizeof(actual)), 0);
     CHECK_STR_EQ(actual, "before-name\n");
@@ -3453,6 +3462,7 @@ TEST_MAIN_BEGIN()
     if (g_fork_coverage_child) return ts_test_finish();
     RUN_TEST(fork_child_closes_active_snapshot_finalizer_and_retirement_descriptors);
     if (g_fork_coverage_child) return ts_test_finish();
+    RUN_TEST(conflict_retry_never_rebases_onto_unrelated_same_path_generation);
     RUN_TEST(real_git_proves_narrow_ssh_environment_precedence_and_api_rejects_it);
     RUN_TEST(managed_command_scope_overrides_are_rejected_before_snapshot);
     RUN_TEST(late_command_override_is_rejected_at_account_writer_boundary);
@@ -3481,7 +3491,6 @@ TEST_MAIN_BEGIN()
     RUN_TEST(replaced_config_namespace_with_identical_vectors_is_never_rolled_back);
     RUN_TEST(replaced_config_file_with_identical_vectors_is_never_rolled_back);
     RUN_TEST(replaced_config_file_with_one_conflict_is_never_partially_rebased);
-    RUN_TEST(conflict_retry_never_rebases_onto_unrelated_same_path_generation);
     RUN_TEST(postpublish_path_race_retains_the_installed_generation_for_retry);
     RUN_TEST(fork_child_cannot_use_parent_snapshot_and_can_start_fresh);
     RUN_TEST(fork_child_abandon_preserves_reused_snapshot_descriptors);
