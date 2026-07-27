@@ -127,8 +127,9 @@ static void usage(const char *program)
             "       %s --internal-release-tree-consume-v1 ROOT BUILD_COMPONENT DIST_COMPONENT PRIVATE_NAME -- PRODUCER [ARG ...] --internal-consumer-v1 CONSUMER [ARG ...]\n"
             "       %s --internal-release-tree-from-dir-v1 ROOT BUILD_COMPONENT DIST_COMPONENT FINAL_NAME SOURCE_DIR_FD SOURCE_DIR_DEV SOURCE_DIR_INO EXPECTED_DEV EXPECTED_INO EXPECTED_SIZE EXPECTED_SHA256\n"
             "       %s --internal-rpm-stage-v1 RPMS_FD RPMS_DEV RPMS_INO SRPMS_FD SRPMS_DEV SRPMS_INO PUBLISH_FD PUBLISH_DEV PUBLISH_INO\n"
+            "       %s --internal-regular-fd-identity-v1 FD\n"
             "       %s --internal-retire-tree-v1 HOME PRIVATE_NAME EXPECTED_DEV EXPECTED_INO\n",
-            program, program, program, program, program, program);
+            program, program, program, program, program, program, program);
 }
 
 static bool same_identity(const struct stat *left, const struct stat *right)
@@ -4648,6 +4649,33 @@ static int validate_inherited_directory(int fd, struct stat *identity)
     return 0;
 }
 
+/* Internal release-shell ABI: pathname stat(1) cannot portably identify an
+ * already-open descriptor. In particular, FreeBSD's /dev/fd is fdescfs and
+ * stat(1) reports that vnode rather than the regular file behind the open fd.
+ * Keep the output to three bounded canonical decimal fields so the shell can
+ * compare it directly with pathname identities without parsing diagnostics. */
+static int report_inherited_regular_identity(const char *fd_text)
+{
+    struct stat identity;
+    int fd;
+
+    if (parse_inherited_fd(fd_text, &fd) != 0 ||
+        fstat(fd, &identity) != 0) {
+        return -1;
+    }
+    if (!S_ISREG(identity.st_mode) || identity.st_size <= 0) {
+        errno = EINVAL;
+        return -1;
+    }
+    if (printf("%" PRIuMAX ":%" PRIuMAX ":%" PRIuMAX "\n",
+               (uintmax_t)identity.st_dev, (uintmax_t)identity.st_ino,
+               (uintmax_t)identity.st_size) < 0 ||
+        fflush(stdout) != 0) {
+        return -1;
+    }
+    return 0;
+}
+
 static int copy_regular_descriptor(int source_fd, off_t size,
                                    int destination_fd)
 {
@@ -5826,6 +5854,16 @@ int main(int argc, char **argv)
             return EXIT_FAILURE;
         }
         return run_internal_retire_tree(argv[2], argv[3], argv[4], argv[5]);
+    }
+    if (argc >= 2 &&
+        strcmp(argv[1], "--internal-regular-fd-identity-v1") == 0) {
+        if (argc != 3 ||
+            report_inherited_regular_identity(argv[2]) != 0) {
+            fprintf(stderr,
+                    "ERROR: invalid inherited regular-file descriptor\n");
+            return EXIT_FAILURE;
+        }
+        return EXIT_SUCCESS;
     }
     if (argc >= 2 && strcmp(argv[1], "--internal-rpm-stage-v1") == 0) {
         if (argc != 11) {

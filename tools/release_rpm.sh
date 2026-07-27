@@ -62,7 +62,8 @@ rpm_regular_path_identity()
 rpm_regular_fd_identity()
 {
     rpm_regular_identity_fd=$1
-    rpm_regular_path_identity "/dev/fd/$rpm_regular_identity_fd"
+    "$rpm_publisher" --internal-regular-fd-identity-v1 \
+        "$rpm_regular_identity_fd"
 }
 
 rpm_sha256_fd()
@@ -397,8 +398,9 @@ rpm_source=$rpm_topdir/SOURCES/$rpm_archive_name
 exec 8<"$rpm_source" || rpm_fail "cannot open private RPM source"
 rpm_source_identity=$(rpm_regular_fd_identity 8) ||
     rpm_fail "cannot identify private RPM source descriptor"
-[ -s /dev/fd/8 ] && [ -f /dev/fd/8 ] ||
-    rpm_fail "private RPM source is not a nonempty regular file"
+# The versioned C identity ABI has already fstat-verified a nonempty regular
+# file. Do not repeat that proof through /dev/fd: FreeBSD stat predicates see
+# the fdescfs node rather than the opened file.
 chmod 0400 /dev/fd/8 || rpm_fail "cannot seal private RPM source"
 rpm_source_digest=$(rpm_sha256_fd 8) ||
     rpm_fail "cannot hash private RPM source"
@@ -417,8 +419,7 @@ exec 9<"$rpm_spec" ||
     rpm_fail "cannot open archive-embedded RPM spec"
 rpm_spec_identity=$(rpm_regular_fd_identity 9) ||
     rpm_fail "cannot identify archive-embedded RPM spec"
-[ -s /dev/fd/9 ] && [ -f /dev/fd/9 ] ||
-    rpm_fail "archive-embedded RPM spec is not a nonempty regular file"
+# As above, the C helper owns the portable regular/nonempty proof.
 chmod 0400 /dev/fd/9 || rpm_fail "cannot seal private RPM spec"
 rpm_spec_digest=$(rpm_sha256_fd 9) ||
     rpm_fail "cannot hash archive-embedded RPM spec"

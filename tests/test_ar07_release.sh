@@ -2000,6 +2000,66 @@ EOF
     copy_platform=$(uname -s) ||
         fail "cannot identify release publisher test platform"
 
+    # AR-14: descriptor identities come from fstat(2), not stat(1) on
+    # /dev/fd/N. FreeBSD's fdescfs reports the descriptor-node identity for
+    # that pathname. Pin a regular file, replace its pathname, and prove the
+    # internal ABI reports the exact still-open generation. Also reject every
+    # descriptor class the RPM shell must not accept.
+    fd_identity_path=$tmp/fd-identity
+    fd_identity_pinned=$tmp/fd-identity.pinned
+    fd_identity_empty=$tmp/fd-identity.empty
+    printf '%s\n' 'pinned descriptor generation' >"$fd_identity_path" ||
+        fail "cannot create descriptor-identity fixture"
+    : >"$fd_identity_empty" ||
+        fail "cannot create empty descriptor-identity fixture"
+    case $copy_platform in
+        Linux)
+            fd_identity_expected=$(stat -L -c '%d:%i:%s' \
+                "$fd_identity_path") ||
+                fail "cannot identify descriptor-identity fixture"
+            ;;
+        Darwin|FreeBSD)
+            fd_identity_expected=$(stat -L -f '%d:%i:%z' \
+                "$fd_identity_path") ||
+                fail "cannot identify descriptor-identity fixture"
+            ;;
+        *) fail "unsupported descriptor-identity platform: $copy_platform" ;;
+    esac
+    exec 7<"$fd_identity_path" ||
+        fail "cannot pin descriptor-identity fixture"
+    mv "$fd_identity_path" "$fd_identity_pinned" ||
+        fail "cannot replace descriptor-identity pathname"
+    printf '%s\n' 'replacement pathname generation' >"$fd_identity_path" ||
+        fail "cannot create descriptor-identity replacement"
+    fd_identity_actual=$(
+        "$named_publish_helper" --internal-regular-fd-identity-v1 7
+    ) || fail "release publisher rejected an inherited regular descriptor"
+    [ "$fd_identity_actual" = "$fd_identity_expected" ] ||
+        fail "release publisher identified the replacement pathname instead of the exact open fd"
+    exec 7<&-
+    if "$named_publish_helper" --internal-regular-fd-identity-v1 7 \
+        >"$tmp/fd-identity-closed.out" 2>&1; then
+        fail "release publisher accepted a closed inherited descriptor"
+    fi
+    exec 7<"$fd_identity_empty" ||
+        fail "cannot open empty descriptor-identity fixture"
+    if "$named_publish_helper" --internal-regular-fd-identity-v1 7 \
+        >"$tmp/fd-identity-empty.out" 2>&1; then
+        fail "release publisher accepted an empty regular descriptor"
+    fi
+    exec 7<&-
+    exec 7</dev/null ||
+        fail "cannot open nonregular descriptor-identity fixture"
+    if "$named_publish_helper" --internal-regular-fd-identity-v1 7 \
+        >"$tmp/fd-identity-nonregular.out" 2>&1; then
+        fail "release publisher accepted a nonregular inherited descriptor"
+    fi
+    exec 7<&-
+    if "$named_publish_helper" --internal-regular-fd-identity-v1 invalid \
+        >"$tmp/fd-identity-invalid.out" 2>&1; then
+        fail "release publisher accepted a nonnumeric inherited descriptor"
+    fi
+
     # AR-11 L42: distcheck consumes a descriptor-pinned private archive and
     # never publishes the canonical name. Force the named fallback on every
     # host to prove normal retirement/retention, post-validation substitution,
@@ -5224,8 +5284,6 @@ for rpm_component in BUILD BUILDROOT PUBLISH RPMS SOURCES SPECS SRPMS TMP; do
 done
 [ "$rpm_spec" = /dev/fd/9 ] ||
     rpm_die "-ba did not receive descriptor-pinned spec fd 9"
-[ -f "$rpm_spec" ] ||
-    rpm_die "descriptor-pinned spec is not a regular file"
 
 rpm_spec_fd=$rpm_spec
 rpm_named_spec=$rpm_topdir/SPECS/gitswitcher.spec
@@ -5238,9 +5296,11 @@ if [ "$AR11_RPM_MODE" = descriptor-inputs ]; then
         rpm_die "cannot record private spec substitution"
 fi
 
-# Plain FreeBSD fdescfs duplicates fd 9 with a shared offset. Consume that
-# descriptor exactly once, after the causal pathname substitution above, then
-# perform every fixture read against a private regular snapshot.
+# Plain FreeBSD fdescfs duplicates fd 9 with a shared offset, and pathname
+# type predicates inspect the fdescfs node rather than the opened file. The
+# production C identity ABI already proved fd 9 is regular and nonempty;
+# consume it exactly once after the causal pathname substitution, then prove
+# and perform every fixture read against a private regular snapshot.
 rpm_spec=$AR11_RPM_STATE/.spec-snapshot.$AR11_RPM_MODE.$$
 (umask 077 && /bin/cat "$rpm_spec_fd" >"$rpm_spec") ||
     rpm_die "cannot snapshot descriptor-pinned spec"
@@ -5686,6 +5746,8 @@ EOF
         fail "RPM helper restored private spec pathname consumption"
     fi
     grep -F -- "--internal-rpm-stage-v1 3 \"\$rpm_rpms_device\"" \
+        "$rpm_helper" >/dev/null &&
+    grep -F -- '--internal-regular-fd-identity-v1' \
         "$rpm_helper" >/dev/null &&
     grep -F "4 \"\$rpm_srpms_device\" \"\$rpm_srpms_inode\"" \
         "$rpm_helper" >/dev/null &&
@@ -6420,6 +6482,10 @@ set -u
 : "${AR11_RPM_PUBLISH_CALLS:?}"
 : "${AR11_RPM_PUBLISH_COUNT:?}"
 if [ "${1-}" = --internal-retire-tree-v1 ]; then
+    exec "$AR11_RPM_REAL_PUBLISHER" "$@"
+fi
+if [ "${1-}" = --internal-regular-fd-identity-v1 ]; then
+    [ "$#" -eq 2 ] || exit 89
     exec "$AR11_RPM_REAL_PUBLISHER" "$@"
 fi
 if [ "${1-}" = --internal-rpm-stage-v1 ]; then
