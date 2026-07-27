@@ -200,7 +200,6 @@ static int m20_replace_gpgconf(const char *path) {
     if (!path ||
         safe_snprintf(replacement, sizeof(replacement), "%s.new", path) != 0 ||
         copy_file(g_self_executable, replacement) != 0 ||
-        chmod(replacement, 0755) != 0 ||
         rename(replacement, path) != 0) {
         (void)unlink(replacement);
         return -1;
@@ -616,9 +615,7 @@ static int m20_create_private_tool_copies(
         safe_snprintf(fixture->gpg, sizeof(fixture->gpg),
                       "%s/gpg", fixture->tools) != 0 ||
         copy_file(gpgconf_source, fixture->gpgconf) != 0 ||
-        chmod(fixture->gpgconf, 0755) != 0 ||
-        copy_file(gpgconf_source, fixture->gpg) != 0 ||
-        chmod(fixture->gpg, 0755) != 0) {
+        copy_file(gpgconf_source, fixture->gpg) != 0) {
         int saved_errno = errno ? errno : EIO;
 
         m20_remove_private_tools(fixture);
