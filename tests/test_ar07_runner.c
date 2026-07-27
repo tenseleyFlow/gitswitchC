@@ -438,7 +438,7 @@ static int64_t test_monotonic_ms(void) {
     return (int64_t)now.tv_sec * 1000 + now.tv_nsec / 1000000;
 }
 
-static bool reap_within(pid_t pid, int timeout_ms, int *status_out) {
+static bool waitpid_within(pid_t pid, int timeout_ms, int *status_out) {
     struct timespec pause = {.tv_sec = 0, .tv_nsec = 10000000L};
     int elapsed = 0;
     while (elapsed <= timeout_ms) {
@@ -452,9 +452,13 @@ static bool reap_within(pid_t pid, int timeout_ms, int *status_out) {
         nanosleep(&pause, NULL);
         elapsed += 10;
     }
-    kill(pid, SIGKILL);
-    (void)waitpid(pid, NULL, 0);
     return false;
+}
+
+static bool reap_within(pid_t pid, int timeout_ms, int *status_out) {
+    if (waitpid_within(pid, timeout_ms, status_out)) return true;
+    if (kill(pid, SIGKILL) != 0 && errno != ESRCH) return false;
+    return waitpid_within(pid, 1000, status_out);
 }
 
 /* M45/T13: with no descriptor available even for trusted-command pinning,
@@ -1557,9 +1561,23 @@ static bool pty_control_round_trip(unsigned char control,
         return false;
     }
     int status = 0;
-    bool passed = reap_within(worker, 2000, &status) &&
-                  WIFEXITED(status) && WEXITSTATUS(status) == 0;
-    close(master);
+    bool reaped = waitpid_within(worker, 2000, &status);
+    if (!reaped) {
+        /* Darwin can retain a controlling-session leader in the exiting
+         * state until the peer releases the PTY master. Do not turn that
+         * teardown interlock into an unbounded post-SIGKILL wait: release the
+         * master, then give the already-completed worker a bounded reap. */
+        close(master);
+        master = -1;
+        reaped = waitpid_within(worker, 1000, &status);
+    }
+    if (!reaped) {
+        (void)kill(worker, SIGKILL);
+        (void)waitpid_within(worker, 1000, &status);
+    }
+    bool passed =
+        reaped && WIFEXITED(status) && WEXITSTATUS(status) == 0;
+    if (master >= 0) close(master);
     return passed;
 }
 
