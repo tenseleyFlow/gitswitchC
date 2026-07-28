@@ -2079,6 +2079,9 @@ TEST(postimage_pin_reproves_ctime_only_successor_by_exact_bytes) {
     git_fixture_t fixture;
     git_metadata_test_hook_fn previous = NULL;
     char actual[256];
+    error_context_t restore_error;
+    int restore_errno = 0;
+    int restore_rc = -1;
     int seal_rc;
 
     if (!fixture_init(&fixture)) {
@@ -2110,7 +2113,23 @@ TEST(postimage_pin_reproves_ctime_only_successor_by_exact_bytes) {
     CHECK_EQ_INT(g_post_config_pin_churn_errno, 0);
     CHECK_EQ_INT(seal_rc, 0);
     if (seal_rc == 0) {
-        CHECK_EQ_INT(git_config_restore(), 0);
+        restore_rc = git_config_restore();
+        restore_errno = errno;
+        restore_error = *get_last_error();
+        if (restore_rc != 0) {
+            fprintf(
+                stderr,
+                "post-image ctime reproof restore failed: errno=%d "
+                "code=%d system_errno=%d at %s:%d (%s): %s%s%s\n",
+                restore_errno, (int)restore_error.code,
+                restore_error.system_errno, restore_error.file,
+                restore_error.line, restore_error.function,
+                restore_error.message,
+                restore_error.details[0] ? "; " : "",
+                restore_error.details);
+        }
+        errno = restore_errno;
+        CHECK_EQ_INT(restore_rc, 0);
         CHECK_EQ_INT(git_get_all("--local", "user.name", actual,
                                  sizeof(actual)), 0);
         CHECK_STR_EQ(actual, "before-pin-churn\n");
