@@ -3713,6 +3713,7 @@ void run_test_set_supervisor_pending_signal(int signal_number) {
         case SIGHUP:
         case SIGQUIT:
         case SIGTSTP:
+        case SIGKILL:
             g_test_supervisor_pending_signal = signal_number;
             break;
         default:
@@ -5619,6 +5620,11 @@ static int run_argv_real_impl(
         errno = restore_errno;
         return -1;
     }
+    /* The parent never publishes setup status. Drop its writer before any
+     * child handshake so a supervisor that exits without reporting still
+     * produces observable EOF instead of a self-sustaining pipe wait. */
+    close(status_pipe[1]);
+    status_pipe[1] = -1;
     bool group_proven = false;
     runner_tty_state_t tty_state;
     memset(&tty_state, 0, sizeof(tty_state));
@@ -5712,7 +5718,6 @@ static int run_argv_real_impl(
         if (pipe_input) { close(in_pipe[0]); close(in_pipe[1]); }
         if (want_out) { close(out_pipe[0]); close(out_pipe[1]); }
         close(status_pipe[0]);
-        close(status_pipe[1]);
         free(fd_snapshot.fds);
         close(exec_fd);
         trusted_script_launch_cleanup(&script_launch);
@@ -5756,7 +5761,6 @@ static int run_argv_real_impl(
         if (pipe_input) { close(in_pipe[0]); close(in_pipe[1]); }
         if (want_out) { close(out_pipe[0]); close(out_pipe[1]); }
         close(status_pipe[0]);
-        close(status_pipe[1]);
         free(fd_snapshot.fds);
         close(exec_fd);
         trusted_script_launch_cleanup(&script_launch);
@@ -5802,7 +5806,6 @@ static int run_argv_real_impl(
         if (pipe_input) { close(in_pipe[0]); close(in_pipe[1]); }
         if (want_out) { close(out_pipe[0]); close(out_pipe[1]); }
         close(status_pipe[0]);
-        close(status_pipe[1]);
         close(signal_relay_pipe[0]);
         free(fd_snapshot.fds);
         close(exec_fd);
@@ -5856,7 +5859,6 @@ static int run_argv_real_impl(
         if (pipe_input) { close(in_pipe[0]); close(in_pipe[1]); }
         if (want_out) { close(out_pipe[0]); close(out_pipe[1]); }
         close(status_pipe[0]);
-        close(status_pipe[1]);
         free(fd_snapshot.fds);
         close(exec_fd);
         trusted_script_launch_cleanup(&script_launch);
@@ -5885,7 +5887,6 @@ static int run_argv_real_impl(
     if (devnull >= 0) close(devnull);
     if (pipe_input) close(in_pipe[0]);
     if (want_out) close(out_pipe[1]);
-    close(status_pipe[1]);
 
     child_status_t child_status = {0};
     run_test_fd_close_observation_t child_fd_close_observation = {0};

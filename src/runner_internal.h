@@ -49,8 +49,9 @@ void run_test_clear_launch_witness_epochs(void);
 #ifdef GITSWITCH_RUNNER_GROUP_TEST_API
 /* One-shot child-supervisor setpgid(2) failure before GROUP_READY. */
 void run_test_set_child_process_group_failure(int system_errno);
-/* Raise one signal only in the process-group supervisor after its worker fork
- * while the relay set is still blocked. */
+/* Raise one signal only in the process-group supervisor while the relay set
+ * is still blocked. SIGKILL models a silent death before GROUP_READY; the
+ * relayable signals remain pending through the worker fork. */
 void run_test_set_supervisor_pending_signal(int signal_number);
 /* Inject one signal after worker release but before the supervisor restores
  * its inherited mask. Normal signals target the complete process group;

@@ -645,6 +645,45 @@ TEST(process_group_supervisor_setup_failure_is_truthful_and_reaped) {
     CHECK_EQ_INT(retry.exit_code, 0);
 }
 
+static int silent_pre_ready_supervisor_death_worker(void) {
+    const char *argv[] = {"true", NULL};
+    run_result_t failed;
+    run_result_t retry;
+    int64_t started = test_monotonic_ms();
+
+    run_test_set_supervisor_pending_signal(SIGKILL);
+    clear_error();
+    errno = 0;
+    int run_rc = run_argv(argv, NULL, &failed);
+    int returned_errno = errno;
+    int64_t elapsed = test_monotonic_ms() - started;
+    bool reported_group_failure =
+        strstr(get_last_error()->message,
+               "cannot establish and verify isolated child process group") !=
+        NULL;
+    run_test_set_supervisor_pending_signal(0);
+
+    errno = 0;
+    int unreaped = waitpid(-1, NULL, WNOHANG);
+    int unreaped_errno = errno;
+    int retry_rc = run_argv(argv, NULL, &retry);
+
+    return run_rc == -1 && returned_errno == EPIPE &&
+                   failed.spawned && !failed.timed_out &&
+                   failed.exit_code == -1 &&
+                   failed.term_signal == SIGKILL &&
+                   elapsed >= 0 && elapsed < 1000 &&
+                   reported_group_failure &&
+                   unreaped == -1 && unreaped_errno == ECHILD &&
+                   retry_rc == 0 && retry.spawned && retry.exit_code == 0
+               ? 0 : 1;
+}
+
+TEST(silent_pre_ready_supervisor_death_cannot_stall_status_eof) {
+    CHECK(isolated_runner_check_passes_within(
+        silent_pre_ready_supervisor_death_worker, 2000));
+}
+
 TEST(supervisor_stage_failures_are_truthful_reaped_and_one_shot) {
     static const struct {
         run_test_supervisor_failure_stage_t stage;
@@ -2710,6 +2749,7 @@ int main(int argc, char **argv) {
     RUN_TEST(runner_fails_before_spawn_under_fd_exhaustion);
     RUN_TEST(child_setup_status_is_reported_explicitly);
     RUN_TEST(process_group_supervisor_setup_failure_is_truthful_and_reaped);
+    RUN_TEST(silent_pre_ready_supervisor_death_cannot_stall_status_eof);
     RUN_TEST(supervisor_stage_failures_are_truthful_reaped_and_one_shot);
     RUN_TEST(pre_release_group_death_cannot_sigpipe_parent);
     RUN_TEST(early_stdin_close_is_a_runner_failure);

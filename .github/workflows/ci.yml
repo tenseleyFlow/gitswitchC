@@ -237,55 +237,6 @@ jobs:
         # remaining declared capabilities explicit instead of green-skipping
         # them in either build configuration.
         run: brew install dash fish gnupg ksh93 readline
-      - name: Diagnose stalled Darwin transaction process
-        shell: bash
-        run: |
-          /usr/bin/make BUILD_TYPE=debug READLINE=1 WERROR=1 \
-            build/bin/test_ar08_git_transaction
-          export GITSWITCH_SOURCE_ROOT="$PWD"
-          export GITSWITCH_TEST_REQUIRED_CAPS=pty,readline,bash,zsh,fish,sh,dash,ksh,openssh,gpg,unix-sockets
-          build/bin/test_ar08_git_transaction &
-          transaction_pid=$!
-
-          for _ in {1..540}; do
-            if ! kill -0 "$transaction_pid" 2>/dev/null; then
-              if wait "$transaction_pid"; then
-                exit 0
-              else
-                exit $?
-              fi
-            fi
-            sleep 1
-          done
-
-          descendants()
-          {
-            local parent=$1
-            local child
-            for child in $(pgrep -P "$parent" 2>/dev/null || true); do
-              printf '%s\n' "$child"
-              descendants "$child"
-            done
-          }
-
-          echo "transaction suite exceeded 540 seconds; capturing Darwin samples" >&2
-          ps -axo pid,ppid,pgid,state,etime,command
-          sample_pids="$transaction_pid $(descendants "$transaction_pid")"
-          for pid in $sample_pids; do
-            if kill -0 "$pid" 2>/dev/null; then
-              echo "Sampling transaction process $pid" >&2
-              /usr/bin/sample "$pid" 1 1 || true
-            fi
-          done
-          for pid in $sample_pids; do
-            kill -TERM "$pid" 2>/dev/null || true
-          done
-          sleep 2
-          for pid in $sample_pids; do
-            kill -KILL "$pid" 2>/dev/null || true
-          done
-          wait "$transaction_pid" 2>/dev/null || true
-          exit 1
       - name: Build + test (ASan/UBSan, warnings-as-errors)
         run: /usr/bin/make BUILD_TYPE=debug READLINE=1 WERROR=1 test
         env:
