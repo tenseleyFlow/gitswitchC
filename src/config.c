@@ -12940,7 +12940,9 @@ static int config_write_document_atomic(gitswitch_ctx_t *ctx,
     struct stat temp_now;
     struct stat retained_source;
     unsigned char *document_bytes = NULL;
+    const unsigned char *destination_bytes = NULL;
     size_t document_length = 0;
+    size_t destination_length = 0;
     bool destination_existed = false;
     bool temp_exists = false;
     bool temp_registered = false;
@@ -13074,6 +13076,17 @@ static int config_write_document_atomic(gitswitch_ctx_t *ctx,
                   "Config destination is not a safe owned regular file: %s",
                   config_path);
         goto document_fail;
+    }
+    if (destination_existed &&
+        (ctx->config.source_witness_valid ||
+         ctx->config.source_read_witness_valid) &&
+        ctx->config.source_witness_length <=
+            sizeof(ctx->config.source_witness) &&
+        destination_before.st_size >= 0 &&
+        (uintmax_t)destination_before.st_size ==
+            ctx->config.source_witness_length) {
+        destination_bytes = ctx->config.source_witness;
+        destination_length = ctx->config.source_witness_length;
     }
 
     /* Create backup if file exists. AR-06 F51: skip it for a settings-only
@@ -13228,12 +13241,30 @@ static int config_write_document_atomic(gitswitch_ctx_t *ctx,
                          dir_path);
         goto document_fail;
     }
+    if (config_io_fault(CONFIG_IO_DOCUMENT_BEFORE_RENAME,
+                        "config document rename")) {
+        goto document_fail;
+    }
     errno = 0;
     if (fstatat(dir_fd, target_name, &destination_now,
                 AT_SYMLINK_NOFOLLOW) == 0) {
-        if (!destination_existed ||
-            !config_metadata_snapshot_same(&destination_before,
-                                           &destination_now)) {
+        bool destination_matches =
+            destination_existed &&
+            config_metadata_snapshot_same(&destination_before,
+                                          &destination_now);
+
+        if (!destination_matches && destination_existed &&
+            destination_bytes &&
+            config_metadata_ctime_only_change(&destination_before,
+                                              &destination_now) &&
+            config_reprove_existing_file_at(
+                dir_fd, target_name, &destination_before,
+                destination_bytes, destination_length,
+                &destination_now) == 0) {
+            destination_before = destination_now;
+            destination_matches = true;
+        }
+        if (!destination_matches) {
             errno = destination_existed ? ESTALE : EEXIST;
             set_system_error(ERR_CONFIG_WRITE_FAILED,
                              "Config destination changed before publication: %s",
@@ -13252,15 +13283,11 @@ static int config_write_document_atomic(gitswitch_ctx_t *ctx,
      * the final exact before-image proof, renameat is the cross-platform
      * commit point. Its success is latched separately from later proof and
      * durability state so a completed install is never reported as absent. */
-    if (config_io_fault(CONFIG_IO_DOCUMENT_BEFORE_RENAME,
-                        "config document rename")) {
-        goto document_fail;
-    }
     if (destination_existed) {
         publish_result = config_replace_exact_name_at(
             dir_fd, temp_name, &temp_generation,
             document_bytes, document_length, target_name,
-            &destination_before, NULL, 0U,
+            &destination_before, destination_bytes, destination_length,
             CONFIG_DOCUMENT_SETTLED_PREFIX,
             &destination_now, &document_committed);
     } else {

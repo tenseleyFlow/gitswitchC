@@ -214,6 +214,8 @@ static char document_close_ctime_path[256];
 static int document_close_ctime_error;
 static char document_reproof_ctime_path[256];
 static int document_reproof_ctime_error;
+static char document_prepublication_ctime_path[256];
+static int document_prepublication_ctime_error;
 static char document_rewrite_path[256];
 static const char *document_rewrite_content;
 static struct stat document_rewrite_before;
@@ -329,6 +331,23 @@ static bool drift_document_ctime_during_reproof(
             document_reproof_ctime_error = errno ? errno : EIO;
         }
         document_reproof_ctime_path[0] = '\0';
+    }
+    return false;
+}
+
+static bool drift_document_ctime_before_publication(
+    config_io_boundary_t boundary) {
+    struct stat before;
+    struct stat after;
+
+    if (boundary == CONFIG_IO_DOCUMENT_BEFORE_RENAME &&
+        document_prepublication_ctime_path[0] != '\0') {
+        if (lstat(document_prepublication_ctime_path, &before) != 0 ||
+            force_ctime_only_drift(
+                document_prepublication_ctime_path, &before, &after) != 0) {
+            document_prepublication_ctime_error = errno ? errno : EIO;
+        }
+        document_prepublication_ctime_path[0] = '\0';
     }
     return false;
 }
@@ -1118,10 +1137,19 @@ TEST(self_published_witness_admits_only_exact_ctime_drift) {
     CHECK_STR_EQ(text, "none\nactive=alice\n");
 
     /* The same witness also authorizes a later full-model replacement. This
-     * is a distinct admission path and runs again after state publication. */
+     * is a distinct admission path and runs again after state publication.
+     * The retained bytes also cover a final UFS ctime-only step caused by the
+     * verified backup read immediately before atomic replacement. */
     ctx.config.default_scope = GIT_SCOPE_GLOBAL;
+    snprintf(document_prepublication_ctime_path,
+             sizeof(document_prepublication_ctime_path), "%s", path);
+    document_prepublication_ctime_error = 0;
+    config_set_io_fault_fn(drift_document_ctime_before_publication);
     installed = false;
     CHECK_EQ_INT(config_save_transactional(&ctx, path, &installed), 0);
+    config_set_io_fault_fn(NULL);
+    CHECK_EQ_INT(document_prepublication_ctime_error, 0);
+    CHECK(document_prepublication_ctime_path[0] == '\0');
     CHECK(installed);
     CHECK(ctx.config.source_witness_valid);
     CHECK_EQ_INT(lstat(path, &drifted), 0);
