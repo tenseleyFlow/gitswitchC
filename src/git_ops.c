@@ -1173,6 +1173,31 @@ static int git_parse_snapshot_listing(const char *buf, size_t len,
     return 0;
 }
 
+typedef struct {
+    const char *const *argv;
+    const run_opts_t *opts;
+    run_result_t *result;
+    error_context_t runner_error;
+    int run_errno;
+    bool runner_error_fresh;
+} git_snapshot_run_observation_t;
+
+static int git_snapshot_run_observed(void *context) {
+    git_snapshot_run_observation_t *observation = context;
+    uint64_t error_generation = error_report_generation();
+    int run_rc;
+
+    run_rc = run_argv(observation->argv, observation->opts,
+                      observation->result);
+    observation->run_errno = errno;
+    observation->runner_error_fresh =
+        error_report_generation() != error_generation;
+    if (observation->runner_error_fresh) {
+        observation->runner_error = *get_last_error();
+    }
+    return run_rc;
+}
+
 /* Grow until the complete binary listing fits. A hard cap bounds hostile or
  * corrupt config input; reaching it is a preflight failure, never a partial
  * snapshot followed by mutation (AR-07 M24). */
@@ -1180,6 +1205,7 @@ static int git_read_snapshot_listing(git_scope_t scope, bool includes,
                                      char **out, size_t *out_len) {
     const char *scope_flag = git_scope_to_flag(scope);
     size_t capacity = GIT_SNAPSHOT_INITIAL_BYTES;
+    unsigned int empty_failure_retries_remaining = 1U;
     char *buf;
 
     if (!scope_flag || !out || !out_len) {
@@ -1203,13 +1229,12 @@ static int git_read_snapshot_listing(git_scope_t scope, bool includes,
         };
         run_opts_t opts;
         run_result_t res;
-        error_context_t runner_error;
-        uint64_t error_generation;
+        git_snapshot_run_observation_t observation;
         int run_rc;
 
         memset(&opts, 0, sizeof(opts));
         memset(&res, 0, sizeof(res));
-        memset(&runner_error, 0, sizeof(runner_error));
+        memset(&observation, 0, sizeof(observation));
         opts.out = buf;
         opts.out_size = capacity;
         /* Git reports a genuinely absent explicitly selected scope file as
@@ -1220,16 +1245,17 @@ static int git_read_snapshot_listing(git_scope_t scope, bool includes,
          * fail closed instead of being silently discarded. */
         opts.merge_stderr = true;
         opts.extra_env = diagnostic_env;
-        error_generation = error_report_generation();
-        run_rc = run_argv(argv, &opts, &res);
+        observation.argv = argv;
+        observation.opts = &opts;
+        observation.result = &res;
+        run_rc = error_run_observational(
+            git_snapshot_run_observed, &observation);
         if (run_rc != 0) {
             static const char missing_prefix[] =
                 "fatal: unable to read config file '";
             static const char missing_suffix[] =
                 "': No such file or directory\n";
-            int run_errno = errno;
-            bool runner_error_fresh =
-                error_report_generation() != error_generation;
+            int run_errno = observation.run_errno;
             size_t prefix_len = sizeof(missing_prefix) - 1U;
             size_t suffix_len = sizeof(missing_suffix) - 1U;
             bool clean_missing =
@@ -1249,7 +1275,18 @@ static int git_read_snapshot_listing(git_scope_t scope, bool includes,
                 *out_len = 0;
                 return 0;
             }
-            if (runner_error_fresh) runner_error = *get_last_error();
+            /* The listing is side-effect-free. Retry one empty boundary
+             * failure: Darwin runners have intermittently rejected a
+             * short-lived helper without Git producing any diagnostic bytes.
+             * Output-bearing Git failures, timeouts, and signals remain
+             * immediately fatal. Later exact generation/ownership checks
+             * still gate every rollback write. */
+            if (empty_failure_retries_remaining > 0U &&
+                res.out_len == 0U && !res.out_truncated &&
+                !res.timed_out && res.term_signal == 0) {
+                empty_failure_retries_remaining--;
+                continue;
+            }
             free(buf);
             (void)set_error(
                 ERR_GIT_CONFIG_FAILED,
@@ -1259,8 +1296,9 @@ static int git_read_snapshot_listing(git_scope_t scope, bool includes,
                 scope_flag, includes ? "on" : "off", res.spawned ? 1 : 0,
                 res.exit_code, res.term_signal, res.timed_out ? 1 : 0,
                 res.out_truncated ? 1 : 0, res.out_len, 160,
-                runner_error_fresh && runner_error.message[0]
-                    ? runner_error.message : "none");
+                observation.runner_error_fresh &&
+                        observation.runner_error.message[0]
+                    ? observation.runner_error.message : "none");
             errno = run_errno;
             return -1;
         }

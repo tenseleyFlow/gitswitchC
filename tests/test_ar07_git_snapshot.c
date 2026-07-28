@@ -16,6 +16,8 @@ static char g_expanded[LIST_CAP];
 static size_t g_direct_len;
 static size_t g_expanded_len;
 static bool g_fail_lists;
+static int g_fail_lists_remaining;
+static bool g_fail_list_reports_error;
 typedef enum {
     LIST_ERROR_NONE = 0,
     LIST_ERROR_MISSING,
@@ -72,6 +74,8 @@ static void fixture_reset(void) {
     memset(g_expanded, 0, sizeof(g_expanded));
     g_direct_len = g_expanded_len = 0;
     g_fail_lists = false;
+    g_fail_lists_remaining = 0;
+    g_fail_list_reports_error = false;
     g_list_error = LIST_ERROR_NONE;
     g_always_truncate = false;
     g_list_calls = g_mutations = 0;
@@ -122,7 +126,15 @@ static int snapshot_runner(const char *const argv[], const run_opts_t *opts,
         size_t copied;
 
         g_list_calls++;
-        if (g_fail_lists) return fake_ret(result, 2);
+        if (g_fail_lists || g_fail_lists_remaining > 0) {
+            if (g_fail_lists_remaining > 0) g_fail_lists_remaining--;
+            if (g_fail_list_reports_error) {
+                errno = EPERM;
+                set_system_error(ERR_SYSTEM_CALL,
+                                 "injected snapshot runner failure");
+            }
+            return fake_ret(result, 2);
+        }
         if (g_list_error == LIST_ERROR_MISSING) {
             return fake_list_error(
                 opts, result,
@@ -211,12 +223,32 @@ TEST(snapshot_read_and_oversize_fail_before_mutation) {
     CHECK(strstr(get_last_error()->message, "spawned=1") != NULL);
     CHECK(strstr(get_last_error()->message, "exit=2") != NULL);
     CHECK(strstr(get_last_error()->message, "runner=none") != NULL);
+    CHECK_EQ_INT(g_list_calls, 2); /* one retry, then fail closed */
 
     fixture_reset();
     g_always_truncate = true;
     CHECK_EQ_INT(git_config_snapshot(GIT_SCOPE_GLOBAL), -1);
     CHECK(g_list_calls > 1);
     CHECK_EQ_INT(g_mutations, 0);
+    run_set_runner(previous);
+}
+
+TEST(one_empty_snapshot_read_failure_is_retried_observationally) {
+    fixture_reset();
+    g_fail_lists_remaining = 1;
+    g_fail_list_reports_error = true;
+    command_runner_fn previous = run_set_runner(snapshot_runner);
+    set_error(ERR_UNKNOWN, "retained caller diagnostic");
+    uint64_t error_generation = error_report_generation();
+
+    CHECK_EQ_INT(git_config_snapshot(GIT_SCOPE_GLOBAL), 0);
+    CHECK_EQ_INT(g_list_calls, 3); /* failed direct, retry, expanded */
+    CHECK_EQ_INT(g_mutations, 0);
+    CHECK_EQ_INT(get_last_error()->code, ERR_UNKNOWN);
+    CHECK_STR_EQ(get_last_error()->message, "retained caller diagnostic");
+    CHECK_EQ_INT(error_report_generation(), error_generation);
+
+    clear_error();
     run_set_runner(previous);
 }
 
@@ -348,6 +380,7 @@ TEST_MAIN_BEGIN()
     error_init(LOG_LEVEL_WARNING, NULL);
     RUN_TEST(dynamic_snapshot_restores_value_beyond_initial_capture);
     RUN_TEST(snapshot_read_and_oversize_fail_before_mutation);
+    RUN_TEST(one_empty_snapshot_read_failure_is_retried_observationally);
     RUN_TEST(missing_scope_file_is_an_exact_empty_snapshot);
     RUN_TEST(non_enoent_scope_failure_is_refused_before_mutation);
     RUN_TEST(included_managed_value_is_refused_before_mutation);
