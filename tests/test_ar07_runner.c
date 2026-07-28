@@ -1446,6 +1446,10 @@ static int pending_replay_failure_worker(void) {
     bool action_configured = false;
     bool mask_configured = false;
     bool guard_started = false;
+    bool reported_group_failure = false;
+    bool pending_signal_published = false;
+    bool mask_preserved = false;
+    bool action_preserved = false;
 
     if (install_default_signal_fixture(
             SIGHUP, &original_action, &configured_action) != 0) {
@@ -1470,6 +1474,11 @@ static int pending_replay_failure_worker(void) {
     errno = 0;
     int run_rc = run_argv(argv, NULL, &failed);
     int returned_errno = errno;
+    reported_group_failure =
+        strstr(get_last_error()->message,
+               "process-group supervisor setup failed") != NULL;
+    pending_signal_published =
+        signals_pending() || signals_pending_signal() != 0;
     run_test_set_supervisor_pending_signal(0);
     run_test_set_supervisor_failure(
         RUN_TEST_SUPERVISOR_FAILURE_NONE, 0);
@@ -1480,6 +1489,15 @@ static int pending_replay_failure_worker(void) {
         sigprocmask(SIG_SETMASK, NULL, &after_mask);
     int action_query_rc =
         sigaction(SIGHUP, NULL, &after_action);
+    if (mask_query_rc == 0) {
+        mask_preserved =
+            sigsets_semantically_equal(&configured_mask, &after_mask);
+    }
+    if (action_query_rc == 0) {
+        action_preserved =
+            sigactions_semantically_equal(
+                &configured_action, &after_action);
+    }
     errno = 0;
     int unreaped = waitpid(-1, NULL, WNOHANG);
     int unreaped_errno = errno;
@@ -1487,18 +1505,26 @@ static int pending_replay_failure_worker(void) {
     outcome =
         run_rc == -1 && returned_errno == EIO &&
                 failed.spawned && failed.exit_code == 126 &&
-                strstr(get_last_error()->message,
-                       "process-group supervisor setup failed") != NULL &&
-                !signals_pending() && signals_pending_signal() == 0 &&
+                reported_group_failure && !pending_signal_published &&
                 retry_rc == 0 && retry.spawned && retry.exit_code == 0 &&
                 guard_end_rc == 0 &&
                 mask_query_rc == 0 && action_query_rc == 0 &&
-                sigsets_semantically_equal(
-                    &configured_mask, &after_mask) &&
-                sigactions_semantically_equal(
-                    &configured_action, &after_action) &&
+                mask_preserved && action_preserved &&
                 unreaped == -1 && unreaped_errno == ECHILD
             ? 0 : 92;
+    if (outcome != 0) {
+        fprintf(
+            stderr,
+            "  pending-replay diagnostics: run=%d errno=%d spawned=%d exit=%d "
+            "reported=%d pending=%d retry=%d retry-spawned=%d retry-exit=%d "
+            "guard-end=%d mask-query=%d action-query=%d mask-equal=%d "
+            "action-equal=%d unreaped=%ld unreaped-errno=%d\n",
+            run_rc, returned_errno, failed.spawned, failed.exit_code,
+            reported_group_failure, pending_signal_published, retry_rc,
+            retry.spawned, retry.exit_code, guard_end_rc, mask_query_rc,
+            action_query_rc, mask_preserved, action_preserved,
+            (long)unreaped, unreaped_errno);
+    }
 
 cleanup:
     run_test_set_supervisor_pending_signal(0);
