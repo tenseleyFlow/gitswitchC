@@ -3462,7 +3462,6 @@ TEST_MAIN_BEGIN()
     if (g_fork_coverage_child) return ts_test_finish();
     RUN_TEST(fork_child_closes_active_snapshot_finalizer_and_retirement_descriptors);
     if (g_fork_coverage_child) return ts_test_finish();
-    RUN_TEST(conflict_retry_never_rebases_onto_unrelated_same_path_generation);
     RUN_TEST(real_git_proves_narrow_ssh_environment_precedence_and_api_rejects_it);
     RUN_TEST(managed_command_scope_overrides_are_rejected_before_snapshot);
     RUN_TEST(late_command_override_is_rejected_at_account_writer_boundary);
@@ -3491,6 +3490,7 @@ TEST_MAIN_BEGIN()
     RUN_TEST(replaced_config_namespace_with_identical_vectors_is_never_rolled_back);
     RUN_TEST(replaced_config_file_with_identical_vectors_is_never_rolled_back);
     RUN_TEST(replaced_config_file_with_one_conflict_is_never_partially_rebased);
+    RUN_TEST(conflict_retry_never_rebases_onto_unrelated_same_path_generation);
     RUN_TEST(postpublish_path_race_retains_the_installed_generation_for_retry);
     RUN_TEST(fork_child_cannot_use_parent_snapshot_and_can_start_fresh);
     RUN_TEST(fork_child_abandon_preserves_reused_snapshot_descriptors);
