@@ -4525,10 +4525,12 @@ static void run_deadline_set_error(int deadline_rc, const char *phase,
 #define RUNNER_POLL_SLICE_MS 50
 #define RUNNER_CAPTURE_GRACE_MS 250
 #define RUNNER_DRAIN_CHUNKS_PER_POLL 16
+#define RUNNER_SILENT_SETUP_RETRIES 1U
 
 static int run_argv_real_impl(
     const char *const argv[], const run_opts_t *opts,
-    const run_launch_witness_t *expected, run_result_t *result) {
+    const run_launch_witness_t *expected, run_result_t *result,
+    unsigned int silent_setup_retries_remaining) {
     run_opts_t no_opts;
     run_result_t local;
     memset(&no_opts, 0, sizeof(no_opts));
@@ -5681,6 +5683,9 @@ static int run_argv_real_impl(
     close(group_ready_pipe[0]);
     if (!group_proven || runner_tty_prepare(&tty_state) != 0 ||
         runner_tty_transfer(&tty_state, pid) != 0) {
+        bool silent_pre_ready_failure =
+            group_ready_rc != 0 && group_ready_errno == EPIPE &&
+            early_group_failure_rc == 0;
         int group_errno =
             early_group_failure_rc > 0 &&
                     early_group_failure.stage ==
@@ -5690,13 +5695,18 @@ static int run_argv_real_impl(
                        ? group_ready_errno
                        : (errno != 0 ? errno : EIO));
         int cleanup_wait_errno = 0;
+        int tty_cleanup_errno = 0;
+        int spawn_mask_restore_errno = 0;
+        int wait_mask_restore_errno = 0;
         int group_status = 0;
         signals_child_wait_result_t wait_result;
 
         close(group_release_pipe[1]);
         close(signal_relay_pipe[0]);
         runner_signal_child(pid, group_proven, SIGKILL);
-        (void)runner_tty_restore(&tty_state);
+        if (runner_tty_restore(&tty_state) != 0) {
+            tty_cleanup_errno = errno;
+        }
         do {
             wait_result = signals_wait_child(pid, &group_status, 0);
         } while (wait_result.waited < 0 &&
@@ -5712,8 +5722,12 @@ static int run_argv_real_impl(
                    WIFSIGNALED(group_status)) {
             result->term_signal = WTERMSIG(group_status);
         }
-        (void)signals_restore_after_child_spawn(&pre_spawn_mask);
-        (void)signals_child_wait_end(&pre_wait_mask);
+        if (signals_restore_after_child_spawn(&pre_spawn_mask) != 0) {
+            spawn_mask_restore_errno = errno;
+        }
+        if (signals_child_wait_end(&pre_wait_mask) != 0) {
+            wait_mask_restore_errno = errno;
+        }
         if (devnull >= 0) close(devnull);
         if (pipe_input) { close(in_pipe[0]); close(in_pipe[1]); }
         if (want_out) { close(out_pipe[0]); close(out_pipe[1]); }
@@ -5721,6 +5735,23 @@ static int run_argv_real_impl(
         free(fd_snapshot.fds);
         close(exec_fd);
         trusted_script_launch_cleanup(&script_launch);
+        /* Before GROUP_READY the supervisor has not created or released the
+         * worker, so the requested command cannot have executed. A platform
+         * or runtime may nevertheless terminate this short-lived fork child
+         * without a setup record.
+         * Retry that side-effect-free window once, but never retry an explicit
+         * setup report or continue after incomplete signal/reap cleanup. */
+        if (silent_pre_ready_failure &&
+            silent_setup_retries_remaining > 0U &&
+            wait_result.waited == pid &&
+            (WIFEXITED(group_status) || WIFSIGNALED(group_status)) &&
+            cleanup_wait_errno == 0 && wait_result.mask_errno == 0 &&
+            tty_cleanup_errno == 0 && spawn_mask_restore_errno == 0 &&
+            wait_mask_restore_errno == 0) {
+            return run_argv_real_impl(
+                argv, opts, expected, result,
+                silent_setup_retries_remaining - 1U);
+        }
         errno = group_errno;
         if (early_group_failure_rc > 0 &&
             early_group_failure.stage == CHILD_STAGE_PROCESS_GROUP) {
@@ -5737,6 +5768,15 @@ static int run_argv_real_impl(
         }
         report_secondary_runner_cleanup_failure(
             "while reaping failed process-group setup", cleanup_wait_errno);
+        report_secondary_runner_cleanup_failure(
+            "while restoring terminal ownership after failed process-group setup",
+            tty_cleanup_errno);
+        report_secondary_runner_cleanup_failure(
+            "while restoring the guarded spawn mask after failed process-group setup",
+            spawn_mask_restore_errno);
+        report_secondary_runner_cleanup_failure(
+            "while restoring SIGCHLD ownership after failed process-group setup",
+            wait_mask_restore_errno);
         errno = group_errno;
         return -1;
     }
@@ -6484,7 +6524,8 @@ static int run_argv_real_impl(
 
 int run_argv_real(const char *const argv[], const run_opts_t *opts,
                   run_result_t *result) {
-    return run_argv_real_impl(argv, opts, NULL, result);
+    return run_argv_real_impl(argv, opts, NULL, result,
+                              RUNNER_SILENT_SETUP_RETRIES);
 }
 
 static command_runner_fn g_runner = run_argv_real;
@@ -6531,7 +6572,8 @@ int run_argv_with_expected_launch(
         return -1;
     }
     if (g_runner == run_argv_real) {
-        return run_argv_real_impl(argv, opts, expected, result);
+        return run_argv_real_impl(argv, opts, expected, result,
+                                  RUNNER_SILENT_SETUP_RETRIES);
     }
     rc = g_runner(argv, opts, observed);
     if (rc != 0) return rc;

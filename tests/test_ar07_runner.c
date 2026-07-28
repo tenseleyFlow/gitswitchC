@@ -645,13 +645,50 @@ TEST(process_group_supervisor_setup_failure_is_truthful_and_reaped) {
     CHECK_EQ_INT(retry.exit_code, 0);
 }
 
-static int silent_pre_ready_supervisor_death_worker(void) {
+static int one_silent_pre_ready_supervisor_death_worker(void) {
     const char *argv[] = {"true", NULL};
-    run_result_t failed;
-    run_result_t retry;
+    run_result_t recovered;
     int64_t started = test_monotonic_ms();
 
     run_test_set_supervisor_pending_signal(SIGKILL);
+    clear_error();
+    errno = 0;
+    int run_rc = run_argv(argv, NULL, &recovered);
+    int64_t elapsed = test_monotonic_ms() - started;
+    run_test_set_supervisor_pending_signal(0);
+
+    errno = 0;
+    int unreaped = waitpid(-1, NULL, WNOHANG);
+    int unreaped_errno = errno;
+
+    return run_rc == 0 && recovered.spawned && !recovered.timed_out &&
+                   recovered.exit_code == 0 && recovered.term_signal == 0 &&
+                   elapsed >= 0 && elapsed < 2000 &&
+                   unreaped == -1 && unreaped_errno == ECHILD
+               ? 0 : 1;
+}
+
+TEST(one_silent_pre_ready_supervisor_death_retries_before_execution) {
+    CHECK(isolated_runner_check_passes_within(
+        one_silent_pre_ready_supervisor_death_worker, 4000));
+}
+
+static int g_silent_pre_ready_attempts;
+
+static void rearm_silent_pre_ready_supervisor_death(void) {
+    g_silent_pre_ready_attempts++;
+    run_test_set_supervisor_pending_signal(SIGKILL);
+}
+
+static int repeated_silent_pre_ready_supervisor_death_worker(void) {
+    const char *argv[] = {"true", NULL};
+    run_result_t failed;
+    int64_t started = test_monotonic_ms();
+
+    run_test_set_supervisor_pending_signal(SIGKILL);
+    g_silent_pre_ready_attempts = 0;
+    run_test_set_post_fork_pre_publish_hook(
+        rearm_silent_pre_ready_supervisor_death);
     clear_error();
     errno = 0;
     int run_rc = run_argv(argv, NULL, &failed);
@@ -661,27 +698,27 @@ static int silent_pre_ready_supervisor_death_worker(void) {
         strstr(get_last_error()->message,
                "cannot establish and verify isolated child process group") !=
         NULL;
+    run_test_set_post_fork_pre_publish_hook(NULL);
     run_test_set_supervisor_pending_signal(0);
 
     errno = 0;
     int unreaped = waitpid(-1, NULL, WNOHANG);
     int unreaped_errno = errno;
-    int retry_rc = run_argv(argv, NULL, &retry);
 
     return run_rc == -1 && returned_errno == EPIPE &&
                    failed.spawned && !failed.timed_out &&
                    failed.exit_code == -1 &&
                    failed.term_signal == SIGKILL &&
-                   elapsed >= 0 && elapsed < 1000 &&
+                   elapsed >= 0 && elapsed < 3000 &&
                    reported_group_failure &&
-                   unreaped == -1 && unreaped_errno == ECHILD &&
-                   retry_rc == 0 && retry.spawned && retry.exit_code == 0
+                   g_silent_pre_ready_attempts == 2 &&
+                   unreaped == -1 && unreaped_errno == ECHILD
                ? 0 : 1;
 }
 
-TEST(silent_pre_ready_supervisor_death_cannot_stall_status_eof) {
+TEST(repeated_silent_pre_ready_supervisor_death_is_bounded_and_truthful) {
     CHECK(isolated_runner_check_passes_within(
-        silent_pre_ready_supervisor_death_worker, 2000));
+        repeated_silent_pre_ready_supervisor_death_worker, 5000));
 }
 
 TEST(supervisor_stage_failures_are_truthful_reaped_and_one_shot) {
@@ -2749,7 +2786,8 @@ int main(int argc, char **argv) {
     RUN_TEST(runner_fails_before_spawn_under_fd_exhaustion);
     RUN_TEST(child_setup_status_is_reported_explicitly);
     RUN_TEST(process_group_supervisor_setup_failure_is_truthful_and_reaped);
-    RUN_TEST(silent_pre_ready_supervisor_death_cannot_stall_status_eof);
+    RUN_TEST(one_silent_pre_ready_supervisor_death_retries_before_execution);
+    RUN_TEST(repeated_silent_pre_ready_supervisor_death_is_bounded_and_truthful);
     RUN_TEST(supervisor_stage_failures_are_truthful_reaped_and_one_shot);
     RUN_TEST(pre_release_group_death_cannot_sigpipe_parent);
     RUN_TEST(early_stdin_close_is_a_runner_failure);
