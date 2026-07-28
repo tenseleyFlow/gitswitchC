@@ -34,6 +34,7 @@ static char g_xdg[64]; /* keep AF_UNIX paths below sun_path's small cap */
 static int g_runner_calls;
 static int g_agent_spawn_calls;
 static pid_t g_post_spawn_agent_pid = -1;
+static pid_t g_successful_agent_pid = -1;
 static int g_fake_agent_listener = -1;
 static int g_fake_agent_pidfd_write = -1;
 static ssh_process_image_t g_fake_agent_image;
@@ -444,6 +445,30 @@ static int post_spawn_failure_runner(const char *const argv[],
     return rc == 0 ? -1 : rc;
 }
 
+/* Use a real protocol-capable ssh-agent while keeping the deterministic
+ * ssh-add/ssh-keygen responses supplied by fake_agent_runner. Darwin proves
+ * the socket protocol before accepting its peer credentials, so a bare
+ * listening socket is not a successful-start fixture there. */
+static int successful_agent_runner(const char *const argv[],
+                                   const run_opts_t *opts,
+                                   run_result_t *result) {
+    int rc;
+
+    if (argv[0][0] != '/' ||
+        strcmp(strrchr(argv[0], '/') + 1, "ssh-agent") != 0) {
+        return fake_agent_runner(argv, opts, result);
+    }
+    rc = run_argv_real(argv, opts, result);
+    if (rc == 0 && opts && opts->out) {
+        const char *pid_text = strstr(opts->out, "SSH_AGENT_PID=");
+        if (pid_text) {
+            g_successful_agent_pid = (pid_t)strtol(
+                pid_text + strlen("SSH_AGENT_PID="), NULL, 10);
+        }
+    }
+    return rc;
+}
+
 /* Fail only the second environment write so the test proves that a partially
  * mutated process environment is restored, not merely that an early failure
  * is propagated. */
@@ -572,6 +597,12 @@ static int write_agent_record(const char *agent_dir, const char *name,
                          sizeof(record.image.executable_path)) == 0) {
             record.image.valid = true;
             record.image.effective_uid = geteuid();
+            /* This fixture deliberately models a same-image listener that
+             * does not speak the SSH-agent protocol. Record its known peer
+             * directly so setup does not consume the negative preflight that
+             * ssh_manager_reset() is meant to exercise. */
+            record.image.socket_peer_pid = pid;
+            record.image.socket_peer_uid = geteuid();
             image_rc = 0;
         }
         free(canonical);
@@ -1074,15 +1105,6 @@ TEST(post_spawn_runner_failure_reaps_runtime_and_allows_retry) {
     account_t account;
     error_context_t launch_error;
     command_runner_fn previous;
-    ssh_reap_test_ops_t previous_reap_ops;
-    const ssh_reap_test_ops_t fake_reap_ops = {
-        .identity = classify_fake_agent_owned,
-        .generation = capture_fake_agent_generation,
-        .image = capture_fake_agent_image,
-        .signal = fake_agent_signal,
-        .pidfd_open = fake_agent_pidfd_open,
-        .pidfd_signal = fake_agent_pidfd_signal,
-    };
     bool pid_gone;
 
     if (!command_exists("ssh-agent")) {
@@ -1192,18 +1214,18 @@ TEST(post_spawn_runner_failure_reaps_runtime_and_allows_retry) {
     memset(&cfg, 0, sizeof(cfg));
     cfg.mode = SSH_AGENT_ISOLATED;
     cfg.agent_pid = -1;
-    previous_reap_ops = ssh_manager_set_reap_test_ops(&fake_reap_ops);
-    previous = run_set_runner(fake_agent_runner);
+    g_successful_agent_pid = -1;
+    previous = run_set_runner(successful_agent_runner);
     CHECK_EQ_INT(ssh_start_isolated_agent(&cfg, &account), 0);
     run_set_runner(previous);
     CHECK(entry_exists(sock));
     CHECK(entry_exists(pidfile));
     CHECK(entry_exists(current));
     CHECK_EQ_INT(ssh_manager_reset("work"), 0);
-    ssh_manager_set_reap_test_ops(&previous_reap_ops);
     CHECK(!entry_exists(sock));
     CHECK(!entry_exists(pidfile));
     CHECK(!entry_exists(current));
+    stop_real_agent(g_successful_agent_pid, sock, current);
 }
 
 TEST(fresh_agent_retarget_failure_reaps_and_restores_environment) {
