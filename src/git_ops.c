@@ -1203,9 +1203,13 @@ static int git_read_snapshot_listing(git_scope_t scope, bool includes,
         };
         run_opts_t opts;
         run_result_t res;
+        error_context_t runner_error;
+        uint64_t error_generation;
+        int run_rc;
 
         memset(&opts, 0, sizeof(opts));
         memset(&res, 0, sizeof(res));
+        memset(&runner_error, 0, sizeof(runner_error));
         opts.out = buf;
         opts.out_size = capacity;
         /* Git reports a genuinely absent explicitly selected scope file as
@@ -1216,11 +1220,16 @@ static int git_read_snapshot_listing(git_scope_t scope, bool includes,
          * fail closed instead of being silently discarded. */
         opts.merge_stderr = true;
         opts.extra_env = diagnostic_env;
-        if (run_argv(argv, &opts, &res) != 0) {
+        error_generation = error_report_generation();
+        run_rc = run_argv(argv, &opts, &res);
+        if (run_rc != 0) {
             static const char missing_prefix[] =
                 "fatal: unable to read config file '";
             static const char missing_suffix[] =
                 "': No such file or directory\n";
+            int run_errno = errno;
+            bool runner_error_fresh =
+                error_report_generation() != error_generation;
             size_t prefix_len = sizeof(missing_prefix) - 1U;
             size_t suffix_len = sizeof(missing_suffix) - 1U;
             bool clean_missing =
@@ -1240,10 +1249,19 @@ static int git_read_snapshot_listing(git_scope_t scope, bool includes,
                 *out_len = 0;
                 return 0;
             }
+            if (runner_error_fresh) runner_error = *get_last_error();
             free(buf);
-            set_error(ERR_GIT_CONFIG_FAILED,
-                      "Failed to read %s Git configuration for rollback",
-                      scope_flag);
+            (void)set_error(
+                ERR_GIT_CONFIG_FAILED,
+                "Failed to read %s Git configuration for rollback "
+                "(includes=%s spawned=%d exit=%d signal=%d timeout=%d "
+                "truncated=%d bytes=%zu runner=%.*s)",
+                scope_flag, includes ? "on" : "off", res.spawned ? 1 : 0,
+                res.exit_code, res.term_signal, res.timed_out ? 1 : 0,
+                res.out_truncated ? 1 : 0, res.out_len, 160,
+                runner_error_fresh && runner_error.message[0]
+                    ? runner_error.message : "none");
+            errno = run_errno;
             return -1;
         }
         if (!res.out_truncated) {

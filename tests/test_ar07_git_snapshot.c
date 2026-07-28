@@ -207,6 +207,10 @@ TEST(snapshot_read_and_oversize_fail_before_mutation) {
     g_fail_lists = true;
     CHECK_EQ_INT(git_config_snapshot(GIT_SCOPE_GLOBAL), -1);
     CHECK_EQ_INT(g_mutations, 0);
+    CHECK(strstr(get_last_error()->message, "includes=off") != NULL);
+    CHECK(strstr(get_last_error()->message, "spawned=1") != NULL);
+    CHECK(strstr(get_last_error()->message, "exit=2") != NULL);
+    CHECK(strstr(get_last_error()->message, "runner=none") != NULL);
 
     fixture_reset();
     g_always_truncate = true;
