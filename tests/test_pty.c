@@ -1386,7 +1386,9 @@ TEST(bash_tab_completion_preserves_active_quote_argv) {
         "gitswitch edit PRIOR\ngitswitch edit M35C:Par\t",
         "printf '%s' 'old;old&&old||old|old&old';"
         "gitswitch edit M35C:Par\t",
-        "printf %s $(case x in x) printf y;; esac);"
+        "printf %s $(if true; then printf y; else printf z; fi);"
+        "gitswitch edit M35C:Par\t",
+        "printf %s `case x in x) printf y;; esac`;"
         "gitswitch edit M35C:Par\t",
         "printf %s $(printf \"%s\" \"$(date)\");"
         "gitswitch edit M35C:Par\t",
