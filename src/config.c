@@ -264,7 +264,8 @@ typedef enum {
     SWITCH_GUARD_SNAPSHOT_AFTER_MARKER_READ,
     SWITCH_GUARD_RECONCILE_AFTER_NORMALIZE_SYNC,
     SWITCH_GUARD_RETAIN_AFTER_MARKER_SYNC,
-    SWITCH_GUARD_READ_AFTER_EXACT_DESCRIPTOR_PROOF
+    SWITCH_GUARD_READ_AFTER_EXACT_DESCRIPTOR_PROOF,
+    SWITCH_GUARD_DESTINATION_AFTER_OPEN
 } switch_guard_test_stage_t;
 typedef int (*switch_guard_test_hook_fn)(
     switch_guard_test_stage_t stage, int directory_fd);
@@ -303,7 +304,8 @@ enum {
     SWITCH_GUARD_SNAPSHOT_AFTER_MARKER_READ,
     SWITCH_GUARD_RECONCILE_AFTER_NORMALIZE_SYNC,
     SWITCH_GUARD_RETAIN_AFTER_MARKER_SYNC,
-    SWITCH_GUARD_READ_AFTER_EXACT_DESCRIPTOR_PROOF
+    SWITCH_GUARD_READ_AFTER_EXACT_DESCRIPTOR_PROOF,
+    SWITCH_GUARD_DESTINATION_AFTER_OPEN
 };
 #define SWITCH_GUARD_TEST_CHECKPOINT(stage, fd) \
     ((void)(stage), (void)(fd), 0)
@@ -7460,6 +7462,16 @@ static bool config_switch_same_destinations_authority(
     return true;
 }
 
+static bool config_switch_same_directory_stat_authority(
+    const struct stat *before, const struct stat *after) {
+    return before && after && S_ISDIR(before->st_mode) &&
+           S_ISDIR(after->st_mode) &&
+           config_metadata_same_file(before, after) &&
+           before->st_mode == after->st_mode &&
+           before->st_uid == after->st_uid &&
+           before->st_gid == after->st_gid;
+}
+
 static int config_switch_directory_authority_live(
     const char *path, const publication_identity_t *recorded,
     const char *diagnostic) {
@@ -7480,9 +7492,12 @@ static int config_switch_directory_authority_live(
     }
     fd = open(
         path, O_RDONLY | O_CLOEXEC | O_DIRECTORY | O_NOFOLLOW);
-    if (fd < 0 || fstat(fd, &opened) != 0 ||
-        !S_ISDIR(opened.st_mode) ||
-        !config_metadata_snapshot_same(&before, &opened)) {
+    if (fd < 0 ||
+        SWITCH_GUARD_TEST_CHECKPOINT(
+            SWITCH_GUARD_DESTINATION_AFTER_OPEN, fd) != 0 ||
+        fstat(fd, &opened) != 0 ||
+        !config_switch_same_directory_stat_authority(
+            &before, &opened)) {
         saved_errno = errno ? errno : ESTALE;
         goto authority_fail;
     }
@@ -7492,8 +7507,9 @@ static int config_switch_directory_authority_live(
         goto authority_fail;
     }
     fd = -1;
-    if (lstat(path, &after) != 0 || !S_ISDIR(after.st_mode) ||
-        !config_metadata_snapshot_same(&opened, &after)) {
+    if (lstat(path, &after) != 0 ||
+        !config_switch_same_directory_stat_authority(
+            &opened, &after)) {
         saved_errno = errno ? errno : ESTALE;
         goto authority_fail;
     }

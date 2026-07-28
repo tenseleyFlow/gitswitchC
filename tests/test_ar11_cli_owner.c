@@ -44,7 +44,8 @@ typedef enum {
     SWITCH_GUARD_SNAPSHOT_AFTER_MARKER_READ,
     SWITCH_GUARD_RECONCILE_AFTER_NORMALIZE_SYNC,
     SWITCH_GUARD_RETAIN_AFTER_MARKER_SYNC,
-    SWITCH_GUARD_READ_AFTER_EXACT_DESCRIPTOR_PROOF
+    SWITCH_GUARD_READ_AFTER_EXACT_DESCRIPTOR_PROOF,
+    SWITCH_GUARD_DESTINATION_AFTER_OPEN
 } switch_guard_test_stage_t;
 typedef int (*switch_guard_test_hook_fn)(
     switch_guard_test_stage_t stage, int directory_fd);
@@ -174,6 +175,11 @@ static bool g_switch_guard_replace_directory_after_read;
 static int g_switch_guard_directory_replacement_rc;
 static char g_switch_guard_directory_path[PATH_MAX];
 static char g_switch_guard_displaced_directory_path[PATH_MAX];
+static bool g_switch_guard_churn_destination_directory;
+static int g_switch_guard_destination_churn_calls;
+static int g_switch_guard_destination_churn_rc;
+static struct stat g_switch_guard_destination_before_churn;
+static struct stat g_switch_guard_destination_after_churn;
 static volatile sig_atomic_t g_returning_signal_calls;
 
 typedef enum {
@@ -1378,6 +1384,54 @@ static int replace_switch_guard_directory_after_read(
         return -1;
     }
     g_switch_guard_directory_replacement_rc = 0;
+    return 0;
+}
+
+static int churn_switch_guard_destination_directory(
+    switch_guard_test_stage_t stage, int directory_fd) {
+    static const char churn_name[] =
+        ".gitswitch-test-destination-churn";
+    struct timespec remaining = {0, 20 * 1000 * 1000};
+    int churn_fd = -1;
+
+    if (stage != SWITCH_GUARD_DESTINATION_AFTER_OPEN ||
+        !g_switch_guard_churn_destination_directory) {
+        return 0;
+    }
+    g_switch_guard_churn_destination_directory = false;
+    g_switch_guard_destination_churn_calls++;
+    g_switch_guard_destination_churn_rc = -1;
+    if (fstat(
+            directory_fd,
+            &g_switch_guard_destination_before_churn) != 0) {
+        return -1;
+    }
+    while (nanosleep(&remaining, &remaining) != 0) {
+        if (errno != EINTR) return -1;
+    }
+    churn_fd = openat(
+        directory_fd, churn_name,
+        O_WRONLY | O_CREAT | O_EXCL | O_CLOEXEC | O_NOFOLLOW,
+        0600);
+    if (churn_fd < 0) return -1;
+    if (close(churn_fd) != 0) {
+        churn_fd = -1;
+        return -1;
+    }
+    churn_fd = -1;
+    if (
+        unlinkat(directory_fd, churn_name, 0) != 0 ||
+        fstat(
+            directory_fd,
+            &g_switch_guard_destination_after_churn) != 0) {
+        int saved_errno = errno ? errno : EIO;
+
+        (void)unlinkat(directory_fd, churn_name, 0);
+        errno = saved_errno;
+        return -1;
+    }
+    g_switch_guard_destination_churn_rc = 0;
+    errno = 0;
     return 0;
 }
 
@@ -5652,6 +5706,68 @@ TEST(parent_guard_abandon_then_adopt_reuses_exact_authority) {
     ts_rm_rf(fixture.root);
 }
 
+TEST(parent_guard_adopt_allows_destination_directory_bookkeeping_churn) {
+    cli_owner_fixture_t fixture = {0};
+    h1_guard_case_t guard_case = {0};
+    int begin_result = -1;
+    int fixture_result;
+
+    fixture_result = h1_fixture_setup(&fixture);
+    CHECK_EQ_INT(fixture_result, 0);
+    if (fixture_result == 0) {
+        begin_result = h1_guard_case_begin(&fixture, &guard_case);
+    }
+    CHECK_EQ_INT(begin_result, 0);
+    if (begin_result == 0) {
+        CHECK_EQ_INT(
+            config_switch_guard_install_or_adopt(
+                guard_case.ctx, guard_case.target, GIT_SCOPE_GLOBAL,
+                guard_case.destinations, guard_case.destination_count,
+                &guard_case.guard),
+            0);
+        CHECK(config_switch_guard_was_created(guard_case.guard));
+        config_switch_guard_abandon(&guard_case.guard);
+
+        g_switch_guard_churn_destination_directory = true;
+        g_switch_guard_destination_churn_calls = 0;
+        g_switch_guard_destination_churn_rc = -1;
+        (void)gitswitch_test_set_switch_guard_hook(
+            churn_switch_guard_destination_directory);
+        CHECK_EQ_INT(
+            config_switch_guard_install_or_adopt(
+                guard_case.ctx, guard_case.target, GIT_SCOPE_GLOBAL,
+                guard_case.destinations, guard_case.destination_count,
+                &guard_case.guard),
+            0);
+        (void)gitswitch_test_set_switch_guard_hook(NULL);
+        CHECK(!g_switch_guard_churn_destination_directory);
+        CHECK_EQ_INT(g_switch_guard_destination_churn_calls, 1);
+        CHECK_EQ_INT(g_switch_guard_destination_churn_rc, 0);
+        CHECK(ts_same_identity(
+            &g_switch_guard_destination_before_churn,
+            &g_switch_guard_destination_after_churn));
+        CHECK_EQ_INT(
+            g_switch_guard_destination_before_churn.st_mode,
+            g_switch_guard_destination_after_churn.st_mode);
+        CHECK_EQ_INT(
+            g_switch_guard_destination_before_churn.st_uid,
+            g_switch_guard_destination_after_churn.st_uid);
+        CHECK_EQ_INT(
+            g_switch_guard_destination_before_churn.st_gid,
+            g_switch_guard_destination_after_churn.st_gid);
+        CHECK(!h1_same_ctime(
+            &g_switch_guard_destination_before_churn,
+            &g_switch_guard_destination_after_churn));
+        CHECK(guard_case.guard != NULL);
+        CHECK(!config_switch_guard_was_created(guard_case.guard));
+        CHECK_EQ_INT(
+            config_switch_guard_clear(&guard_case.guard), 0);
+    }
+    (void)gitswitch_test_set_switch_guard_hook(NULL);
+    h1_guard_case_end(&guard_case);
+    ts_rm_rf(fixture.root);
+}
+
 #if !defined(__FreeBSD__)
 TEST(parent_guard_adopts_exact_portable_pair_after_normalization) {
     cli_owner_fixture_t fixture = {0};
@@ -7460,6 +7576,8 @@ TEST_MAIN_BEGIN()
     RUN_TEST(
         parent_guard_probe_rejects_parse_valid_token_mutation_after_exact_proof);
     RUN_TEST(parent_guard_abandon_then_adopt_reuses_exact_authority);
+    RUN_TEST(
+        parent_guard_adopt_allows_destination_directory_bookkeeping_churn);
 #if !defined(__FreeBSD__)
     RUN_TEST(
         parent_guard_adopts_exact_portable_pair_after_normalization);
