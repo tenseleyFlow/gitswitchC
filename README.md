@@ -169,7 +169,9 @@ rewrites Git configuration.
 > refuses to place these homes on non-memory-backed storage unless you opt in
 > with `GITSWITCH_ALLOW_TMP_GPG=1`; note that on that opt-in path deletion is a
 > plain unlink, so the key bytes may remain recoverable from the disk until
-> overwritten — true erasure is only guaranteed on tmpfs-backed storage.
+> overwritten. Memory-backed placement reduces persistent-disk exposure, but
+> it is not a forensic-erasure guarantee: swapping, hibernation, crash dumps,
+> snapshots, or copies outside gitswitch's control may still retain key bytes.
 
 > **Migrating from the Python gitswitch?** The old `gitswitch --ssh-agent-info`
 > invocation still works as a compat alias that auto-detects your shell from

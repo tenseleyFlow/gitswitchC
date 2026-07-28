@@ -28,19 +28,11 @@
  *     mid-way and persist a mixed identity (AR-08 M4 / AR-02 #2), so further
  *     signals stay recorded until commit or completed abort. Interactive
  *     children keep default dispositions, so Ctrl-C still interrupts them.
- *   - That rollback deferral is BOUNDED, not absolute (AR-03 L8): a
- *     PROCESS-TARGETED kill never reaches the child's terminal group, so a
- *     rollback blocked at a re-prompting ssh-add passphrase read used to
- *     defer `kill -TERM <pid>` forever — unkillable short of SIGKILL, with
- *     the identity left half-rolled-back. Now run_argv publishes the
- *     in-flight child pid (signals_child_spawned/reaped, a single
- *     sig_atomic_t store), and a further guarded signal inside the rollback
- *     window forwards that signal to the CHILD's pid via kill() (which is
- *     async-signal-safe), escalating to SIGKILL if the same child survives a
- *     repeat. Killing the blocker makes the rollback PROCEED — every restore
- *     step is already per-key/best-effort, so the sequence still runs to
- *     completion and the mainline dispatches normally; this is not a return
- *     of the emergency exit mid-restore.
+ *   - That rollback deferral is BOUNDED, not absolute (AR-03 L8/L20).
+ *     run_argv publishes an independently proven, isolated child process
+ *     group while guarded signals are blocked. A further guarded signal
+ *     during rollback reaches the whole group, escalating to SIGKILL on a
+ *     repeat, so wrappers and their descendants cannot keep rollback wedged.
  *   - Signals whose disposition is SIG_IGN at guard time stay ignored (so a
  *     nohup'd run keeps ignoring SIGHUP), matching sigaction(2) convention.
  */
@@ -51,6 +43,7 @@
 #include <stdbool.h>
 #include <stdint.h>
 #include <signal.h>
+#include <sys/stat.h>
 #include <sys/types.h>
 
 /**
@@ -75,6 +68,19 @@ int signals_guard_begin(void);
  * transaction in that state could consume or overwrite the retained cleanup
  * obligation. */
 bool signals_guard_active(void);
+
+/**
+ * Dispose of transaction state inherited across fork without dispatching a
+ * pending signal or touching registered scratch paths. State is tagged with
+ * its creating process epoch: calling this for current-process state is an
+ * idempotent no-op, so a child-owned guard created before the accounts layer
+ * observes the fork remains intact. For a foreign epoch, restore every
+ * pre-guard disposition and any deferred-dispatch saved mask, then clear
+ * child-local guard, rollback, pending, subprocess, dispatch, and scratch
+ * bookkeeping. If restoration fails, returns -1 and retains only the
+ * retryable disposition and/or saved-mask restoration obligation.
+ */
+int signals_reset_inherited_transaction_state(void);
 
 /* Deterministic, one-shot fault injection for each sigaction(2) stage used by
  * the guard. Failures are stored independently by stage, so a test can arm an
@@ -202,13 +208,19 @@ signals_child_wait_result_t signals_wait_child(pid_t pid, int *status,
                                                 int options);
 
 /**
- * Publish the in-flight subprocess (AR-03 L8). run_argv calls this while
- * guarded signals are blocked immediately after fork. Retirement is owned
- * exclusively by signals_wait_child(), which closes the reap-to-clear PID
- * reuse window. Publishing outside the rollback window is harmless: the
- * handler consults the PID only for a repeated signal during rollback.
+ * Publish the in-flight subprocess and, only when independently proven equal
+ * to pid, its isolated process group. run_argv calls this while guarded
+ * signals are blocked and before releasing the supervisor's pre-exec gate.
+ * Retirement is owned exclusively by signals_wait_child(), which clears PID,
+ * PGID, escalation, and relay-credit state in the guarded reap transition.
  */
 void signals_child_spawned(pid_t pid);
+
+#ifdef GITSWITCH_SIGNALS_RUNNER_INTERNAL
+void signals_child_group_spawned(pid_t pid, pid_t proven_pgid);
+/* Record a guarded signal proven by the runner supervisor relay. */
+void signals_record_relayed_group_signal(int signal_number);
+#endif
 
 #ifdef GITSWITCH_TESTING
 /* One-shot checkpoint after waitpid returns but before child publication is
@@ -248,12 +260,10 @@ int signals_dispatch_pending(void);
 /* --- SIG-02: scratch-file registry -----------------------------------------
  *
  * Temp files written via a create-then-rename pattern leak when the process
- * dies to a signal mid-write. Creators register the temp path right after
- * creating the file and unregister it after the rename/unlink; the emergency
- * (second-signal) handler and signals_scratch_cleanup() unlink whatever is
- * still registered. Fixed-size table, no allocation: registration in normal
- * context publishes a slot only after the path is fully copied, so the
- * handler can never observe a half-written entry.
+ * dies to a signal mid-write. Legacy path registrations are removed by the
+ * emergency (second-signal) handler and signals_scratch_cleanup(). Identity
+ * registrations are normal-context-only and require the directory-serialized
+ * cleanup API below for deletion.
  *
  * Adopters register around the temp file's lifetime; the table and handler
  * here do the rest. Registration is only effective while a guard is active:
@@ -273,14 +283,58 @@ int signals_dispatch_pending(void);
  */
 int signals_scratch_register(const char *path);
 
+/**
+ * Register a scratch path together with the identity observed immediately
+ * after creation. Generic cleanup only retires a missing or substituted name;
+ * it deliberately leaves the exact identity tracked for serialized cleanup.
+ * Registration is idempotent only for the same path/device/inode tuple and
+ * rejects a collision with a legacy path-only registration or a different
+ * identity. A matching legacy path slot is upgraded atomically so emergency
+ * signal cleanup cannot race through a path-only unlink after ownership has
+ * become identity-sensitive. The captured object must be an owned regular
+ * file with one link, or two links while retiring a just-published source
+ * alias.
+ */
+int signals_scratch_register_identity(const char *path,
+                                      const struct stat *identity);
+
 /** Remove a path from the registry (after the temp was renamed/unlinked). */
 void signals_scratch_unregister(const char *path);
 
 /**
- * Unlink and drop every registered scratch path (normal context). Used on the
- * switch failure path so an interrupted switch leaves no *.tmp.* orphans;
- * unlinking an already-renamed/nonexistent path is harmless.
+ * Unlink and drop every legacy path-only registration (normal context).
+ * Identity registrations whose names are missing or no longer match are
+ * retired; exact identities and inspection failures remain tracked.
  */
 void signals_scratch_cleanup(void);
+
+/**
+ * Delete tracked identity-bound scratch files that are direct children of
+ * exactly dir_path, using dir_fd for fstatat(AT_SYMLINK_NOFOLLOW) followed
+ * immediately by unlinkat. The caller must hold the exclusive writer boundary
+ * for this directory for the entire call; dir_fd must still identify exactly
+ * dir_path. This API is normal-context-only.
+ *
+ * Missing or mismatched names retire their slots. Successful exact deletions
+ * retire their slots. Other inspection/deletion failures retain their slots
+ * and return -1 with the first errno; success preserves the caller's errno.
+ */
+int signals_scratch_cleanup_identities_at(int dir_fd,
+                                          const char *dir_path);
+
+#ifdef GITSWITCH_TESTING
+/** Arm a one-shot serialized identity unlink failure. */
+void signals_test_fail_scratch_unlink(int system_errno);
+
+/**
+ * Install a one-shot checkpoint after a matching path-only scratch slot has
+ * stopped being handler-visible and before its identity metadata is written.
+ * Production objects export no such checkpoint.
+ */
+typedef void (*signals_test_scratch_upgrade_hook_fn)(void);
+signals_test_scratch_upgrade_hook_fn
+signals_test_set_scratch_upgrade_hook(
+    signals_test_scratch_upgrade_hook_fn hook);
+#endif
 
 #endif /* SIGNALS_H */

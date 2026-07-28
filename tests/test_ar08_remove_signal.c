@@ -87,6 +87,20 @@ static int write_private(const char *path, const char *text) {
     return close(fd);
 }
 
+static int generate_ssh_key(const char *path) {
+    const char *argv[] = {
+        "ssh-keygen", "-q", "-t", "ed25519", "-N", "",
+        "-C", "gitswitch-remove-signal-fixture", "-f", path, NULL
+    };
+    run_opts_t opts;
+    run_result_t result;
+
+    memset(&opts, 0, sizeof(opts));
+    memset(&result, 0, sizeof(result));
+    opts.stderr_to_devnull = true;
+    return run_argv_real(argv, &opts, &result);
+}
+
 static size_t read_text(const char *path, char *text, size_t size) {
     int fd = open(path, O_RDONLY | O_CLOEXEC);
     size_t total = 0;
@@ -272,8 +286,7 @@ static int fixture_setup(remove_fixture_t *fixture, bool credentialled) {
         return -1;
     }
     if (credentialled) {
-        if (write_private(fixture->ssh_key,
-                          "-----BEGIN OPENSSH PRIVATE KEY-----\nfixture\n") != 0 ||
+        if (generate_ssh_key(fixture->ssh_key) != 0 ||
             (size_t)snprintf(
                 config_body, sizeof(config_body),
                 "[settings]\n"

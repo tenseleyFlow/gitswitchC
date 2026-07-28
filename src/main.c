@@ -81,8 +81,8 @@ static int print_usage(const char *prog_name) {
     printf("  init <shell>         Emit shell integration (");
     print_supported_shells(stdout, "|");
     printf(")\n");
-    printf("  resume               Restore saved boot-volatile SSH/GPG state (never rewrites Git config)\n");
-    printf("  reset [account]      Kill agents and delete isolated GPG/SSH state (all, or one)\n");
+    printf("  resume               Restore saved SSH/GPG state, or reconcile an incomplete switch\n");
+    printf("  reset [account]      Retire isolated GPG/SSH state (all, or one)\n");
     printf("  switch <account>     Switch to specified account\n");
     printf("  <account>            Switch to specified account\n");
     printf("\nOptions:\n");
@@ -134,6 +134,7 @@ typedef enum {
     COMMAND_NOTICE_ADD,
     COMMAND_NOTICE_EDIT,
     COMMAND_NOTICE_REMOVE,
+    COMMAND_NOTICE_REMOVE_RECOVERED,
     COMMAND_NOTICE_SWITCH,
     COMMAND_NOTICE_RESET_ONE,
     COMMAND_NOTICE_RESET_ALL
@@ -158,6 +159,7 @@ typedef struct {
     bool remove_prepared;
     bool reset_guarded;
     bool reset_retirement_prepared;
+    bool switch_persistence_unresolved;
     accounts_transaction_token_t reset_token;
     command_failure_kind_t failure_kind;
     error_accumulator_t failure_errors;
@@ -180,6 +182,7 @@ typedef command_result_t (*mutation_handler_t)(gitswitch_ctx_t *ctx,
 typedef enum {
     RETAINED_CLI_CONTEXT_NONE = 0,
     RETAINED_CLI_CONTEXT_SWITCH_ABORT,
+    RETAINED_CLI_CONTEXT_SWITCH_UNRESOLVED,
     RETAINED_CLI_CONTEXT_RESET_RELEASE,
     RETAINED_CLI_CONTEXT_SIGNAL_GUARD_RELEASE,
     RETAINED_CLI_CONTEXT_UNEXPECTED_ACCOUNT_OWNER
@@ -551,6 +554,26 @@ static int settle_retained_cli_context(void) {
     primary = g_retained_cli_context.primary_error;
     primary_errno = g_retained_cli_context.primary_errno;
 
+    /* The active-state bytes are neither the captured before-image nor the
+     * switch post-image. Normal abort would restore Git/runtime and erase a
+     * freshly installed switch fence around an unowned persistence image.
+     * Keep the exact prepared owner untouched for the lifetime of this
+     * process; after process exit, the durable `.switch-incomplete` marker is
+     * the only authority a fresh explicit `resume` may adopt. */
+    if (g_retained_cli_context.kind ==
+        RETAINED_CLI_CONTEXT_SWITCH_UNRESOLVED) {
+        fprintf(stderr,
+                "gitswitch: an unresolved switch still owns this process; "
+                "refusing another in-process CLI entry without changing Git, "
+                "runtime, or active-state bytes. Exit this process and run "
+                "`gitswitch resume` to adopt the durable recovery marker. "
+                "Original failure: %s\n",
+                primary.message[0] ? primary.message :
+                                     "unknown active-state settlement error");
+        restore_cli_error(&primary, primary_errno);
+        return -1;
+    }
+
     if (g_retained_cli_context.kind !=
             RETAINED_CLI_CONTEXT_SWITCH_ABORT &&
         g_retained_cli_context.kind !=
@@ -713,10 +736,17 @@ static int handle_resume_check_command(gitswitch_ctx_t *ctx);
 static bool command_activates_account(const char *command,
                                       bool resume_check);
 static bool command_mutates_unrelated_retirement_state(const char *command);
+static bool command_mutates_switch_guard_state(const char *command,
+                                               bool resume_check);
 static bool retirement_guard_blocks_activation(const gitswitch_ctx_t *ctx);
 static bool retirement_guard_rejects_command(
     const gitswitch_ctx_t *ctx, const char *command, bool resume_check,
     bool activation_command, bool unrelated_mutation, int *exit_code);
+static bool switch_guard_rejects_command(
+    const char *config_path, const char *command, bool resume_check,
+    bool relevant_command, bool dry_run,
+    config_switch_guard_recovery_t *recovery, bool *recovering,
+    int *exit_code);
 static command_result_t handle_reset_command(gitswitch_ctx_t *ctx,
                                              const char *account);
 static const char *detect_shell_from_env(void);
@@ -843,6 +873,64 @@ static char **option_first_argv_copy(int argc, char *const argv[]) {
     return copy;
 }
 
+#ifdef DEBUG
+/* Resolve only no-argument long options, including the unambiguous prefixes
+ * accepted by getopt_long(). An '=' suffix is invalid for every option in the
+ * CLI table and must not opt an otherwise quiet readiness probe into startup
+ * telemetry. */
+static int preinit_long_option_value(
+    const char *argument, const struct option options[]) {
+    const char *name;
+    size_t name_length;
+    int matched_value = 0;
+    bool matched = false;
+
+    if (!argument || !options ||
+        argument[0] != '-' || argument[1] != '-' ||
+        argument[2] == '\0') {
+        return 0;
+    }
+    name = argument + 2;
+    if (strchr(name, '=') != NULL) return 0;
+    name_length = strlen(name);
+
+    for (size_t index = 0; options[index].name; index++) {
+        size_t option_length = strlen(options[index].name);
+
+        if (name_length > option_length ||
+            memcmp(name, options[index].name, name_length) != 0) {
+            continue;
+        }
+        if (name_length == option_length) {
+            return options[index].val;
+        }
+        if (matched) {
+            return 0;
+        }
+        matched = true;
+        matched_value = options[index].val;
+    }
+    return matched ? matched_value : 0;
+}
+
+/* All short options are argument-free. A token contributes a pre-init logging
+ * request only when its complete bundle is valid; characters hidden inside a
+ * malformed bundle such as -xV must not enable startup telemetry. */
+static bool preinit_short_logging_option(const char *argument) {
+    bool logging = false;
+
+    if (!argument || argument[0] != '-' || argument[1] == '-' ||
+        argument[1] == '\0') {
+        return false;
+    }
+    for (const char *option = argument + 1; *option; option++) {
+        if (!strchr("hvcCVdngly", *option)) return false;
+        if (*option == 'V' || *option == 'd') logging = true;
+    }
+    return logging;
+}
+#endif
+
 static command_result_t command_result(int status) {
     command_result_t result;
 
@@ -865,6 +953,11 @@ static void emit_command_success(const gitswitch_ctx_t *ctx,
             break;
         case COMMAND_NOTICE_REMOVE:
             display_success("Account removed successfully.");
+            break;
+        case COMMAND_NOTICE_REMOVE_RECOVERED:
+            display_success(
+                "Completed interrupted removal for account ID %s.",
+                result->subject);
             break;
         case COMMAND_NOTICE_SWITCH:
             display_success("Switched to: %s", result->subject);
@@ -893,6 +986,9 @@ int main(int argc, char *argv[]) {
     bool read_only_command = false;
     bool activation_command = false;
     bool unrelated_retirement_mutation = false;
+    bool switch_guard_relevant = false;
+    bool switch_recovery_pending = false;
+    config_switch_guard_recovery_t *switch_recovery = NULL;
     const char *pending_signal_notice = NULL;
     int config_lock_fd = -1;
     int opt;
@@ -934,7 +1030,7 @@ int main(int argc, char *argv[]) {
     int operand_count = 0;
     int exit_code = EXIT_SUCCESS;
     
-    static struct option long_options[] = {
+    static const struct option long_options[] = {
         {"help", no_argument, 0, 'h'},
         {"version", no_argument, 0, 'v'},
         {"color", no_argument, 0, 'c'},
@@ -961,12 +1057,39 @@ int main(int argc, char *argv[]) {
         {0, 0, 0, 0}
     };
     
-    /* Initialize error handling - use WARN level for release builds, INFO for debug */
+    /* Initialize error handling at the build default, except for the internal
+     * readiness probe whose normal contract is status-only. Resolve the same
+     * no-argument long-option prefixes and complete short-option bundles that
+     * getopt_long accepts so malformed or post-`--` text cannot enable DEBUG
+     * startup telemetry. Explicit verbose/debug options keep that telemetry.
+     * Direct CLI diagnostics remain visible because they do not use INFO
+     * logging. */
+    log_level_t initial_log_level = LOG_LEVEL_WARNING;
 #ifdef DEBUG
-    if (error_init(LOG_LEVEL_INFO, NULL) != 0) {
-#else
-    if (error_init(LOG_LEVEL_WARNING, NULL) != 0) {
+    bool quiet_resume_check = false;
+    bool explicit_logging = false;
+
+    initial_log_level = LOG_LEVEL_INFO;
+    for (int arg_index = 1;
+         argv && arg_index < argc && argv[arg_index]; arg_index++) {
+        const char *argument = argv[arg_index];
+        int long_value;
+
+        if (strcmp(argument, "--") == 0) break;
+        long_value = preinit_long_option_value(argument, long_options);
+        if (long_value == OPT_RESUME_CHECK) {
+            quiet_resume_check = true;
+        }
+        if (long_value == 'V' || long_value == 'd' ||
+            preinit_short_logging_option(argument)) {
+            explicit_logging = true;
+        }
+    }
+    if (quiet_resume_check && !explicit_logging) {
+        initial_log_level = LOG_LEVEL_WARNING;
+    }
 #endif
+    if (error_init(initial_log_level, NULL) != 0) {
         fprintf(stderr, "Failed to initialize error handling\n");
         return EXIT_FAILURE;
     }
@@ -1060,15 +1183,6 @@ int main(int argc, char *argv[]) {
     }
     free(option_argv);
 
-    /* AR-06 F62: --global and --local are contradictory. Silently letting
-     * --global win hid a user's mistake and could write the wrong scope; fail
-     * with a clear message instead. */
-    if (force_global && force_local) {
-        fprintf(stderr, "gitswitch: --global and --local are mutually exclusive\n");
-        error_cleanup();
-        return EXIT_FAILURE;
-    }
-
     /* Help/version remain unconditional informational exits. Every executable
      * command form, including the legacy init alias, is otherwise checked here
      * before display/config initialization can cause observable work. */
@@ -1119,6 +1233,14 @@ int main(int argc, char *argv[]) {
         return rc == 0 ? EXIT_SUCCESS : EXIT_FAILURE;
     }
 
+    /* The shell readiness probe is plumbing: status alone tells the generated
+     * integration whether to invoke `resume`. Keep expected fail-closed
+     * observations silent even in DEBUG builds, while preserving telemetry
+     * when the caller explicitly requested -V/-d. */
+    if (resume_check && !verbose_requested) {
+        set_log_level(LOG_LEVEL_WARNING);
+    }
+
     /* Initialize display system */
     if (display_init(force_color, no_color) != 0) {
         log_error("Failed to initialize display system");
@@ -1130,6 +1252,17 @@ int main(int argc, char *argv[]) {
         int rc = print_usage(argv[0]);
         error_cleanup();
         return rc == 0 ? EXIT_SUCCESS : EXIT_FAILURE;
+    }
+
+    /* AR-06 F62 / AR-14 L7: --global and --local are contradictory for an
+     * executable command, but help and version are unconditional
+     * informational actions. Validate the command scope only after both
+     * informational dispatches so their status does not depend on unrelated
+     * command options. */
+    if (force_global && force_local) {
+        fprintf(stderr, "gitswitch: --global and --local are mutually exclusive\n");
+        error_cleanup();
+        return EXIT_FAILURE;
     }
 
     if (legacy_agent_info) {
@@ -1164,13 +1297,25 @@ int main(int argc, char *argv[]) {
     activation_command = command_activates_account(command, resume_check);
     unrelated_retirement_mutation =
         command_mutates_unrelated_retirement_state(command);
+    switch_guard_relevant =
+        command_mutates_switch_guard_state(command, resume_check);
+    if (switch_guard_relevant) {
+        switch_recovery = calloc(1U, sizeof(*switch_recovery));
+        if (!switch_recovery) {
+            display_error("Could not allocate switch recovery state", "%s",
+                          strerror(errno));
+            exit_code = EXIT_FAILURE;
+            goto cleanup;
+        }
+    }
 
     /* Inspect before acquiring a lock or loading configuration so an existing
      * durable retirement marker blocks unrelated work without first creating,
      * repairing, or probing runtime state. A missing/unsafe configuration path
      * also fails closed for these commands. Recovery remove/reset commands and
      * genuinely read-only commands deliberately do not pass through this gate. */
-    if (activation_command || unrelated_retirement_mutation) {
+    if (activation_command || unrelated_retirement_mutation ||
+        switch_guard_relevant) {
         if (config_get_path(ctx->config.config_path,
                             sizeof(ctx->config.config_path)) != 0) {
             ctx->config.config_path[0] = '\0';
@@ -1180,6 +1325,12 @@ int main(int argc, char *argv[]) {
                 unrelated_retirement_mutation, &exit_code)) {
             goto cleanup;
         }
+        if (switch_guard_rejects_command(
+                ctx->config.config_path, command, resume_check,
+                switch_guard_relevant, dry_run, switch_recovery,
+                &switch_recovery_pending, &exit_code)) {
+            goto cleanup;
+        }
     }
 
     /* For commands that mutate shared state, hold an exclusive cross-process
@@ -1187,7 +1338,8 @@ int main(int argc, char *argv[]) {
      * config read-modify-writers (add/edit/remove, a bare-account switch that
      * updates active_account): `resume` mutates only boot-volatile SSH/GPG
      * runtime state (it deliberately leaves Git configuration untouched), and
-     * `reset` kills agents and retargets/deletes runtime symlinks. Both must be
+     * `reset` safely retires agents and retargets/deletes runtime symlinks.
+     * Both must be
      * serialized against a concurrent switch or the final runtime can belong
      * to a different account than the switch's persisted Git identity
      * (AR-02 #1: tmux-restore shells running resume while another shell
@@ -1218,14 +1370,11 @@ int main(int argc, char *argv[]) {
                 contended = contended || lock_errno == EAGAIN;
 #endif
 
-                /* Shell integration invokes resume during login. A concurrent
-                 * switch already owns serialization and will leave a coherent
-                 * result, so this redundant restore is a successful no-op and
-                 * must not delay or alarm every newly opened shell. */
-                if (contended && c && strcmp(c, "resume") == 0) {
-                    exit_code = EXIT_SUCCESS;
-                    goto cleanup;
-                }
+                /* Contention carries no typed proof of which command owns the
+                 * lock or which account/runtime state it will publish. Resume
+                 * therefore cannot safely treat an unknown holder as having
+                 * completed its work; report the retryable failure immediately
+                 * like every other mutation. */
                 if (contended) {
                     display_error("Another gitswitch holds the config lock",
                                   "try again after that command finishes");
@@ -1251,6 +1400,22 @@ int main(int argc, char *argv[]) {
             unrelated_retirement_mutation, &exit_code)) {
         goto cleanup;
     }
+    if (config_lock_fd >= 0 && switch_guard_relevant) {
+        if (config_switch_guard_reconcile_preintent(
+                ctx->config.config_path) != 0) {
+            display_error(
+                "Cannot reconcile incomplete switch preparation",
+                "%s", get_last_error()->message);
+            exit_code = EXIT_FAILURE;
+            goto cleanup;
+        }
+        if (switch_guard_rejects_command(
+                ctx->config.config_path, command, resume_check,
+                switch_guard_relevant, dry_run, switch_recovery,
+                &switch_recovery_pending, &exit_code)) {
+            goto cleanup;
+        }
+    }
 
     /* Completion invokes `list --names` on every TAB. Give exactly that
      * grammar a names-only loader which parses the full account document but
@@ -1270,6 +1435,28 @@ int main(int argc, char *argv[]) {
     }
     
     /* Set dry run mode if requested */
+    if (switch_recovery_pending) {
+        bool scope_conflict =
+            (force_global &&
+             switch_recovery->effective_scope != GIT_SCOPE_GLOBAL) ||
+            (force_local &&
+             switch_recovery->effective_scope != GIT_SCOPE_LOCAL);
+
+        if (scope_conflict) {
+            display_error(
+                "Incomplete switch recovery has a fixed Git scope",
+                "the durable marker requires %s scope; retry `gitswitch resume` without a conflicting scope flag",
+                switch_recovery->effective_scope == GIT_SCOPE_GLOBAL
+                    ? "global" : "local");
+            exit_code = EXIT_FAILURE;
+            goto cleanup;
+        }
+        force_global =
+            switch_recovery->effective_scope == GIT_SCOPE_GLOBAL;
+        force_local =
+            switch_recovery->effective_scope == GIT_SCOPE_LOCAL;
+        ctx->config.recovering_switch = true;
+    }
     ctx->config.dry_run = dry_run;
     ctx->config.force_global = force_global;
     ctx->config.force_local = force_local;
@@ -1320,7 +1507,24 @@ int main(int argc, char *argv[]) {
     } else if (strcmp(command, "config") == 0) {
         exit_code = handle_config_command(ctx);
     } else if (strcmp(command, "resume") == 0) {
-        exit_code = handle_resume_command(ctx);
+        if (switch_recovery_pending) {
+            /* Recovery is a full transactional switch, but remains
+             * noninteractive like ordinary login-shell resume. The marker's
+             * exact local destination either matches this cwd or prepare
+             * fails before mutation; it must never fall back to a hidden
+             * global-scope consent prompt. */
+            if (!freopen("/dev/null", "r", stdin)) {
+                display_error(
+                    "Cannot detach stdin for switch recovery", "%s",
+                    strerror(errno));
+                exit_code = EXIT_FAILURE;
+            } else {
+                mutation_handler = handle_switch_command;
+                mutation_argument = switch_recovery->target.name;
+            }
+        } else {
+            exit_code = handle_resume_command(ctx);
+        }
     } else if (strcmp(command, "reset") == 0) {
         mutation_handler = handle_reset_command;
         mutation_argument = arg1;
@@ -1386,6 +1590,8 @@ int main(int argc, char *argv[]) {
         int save_rc = 0;
         bool config_installed = false;
         bool switch_commit_retained = false;
+        config_active_rollback_state_t switch_persistence_state =
+            CONFIG_ACTIVE_ROLLBACK_UNRESOLVED;
         accounts_switch_commit_state_t switch_commit_state =
             ACCOUNTS_SWITCH_COMMIT_NOT_COMMITTED;
         error_context_t save_error_context = {0};
@@ -1457,6 +1663,41 @@ int main(int argc, char *argv[]) {
                 switch_commit_retained =
                     switch_commit_state !=
                     ACCOUNTS_SWITCH_COMMIT_NOT_COMMITTED;
+            }
+        }
+
+        /* A post-install persistence error does not say which complete state
+         * image is now durable.  Prove that direction before consuming the
+         * prepared account owner.  If the post-image is current, reconcile
+         * forward; rolling Git/runtime back around that durable active image
+         * is the split-state defect this transaction boundary prevents. */
+        if (mutation.switch_prepare_state ==
+                ACCOUNTS_SWITCH_PREPARE_PREPARED &&
+            save_rc != 0 && !switch_commit_retained) {
+            if (config_resume_hint_snapshot_settle(
+                    &mutation.hint_snapshot,
+                    &switch_persistence_state) == 0 &&
+                switch_persistence_state ==
+                    CONFIG_ACTIVE_ROLLBACK_POST_DURABLE) {
+                int forward_rc =
+                    accounts_switch_commit_result(ctx,
+                                                  &switch_commit_state);
+
+                if (forward_rc == 0 ||
+                    switch_commit_state !=
+                        ACCOUNTS_SWITCH_COMMIT_NOT_COMMITTED) {
+                    switch_commit_retained = true;
+                } else {
+                    /* Alias publication can fail before the commit point. The
+                     * owner is still prepared, so make one guarded attempt to
+                     * settle the active state backward before authorizing an
+                     * account abort. */
+                    switch_persistence_state =
+                        CONFIG_ACTIVE_ROLLBACK_UNRESOLVED;
+                    (void)config_resume_hint_snapshot_settle(
+                        &mutation.hint_snapshot,
+                        &switch_persistence_state);
+                }
             }
         }
 
@@ -1583,33 +1824,37 @@ int main(int argc, char *argv[]) {
                                             &save_error_context);
             }
 
-            /* Keep the cross-HOME runtime lock owned by the prepared switch
-             * until the persistence before-images are restored. Reversing
-             * accounts first released that lock and let another HOME sharing
-             * XDG_RUNTIME_DIR interleave between runtime and active/hint
-             * rollback. The outer config lock still excludes same-HOME
-             * writers while these persisted before-images are installed. */
-            safe_strncpy(ctx->config.active_account,
-                         mutation.previous_active,
-                         sizeof(ctx->config.active_account));
-            /* Restore the exact captured bytes only while the active-state
-             * inode installed by this switch is still current. A later writer
-             * is a rollback conflict and retains ownership of its generation;
-             * the outer config/runtime locks cover cooperating writers. */
-            if (config_installed &&
-                config_resume_hint_snapshot_restore(
-                    &mutation.hint_snapshot) != 0) {
+            /* Consume the account owner only in the direction proved by the
+             * synchronized active-state image above.  UNRESOLVED deliberately
+             * leaves the prepared owner live; cleanup must retain its context
+             * instead of freeing the only in-process retry handle. */
+            if (switch_persistence_state ==
+                CONFIG_ACTIVE_ROLLBACK_UNRESOLVED) {
+                mutation.switch_persistence_unresolved = true;
                 rollback_complete = false;
                 (void)error_accumulator_add_last(
-                    &rollback_errors, "resume-hint rollback");
-            }
-            /* accounts_switch_abort is deliberately last: it restores
-             * Git/runtime and releases the retained shared-runtime lock only
-             * after every config/hint rollback attempt has finished. */
-            if (accounts_switch_abort(ctx, true) != 0) {
+                    &rollback_errors, "active-state settlement");
+            } else if (switch_persistence_state ==
+                       CONFIG_ACTIVE_ROLLBACK_BEFORE_DURABLE) {
+                safe_strncpy(ctx->config.active_account,
+                             mutation.previous_active,
+                             sizeof(ctx->config.active_account));
+                /* accounts_switch_abort is deliberately last: it restores
+                 * Git/runtime and releases the retained shared-runtime lock
+                 * only after the active before-image is durable. */
+                if (accounts_switch_abort(ctx, true) != 0) {
+                    rollback_complete = false;
+                    (void)error_accumulator_add_last(
+                        &rollback_errors, "account switch abort");
+                }
+            } else {
+                /* POST_DURABLE reaches this branch only when forward commit
+                 * failed before its point of no return and the guarded reverse
+                 * settlement could not prove the before-image. */
+                mutation.switch_persistence_unresolved = true;
                 rollback_complete = false;
                 (void)error_accumulator_add_last(
-                    &rollback_errors, "account switch abort");
+                    &rollback_errors, "forward switch settlement");
             }
             (void)error_accumulator_publish(&rollback_errors);
             rollback_error = *get_last_error();
@@ -1655,8 +1900,9 @@ int main(int argc, char *argv[]) {
                         "Account switch committed, but SSH alias publication is uncertain",
                         "%s; active metadata, Git identity, runtime state, and "
                         "the installed alias were retained together. Verify "
-                        "~/.ssh/config and its filesystem durability before "
-                        "retrying", detail);
+                        "~/.ssh/config and its filesystem durability, then "
+                        "run `gitswitch resume` to reconcile and clear the "
+                        "durable .switch-incomplete marker", detail);
                     break;
                 case ACCOUNTS_SWITCH_COMMIT_ALIAS_CLEANUP_FAILED:
                     display_error(
@@ -1665,6 +1911,42 @@ int main(int argc, char *argv[]) {
                         "%s; the switch is in effect — active metadata, Git "
                         "identity, runtime state, and the alias were retained "
                         "together", detail);
+                    break;
+                case ACCOUNTS_SWITCH_COMMIT_RECOVERY_FENCE_RETAINED:
+                    display_error(
+                        "Account switch committed, but recovery fencing remains",
+                        "%s; the new active metadata, Git identity, runtime "
+                        "state, and alias were retained together. Explicit "
+                        "`gitswitch resume` must reconcile and clear the "
+                        "durable .switch-incomplete marker",
+                        detail);
+                    break;
+                case ACCOUNTS_SWITCH_COMMIT_FORWARD_RECOVERY_REQUIRED:
+                    display_error(
+                        "Account switch requires forward recovery",
+                        "%s; the new active/runtime state was retained, but "
+                        "the final Git/alias image was not proven. Explicit "
+                        "`gitswitch resume` must reconcile the exact durable "
+                        ".switch-incomplete marker",
+                        detail);
+                    break;
+                case ACCOUNTS_SWITCH_COMMIT_RECOVERY_FENCE_CLEANUP_FAILED:
+                    display_error(
+                        "Account switch committed, but recovery-fence cleanup "
+                        "is uncertain",
+                        "%s; the coherent switch is in effect, but no durable "
+                        "resume marker is being claimed. Inspect the gitswitch "
+                        "configuration directory before another mutation",
+                        detail);
+                    break;
+                case ACCOUNTS_SWITCH_COMMIT_FINALIZATION_CLEANUP_FAILED:
+                    display_error(
+                        "Account switch committed, but Git finalization "
+                        "cleanup failed",
+                        "%s; the coherent switch is in effect, but a "
+                        "transaction lock may require cleanup before another "
+                        "Git writer can proceed",
+                        detail);
                     break;
                 case ACCOUNTS_SWITCH_COMMIT_COMPLETE:
                 case ACCOUNTS_SWITCH_COMMIT_NOT_COMMITTED:
@@ -1843,7 +2125,9 @@ cleanup:
                            ACCOUNTS_SWITCH_PREPARE_PREPARED ||
                        mutation.switch_prepare_state ==
                            ACCOUNTS_SWITCH_PREPARE_ABORT_REQUIRED) {
-                kind = RETAINED_CLI_CONTEXT_SWITCH_ABORT;
+                kind = mutation.switch_persistence_unresolved
+                    ? RETAINED_CLI_CONTEXT_SWITCH_UNRESOLVED
+                    : RETAINED_CLI_CONTEXT_SWITCH_ABORT;
             } else {
                 kind = RETAINED_CLI_CONTEXT_UNEXPECTED_ACCOUNT_OWNER;
             }
@@ -1859,6 +2143,11 @@ cleanup:
      * at exit). */
     if (config_lock_fd >= 0) {
         config_write_unlock(config_lock_fd);
+    }
+    if (switch_recovery) {
+        secure_zero_memory(switch_recovery, sizeof(*switch_recovery));
+        free(switch_recovery);
+        switch_recovery = NULL;
     }
 
     /* The context can contain key paths and identity metadata.  Zero it before
@@ -1956,6 +2245,16 @@ cleanup:
         }
     }
     command_failure_publish_and_display(&mutation);
+
+    /* AR-14 L8: display helpers and ordinary printf paths may leave a write
+     * failure latched until the final stdio flush. Promote that latent failure
+     * only when the command has no primary failure of its own. Informational
+     * and shell-snippet paths return through their dedicated finishers above;
+     * names-only output is already checked in its handler, making this
+     * successful recheck harmless. */
+    if (exit_code == EXIT_SUCCESS && finish_stdout_output() != 0) {
+        exit_code = EXIT_FAILURE;
+    }
 
     /* Cleanup error handling */
     error_cleanup();
@@ -2062,6 +2361,7 @@ static int handle_list_names(gitswitch_ctx_t *ctx) {
 static command_result_t handle_remove_command(gitswitch_ctx_t *ctx,
                                               const char *identifier) {
     command_result_t result = command_result(EXIT_FAILURE);
+    int recovery_rc;
     size_t previous_count;
 
     if (!ctx || !identifier) return result;
@@ -2075,7 +2375,8 @@ static command_result_t handle_remove_command(gitswitch_ctx_t *ctx,
         return result;
     }
 
-    /* AR-06 F07: accounts_remove tears down the SSH/GPG runtime (kills agents,
+    /* AR-06 F07: accounts_remove tears down the SSH/GPG runtime (safely
+     * terminates agents where provable or detaches proved SSH endpoints, and
      * deletes the isolated GPG home with its exported secret-key copy) with no
      * dry_run check of its own — the exact destructive-preview hole AR-05 H1
      * closed for `reset` only. Gate here, before the confirmation prompt, the
@@ -2088,11 +2389,38 @@ static command_result_t handle_remove_command(gitswitch_ctx_t *ctx,
             return result;
         }
         display_info("DRY RUN MODE - No actual changes will be made");
-        printf("Would kill the SSH/GPG agents and delete the isolated GPG home for\n"
+        printf("Would retire the SSH/GPG agent state and delete the isolated GPG home for\n"
                "'%s' (removing its on-disk secret-key copy), then remove the account\n"
                "from %s.\n", acct->name, ctx->config.config_path);
         display_success("DRY RUN complete - no changes were made");
         result.status = EXIT_SUCCESS;
+        return result;
+    }
+
+    /* AR-14 H2: an installed-but-durability-uncertain remove has already
+     * deleted its live account, so ordinary name/email resolution no longer
+     * has a retry handle. The durable marker retains only immutable identity;
+     * accept its exact canonical numeric ID, prove every RETIRING Git
+     * destination clean under canonical locks, and settle the same marker.
+     * Nonmatching selectors continue through the historical remove path. */
+    recovery_rc = accounts_remove_recover_incomplete(ctx, identifier);
+    if (recovery_rc < 0) {
+        error_context_t recovery_error = *get_last_error();
+        int recovery_errno = errno;
+
+        result.failure_kind = COMMAND_FAILURE_REMOVE;
+        errno = recovery_errno;
+        (void)error_accumulator_add(
+            &result.failure_errors,
+            "interrupted removal recovery", &recovery_error);
+        errno = recovery_errno;
+        return result;
+    }
+    if (recovery_rc > 0) {
+        result.status = EXIT_SUCCESS;
+        result.notice_kind = COMMAND_NOTICE_REMOVE_RECOVERED;
+        (void)safe_strncpy(result.subject, identifier,
+                           sizeof(result.subject));
         return result;
     }
 
@@ -2157,9 +2485,13 @@ static command_result_t handle_switch_command(gitswitch_ctx_t *ctx,
      * not real switches and must fail without rewriting the account file. The
      * prepared switch resolves it again under the same outer config lock after
      * migration, so no pointer from this admission check is retained. */
-    if (!config_find_account(ctx, identifier)) {
+    if (!(ctx->config.recovering_switch
+              ? config_find_account_exact(ctx, identifier)
+              : config_find_account(ctx, identifier))) {
         display_error("Failed to switch account", "%s",
-                      get_last_error()->message);
+                      get_last_error()->message[0] != '\0'
+                          ? get_last_error()->message
+                          : "Recovery target account no longer exists");
         return result;
     }
 
@@ -2918,6 +3250,108 @@ static bool command_mutates_unrelated_retirement_state(const char *command) {
             strcmp(command, "config") == 0);
 }
 
+/* Unlike retirement, an incomplete switch is bound to the exact account
+ * document generation. Removing/resetting its target would destroy recovery
+ * authority, so every account/runtime mutation is blocked except the one
+ * explicit `resume` path that adopts the exact marker. */
+static bool command_mutates_switch_guard_state(const char *command,
+                                               bool resume_check) {
+    if (resume_check) return true;
+    if (!command) return false;
+    if (command_activates_account(command, false)) return true;
+    return strcmp(command, "add") == 0 ||
+           strcmp(command, "edit") == 0 ||
+           strcmp(command, "remove") == 0 ||
+           strcmp(command, "rm") == 0 ||
+           strcmp(command, "delete") == 0 ||
+           strcmp(command, "config") == 0 ||
+           strcmp(command, "reset") == 0;
+}
+
+/* Probe before load and again under `.config.lock`. A valid canonical marker
+ * authorizes only a non-preview explicit `resume`; malformed/unsafe/staged
+ * state blocks every mutation. For the shell readiness probe, a valid marker
+ * deliberately returns failure so the shell invokes recovery, while an
+ * invalid marker returns success to suppress an unsafe automatic retry. */
+static bool switch_guard_rejects_command(
+    const char *config_path, const char *command, bool resume_check,
+    bool relevant_command, bool dry_run,
+    config_switch_guard_recovery_t *recovery, bool *recovering,
+    int *exit_code) {
+    bool blocked = true;
+    bool explicit_resume =
+        command && strcmp(command, "resume") == 0;
+    const char *detail;
+
+    if (recovering) *recovering = false;
+    if (recovery) {
+        secure_zero_memory(recovery, sizeof(*recovery));
+    }
+    if (!relevant_command) return false;
+    if (!config_path || config_path[0] == '\0' || !recovery ||
+        !recovering) {
+        errno = EINVAL;
+        set_error(ERR_INVALID_ARGS,
+                  "Cannot inspect .switch-incomplete without a valid configuration path");
+        if (exit_code) *exit_code = resume_check ? EXIT_SUCCESS : EXIT_FAILURE;
+        return true;
+    }
+
+    clear_error();
+    errno = 0;
+    if (config_switch_guard_probe(config_path, &blocked, recovery) != 0) {
+        if (get_last_error()->message[0] == '\0') {
+            errno = errno ? errno : EIO;
+            set_system_error(
+                ERR_FILE_IO,
+                "Cannot validate .switch-incomplete; account mutation remains blocked");
+        }
+        if (exit_code) *exit_code = resume_check ? EXIT_SUCCESS : EXIT_FAILURE;
+        if (!resume_check) {
+            display_error(
+                "Cannot validate incomplete switch recovery",
+                "%s", get_last_error()->message);
+        }
+        return true;
+    }
+    if (!blocked) {
+        clear_error();
+        errno = 0;
+        return false;
+    }
+    if (recovery->valid && explicit_resume && !resume_check && !dry_run) {
+        *recovering = true;
+        clear_error();
+        errno = 0;
+        return false;
+    }
+
+    if (exit_code) {
+        *exit_code = resume_check
+            ? (recovery->valid ? EXIT_FAILURE : EXIT_SUCCESS)
+            : EXIT_FAILURE;
+    }
+    if (resume_check) return true;
+
+    detail = get_last_error()->message[0] != '\0'
+        ? get_last_error()->message
+        : (recovery->valid
+               ? "a durable .switch-incomplete marker requires exact explicit recovery"
+               : "the switch recovery marker is malformed, unsafe, or incomplete");
+    if (recovery->valid && explicit_resume && dry_run) {
+        display_error(
+            "Cannot preview incomplete switch recovery",
+            "%s; rerun `gitswitch resume` without --dry-run to reconcile the exact transaction",
+            detail);
+    } else {
+        display_error(
+            "Cannot modify account state while a switch is incomplete",
+            "%s; only `gitswitch resume` may adopt the exact durable recovery marker",
+            detail);
+    }
+    return true;
+}
+
 /* A retirement guard means durable Git credential state may no longer agree
  * with the account/active-state document.  Activation is the one operation
  * that could silently turn that split state back into live runtime identity,
@@ -3135,8 +3569,10 @@ static int handle_resume_command(gitswitch_ctx_t *ctx) {
     return EXIT_SUCCESS;
 }
 
-/* Tear down isolated SSH/GPG state: kill the per-account agents and delete
- * (unlink) the isolated GPG homes holding the exported secret-key copies. On
+/* Tear down isolated SSH/GPG state: terminate per-account agents when safely
+ * provable, or clear/detach eligible SSH endpoints while warning that their
+ * process and preexisting connections may remain. Delete (unlink) the
+ * isolated GPG homes holding the exported secret-key copies. On
  * the default memory-backed storage that destroys the bytes; on the
  * GITSWITCH_ALLOW_TMP_GPG non-tmpfs opt-in path they may remain forensically
  * recoverable after deletion (AR-02 #26). With an account argument, only that
@@ -3188,10 +3624,10 @@ static command_result_t handle_reset_command(gitswitch_ctx_t *ctx,
     if (ctx->config.dry_run) {
         display_info("DRY RUN MODE - No actual changes will be made");
         if (target) {
-            printf("Would kill the SSH/GPG agents and delete the isolated GPG home for\n"
+            printf("Would retire the SSH/GPG agent state and delete the isolated GPG home for\n"
                    "'%s', removing its on-disk secret-key copy.\n", target);
         } else {
-            printf("Would kill ALL gitswitch SSH/GPG agents and delete ALL isolated GPG\n"
+            printf("Would retire ALL gitswitch SSH/GPG agent state and delete ALL isolated GPG\n"
                    "homes, removing every on-disk secret-key copy.\n");
         }
         if ((!target || (active_account &&
@@ -3218,13 +3654,13 @@ static command_result_t handle_reset_command(gitswitch_ctx_t *ctx,
         if (target) {
             prompt_length = snprintf(
                 confirmation_prompt, sizeof(confirmation_prompt),
-                "This kills the SSH/GPG agents and deletes the isolated GPG home for\n"
+                "This retires the SSH/GPG agent state and deletes the isolated GPG home for\n"
                 "'%s', removing its on-disk secret-key copy.\n"
                 "Type 'yes' to continue: ", target);
         } else {
             prompt_length = snprintf(
                 confirmation_prompt, sizeof(confirmation_prompt),
-                "This kills ALL gitswitch SSH/GPG agents and deletes ALL isolated GPG\n"
+                "This retires ALL gitswitch SSH/GPG agent state and deletes ALL isolated GPG\n"
                 "homes, removing every on-disk secret-key copy.\n"
                 "Type 'yes' to continue: ");
         }
@@ -3264,10 +3700,10 @@ static command_result_t handle_reset_command(gitswitch_ctx_t *ctx,
             return result;
         }
     } else if (target) {
-        printf("This kills the SSH/GPG agents and deletes the isolated GPG home for\n"
+        printf("This retires the SSH/GPG agent state and deletes the isolated GPG home for\n"
                "'%s', removing its on-disk secret-key copy.\n", target);
     } else {
-        printf("This kills ALL gitswitch SSH/GPG agents and deletes ALL isolated GPG\n"
+        printf("This retires ALL gitswitch SSH/GPG agent state and deletes ALL isolated GPG\n"
                "homes, removing every on-disk secret-key copy.\n");
     }
 

@@ -30,6 +30,24 @@ static gpg_reset_quarantine_hook_stage_t g_failure_stage;
 static bool g_hook_fired;
 static char g_quarantine[GPG_QUARANTINE_NAME_LEN];
 
+#if !defined(__FreeBSD__)
+static int identity_unlink_for_test(int dir_fd, const char *name,
+                                    const struct stat *expected) {
+    struct stat observed;
+    if (!expected ||
+        fstatat(dir_fd, name, &observed, AT_SYMLINK_NOFOLLOW) != 0 ||
+        observed.st_dev != expected->st_dev ||
+        observed.st_ino != expected->st_ino ||
+        observed.st_mode != expected->st_mode ||
+        observed.st_uid != expected->st_uid ||
+        observed.st_size != expected->st_size) {
+        errno = ESTALE;
+        return -1;
+    }
+    return unlinkat(dir_fd, name, 0);
+}
+#endif
+
 static int null_runner(const char *const argv[], const run_opts_t *opts,
                        run_result_t *result) {
     (void)argv;
@@ -260,7 +278,7 @@ TEST(reset_retry_completes_from_witness_only_retirement_state) {
     gpg_manager_set_reset_quarantine_hook_fn(old_hook);
 }
 
-TEST(reset_retry_preserves_unwitnessed_quarantine) {
+TEST(full_reset_retires_self_owned_unwitnessed_quarantine) {
     char xdg[128];
     char base[256];
     char home[320];
@@ -291,11 +309,8 @@ TEST(reset_retry_preserves_unwitnessed_quarantine) {
     CHECK_EQ_INT(unlink(witness_path), 0);
     gpg_manager_set_reset_quarantine_hook_fn(NULL);
 
-    CHECK_EQ_INT(gpg_manager_reset(NULL), -1);
-    CHECK(strstr(get_last_error()->message, "Unwitnessed") != NULL);
-    CHECK_EQ_INT(lstat(retained, &after), 0);
-    CHECK_EQ_INT(after.st_dev, before.st_dev);
-    CHECK_EQ_INT(after.st_ino, before.st_ino);
+    CHECK_EQ_INT(gpg_manager_reset(NULL), 0);
+    CHECK(lstat(retained, &after) != 0 && errno == ENOENT);
     run_set_runner(old_runner);
     gpg_manager_set_reset_quarantine_hook_fn(old_hook);
 }
@@ -351,11 +366,14 @@ TEST(reset_preserves_replacement_installed_at_unlink_boundary) {
 
 TEST_MAIN_BEGIN()
     error_init(LOG_LEVEL_ERROR, NULL);
+#if !defined(__FreeBSD__)
+    gpg_manager_set_identity_unlink_fn(identity_unlink_for_test);
+#endif
     RUN_TEST(reset_retries_after_post_rename_capture_failure);
     RUN_TEST(reset_retries_after_post_rename_revalidation_failure);
     RUN_TEST(reset_retries_after_post_rename_unlink_failure);
     RUN_TEST(reset_retry_preserves_foreign_quarantine_replacement);
     RUN_TEST(reset_retry_completes_from_witness_only_retirement_state);
-    RUN_TEST(reset_retry_preserves_unwitnessed_quarantine);
+    RUN_TEST(full_reset_retires_self_owned_unwitnessed_quarantine);
     RUN_TEST(reset_preserves_replacement_installed_at_unlink_boundary);
 TEST_MAIN_END()

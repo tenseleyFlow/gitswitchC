@@ -13,7 +13,7 @@ permissions:
 
 jobs:
   linux:
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04
     steps:
       - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
         with:
@@ -37,13 +37,39 @@ jobs:
           sudo apt-get update
           sudo apt-get install -y \
             bash binutils dash fish gnupg ksh libreadline-dev openssh-client zsh \
-            cppcheck flawfinder gcovr rpm shellcheck valgrind
+            cppcheck curl flawfinder rpm shellcheck valgrind
       # Every Linux make invocation below uses the package-owned absolute path.
       # Verify its recorded package checksum before any build command executes,
       # so a resolver or filesystem replacement cannot turn literal gates into
       # no-op command text.
       - name: Verify GNU Make package provenance
         run: /usr/bin/dpkg --verify make
+      - name: Behavioral coverage policy
+        run: COVERAGE_POLICY_MAKE=/usr/bin/make /bin/sh tests/test_coverage.sh --static Makefile
+      # Ubuntu 24.04's gcovr 7.0 cannot consume GCC 13 block records. Use the
+      # upstream 8.6 standalone binary, bound to its reviewed release digest,
+      # from a private runner-temporary directory. Only its verified absolute
+      # path crosses the step boundary.
+      - name: Install pinned gcovr coverage reporter
+        id: gcovr
+        run: |
+          set -eu
+          umask 077
+          test "$(/usr/bin/uname -m)" = x86_64
+          gcovr_url='https://github.com/gcovr/gcovr/releases/download/8.6/gcovr-8.6-linux-x86_64'
+          gcovr_sha256='dbeacffd6d1ed7bac9ef706c7405a80415c03ce37471fb77ec9db1937d780bc8'
+          gcovr_dir=$(/usr/bin/mktemp -d "$RUNNER_TEMP/gcovr.XXXXXX")
+          test "$(/usr/bin/stat -c '%u:%a:%F' "$gcovr_dir")" = "$(/usr/bin/id -u):700:directory"
+          gcovr_download="$gcovr_dir/gcovr-8.6-linux-x86_64.download"
+          gcovr_path="$gcovr_dir/gcovr-8.6-linux-x86_64"
+          /usr/bin/curl --fail --show-error --silent --location --retry 5 --retry-all-errors --proto '=https' --proto-redir '=https' --tlsv1.2 "$gcovr_url" --output "$gcovr_download"
+          printf '%s  %s\n' "$gcovr_sha256" "$gcovr_download" | /usr/bin/sha256sum --check --strict -
+          /usr/bin/install -m 0555 "$gcovr_download" "$gcovr_path"
+          test "$(/usr/bin/stat -c '%u:%a:%F' "$gcovr_path")" = "$(/usr/bin/id -u):555:regular file"
+          printf '%s  %s\n' "$gcovr_sha256" "$gcovr_path" | /usr/bin/sha256sum --check --strict -
+          /usr/bin/rm -- "$gcovr_download"
+          test "$("$gcovr_path" --version | /usr/bin/sed -n '1p')" = 'gcovr 8.6'
+          printf 'path=%s\n' "$gcovr_path" >> "$GITHUB_OUTPUT"
       - name: Shell assets (ShellCheck + native parsers)
         run: /usr/bin/make shell-static-test
       # Fast textual tripwire only — headers included, but whitespace variants,
@@ -71,6 +97,7 @@ jobs:
         run: /usr/bin/make coverage
         env:
           GITSWITCH_TEST_REQUIRED_CAPS: pty,readline,bash,zsh,fish,sh,dash,ksh,openssh,gpg,unix-sockets,mount-namespace
+          GCOVR: ${{ steps.gcovr.outputs.path }}
       - name: Verify coverage build provenance
         run: test "$(/usr/bin/sed -n '1s/|.*//p' build/obj/.buildconfig)" = coverage && test -s build/coverage/coverage.json
       - name: Upload source coverage reports
@@ -131,7 +158,7 @@ jobs:
         run: /usr/bin/make CC=clang BUILD_TYPE=release READLINE=1 WERROR=1 release-artifact-test
 
   freebsd:
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04
     steps:
       - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
         with:

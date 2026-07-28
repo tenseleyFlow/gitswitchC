@@ -9,7 +9,7 @@
  *                        and git user.name; also the M3 socket-name parser.
  *   - validate_email  -> written verbatim as user.email into ~/.gitconfig.
  *   - validate_key_id -> handed to gpg/git as an argv element.
- *   - is_safe_ssh_key_path -> core.sshCommand (/bin/sh) and ~/.ssh/config.
+ *   - is_safe_ssh_key_path -> conservative core.sshCommand path admission.
  *
  * Each assertion documents the *expected safe* behavior. A failing assertion is
  * a real defect in the current tree, not a broken test — see result_summary.
@@ -80,18 +80,15 @@ TEST(validate_email_rejects_embedded_control_and_newline) {
 }
 
 /* ------------------------------------------------------------------------- *
- * is_safe_ssh_key_path: NOT referenced by any test file in the tree, yet it is
- * the shared guard for the two SSH-key sinks (core.sshCommand handed to /bin/sh
- * with the path in single quotes, and the IdentityFile line in ~/.ssh/config).
- * A single quote ends the shell quote and smuggles ssh options
- * (-oProxyCommand=...); a newline injects an ssh_config keyword. */
+ * is_safe_ssh_key_path: preserve the conservative quote/control contract in
+ * front of core.sshCommand independently of its shell-word serializer. The
+ * OpenSSH IdentityFile sink has separate grammar-aware coverage. */
 TEST(is_safe_ssh_key_path_blocks_quote_and_control_injection) {
-    /* Single quote: breaks out of the '...' wrapper in core.sshCommand. */
+    /* Both quote forms remain outside this conservative sink contract. */
     CHECK(!is_safe_ssh_key_path("/home/u/.ssh/id' -oProxyCommand=calc '"));
     CHECK(!is_safe_ssh_key_path("/home/u/id_ed25519'"));
-    /* Double quote: breaks ~/.ssh/config directive tokenization. */
     CHECK(!is_safe_ssh_key_path("/home/u/\"evil\"/key"));
-    /* Newline / CR: inject a new ssh_config line (ProxyCommand). */
+    /* Newline / CR and other controls remain forbidden. */
     CHECK(!is_safe_ssh_key_path("/home/u/key\nProxyCommand id"));
     CHECK(!is_safe_ssh_key_path("/home/u/key\rProxyCommand id"));
     /* Other control bytes and DEL. */

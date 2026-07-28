@@ -895,6 +895,290 @@ static bool m10_retirement_artifacts_absent(const char *config_path) {
     return absent;
 }
 
+static int m10_prepare_remove_recovery(
+    m10_fixture_t *fixture,
+    const char *record_incarnation,
+    publication_state_t record_state,
+    bool include_record,
+    const config_retirement_ssh_alias_obligation_t *obligation) {
+    static const char config_body[] =
+        "[settings]\n"
+        "default_scope = \"local\"\n"
+        "active_account = \"alice\"\n"
+        "[accounts.41]\n"
+        "incarnation = \"" M10_INCARNATION "\"\n"
+        "name = \"alice\"\n"
+        "email = \"alice@example.test\"\n"
+        "preferred_scope = \"local\"\n";
+    config_retirement_owner_t owner;
+    config_retirement_guard_t *guard = NULL;
+
+    if (!fixture || !record_incarnation || !obligation ||
+        m10_write_file(fixture->config_path, config_body) != 0 ||
+        config_load(&fixture->ctx, fixture->config_path) != 0) {
+        return -1;
+    }
+    if (include_record) {
+        if (m10_add_record(fixture, PUBLICATION_SCOPE_LOCAL,
+                           fixture->repo_a_local, fixture->repo_a) != 0 ||
+            safe_strncpy(
+                fixture->records[0].account_incarnation,
+                record_incarnation,
+                sizeof(fixture->records[0].account_incarnation)) != 0) {
+            return -1;
+        }
+        fixture->records[0].state = record_state;
+        if (publication_record_validate(&fixture->records[0]) != 0) {
+            return -1;
+        }
+    }
+    if (m10_write_ledger(fixture) != 0) return -1;
+    memset(&owner, 0, sizeof(owner));
+    owner.account_id = UINT32_C(41);
+    if (safe_strncpy(owner.account_incarnation, M10_INCARNATION,
+                     sizeof(owner.account_incarnation)) != 0 ||
+        config_retirement_guard_install_or_adopt_with_ssh_alias_obligation(
+            fixture->config_path, CONFIG_RETIREMENT_REMOVE,
+            &owner, 1U, obligation, &guard) != 0 ||
+        !guard) {
+        config_retirement_guard_abandon(&guard);
+        return -1;
+    }
+    config_retirement_guard_abandon(&guard);
+    fixture->ctx.account_count = 0U;
+    fixture->ctx.current_account = NULL;
+    fixture->ctx.config.active_account[0] = '\0';
+    m10_model_records(fixture);
+    if (include_record) {
+        m10_destination_clear_values(&m10_destinations[0]);
+    }
+    return 0;
+}
+
+static int m10_alias_obligation(
+    const m10_fixture_t *fixture,
+    config_retirement_ssh_alias_obligation_t *obligation) {
+    struct stat home_st;
+    struct stat ssh_st;
+
+    if (!fixture || !obligation ||
+        stat(fixture->root, &home_st) != 0 ||
+        stat(fixture->repo_a, &ssh_st) != 0) {
+        return -1;
+    }
+    memset(obligation, 0, sizeof(*obligation));
+    obligation->known = true;
+    obligation->present = true;
+    if (safe_strncpy(obligation->ssh_host_alias, "retired-alias",
+                     sizeof(obligation->ssh_host_alias)) != 0 ||
+        safe_strncpy(obligation->home_path, fixture->root,
+                     sizeof(obligation->home_path)) != 0) {
+        return -1;
+    }
+    publication_identity_from_stat(&obligation->home_identity, &home_st);
+    publication_identity_from_stat(
+        &obligation->ssh_directory_identity, &ssh_st);
+    return 0;
+}
+
+TEST(incomplete_remove_recovery_settles_clean_retiring_destination) {
+    config_retirement_ssh_alias_obligation_t obligation;
+    m10_fixture_t fixture;
+    command_runner_fn previous;
+    bool blocked = true;
+
+    memset(&obligation, 0, sizeof(obligation));
+    obligation.known = true;
+    CHECK_EQ_INT(m10_fixture_init(&fixture), 0);
+    CHECK_EQ_INT(m10_prepare_remove_recovery(
+                     &fixture, M10_INCARNATION,
+                     PUBLICATION_STATE_RETIRING, true, &obligation), 0);
+    previous = run_set_runner(NULL);
+    CHECK_EQ_INT(accounts_remove_recover_incomplete(
+                     &fixture.ctx, "41"), 1);
+    run_set_runner(previous);
+    CHECK_EQ_INT(config_retirement_guard_probe(
+                     fixture.config_path, &blocked), 0);
+    CHECK(!blocked);
+    CHECK_EQ_INT(access(fixture.repo_a_local, F_OK), 0);
+    m10_fixture_cleanup(&fixture);
+}
+
+TEST(incomplete_remove_recovery_rejects_conflicting_incarnation_tombstone) {
+    static const char other_incarnation[] =
+        "2222222222222222222222222222222222222222222222222222222222222222";
+    config_retirement_ssh_alias_obligation_t obligation;
+    m10_fixture_t fixture;
+    bool blocked = false;
+
+    memset(&obligation, 0, sizeof(obligation));
+    obligation.known = true;
+    CHECK_EQ_INT(m10_fixture_init(&fixture), 0);
+    CHECK_EQ_INT(m10_prepare_remove_recovery(
+                     &fixture, other_incarnation,
+                     PUBLICATION_STATE_RETIRING, true, &obligation), 0);
+    CHECK_EQ_INT(accounts_remove_recover_incomplete(
+                     &fixture.ctx, "41"), -1);
+    CHECK(m10_error_contains("conflicting durable incarnation"));
+    CHECK_EQ_INT(config_retirement_guard_probe(
+                     fixture.config_path, &blocked), 0);
+    CHECK(blocked);
+    m10_fixture_cleanup(&fixture);
+}
+
+TEST(incomplete_remove_recovery_rejects_nonretiring_tombstone) {
+    config_retirement_ssh_alias_obligation_t obligation;
+    m10_fixture_t fixture;
+    bool blocked = false;
+
+    memset(&obligation, 0, sizeof(obligation));
+    obligation.known = true;
+    CHECK_EQ_INT(m10_fixture_init(&fixture), 0);
+    CHECK_EQ_INT(m10_prepare_remove_recovery(
+                     &fixture, M10_INCARNATION,
+                     PUBLICATION_STATE_PUBLISHED, true, &obligation), 0);
+    CHECK_EQ_INT(accounts_remove_recover_incomplete(
+                     &fixture.ctx, "41"), -1);
+    CHECK(m10_error_contains("non-retiring publication provenance"));
+    CHECK_EQ_INT(config_retirement_guard_probe(
+                     fixture.config_path, &blocked), 0);
+    CHECK(blocked);
+    m10_fixture_cleanup(&fixture);
+}
+
+TEST(incomplete_remove_recovery_requires_canonical_tombstone_ledger) {
+    config_retirement_ssh_alias_obligation_t obligation;
+    m10_fixture_t fixture;
+    bool blocked = false;
+
+    memset(&obligation, 0, sizeof(obligation));
+    obligation.known = true;
+    CHECK_EQ_INT(m10_fixture_init(&fixture), 0);
+    CHECK_EQ_INT(m10_prepare_remove_recovery(
+                     &fixture, M10_INCARNATION,
+                     PUBLICATION_STATE_RETIRING, false, &obligation), 0);
+    CHECK_EQ_INT(accounts_remove_recover_incomplete(
+                     &fixture.ctx, "41"), -1);
+    CHECK(m10_error_contains("no canonical publication tombstone ledger"));
+    CHECK_EQ_INT(config_retirement_guard_probe(
+                     fixture.config_path, &blocked), 0);
+    CHECK(blocked);
+    m10_fixture_cleanup(&fixture);
+}
+
+TEST(incomplete_remove_recovery_requires_owner_tombstone) {
+    config_retirement_ssh_alias_obligation_t obligation;
+    m10_fixture_t fixture;
+    bool blocked = false;
+
+    memset(&obligation, 0, sizeof(obligation));
+    obligation.known = true;
+    CHECK_EQ_INT(m10_fixture_init(&fixture), 0);
+    CHECK_EQ_INT(m10_prepare_remove_recovery(
+                     &fixture, M10_INCARNATION,
+                     PUBLICATION_STATE_RETIRING, true, &obligation), 0);
+    fixture.records[0].account_id = UINT32_C(42);
+    CHECK_EQ_INT(publication_record_validate(&fixture.records[0]), 0);
+    CHECK_EQ_INT(m10_write_ledger(&fixture), 0);
+    CHECK_EQ_INT(accounts_remove_recover_incomplete(
+                     &fixture.ctx, "41"), -1);
+    CHECK(m10_error_contains("no durable publication tombstones"));
+    CHECK_EQ_INT(config_retirement_guard_probe(
+                     fixture.config_path, &blocked), 0);
+    CHECK(blocked);
+    m10_fixture_cleanup(&fixture);
+}
+
+TEST(incomplete_remove_recovery_rejects_live_alias_claimant) {
+    config_retirement_ssh_alias_obligation_t obligation;
+    m10_fixture_t fixture;
+    bool blocked = false;
+
+    CHECK_EQ_INT(m10_fixture_init(&fixture), 0);
+    CHECK_EQ_INT(m10_alias_obligation(&fixture, &obligation), 0);
+    CHECK_EQ_INT(m10_prepare_remove_recovery(
+                     &fixture, M10_INCARNATION,
+                     PUBLICATION_STATE_RETIRING, true, &obligation), 0);
+    fixture.ctx.account_count = 1U;
+    fixture.ctx.accounts[0].id = UINT32_C(77);
+    CHECK_EQ_INT(safe_strncpy(
+                     fixture.ctx.accounts[0].ssh_host_alias,
+                     obligation.ssh_host_alias,
+                     sizeof(fixture.ctx.accounts[0].ssh_host_alias)), 0);
+    CHECK_EQ_INT(accounts_remove_recover_incomplete(
+                     &fixture.ctx, "41"), -1);
+    CHECK(m10_error_contains("live account ID 77 claims SSH alias"));
+    CHECK_EQ_INT(config_retirement_guard_probe(
+                     fixture.config_path, &blocked), 0);
+    CHECK(blocked);
+    m10_fixture_cleanup(&fixture);
+}
+
+TEST(incomplete_remove_recovery_ignores_noncanonical_identifiers) {
+    gitswitch_ctx_t ctx;
+    static const char *const identifiers[] = {
+        "", "0", "-1", "41x", "4294967296"
+    };
+
+    memset(&ctx, 0, sizeof(ctx));
+    CHECK_EQ_INT(accounts_remove_recover_incomplete(NULL, "41"), -1);
+    CHECK_EQ_INT(accounts_remove_recover_incomplete(&ctx, NULL), -1);
+    for (size_t i = 0U;
+         i < sizeof(identifiers) / sizeof(identifiers[0]); i++) {
+        CHECK_EQ_INT(accounts_remove_recover_incomplete(
+                         &ctx, identifiers[i]), 0);
+    }
+}
+
+TEST(incomplete_remove_recovery_defers_to_exact_live_owner) {
+    config_retirement_ssh_alias_obligation_t obligation;
+    m10_fixture_t fixture;
+    bool blocked = false;
+
+    memset(&obligation, 0, sizeof(obligation));
+    obligation.known = true;
+    CHECK_EQ_INT(m10_fixture_init(&fixture), 0);
+    CHECK_EQ_INT(m10_prepare_remove_recovery(
+                     &fixture, M10_INCARNATION,
+                     PUBLICATION_STATE_RETIRING, true, &obligation), 0);
+    fixture.ctx.account_count = 1U;
+    fixture.ctx.current_account = &fixture.ctx.accounts[0];
+    CHECK_EQ_INT(accounts_remove_recover_incomplete(
+                     &fixture.ctx, "41"), 0);
+    CHECK_EQ_INT(config_retirement_guard_probe(
+                     fixture.config_path, &blocked), 0);
+    CHECK(blocked);
+    m10_fixture_cleanup(&fixture);
+}
+
+TEST(incomplete_remove_recovery_rejects_reused_live_owner_id) {
+    static const char other_incarnation[] =
+        "2222222222222222222222222222222222222222222222222222222222222222";
+    config_retirement_ssh_alias_obligation_t obligation;
+    m10_fixture_t fixture;
+    bool blocked = false;
+
+    memset(&obligation, 0, sizeof(obligation));
+    obligation.known = true;
+    CHECK_EQ_INT(m10_fixture_init(&fixture), 0);
+    CHECK_EQ_INT(m10_prepare_remove_recovery(
+                     &fixture, M10_INCARNATION,
+                     PUBLICATION_STATE_RETIRING, true, &obligation), 0);
+    fixture.ctx.account_count = 1U;
+    fixture.ctx.accounts[0].incarnation_persisted = true;
+    CHECK_EQ_INT(safe_strncpy(
+                     fixture.ctx.accounts[0].incarnation,
+                     other_incarnation,
+                     sizeof(fixture.ctx.accounts[0].incarnation)), 0);
+    CHECK_EQ_INT(accounts_remove_recover_incomplete(
+                     &fixture.ctx, "41"), -1);
+    CHECK(m10_error_contains("live account uses a different incarnation"));
+    CHECK_EQ_INT(config_retirement_guard_probe(
+                     fixture.config_path, &blocked), 0);
+    CHECK(blocked);
+    m10_fixture_cleanup(&fixture);
+}
+
 TEST(removal_from_repository_b_retires_repository_a_and_b_destinations) {
     m10_fixture_t fixture;
     command_runner_fn previous;
@@ -1829,6 +2113,17 @@ TEST(retiring_record_in_multi_destination_set_fails_before_git) {
 
 TEST_MAIN_BEGIN()
     error_init(LOG_LEVEL_WARNING, NULL);
+    RUN_TEST(incomplete_remove_recovery_settles_clean_retiring_destination);
+    RUN_TEST(
+        incomplete_remove_recovery_rejects_conflicting_incarnation_tombstone);
+    RUN_TEST(incomplete_remove_recovery_rejects_nonretiring_tombstone);
+    RUN_TEST(
+        incomplete_remove_recovery_requires_canonical_tombstone_ledger);
+    RUN_TEST(incomplete_remove_recovery_requires_owner_tombstone);
+    RUN_TEST(incomplete_remove_recovery_rejects_live_alias_claimant);
+    RUN_TEST(incomplete_remove_recovery_ignores_noncanonical_identifiers);
+    RUN_TEST(incomplete_remove_recovery_defers_to_exact_live_owner);
+    RUN_TEST(incomplete_remove_recovery_rejects_reused_live_owner_id);
     RUN_TEST(removal_from_repository_b_retires_repository_a_and_b_destinations);
     RUN_TEST(removal_outside_repository_ignores_poisoned_git_environment);
     RUN_TEST(local_and_worktree_publications_in_one_repository_are_both_retired);

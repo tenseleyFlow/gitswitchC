@@ -23,6 +23,16 @@ static int g_backup_chunk_calls;
 static int g_document_rename_calls;
 static int g_document_dirsync_calls;
 static int g_toml_publication_calls;
+typedef enum {
+    DOCUMENT_POSTRENAME_NONE = 0,
+    DOCUMENT_POSTRENAME_SUBSTITUTE_PARENT,
+    DOCUMENT_POSTRENAME_REMOVE_LEAF,
+    DOCUMENT_POSTRENAME_FAIL_REPROOF
+} document_postrename_action_t;
+static document_postrename_action_t g_document_postrename_action;
+static int g_document_postrename_action_calls;
+static char g_document_parent[1024];
+static char g_detached_document_parent[1024];
 static bool g_replace_source_name;
 static bool g_rewrite_source_after_first_chunk;
 static bool g_replace_backup_destination;
@@ -449,6 +459,29 @@ static bool publication_observer(config_io_boundary_t boundary) {
         g_document_rename_calls++;
     } else if (boundary == CONFIG_IO_DOCUMENT_BEFORE_DIR_SYNC) {
         g_document_dirsync_calls++;
+        if (g_document_postrename_action ==
+            DOCUMENT_POSTRENAME_SUBSTITUTE_PARENT) {
+            static const char competitor[] = "canonical-competitor\n";
+
+            g_document_postrename_action_calls++;
+            if (rename(g_document_parent,
+                       g_detached_document_parent) != 0 ||
+                mkdir(g_document_parent, 0700) != 0 ||
+                write_text(g_target, competitor) != 0) {
+                g_hook_error = errno ? errno : EIO;
+            }
+        } else if (g_document_postrename_action ==
+                   DOCUMENT_POSTRENAME_REMOVE_LEAF) {
+            g_document_postrename_action_calls++;
+            if (unlink(g_target) != 0) {
+                g_hook_error = errno ? errno : EIO;
+            }
+        }
+    } else if (boundary == CONFIG_IO_DOCUMENT_REPROOF_AFTER_BYTES &&
+               g_document_postrename_action ==
+                   DOCUMENT_POSTRENAME_FAIL_REPROOF) {
+        g_document_postrename_action_calls++;
+        return true;
     }
     return false;
 }
@@ -933,6 +966,117 @@ TEST(full_save_has_one_document_publisher_and_ignores_fault_environment) {
     CHECK_EQ_INT(count_prefix(dir, ".gitswitch-toml."), 0);
 }
 
+static void exercise_full_save_postrename_classification(
+    document_postrename_action_t action) {
+    static const char competitor[] = "canonical-competitor\n";
+    char dir[256];
+    char path[512];
+    char detached_path[512];
+    char hint[512];
+    char detached_hint[512];
+    char text[1024];
+    struct stat source_before;
+    gitswitch_ctx_t ctx;
+    bool installed = false;
+    int save_result;
+    int save_errno;
+
+    CHECK_EQ_INT(private_dir(dir, sizeof(dir)), 0);
+    snprintf(path, sizeof(path), "%s/accounts.toml", dir);
+    snprintf(hint, sizeof(hint), "%s/.resume-hint", dir);
+    snprintf(g_detached_document_parent,
+             sizeof(g_detached_document_parent), "%s.detached", dir);
+    snprintf(detached_path, sizeof(detached_path),
+             "%s.detached/accounts.toml", dir);
+    snprintf(detached_hint, sizeof(detached_hint),
+             "%s.detached/.resume-hint", dir);
+    memset(&ctx, 0, sizeof(ctx));
+    ctx.config.default_scope = GIT_SCOPE_LOCAL;
+    CHECK_EQ_INT(config_save_transactional(&ctx, path, &installed), 0);
+    CHECK(installed);
+    source_before = ctx.config.source_generation;
+    CHECK(read_bytes(hint, text, sizeof(text)) > 0);
+    CHECK_STR_EQ(text, "none\ninactive=v1\n");
+
+    ctx.config.default_scope = GIT_SCOPE_GLOBAL;
+    installed = true;
+    g_hook_error = 0;
+    g_document_postrename_action_calls = 0;
+    g_document_postrename_action = action;
+    snprintf(g_document_parent, sizeof(g_document_parent), "%s", dir);
+    snprintf(g_target, sizeof(g_target), "%s", path);
+    clear_error();
+    errno = 0;
+    config_set_io_fault_fn(publication_observer);
+    save_result = config_save_transactional(&ctx, path, &installed);
+    save_errno = errno;
+    config_set_io_fault_fn(NULL);
+    g_document_postrename_action = DOCUMENT_POSTRENAME_NONE;
+
+    CHECK_EQ_INT(g_hook_error, 0);
+    CHECK_EQ_INT(g_document_postrename_action_calls, 1);
+    CHECK_EQ_INT(save_result, -1);
+    CHECK(ts_same_identity(&source_before,
+                           &ctx.config.source_generation));
+
+    if (action == DOCUMENT_POSTRENAME_FAIL_REPROOF) {
+        CHECK_EQ_INT(save_errno, EIO);
+        CHECK_EQ_INT(get_last_error()->code, ERR_CONFIG_WRITE_FAILED);
+        CHECK_EQ_INT(get_last_error()->system_errno, EIO);
+        CHECK(installed); /* exact canonical generation, proof I/O uncertain */
+        CHECK(read_bytes(path, text, sizeof(text)) > 0);
+        CHECK(strstr(text, "default_scope = \"global\"") != NULL);
+        CHECK(read_bytes(hint, text, sizeof(text)) > 0);
+        CHECK_STR_EQ(text, "none\ninactive=v1\n");
+    } else {
+        CHECK_EQ_INT(save_errno, ESTALE);
+        CHECK_EQ_INT(get_last_error()->code, ERR_FILE_IO);
+        CHECK_EQ_INT(get_last_error()->system_errno, ESTALE);
+        CHECK(!installed);
+        if (action == DOCUMENT_POSTRENAME_SUBSTITUTE_PARENT) {
+            CHECK(read_bytes(path, text, sizeof(text)) > 0);
+            CHECK_STR_EQ(text, competitor);
+            CHECK_EQ_INT(access(hint, F_OK), -1);
+            CHECK_EQ_INT(errno, ENOENT);
+            CHECK(read_bytes(detached_path, text, sizeof(text)) > 0);
+            CHECK(strstr(text, "default_scope = \"global\"") != NULL);
+            CHECK(read_bytes(detached_hint, text, sizeof(text)) > 0);
+            CHECK_STR_EQ(text, "none\ninactive=v1\n");
+        } else {
+            CHECK_EQ_INT(access(path, F_OK), -1);
+            CHECK_EQ_INT(errno, ENOENT);
+            CHECK(read_bytes(hint, text, sizeof(text)) > 0);
+            CHECK_STR_EQ(text, "none\ninactive=v1\n");
+        }
+    }
+    CHECK_EQ_INT(count_prefix(dir, "accounts.toml.tmp."), 0);
+    if (action == DOCUMENT_POSTRENAME_SUBSTITUTE_PARENT) {
+        CHECK_EQ_INT(count_prefix(g_detached_document_parent,
+                                  "accounts.toml.tmp."), 0);
+    }
+
+    ts_rm_rf(dir);
+    ts_rm_rf(g_detached_document_parent);
+    g_document_parent[0] = '\0';
+    g_detached_document_parent[0] = '\0';
+    g_target[0] = '\0';
+}
+
+TEST(full_save_rejects_a_detached_parent_publication) {
+    exercise_full_save_postrename_classification(
+        DOCUMENT_POSTRENAME_SUBSTITUTE_PARENT);
+}
+
+TEST(full_save_reports_a_missing_canonical_leaf_as_not_installed) {
+    exercise_full_save_postrename_classification(
+        DOCUMENT_POSTRENAME_REMOVE_LEAF);
+}
+
+TEST(full_save_retains_install_uncertainty_for_reproof_io_failure) {
+    exercise_full_save_postrename_classification(
+        DOCUMENT_POSTRENAME_FAIL_REPROOF);
+}
+
 static void initialize_concurrent_writer_context(gitswitch_ctx_t *ctx,
                                                  git_scope_t scope,
                                                  bool with_account,
@@ -1178,6 +1322,9 @@ TEST_MAIN_BEGIN()
     RUN_TEST(full_save_rejects_pre_copy_rewrite_with_restored_mtime);
     RUN_TEST(rejected_full_save_preserves_five_retained_backups);
     RUN_TEST(full_save_has_one_document_publisher_and_ignores_fault_environment);
+    RUN_TEST(full_save_rejects_a_detached_parent_publication);
+    RUN_TEST(full_save_reports_a_missing_canonical_leaf_as_not_installed);
+    RUN_TEST(full_save_retains_install_uncertainty_for_reproof_io_failure);
     RUN_TEST(concurrent_public_save_cannot_commit_inside_document_replace_gap);
     RUN_TEST(concurrent_public_save_cannot_commit_inside_state_replace_gap);
     RUN_TEST(directory_metadata_mismatches_use_stable_estale_diagnostics);

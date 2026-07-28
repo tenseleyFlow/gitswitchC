@@ -13,6 +13,7 @@
 #include "toml_parser.h"
 #include "signals.h"
 #include "error.h"
+#include "utils.h"
 #include <string.h>
 #include <stdio.h>
 #include <stdlib.h>
@@ -45,13 +46,38 @@ static int make_scratch_dir(char *dir, size_t size) {
     return 0;
 }
 
+static int write_valid_ssh_key(const char *path);
+
 /* Write content to path with the 0600 mode the loader requires. */
 static int write_config(const char *path, const char *content, size_t len) {
-    FILE *f = fopen(path, "w");
+    static const char placeholder[] =
+        "-----BEGIN OPENSSH PRIVATE KEY-----\nfixture\n";
+    FILE *f;
+
+    if (len == sizeof(placeholder) - 1U &&
+        memcmp(content, placeholder, sizeof(placeholder) - 1U) == 0) {
+        return write_valid_ssh_key(path);
+    }
+    f = fopen(path, "w");
     if (!f) return -1;
     if (fwrite(content, 1, len, f) != len) { fclose(f); return -1; }
     fclose(f);
     return chmod(path, 0600);
+}
+
+/* Successful SSH admission fixtures must contain material OpenSSH accepts;
+ * a shape-only envelope would bypass the production parser under test. */
+static int write_valid_ssh_key(const char *path) {
+    const char *argv[] = {
+        "ssh-keygen", "-q", "-t", "ed25519", "-N", "", "-f", path, NULL
+    };
+    run_opts_t opts;
+    run_result_t result;
+
+    memset(&opts, 0, sizeof(opts));
+    memset(&result, 0, sizeof(result));
+    opts.stderr_to_devnull = true;
+    return run_argv_real(argv, &opts, &result);
 }
 
 static size_t slurp(const char *path, char *buf, size_t size) {
@@ -64,8 +90,8 @@ static size_t slurp(const char *path, char *buf, size_t size) {
     return n;
 }
 
-static int join_path(char *dest, size_t size, const char *base,
-                     const char *suffix) {
+static int test_join_path(char *dest, size_t size, const char *base,
+                          const char *suffix) {
     size_t base_len = strlen(base);
     size_t suffix_len = strlen(suffix);
 
@@ -347,9 +373,9 @@ TEST(system_scope_is_rejected_before_admission_or_persistence) {
     CHECK_EQ_INT(config_validate(&ctx), -1); /* pre-fix: 0 */
 
     CHECK_EQ_INT(make_scratch_dir(dir, sizeof(dir)), 0);
-    CHECK_EQ_INT(join_path(default_path, sizeof(default_path), dir,
+    CHECK_EQ_INT(test_join_path(default_path, sizeof(default_path), dir,
                            "/default.toml"), 0);
-    CHECK_EQ_INT(join_path(default_hint, sizeof(default_hint), dir,
+    CHECK_EQ_INT(test_join_path(default_hint, sizeof(default_hint), dir,
                            "/.resume-hint"), 0);
 
     memset(&ctx, 0, sizeof(ctx));
@@ -360,12 +386,12 @@ TEST(system_scope_is_rejected_before_admission_or_persistence) {
 
     /* Use a separate private directory so an accidental resume-hint write by
      * the first save cannot mask whether the account-scope save was pure. */
-    CHECK_EQ_INT(join_path(account_dir, sizeof(account_dir), dir,
+    CHECK_EQ_INT(test_join_path(account_dir, sizeof(account_dir), dir,
                            "/account-dir"), 0);
     CHECK_EQ_INT(mkdir(account_dir, 0700), 0);
-    CHECK_EQ_INT(join_path(account_path, sizeof(account_path), account_dir,
+    CHECK_EQ_INT(test_join_path(account_path, sizeof(account_path), account_dir,
                            "/account.toml"), 0);
-    CHECK_EQ_INT(join_path(account_hint, sizeof(account_hint), account_dir,
+    CHECK_EQ_INT(test_join_path(account_hint, sizeof(account_hint), account_dir,
                            "/.resume-hint"), 0);
     memset(&ctx, 0, sizeof(ctx));
     ctx.config.default_scope = GIT_SCOPE_LOCAL;
@@ -399,8 +425,8 @@ TEST(zero_account_id_is_rejected_before_mutation_or_persistence) {
     CHECK_EQ_INT(config_validate(&ctx), -1); /* pre-fix: 0 */
 
     CHECK_EQ_INT(make_scratch_dir(dir, sizeof(dir)), 0);
-    CHECK_EQ_INT(join_path(path, sizeof(path), dir, "/accounts.toml"), 0);
-    CHECK_EQ_INT(join_path(hint, sizeof(hint), dir, "/.resume-hint"), 0);
+    CHECK_EQ_INT(test_join_path(path, sizeof(path), dir, "/accounts.toml"), 0);
+    CHECK_EQ_INT(test_join_path(hint, sizeof(hint), dir, "/.resume-hint"), 0);
     CHECK_EQ_INT(config_save(&ctx, path), -1); /* pre-fix: emits accounts.0 */
     CHECK(access(path, F_OK) != 0);
     CHECK(access(hint, F_OK) != 0);
@@ -449,8 +475,8 @@ TEST(failed_reload_preserves_complete_context) {
     gitswitch_ctx_t *before;
 
     CHECK_EQ_INT(make_scratch_dir(dir, sizeof(dir)), 0);
-    CHECK_EQ_INT(join_path(path, sizeof(path), dir, "/accounts.toml"), 0);
-    CHECK_EQ_INT(join_path(hint, sizeof(hint), dir, "/.resume-hint"), 0);
+    CHECK_EQ_INT(test_join_path(path, sizeof(path), dir, "/accounts.toml"), 0);
+    CHECK_EQ_INT(test_join_path(hint, sizeof(hint), dir, "/.resume-hint"), 0);
 
     seed_reload_sentinel(&ctx);
     before = malloc(sizeof(*before));
@@ -616,7 +642,7 @@ static void check_symlinked_config_directory_refused(mode_t target_mode) {
     CHECK_EQ_INT(make_scratch_dir(home, sizeof(home)), 0);
     snprintf(dotconfig, sizeof(dotconfig), "%s/.config", home);
     snprintf(target, sizeof(target), "%s/config-target", home);
-    CHECK_EQ_INT(join_path(link, sizeof(link), dotconfig, "/gitswitch"), 0);
+    CHECK_EQ_INT(test_join_path(link, sizeof(link), dotconfig, "/gitswitch"), 0);
     snprintf(sentinel, sizeof(sentinel), "%s/sentinel", target);
     snprintf(accounts, sizeof(accounts), "%s/accounts.toml", target);
     snprintf(linked_accounts, sizeof(linked_accounts), "%s/accounts.toml", link);
@@ -667,7 +693,7 @@ TEST(config_init_rejects_nondirectory_final_components) {
     save_home_env(saved_home, sizeof(saved_home));
     CHECK_EQ_INT(make_scratch_dir(home, sizeof(home)), 0);
     snprintf(dotconfig, sizeof(dotconfig), "%s/.config", home);
-    CHECK_EQ_INT(join_path(final, sizeof(final), dotconfig, "/gitswitch"), 0);
+    CHECK_EQ_INT(test_join_path(final, sizeof(final), dotconfig, "/gitswitch"), 0);
     CHECK_EQ_INT(mkdir(dotconfig, 0700), 0);
     CHECK_EQ_INT(write_config(final, "not-a-directory\n", 16), 0);
     CHECK(slurp(final, before, sizeof(before)) > 0);
@@ -699,7 +725,7 @@ TEST(config_init_secures_real_or_absent_final_directory) {
     save_home_env(saved_home, sizeof(saved_home));
     CHECK_EQ_INT(make_scratch_dir(home, sizeof(home)), 0);
     snprintf(dotconfig, sizeof(dotconfig), "%s/.config", home);
-    CHECK_EQ_INT(join_path(final, sizeof(final), dotconfig, "/gitswitch"), 0);
+    CHECK_EQ_INT(test_join_path(final, sizeof(final), dotconfig, "/gitswitch"), 0);
     CHECK_EQ_INT(mkdir(dotconfig, 0700), 0);
     CHECK_EQ_INT(mkdir(final, 0755), 0);
     CHECK_EQ_INT(chmod(final, 0755), 0);
@@ -835,6 +861,112 @@ TEST(config_lock_rejects_symlink_fifo_and_unsafe_mode) {
     restore_home_env(saved_home);
 }
 
+TEST(config_lock_startup_cleans_only_proven_resume_hint_temp_residue) {
+    static const char settled_prefix[] =
+        ".gitswitch-resume-hint-settled-";
+    char home[128], saved_home[512], dotconfig[256], config_dir[512];
+    char hint[640], stale[640], foreign[640];
+    char symlink_decoy[640], mode_decoy[640];
+    char unmatched_decoy[640], linked_decoy[640], linked_peer[640];
+    char victim[640], text[64];
+    struct stat st;
+    gitswitch_ctx_t ctx;
+    DIR *stream = NULL;
+    struct dirent *entry;
+    size_t settled_count = 0U;
+    int token = -1;
+
+    save_home_env(saved_home, sizeof(saved_home));
+    CHECK_EQ_INT(make_scratch_dir(home, sizeof(home)), 0);
+    snprintf(dotconfig, sizeof(dotconfig), "%s/.config", home);
+    snprintf(config_dir, sizeof(config_dir), "%s/gitswitch", dotconfig);
+    snprintf(hint, sizeof(hint), "%s/.resume-hint", config_dir);
+    snprintf(stale, sizeof(stale),
+             "%s/.resume-hint.tmp.aB3xY9", config_dir);
+    snprintf(foreign, sizeof(foreign),
+             "%s/.resume-hint.tmp.Frg123", config_dir);
+    snprintf(symlink_decoy, sizeof(symlink_decoy),
+             "%s/.resume-hint.tmp.Sym123", config_dir);
+    snprintf(mode_decoy, sizeof(mode_decoy),
+             "%s/.resume-hint.tmp.Mode12", config_dir);
+    snprintf(unmatched_decoy, sizeof(unmatched_decoy),
+             "%s/.resume-hint.tmp.aB3xY-", config_dir);
+    snprintf(linked_decoy, sizeof(linked_decoy),
+             "%s/.resume-hint.tmp.Link12", config_dir);
+    snprintf(linked_peer, sizeof(linked_peer),
+             "%s/link-peer", config_dir);
+    snprintf(victim, sizeof(victim), "%s/victim", home);
+
+    CHECK_EQ_INT(mkdir(dotconfig, 0700), 0);
+    CHECK_EQ_INT(mkdir(config_dir, 0700), 0);
+    CHECK_EQ_INT(write_config(hint, "none\ninactive=v1\n", 17U), 0);
+    CHECK_EQ_INT(link(hint, stale), 0);
+    CHECK_EQ_INT(write_config(foreign, "foreign\n", 8U), 0);
+    CHECK_EQ_INT(write_config(victim, "victim\n", 7U), 0);
+    CHECK_EQ_INT(symlink(victim, symlink_decoy), 0);
+    CHECK_EQ_INT(write_config(mode_decoy, "mode\n", 5U), 0);
+    CHECK_EQ_INT(chmod(mode_decoy, 0644), 0);
+    CHECK_EQ_INT(write_config(unmatched_decoy, "unmatched\n", 10U), 0);
+    CHECK_EQ_INT(write_config(linked_decoy, "linked\n", 7U), 0);
+    CHECK_EQ_INT(link(linked_decoy, linked_peer), 0);
+    CHECK_EQ_INT(setenv("HOME", home, 1), 0);
+
+    /* This is the real mutating CLI ordering: acquire the config write lock,
+     * then initialize/load configuration while retaining that lock. */
+    token = config_write_lock();
+    CHECK(token >= 0);
+    if (token >= 0) {
+        memset(&ctx, 0, sizeof(ctx));
+        CHECK_EQ_INT(config_init(&ctx), 0);
+        config_write_unlock(token);
+        token = -1;
+    }
+
+    errno = 0;
+    CHECK(lstat(stale, &st) != 0 && errno == ENOENT);
+    CHECK_EQ_INT(lstat(hint, &st), 0);
+    CHECK(S_ISREG(st.st_mode));
+    CHECK(st.st_nlink >= 1 && st.st_nlink <= 2);
+    CHECK(slurp(hint, text, sizeof(text)) > 0);
+    CHECK_STR_EQ(text, "none\ninactive=v1\n");
+    CHECK_EQ_INT(lstat(foreign, &st), 0);
+    CHECK(S_ISREG(st.st_mode));
+    CHECK_EQ_INT((long)st.st_nlink, 1);
+    CHECK(slurp(foreign, text, sizeof(text)) > 0);
+    CHECK_STR_EQ(text, "foreign\n");
+    CHECK_EQ_INT(lstat(symlink_decoy, &st), 0);
+    CHECK(S_ISLNK(st.st_mode));
+    CHECK_EQ_INT(lstat(mode_decoy, &st), 0);
+    CHECK(S_ISREG(st.st_mode));
+    CHECK_EQ_INT((long)(st.st_mode & 0777), 0644);
+    CHECK_EQ_INT(lstat(unmatched_decoy, &st), 0);
+    CHECK(S_ISREG(st.st_mode));
+    CHECK_EQ_INT(lstat(linked_decoy, &st), 0);
+    CHECK(S_ISREG(st.st_mode));
+    CHECK_EQ_INT((long)st.st_nlink, 2);
+    CHECK(slurp(victim, text, sizeof(text)) > 0);
+    CHECK_STR_EQ(text, "victim\n");
+
+    stream = opendir(config_dir);
+    CHECK(stream != NULL);
+    if (stream) {
+        while ((entry = readdir(stream)) != NULL) {
+            if (strncmp(entry->d_name,
+                        settled_prefix,
+                        sizeof(settled_prefix) - 1U) == 0) {
+                settled_count++;
+            }
+        }
+        CHECK_EQ_INT(closedir(stream), 0);
+        stream = NULL;
+    }
+    CHECK(settled_count <= 1U);
+
+    if (token >= 0) config_write_unlock(token);
+    restore_home_env(saved_home);
+    ts_rm_rf(home);
+}
+
 static int config_lock_child_contended(void) {
     pid_t pid = fork();
     int status = 0;
@@ -958,7 +1090,7 @@ TEST(config_init_preserves_symlinked_parent_policy) {
     snprintf(parent, sizeof(parent), "%s/config-parent", home);
     snprintf(parent_link, sizeof(parent_link), "%s/.config", home);
     snprintf(final, sizeof(final), "%s/gitswitch", parent);
-    CHECK_EQ_INT(join_path(accounts, sizeof(accounts), final,
+    CHECK_EQ_INT(test_join_path(accounts, sizeof(accounts), final,
                            "/accounts.toml"), 0);
     CHECK_EQ_INT(mkdir(parent, 0700), 0);
     CHECK_EQ_INT(mkdir(final, 0755), 0);
@@ -2623,6 +2755,7 @@ TEST_MAIN_BEGIN()
     RUN_TEST(config_init_secures_real_or_absent_final_directory);
     RUN_TEST(config_get_path_uses_home_or_passwd_without_filesystem_mutation);
     RUN_TEST(config_lock_rejects_symlink_fifo_and_unsafe_mode);
+    RUN_TEST(config_lock_startup_cleans_only_proven_resume_hint_temp_residue);
     RUN_TEST(config_lock_release_preserves_reused_fd_and_retires_context);
     RUN_TEST(config_lock_survives_post_acquisition_namespace_replacement);
     RUN_TEST(config_init_preserves_symlinked_parent_policy);

@@ -73,10 +73,10 @@ typedef struct {
 /* Function prototypes */
 
 /**
- * Initialize git operations
- * - Verify git is available
- * - Check git version compatibility
- * - Validate current repository if in local scope
+ * Initialize Git executable discovery.
+ * - Resolves a launch-eligible `git` from PATH
+ * - Caches only a successful availability check for this process
+ * - Does not execute a version check or inspect the current repository
  */
 int git_ops_init(void);
 
@@ -295,11 +295,13 @@ size_t git_retirement_transaction_restored_destination_count(
 
 /**
  * Return one reconciled canonical path and its freshly re-proved exact file
- * identity. The query checked-cleans and syncs that destination's transaction
- * artifacts before sealing the generation, then retains its exact bytes for
- * commit to re-prove after the caller refreshes the publication ledger. This
- * prevents delayed filesystem metadata from making the new ledger stale while
- * still detecting an external Git writer. `index` addresses changed-and-
+ * identity. The query converts the transaction-owned canonical lock into a
+ * complete, fsynced recovery marker before sealing the generation, then
+ * retains the exact restored bytes and marker witness for commit to re-prove
+ * and exact-clean after the caller refreshes the publication ledger. This
+ * prevents delayed filesystem metadata from making the new ledger stale,
+ * blocks cooperative Git writers, and still detects a foreign replacement.
+ * `index` addresses changed-and-
  * restored and unchanged/no-op destinations exactly once per physical config
  * namespace. The transaction must remain uncommitted and fully aborted.
  */
@@ -359,6 +361,16 @@ int git_config_export_sealed_publication(publication_record_t *out,
  * `out` carries no account owner or credential values (AR-12 H2).
  */
 int git_config_snapshot_export_destination(publication_record_t *out);
+
+/**
+ * Export the complete canonical destination set owned by the active snapshot:
+ * primary first, followed by any local and worktree secondary scopes that the
+ * transaction will mutate. Valid from git_config_snapshot() on; no sealed
+ * post-image is required. On insufficient capacity, `count` receives the
+ * required element count and the function fails without partially exporting.
+ */
+int git_config_snapshot_export_destinations(
+    publication_record_t *out, size_t capacity, size_t *count);
 
 /**
  * Restore the most recent git_config_snapshot(), rebuilding every key with its

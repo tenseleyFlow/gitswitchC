@@ -4,6 +4,7 @@
 #define GPG_MANAGER_H
 
 #include "gitswitch.h"
+#include "utils.h"
 #include <dirent.h>
 #include <sys/stat.h>
 
@@ -16,7 +17,7 @@ typedef enum {
 
 /* Keep manager identities on the shared account/Git key-ID contract. */
 #define GPG_FINGERPRINT_BUFSIZE MAX_GPG_FINGERPRINT_LEN
-#define GPG_QUARANTINE_NAME_LEN 96
+#define GPG_QUARANTINE_NAME_LEN 128
 
 typedef struct {
     struct stat st;
@@ -51,6 +52,7 @@ typedef struct {
     /* Canonical absolute OpenPGP executable selected by the hardened resolver.
      * One manager transaction keeps this binding even if PATH changes. */
     char executable_path[MAX_PATH_LEN];
+    run_launch_witness_t executable_witness;
     char gnupg_home[MAX_PATH_LEN];    /* GNUPGHOME path */
     char current_key_id[GPG_FINGERPRINT_BUFSIZE];
     bool signing_enabled;
@@ -80,6 +82,14 @@ typedef int (*gpg_agent_conf_precommit_fn)(int home_fd,
                                             const char *temp_name);
 typedef int (*gpg_retarget_commit_hook_fn)(int base_fd);
 typedef int (*gpg_retarget_restore_hook_fn)(int base_fd);
+typedef enum {
+    GPG_RETARGET_FORWARD_AFTER_SNAPSHOT,
+    GPG_RETARGET_FORWARD_AFTER_WITNESS_SYNC,
+    GPG_RETARGET_FORWARD_AFTER_QUARANTINE_SYNC,
+    GPG_RETARGET_FORWARD_AFTER_PUBLICATION_SYNC
+} gpg_retarget_forward_hook_stage_t;
+typedef int (*gpg_retarget_forward_hook_fn)(
+    int base_fd, gpg_retarget_forward_hook_stage_t stage);
 typedef enum {
     GPG_ROLLBACK_HOOK_BEFORE_QUARANTINE,
     GPG_ROLLBACK_HOOK_AFTER_QUARANTINE,
@@ -115,10 +125,57 @@ typedef enum {
 typedef int (*gpg_reset_quarantine_hook_fn)(
     int base_fd, gpg_reset_quarantine_hook_stage_t stage,
     const char *quarantine);
+/* Full-reset recovery retirement seam. It runs after an orphan was moved to
+ * its unpredictable private quarantine and synchronized, immediately before
+ * the final identity check and unlink. */
+typedef int (*gpg_reset_retire_hook_fn)(int base_fd,
+                                        const char *quarantine);
+/* Runs after the final pathname identity validation. A replacement installed
+ * here must survive descriptor-bound retirement or trigger fail-closed
+ * preservation on platforms without that primitive. */
+typedef int (*gpg_reset_postvalidate_hook_fn)(int base_fd,
+                                              const char *quarantine);
+/* Test/provider seam for platforms with a descriptor-bound conditional unlink.
+ * Production uses FreeBSD funlinkat(2); NULL is fail-closed elsewhere. */
+typedef int (*gpg_identity_unlink_fn)(int dir_fd, const char *name,
+                                      const struct stat *expected);
 /* Deterministic mount-identity and managed-writer durability seams. NULL
  * restores the native statx/fsid and fsync implementations. */
 typedef int (*gpg_mount_identity_probe_fn)(int fd, uint64_t *identity);
 typedef int (*gpg_agent_conf_sync_fn)(int fd, bool directory);
+#ifdef GITSWITCH_TESTING
+typedef enum {
+    GPG_AGENT_CONF_PUBLICATION_POSTSYNC_PREOBSERVE = 0,
+    GPG_AGENT_CONF_PUBLICATION_PROOF_PREOPEN
+} gpg_agent_conf_publication_hook_stage_t;
+/* Deterministic publication-proof race seam. The post-sync stage runs after
+ * the directory barrier and before either the retained writable descriptor or
+ * installed pathname is inspected. The proof-preopen stage runs after the
+ * pathname identity is captured and before its read-only proof descriptor is
+ * opened. Production leaves it NULL. */
+typedef int (*gpg_agent_conf_publication_hook_fn)(
+    int home_fd, gpg_agent_conf_publication_hook_stage_t stage);
+/* Deterministic terminal-proof race seam. It runs after the initial pathname
+ * identity is captured and before the no-follow proof descriptor is opened.
+ * Production leaves it NULL. */
+typedef int (*gpg_agent_conf_terminal_preopen_fn)(int home_fd);
+/* Deterministic close-to-path-stat race seam for the exact config proof.
+ * Production leaves it NULL. */
+typedef int (*gpg_agent_conf_postclose_fn)(int home_fd);
+#endif
+/* Exact-descriptor probe for the isolated base's storage policy. Return zero
+ * and set `memory_backed`, or return -1 with errno on an unknown/error state.
+ * NULL restores the native fstatfs implementation. */
+typedef int (*gpg_memory_backed_probe_fn)(int base_fd,
+                                          bool *memory_backed);
+/* Advisory-only pathname probe used to decide whether the fallback warning
+ * should be shown. Its result must never authorize secret-key mutation. */
+typedef bool (*gpg_base_warning_probe_fn)(const char *base_path);
+/* Deterministic cache-hit race seam. It runs after the first recursive home
+ * generation and executable witness have been checked, but before the
+ * mandatory final generation and public-namespace binding validation. */
+typedef int (*gpg_key_cache_post_scan_hook_fn)(const char *home_path,
+                                               bool isolated);
 gpg_readdir_fn gpg_manager_set_readdir_fn(gpg_readdir_fn fn);
 gpg_agent_conf_preopen_fn
 gpg_manager_set_agent_conf_preopen_fn(gpg_agent_conf_preopen_fn fn);
@@ -128,6 +185,8 @@ gpg_retarget_commit_hook_fn
 gpg_manager_set_retarget_commit_hook_fn(gpg_retarget_commit_hook_fn fn);
 gpg_retarget_restore_hook_fn
 gpg_manager_set_retarget_restore_hook_fn(gpg_retarget_restore_hook_fn fn);
+gpg_retarget_forward_hook_fn
+gpg_manager_set_retarget_forward_hook_fn(gpg_retarget_forward_hook_fn fn);
 gpg_rollback_hook_fn
 gpg_manager_set_rollback_hook_fn(gpg_rollback_hook_fn fn);
 gpg_sync_base_fn gpg_manager_set_sync_base_fn(gpg_sync_base_fn fn);
@@ -143,10 +202,36 @@ gpg_reset_current_hook_fn
 gpg_manager_set_reset_current_hook_fn(gpg_reset_current_hook_fn fn);
 gpg_reset_quarantine_hook_fn
 gpg_manager_set_reset_quarantine_hook_fn(gpg_reset_quarantine_hook_fn fn);
+gpg_reset_retire_hook_fn
+gpg_manager_set_reset_retire_hook_fn(gpg_reset_retire_hook_fn fn);
+gpg_reset_postvalidate_hook_fn
+gpg_manager_set_reset_postvalidate_hook_fn(
+    gpg_reset_postvalidate_hook_fn fn);
+gpg_identity_unlink_fn
+gpg_manager_set_identity_unlink_fn(gpg_identity_unlink_fn fn);
+bool gpg_manager_set_process_generation_failure_for_test(bool fail);
 gpg_mount_identity_probe_fn
 gpg_manager_set_mount_identity_probe_fn(gpg_mount_identity_probe_fn fn);
 gpg_agent_conf_sync_fn
 gpg_manager_set_agent_conf_sync_fn(gpg_agent_conf_sync_fn fn);
+#ifdef GITSWITCH_TESTING
+gpg_agent_conf_publication_hook_fn
+gpg_manager_set_agent_conf_publication_hook_fn(
+    gpg_agent_conf_publication_hook_fn fn);
+gpg_agent_conf_terminal_preopen_fn
+gpg_manager_set_agent_conf_terminal_preopen_fn(
+    gpg_agent_conf_terminal_preopen_fn fn);
+gpg_agent_conf_postclose_fn
+gpg_manager_set_agent_conf_postclose_fn(
+    gpg_agent_conf_postclose_fn fn);
+#endif
+gpg_memory_backed_probe_fn
+gpg_manager_set_memory_backed_probe_fn(gpg_memory_backed_probe_fn fn);
+gpg_base_warning_probe_fn
+gpg_manager_set_base_warning_probe_fn(gpg_base_warning_probe_fn fn);
+gpg_key_cache_post_scan_hook_fn
+gpg_manager_set_key_cache_post_scan_hook_fn(
+    gpg_key_cache_post_scan_hook_fn fn);
 
 /* Focused verification entry point for the otherwise-internal managed writer.
  * It stages a durable reload obligation but never launches gpgconf; production
@@ -173,19 +258,19 @@ int gpg_manager_resolve_executable(char *path, size_t path_size);
 int gpg_manager_cleanup(gpg_config_t *gpg_config);
 
 /**
- * Switch to account's GPG configuration with proper isolation
- * - Sets appropriate GNUPGHOME if using isolated mode
- * - Configures git signing key
- * - Enables/disables git commit signing
- * - Validates key exists and is usable
+ * Prepare the account's GPG runtime with proper isolation.
+ * - Resolves and validates the account's canonical signing key
+ * - Sets and retargets GNUPGHOME when using isolated mode
+ * - Records the selected key and signing preference in gpg_config
+ * - Does not modify Git configuration; gpg_configure_git_signing() does
  */
 int gpg_switch_account(gpg_config_t *gpg_config, const account_t *account);
 
 /**
- * Create isolated GNUPGHOME for account
- * - Creates directory with proper permissions (700)
- * - Imports account's GPG key if available
- * - Sets up basic GPG configuration
+ * Create or validate an isolated GNUPGHOME for an account.
+ * - Creates the directory with private permissions when absent
+ * - Sets up the managed GPG agent configuration
+ * - Does not import a key; gpg_switch_account() owns key transfer
  */
 int gpg_create_isolated_home(gpg_config_t *gpg_config, const account_t *account);
 
@@ -364,9 +449,11 @@ int gpg_manager_restore_current_if(gpg_config_t *gpg_config,
                                    bool *changed);
 
 /**
- * Process-lifetime memo of key ids whose secret-key presence a gpg spawn
- * already proved this run, so later availability sanity checks (e.g.
- * git_test_config's read-back probe) can skip a redundant spawn (AR-02 #14).
+ * Compatibility memo for callers using an injected test runner. Production
+ * callers using the real runner never treat selector-only notes as proof:
+ * reusable secret-key evidence is maintained internally and is bound to the
+ * canonical fingerprint, requested capability, exact launch witness, and GPG
+ * home generation.
  */
 void gpg_manager_note_key_available(const char *key_id);
 bool gpg_manager_key_available_cached(const char *key_id);

@@ -19,6 +19,7 @@
 #include "test.h"
 #include "config.h"
 #include "gitswitch.h"
+#include "utils.h"
 #include <errno.h>
 #include <fcntl.h>
 #include <stdbool.h>
@@ -768,9 +769,10 @@ TEST(reset_other_account_keeps_current_sock) {
 
 /* Mutating commands must fail fast on cross-process config-lock contention;
  * waiting is unbounded because the holder may be stopped at an interactive
- * prompt. `resume` is launched implicitly by shell startup, so contention is
- * instead a silent successful no-op. Genuinely read-only commands still skip
- * the lock, while `config` must take it because it can create accounts.toml.
+ * prompt. A contended `resume` also fails truthfully because the raw lock
+ * provides no proof that its holder will restore the requested account.
+ * Genuinely read-only commands still skip the lock, while `config` must take
+ * it because it can create accounts.toml.
  *
  * The child releases early when the parent writes `release`; the timeout keeps
  * this test from deadlocking against the pre-L10 blocking implementation and
@@ -833,16 +835,18 @@ TEST(mutating_commands_fail_fast_on_config_lock_readonly_dont) {
     CHECK_EQ_INT(rc, 0);
     CHECK(access(done, F_OK) != 0); /* returned before the holder released */
 
-    /* Shell-startup resume: contention is a silent successful no-op. */
+    /* Resume must not claim success while an unclassified lock holder is
+     * still active. It reports the same immediate, retryable contention as
+     * every other mutation. */
     snprintf(cmd, sizeof(cmd),
              "HOME='%s' XDG_RUNTIME_DIR='%s' '%s' resume >'%s' 2>&1",
              home, rt, g_bin, out_path);
     rc = run_shell(cmd);
-    CHECK_EQ_INT(rc, 0);
+    CHECK(rc > 0 && rc < 126);
     CHECK(access(done, F_OK) != 0);
-    /* Debug builds emit their normal logger-init line; "silent" here means no
-     * user-facing contention diagnostic. Release builds emit nothing. */
-    CHECK(strstr(slurp(out_path, out, sizeof(out)), "config lock") == NULL);
+    slurp(out_path, out, sizeof(out));
+    CHECK(strstr(out, "Another gitswitch holds the config lock") != NULL);
+    CHECK(strstr(out, "try again after that command finishes") != NULL);
 
     /* Ordinary mutating commands report contention and return immediately. */
     snprintf(cmd, sizeof(cmd),
@@ -1020,6 +1024,21 @@ static int write_key_file(const char *path) {
     return chmod(path, 0600);
 }
 
+/* M22: tests that expect the add flow to admit an SSH key need a genuinely
+ * usable private key, not merely bytes with the OpenSSH armor shape. */
+static int generate_ed25519_private_key(const char *path) {
+    const char *argv[] = {
+        "ssh-keygen", "-q", "-t", "ed25519", "-N", "", "-f", path, NULL
+    };
+    run_opts_t opts;
+    run_result_t result;
+
+    memset(&opts, 0, sizeof(opts));
+    memset(&result, 0, sizeof(result));
+    opts.stderr_to_devnull = true;
+    return run_argv_real(argv, &opts, &result);
+}
+
 /* AR-03 L3: with a hand-planted [accounts.4294967295], `add` used to assign
  * max_id+1 == 0 — an id the loader rejects, so the new account "saved" into a
  * config no later command could load. The add must fall back to the lowest
@@ -1076,6 +1095,9 @@ TEST(add_reprompts_invalid_host_alias_until_valid) {
     char long_alias[321];
     int rc;
 
+    if (!command_exists("ssh-keygen")) {
+        TS_SKIP("openssh", "ssh-keygen unavailable");
+    }
     if (!make_temp_dir(home, sizeof(home)) || !make_temp_dir(rt, sizeof(rt))) {
         CHECK(!"mkdtemp failed");
         return;
@@ -1083,7 +1105,7 @@ TEST(add_reprompts_invalid_host_alias_until_valid) {
     CHECK_EQ_INT(write_config(home,
         "[settings]\ndefault_scope = \"global\"\n"), 0);
     snprintf(key_path, sizeof(key_path), "%s/id_test", home);
-    CHECK_EQ_INT(write_key_file(key_path), 0);
+    CHECK_EQ_INT(generate_ed25519_private_key(key_path), 0);
 
     memset(long_alias, 'a', sizeof(long_alias) - 1);
     long_alias[sizeof(long_alias) - 1] = '\0';
@@ -1121,6 +1143,9 @@ TEST(add_hostname_prompt_warns_on_empty_and_reprompts_on_invalid) {
     char key_path[512], toml_path[4352], toml[8192], out[8192], script[1024];
     int rc;
 
+    if (!command_exists("ssh-keygen")) {
+        TS_SKIP("openssh", "ssh-keygen unavailable");
+    }
     if (!make_temp_dir(home, sizeof(home)) || !make_temp_dir(rt, sizeof(rt))) {
         CHECK(!"mkdtemp failed");
         return;
@@ -1128,7 +1153,7 @@ TEST(add_hostname_prompt_warns_on_empty_and_reprompts_on_invalid) {
     CHECK_EQ_INT(write_config(home,
         "[settings]\ndefault_scope = \"global\"\n"), 0);
     snprintf(key_path, sizeof(key_path), "%s/id_test", home);
-    CHECK_EQ_INT(write_key_file(key_path), 0);
+    CHECK_EQ_INT(generate_ed25519_private_key(key_path), 0);
 
     /* Add #1: alias set, canonical hostname left empty -> default-to-alias
      * warning; name, email, description, ssh key, alias, hostname(empty),
@@ -1396,13 +1421,14 @@ TEST(partial_load_blocks_add_but_switch_persists_active) {
     remove_tree(rt);
 }
 
-/* ---------- AR-03 M9: save failure must surface in the exit code ---------- */
+/* ---------- AR-14 H1: recovery-fence admission must fail closed ---------- */
 
-/* Deny the config directory write permission after load: the switch itself
- * succeeds (git config is written), the save cannot create its temp file, and
- * the command must exit nonzero — pre-fix it warned and exited 0, so scripted
- * callers could not detect that active_account went stale. */
-TEST(switch_save_failure_exits_nonzero) {
+/* Deny config-directory write permission before switch admission. A switch
+ * now installs its durable recovery owner before the first live mutation, so
+ * it must stop at that boundary, report the lifecycle-lock failure, and return
+ * a genuine command failure. Persistence-fault rollback after successful
+ * admission remains covered by the embedded-main lifecycle suites. */
+TEST(switch_recovery_guard_admission_failure_exits_nonzero) {
     char home[256], rt[256], cmd[16384], dir[512], lock[640], err_path[512];
     char buf[8192];
     int rc;
@@ -1424,8 +1450,8 @@ TEST(switch_save_failure_exits_nonzero) {
         "email = \"s@example.com\"\n"
         "preferred_scope = \"global\"\n"), 0);
 
-    /* Pre-create the lock file (the locked open needs no dir write), then
-     * make the config dir read-only so the save's temp create fails. */
+    /* Pre-create the ordinary config lock so the denial is specifically at
+     * the new switch-lifecycle namespace rather than generic config locking. */
     snprintf(dir, sizeof(dir), "%s/.config/gitswitch", home);
     snprintf(lock, sizeof(lock), "%s/.config.lock", dir);
     FILE *f = fopen(lock, "w");
@@ -1439,9 +1465,9 @@ TEST(switch_save_failure_exits_nonzero) {
              "HOME='%s' XDG_RUNTIME_DIR='%s' '%s' -y solo </dev/null >'%s' 2>&1",
              home, rt, g_bin, err_path);
     rc = run_shell(cmd);
-    CHECK(rc > 0 && rc < 126);                                 /* pre-fix: 0 */
+    CHECK(rc > 0 && rc < 126);
     slurp(err_path, buf, sizeof(buf));
-    CHECK(strstr(buf, "Failed to save configuration changes") != NULL);
+    CHECK(strstr(buf, "Cannot acquire the switch lifecycle lock") != NULL);
 
     chmod(dir, 0700); /* so remove_tree can clean up */
     remove_tree(home);
@@ -1622,7 +1648,7 @@ TEST_MAIN_BEGIN()
     RUN_TEST(add_reprompts_email_at_exact_length_bound);
     RUN_TEST(switch_writes_resume_hint_and_reset_clears_it);
     RUN_TEST(partial_load_blocks_add_but_switch_persists_active);
-    RUN_TEST(switch_save_failure_exits_nonzero);
+    RUN_TEST(switch_recovery_guard_admission_failure_exits_nonzero);
     RUN_TEST(configuration_and_command_failures_keep_distinct_exit_codes);
     RUN_TEST(readonly_cli_forms_never_create_or_rewrite_configuration_state);
 TEST_MAIN_END()

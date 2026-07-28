@@ -10,9 +10,12 @@
 #include "error.h"
 #include "gpg_manager.h"
 #include "prompt.h"
+#include "utils.h"
+#include "trusted_command_fixture.h"
 
 #include <signal.h>
 #include <sys/wait.h>
+#include <time.h>
 
 #ifdef HAVE_READLINE
 #include <readline/readline.h>
@@ -22,6 +25,175 @@ typedef struct {
     FILE *stream;
     int saved_fd;
 } redirected_stream_t;
+
+#ifdef HAVE_READLINE
+static int g_readline_fault_fd = -1;
+static int g_readline_fault_calls;
+static int g_readline_fault_errno;
+
+static int readline_pty_error_getc(FILE *stream) {
+    unsigned char byte;
+    ssize_t count;
+
+    (void)stream;
+    g_readline_fault_calls++;
+    do {
+        count = read(g_readline_fault_fd, &byte, 1);
+    } while (count < 0 && errno == EINTR);
+    if (count == 1) return byte;
+    g_readline_fault_errno = count < 0 ? errno : 0;
+    return count == 0 ? EOF : READERR;
+}
+
+static void drain_readline_master(int master) {
+    char discarded[256];
+
+    for (int reads = 0; reads < 16; reads++) {
+        ssize_t count = read(master, discarded, sizeof(discarded));
+
+        if (count > 0) continue;
+        if (count < 0 && errno == EINTR) {
+            reads--;
+            continue;
+        }
+        break;
+    }
+}
+
+static bool reap_readline_child_within(pid_t child, int master,
+                                       int timeout_ms, int *status_out) {
+    const struct timespec pause = {.tv_sec = 0, .tv_nsec = 10000000L};
+    int flags = fcntl(master, F_GETFL);
+
+    if (flags < 0 || fcntl(master, F_SETFL, flags | O_NONBLOCK) != 0) {
+        (void)kill(child, SIGKILL);
+        while (waitpid(child, NULL, 0) < 0 && errno == EINTR) {}
+        return false;
+    }
+
+    for (int elapsed = 0; elapsed <= timeout_ms; elapsed += 10) {
+        int status = 0;
+        pid_t waited = waitpid(child, &status, WNOHANG);
+
+        drain_readline_master(master);
+        if (waited == child) {
+            if (status_out) *status_out = status;
+            return true;
+        }
+        if (waited < 0 && errno != EINTR) break;
+        (void)nanosleep(&pause, NULL);
+    }
+
+    (void)kill(child, SIGKILL);
+    while (waitpid(child, NULL, 0) < 0 && errno == EINTR) {}
+    return false;
+}
+#endif
+
+static int g_unavailable_gpg_runner_calls;
+
+#define PROMPT_GPG_M5_MISS_STATUS \
+    "[GNUPG:] ERROR keylist.getkey 17\n" \
+    "[GNUPG:] FAILURE gpg-exit 33554433\n"
+
+typedef enum {
+    PROMPT_GPG_M5_MISS,
+    PROMPT_GPG_M5_SETUP_126
+} prompt_gpg_m5_mode_t;
+
+static prompt_gpg_m5_mode_t g_prompt_gpg_m5_mode;
+static int g_prompt_gpg_m5_calls;
+
+static bool prompt_gpg_m5_argv_has(const char *const argv[],
+                                   const char *needle) {
+    if (!argv || !needle) return false;
+    for (size_t i = 0; argv[i]; i++) {
+        if (strcmp(argv[i], needle) == 0) return true;
+    }
+    return false;
+}
+
+static int prompt_gpg_m5_runner(const char *const argv[],
+                                const run_opts_t *opts,
+                                run_result_t *result) {
+    const char *output = "";
+    int exit_code;
+
+    if (result) {
+        memset(result, 0, sizeof(*result));
+        result->spawned = true;
+        result->exit_code = 0;
+    }
+    if (opts && opts->out && opts->out_size > 0) opts->out[0] = '\0';
+    if (!prompt_gpg_m5_argv_has(argv, "--list-secret-keys")) {
+        return 0;
+    }
+
+    g_prompt_gpg_m5_calls++;
+    switch (g_prompt_gpg_m5_mode) {
+        case PROMPT_GPG_M5_MISS:
+            output = PROMPT_GPG_M5_MISS_STATUS;
+            exit_code = 2;
+            break;
+        case PROMPT_GPG_M5_SETUP_126:
+            exit_code = 126;
+            break;
+        default:
+            errno = EINVAL;
+            return -1;
+    }
+    if (opts && opts->out && opts->out_size > 0) {
+        size_t length = strlen(output);
+        size_t copied = length < opts->out_size - 1U
+                            ? length : opts->out_size - 1U;
+
+        memcpy(opts->out, output, copied);
+        opts->out[copied] = '\0';
+        if (result) {
+            result->out_len = copied;
+            result->out_truncated = copied < length;
+        }
+    }
+    if (result) result->exit_code = exit_code;
+    errno = ECHILD;
+    return -1;
+}
+
+static int unavailable_gpg_runner(const char *const argv[],
+                                  const run_opts_t *opts,
+                                  run_result_t *result) {
+    static const char key_listing[] =
+        "256 SHA256:AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA "
+        "prompt-fixture (ED25519)\n";
+
+    if (argv && argv[0] && argv[1] &&
+        strcmp(argv[0], "ssh-keygen") == 0 &&
+        strcmp(argv[1], "-lf") == 0) {
+        size_t listing_length = sizeof(key_listing) - 1U;
+
+        if (!opts || !opts->out || opts->out_size <= listing_length) {
+            errno = ENOSPC;
+            return -1;
+        }
+        memcpy(opts->out, key_listing, listing_length + 1U);
+        if (result) {
+            memset(result, 0, sizeof(*result));
+            result->spawned = true;
+            result->exit_code = 0;
+            result->out_len = listing_length;
+        }
+        return 0;
+    }
+
+    g_unavailable_gpg_runner_calls++;
+    if (result) {
+        memset(result, 0, sizeof(*result));
+        result->spawned = true;
+        result->exit_code = 2;
+    }
+    errno = EIO;
+    return -1;
+}
 
 static int redirect_fd(FILE *stream, int target_fd,
                        redirected_stream_t *redirected) {
@@ -368,6 +540,151 @@ TEST(input_error_is_distinct_from_eof) {
     fclose(stream);
 }
 
+#ifdef HAVE_READLINE
+/* AR-14 L40: both standard streams are a PTY, so prompt_line must enter GNU
+ * readline rather than its redirected-stdio fallback. Readline's input
+ * callback performs a real read(2) from a dedicated O_WRONLY /dev/null
+ * descriptor, deterministically producing EBADF without relying on pipe
+ * directionality or platform-specific PTY hangup behavior. The parent drains
+ * the PTY while Readline restores termios: FreeBSD may otherwise wait for
+ * unread slave output during TCSADRAIN. */
+TEST(readline_pty_input_error_is_distinct_from_eof) {
+    typedef struct {
+        int result;
+        int saved_errno;
+        int buffer_empty;
+        int stdin_is_tty;
+        int stdout_is_tty;
+        int callback_calls;
+        int callback_errno;
+    } readline_error_result_t;
+
+    readline_error_result_t observed = {0};
+    char *slave_name;
+    int master = -1;
+    int slave = -1;
+    int result_pipe[2] = {-1, -1};
+    size_t result_used = 0;
+    int status = 0;
+    pid_t child = -1;
+
+    master = posix_openpt(O_RDWR | O_NOCTTY);
+    CHECK(master >= 0);
+    if (master < 0) goto cleanup;
+    CHECK_EQ_INT(grantpt(master), 0);
+    CHECK_EQ_INT(unlockpt(master), 0);
+    slave_name = ptsname(master);
+    CHECK(slave_name != NULL);
+    if (!slave_name) goto cleanup;
+    slave = open(slave_name, O_RDWR | O_NOCTTY);
+    CHECK(slave >= 0);
+    if (slave < 0) goto cleanup;
+    CHECK_EQ_INT(pipe(result_pipe), 0);
+    if (result_pipe[0] < 0 || result_pipe[1] < 0) goto cleanup;
+
+    fflush(NULL);
+    child = fork();
+    CHECK(child >= 0);
+    if (child < 0) goto cleanup;
+    if (child == 0) {
+        char buffer[16] = "secret";
+        size_t written = 0;
+
+        close(result_pipe[0]);
+        if (dup2(slave, STDIN_FILENO) != STDIN_FILENO ||
+            dup2(slave, STDOUT_FILENO) != STDOUT_FILENO) {
+            _exit(2);
+        }
+        close(master);
+        close(slave);
+        clearerr(stdin);
+        clearerr(stdout);
+        observed.stdin_is_tty = isatty(STDIN_FILENO);
+        observed.stdout_is_tty = isatty(STDOUT_FILENO);
+        if (setenv("TERM", "dumb", 1) != 0 ||
+            setenv("INPUTRC", "/dev/null", 1) != 0) {
+            _exit(3);
+        }
+        rl_instream = stdin;
+        rl_outstream = stdout;
+        rl_catch_signals = 0;
+        rl_catch_sigwinch = 0;
+        if (rl_initialize() != 0) _exit(3);
+        g_readline_fault_fd = open("/dev/null", O_WRONLY);
+        if (g_readline_fault_fd < 0) _exit(3);
+        g_readline_fault_calls = 0;
+        g_readline_fault_errno = 0;
+        rl_getc_function = readline_pty_error_getc;
+        errno = 0;
+        observed.result = prompt_line("", buffer, sizeof(buffer), false);
+        observed.saved_errno = errno;
+        observed.buffer_empty = buffer[0] == '\0';
+        observed.callback_calls = g_readline_fault_calls;
+        observed.callback_errno = g_readline_fault_errno;
+        if (close(g_readline_fault_fd) != 0) _exit(3);
+        g_readline_fault_fd = -1;
+
+        while (written < sizeof(observed)) {
+            ssize_t count = write(
+                result_pipe[1], (const char *)&observed + written,
+                sizeof(observed) - written);
+
+            if (count < 0 && errno == EINTR) continue;
+            if (count <= 0) _exit(4);
+            written += (size_t)count;
+        }
+        close(result_pipe[1]);
+        _exit(0);
+    }
+
+    close(result_pipe[1]);
+    result_pipe[1] = -1;
+    close(slave);
+    slave = -1;
+    bool reaped =
+        reap_readline_child_within(child, master, 3000, &status);
+    child = -1;
+    while (result_used < sizeof(observed)) {
+        ssize_t count = read(
+            result_pipe[0], (char *)&observed + result_used,
+            sizeof(observed) - result_used);
+
+        if (count < 0 && errno == EINTR) continue;
+        if (count <= 0) break;
+        result_used += (size_t)count;
+    }
+    CHECK(reaped);
+    if (reaped) {
+        CHECK(WIFEXITED(status));
+        if (WIFEXITED(status)) CHECK_EQ_INT(WEXITSTATUS(status), 0);
+    }
+    CHECK(result_used == sizeof(observed));
+    if (result_used == sizeof(observed)) {
+        CHECK(observed.stdin_is_tty);
+        CHECK(observed.stdout_is_tty);
+        CHECK(observed.callback_calls > 0);
+        CHECK_EQ_INT(observed.callback_errno, EBADF);
+        CHECK_EQ_INT(observed.result, PROMPT_LINE_ERROR);
+        CHECK_EQ_INT(observed.saved_errno, EBADF);
+        CHECK(observed.buffer_empty);
+    }
+
+cleanup:
+    if (child > 0) {
+        (void)kill(child, SIGKILL);
+        (void)waitpid(child, NULL, 0);
+    }
+    if (result_pipe[0] >= 0) close(result_pipe[0]);
+    if (result_pipe[1] >= 0) close(result_pipe[1]);
+    if (slave >= 0) close(slave);
+    if (master >= 0) close(master);
+}
+#else
+TEST(readline_pty_input_error_is_distinct_from_eof) {
+    TS_SKIP("readline", "test requires a HAVE_READLINE build");
+}
+#endif
+
 #if defined(__GLIBC__)
 typedef struct {
     const char *bytes;
@@ -564,6 +881,135 @@ static int build_optional_prompt_prefix(char *buffer, size_t size,
     return length >= 0 && (size_t)length < size ? 0 : -1;
 }
 
+typedef struct {
+    char *value;
+    bool present;
+    bool captured;
+} prompt_env_snapshot_t;
+
+typedef struct {
+    char runtime[128];
+    char source_home[MAX_PATH_LEN];
+    prompt_env_snapshot_t xdg_runtime;
+    prompt_env_snapshot_t allow_tmp_gpg;
+    prompt_env_snapshot_t gnupg_home;
+    ts_trusted_command_fixture_t commands;
+    command_runner_fn previous_runner;
+    bool runner_installed;
+} prompt_gpg_m5_fixture_t;
+
+static int prompt_env_snapshot_capture(prompt_env_snapshot_t *snapshot,
+                                       const char *name) {
+    const char *value;
+
+    if (!snapshot || !name) {
+        errno = EINVAL;
+        return -1;
+    }
+    memset(snapshot, 0, sizeof(*snapshot));
+    value = getenv(name);
+    snapshot->present = value != NULL;
+    if (value) {
+        snapshot->value = strdup(value);
+        if (!snapshot->value) return -1;
+    }
+    snapshot->captured = true;
+    return 0;
+}
+
+static int prompt_env_snapshot_restore(prompt_env_snapshot_t *snapshot,
+                                       const char *name) {
+    int rc = 0;
+
+    if (!snapshot || !snapshot->captured || !name) return 0;
+    rc = snapshot->present ? setenv(name, snapshot->value, 1)
+                           : unsetenv(name);
+    free(snapshot->value);
+    memset(snapshot, 0, sizeof(*snapshot));
+    return rc;
+}
+
+static int prompt_gpg_m5_fixture_end(prompt_gpg_m5_fixture_t *fixture) {
+    int saved_errno = errno;
+    int cleanup_errno = 0;
+    int rc = 0;
+
+    if (!fixture) return 0;
+    if (fixture->runner_installed) {
+        run_set_runner(fixture->previous_runner);
+        fixture->runner_installed = false;
+    }
+    if (ts_trusted_command_fixture_restore(&fixture->commands) != 0) {
+        rc = -1;
+        cleanup_errno = errno;
+    }
+    if (prompt_env_snapshot_restore(&fixture->gnupg_home, "GNUPGHOME") != 0 &&
+        rc == 0) {
+        rc = -1;
+        cleanup_errno = errno;
+    }
+    if (prompt_env_snapshot_restore(&fixture->allow_tmp_gpg,
+                                    "GITSWITCH_ALLOW_TMP_GPG") != 0 &&
+        rc == 0) {
+        rc = -1;
+        cleanup_errno = errno;
+    }
+    if (prompt_env_snapshot_restore(&fixture->xdg_runtime,
+                                    "XDG_RUNTIME_DIR") != 0 &&
+        rc == 0) {
+        rc = -1;
+        cleanup_errno = errno;
+    }
+    if (fixture->runtime[0] != '\0') {
+        ts_rm_rf(fixture->runtime);
+        fixture->runtime[0] = '\0';
+    }
+    errno = rc == 0 ? saved_errno : cleanup_errno;
+    return rc;
+}
+
+static int prompt_gpg_m5_fixture_begin(prompt_gpg_m5_fixture_t *fixture,
+                                       bool install_gpg) {
+    static const char *const gpg_names[] = {"gpg", NULL};
+    static const char *const empty_path_names[] = {"notgpg", NULL};
+
+    if (!fixture) {
+        errno = EINVAL;
+        return -1;
+    }
+    memset(fixture, 0, sizeof(*fixture));
+    if (prompt_env_snapshot_capture(&fixture->xdg_runtime,
+                                    "XDG_RUNTIME_DIR") != 0 ||
+        prompt_env_snapshot_capture(&fixture->allow_tmp_gpg,
+                                    "GITSWITCH_ALLOW_TMP_GPG") != 0 ||
+        prompt_env_snapshot_capture(&fixture->gnupg_home,
+                                    "GNUPGHOME") != 0 ||
+        snprintf(fixture->runtime, sizeof(fixture->runtime),
+                 "/tmp/gsw-prompt-m5-XXXXXX") < 0 ||
+        !ts_mkdtemp(fixture->runtime) ||
+        chmod(fixture->runtime, 0700) != 0 ||
+        safe_snprintf(fixture->source_home, sizeof(fixture->source_home),
+                      "%s/source", fixture->runtime) != 0 ||
+        mkdir(fixture->source_home, 0700) != 0 ||
+        setenv("XDG_RUNTIME_DIR", fixture->runtime, 1) != 0 ||
+        setenv("GITSWITCH_ALLOW_TMP_GPG", "1", 1) != 0 ||
+        setenv("GNUPGHOME", fixture->source_home, 1) != 0 ||
+        ts_trusted_command_fixture_install(
+            &fixture->commands, "gsw_prompt_m5",
+            install_gpg ? gpg_names : empty_path_names) != 0 ||
+        (!install_gpg &&
+         setenv("PATH", fixture->commands.directory, 1) != 0)) {
+        int saved_errno = errno ? errno : EIO;
+
+        (void)prompt_gpg_m5_fixture_end(fixture);
+        errno = saved_errno;
+        return -1;
+    }
+    fixture->previous_runner = run_set_runner(prompt_gpg_m5_runner);
+    fixture->runner_installed = true;
+    return 0;
+}
+
 static void initialize_prompt_context(gitswitch_ctx_t *ctx, bool edit) {
     memset(ctx, 0, sizeof(*ctx));
     ctx->config.assume_yes = true;
@@ -582,11 +1028,16 @@ static void initialize_prompt_context(gitswitch_ctx_t *ctx, bool edit) {
     ctx->accounts[0].preferred_scope = GIT_SCOPE_LOCAL;
 }
 
-static int invoke_account_prompt_flow(gitswitch_ctx_t *ctx, bool edit) {
+static int invoke_account_prompt_flow_capture(gitswitch_ctx_t *ctx, bool edit,
+                                              char *output,
+                                              size_t output_size) {
     FILE *capture = tmpfile();
     redirected_stream_t redirected = { .stream = NULL, .saved_fd = -1 };
+    error_context_t flow_error;
+    int flow_errno;
     int result;
 
+    if (output && output_size > 0) output[0] = '\0';
     if (!capture || fflush(stdout) != 0 ||
         redirect_fd(capture, STDOUT_FILENO, &redirected) != 0) {
         if (capture) fclose(capture);
@@ -594,10 +1045,23 @@ static int invoke_account_prompt_flow(gitswitch_ctx_t *ctx, bool edit) {
     }
     result = edit ? accounts_edit_interactive(ctx, "original")
                   : accounts_add_interactive(ctx);
+    flow_error = *get_last_error();
+    flow_errno = errno;
     CHECK_EQ_INT(fflush(stdout), 0);
     restore_fd(STDOUT_FILENO, &redirected);
+    if (output && output_size > 0 && fseek(capture, 0, SEEK_SET) == 0) {
+        size_t used = fread(output, 1, output_size - 1U, capture);
+
+        output[used] = '\0';
+    }
     fclose(capture);
+    g_last_error = flow_error;
+    errno = flow_errno;
     return result;
+}
+
+static int invoke_account_prompt_flow(gitswitch_ctx_t *ctx, bool edit) {
+    return invoke_account_prompt_flow_capture(ctx, edit, NULL, 0);
 }
 
 static int create_prompt_key(char *root, char *key_path,
@@ -704,10 +1168,13 @@ static void exercise_optional_prompt_read_error(
 TEST(optional_prompt_failures_never_publish_add_or_edit_candidates) {
     char root[] = "/tmp/gsw-prompt-m1-XXXXXX";
     char key_path[256];
+    command_runner_fn old_runner;
     int key_result = create_prompt_key(root, key_path, sizeof(key_path));
 
     CHECK_EQ_INT(key_result, 0);
     if (key_result != 0) return;
+    g_unavailable_gpg_runner_calls = 0;
+    old_runner = run_set_runner(unavailable_gpg_runner);
     gpg_manager_note_key_available("ABCDEF0123456789");
     for (int edit = 0; edit <= 1; edit++) {
         for (optional_prompt_stage_t stage = OPTIONAL_DESCRIPTION;
@@ -718,6 +1185,8 @@ TEST(optional_prompt_failures_never_publish_add_or_edit_candidates) {
 #endif
         }
     }
+    run_set_runner(old_runner);
+    CHECK_EQ_INT(g_unavailable_gpg_runner_calls, 0);
 }
 
 TEST(successful_blank_optional_answers_apply_only_documented_defaults) {
@@ -756,6 +1225,7 @@ TEST(successful_nested_blank_answers_do_not_invent_alias_or_signing) {
     gitswitch_ctx_t ctx;
     FILE *stream;
     redirected_stream_t redirected = { .stream = NULL, .saved_fd = -1 };
+    command_runner_fn old_runner;
     int result = -2;
     int key_result;
     int answer_length;
@@ -775,10 +1245,14 @@ TEST(successful_nested_blank_answers_do_not_invent_alias_or_signing) {
     if (!stream) return;
     initialize_prompt_context(&ctx, false);
     CHECK_EQ_INT(begin_input(stream, &redirected), 0);
+    g_unavailable_gpg_runner_calls = 0;
+    old_runner = run_set_runner(unavailable_gpg_runner);
     if (redirected.saved_fd >= 0) result = invoke_account_prompt_flow(&ctx, false);
+    run_set_runner(old_runner);
     end_input(&redirected);
     fclose(stream);
 
+    CHECK_EQ_INT(g_unavailable_gpg_runner_calls, 0);
     CHECK_EQ_INT(result, 0);
     CHECK_EQ_INT(ctx.account_count, 1);
     if (ctx.account_count == 1) {
@@ -812,6 +1286,190 @@ TEST(successful_blank_edit_answers_preserve_the_account) {
     CHECK(memcmp(&ctx.accounts[0], &before, sizeof(before)) == 0);
 }
 
+TEST(blank_gpg_edit_can_change_only_signing_without_source_resolution) {
+    static const char retained_selector[] =
+        "1234567890ABCDEF1234567890ABCDEF12345678";
+    gitswitch_ctx_t ctx;
+    account_t expected;
+    FILE *stream = input_stream("\n\n\n\n\ny\n\n");
+    redirected_stream_t redirected = { .stream = NULL, .saved_fd = -1 };
+    command_runner_fn old_runner;
+    int result = -2;
+
+    CHECK(stream != NULL);
+    if (!stream) return;
+    initialize_prompt_context(&ctx, true);
+    ctx.accounts[0].gpg_enabled = true;
+    ctx.accounts[0].gpg_signing_enabled = false;
+    CHECK_EQ_INT(safe_strncpy(ctx.accounts[0].gpg_key_id,
+                              retained_selector,
+                              sizeof(ctx.accounts[0].gpg_key_id)), 0);
+    expected = ctx.accounts[0];
+    expected.gpg_signing_enabled = true;
+
+    g_unavailable_gpg_runner_calls = 0;
+    old_runner = run_set_runner(unavailable_gpg_runner);
+    CHECK_EQ_INT(begin_input(stream, &redirected), 0);
+    if (redirected.saved_fd >= 0) {
+        result = invoke_account_prompt_flow(&ctx, true);
+    }
+    end_input(&redirected);
+    run_set_runner(old_runner);
+    fclose(stream);
+
+    CHECK_EQ_INT(result, 0);
+    CHECK_EQ_INT(g_unavailable_gpg_runner_calls, 0);
+    CHECK(memcmp(&ctx.accounts[0], &expected, sizeof(expected)) == 0);
+}
+
+TEST(structured_gpg_miss_reprompts_and_blank_skip_completes) {
+    static const char selector[] = "DEADBEEFCAFEBABE";
+    static const char expected_diagnostic[] =
+        "GPG selector resolved no secret key: DEADBEEFCAFEBABE";
+    char answers[256];
+    char output[8192];
+    gitswitch_ctx_t ctx;
+    gitswitch_ctx_t before;
+    prompt_gpg_m5_fixture_t fixture;
+    FILE *stream = NULL;
+    redirected_stream_t redirected = { .stream = NULL, .saved_fd = -1 };
+    int result = -2;
+
+    CHECK_EQ_INT(prompt_gpg_m5_fixture_begin(&fixture, true), 0);
+    if (!fixture.commands.active) return;
+    CHECK((size_t)snprintf(answers, sizeof(answers),
+                           "\n\n\n\n%s\n\n\n", selector) <
+          sizeof(answers));
+    stream = input_stream(answers);
+    CHECK(stream != NULL);
+    if (!stream) goto cleanup;
+    initialize_prompt_context(&ctx, true);
+    before = ctx;
+    g_prompt_gpg_m5_mode = PROMPT_GPG_M5_MISS;
+    g_prompt_gpg_m5_calls = 0;
+
+    CHECK_EQ_INT(begin_input(stream, &redirected), 0);
+    if (redirected.saved_fd >= 0) {
+        result = invoke_account_prompt_flow_capture(
+            &ctx, true, output, sizeof(output));
+    }
+    end_input(&redirected);
+
+    CHECK_EQ_INT(result, 0);
+    CHECK_EQ_INT(g_prompt_gpg_m5_calls, 1);
+    CHECK(memcmp(&ctx, &before, sizeof(ctx)) == 0);
+    CHECK(strstr(output, expected_diagnostic) != NULL);
+    CHECK(strstr(output, "(try again, or Enter to skip)") != NULL);
+    CHECK_EQ_INT(count_occurrences(output, "GPG Key ID"), 2);
+    CHECK(strstr(output, "Preferred Git Scope") != NULL);
+    CHECK(strstr(output, "GPG key not found in keyring") == NULL);
+
+cleanup:
+    end_input(&redirected);
+    if (stream) fclose(stream);
+    CHECK_EQ_INT(prompt_gpg_m5_fixture_end(&fixture), 0);
+}
+
+static void exercise_gpg_operational_prompt_failure(
+    bool edit, bool install_gpg, prompt_gpg_m5_mode_t mode,
+    const char *selector, error_code_t expected_code,
+    int expected_runner_calls,
+    const char *expected_diagnostic) {
+    char answers[256];
+    char fingerprint[GPG_FINGERPRINT_BUFSIZE];
+    char output[8192];
+    gitswitch_ctx_t ctx;
+    gitswitch_ctx_t before;
+    error_context_t reference_error;
+    error_context_t error;
+    prompt_gpg_m5_fixture_t fixture = {0};
+    FILE *stream = NULL;
+    redirected_stream_t redirected = { .stream = NULL, .saved_fd = -1 };
+    uint64_t reference_generation_before;
+    uint64_t reference_generation_after;
+    uint64_t flow_generation_before;
+    uint64_t flow_generation_after;
+    int reference_errno;
+    int flow_errno;
+    int result = -2;
+
+    CHECK_EQ_INT(prompt_gpg_m5_fixture_begin(&fixture, install_gpg), 0);
+    if (!fixture.commands.active) goto cleanup;
+    g_prompt_gpg_m5_mode = mode;
+    g_prompt_gpg_m5_calls = 0;
+    reference_generation_before = error_report_generation();
+    CHECK_EQ_INT(gpg_manager_resolve_system_key(
+                     selector, false, fingerprint, sizeof(fingerprint)),
+                 -1);
+    reference_error = *get_last_error();
+    reference_errno = errno;
+    reference_generation_after = error_report_generation();
+    CHECK(reference_generation_after > reference_generation_before);
+    CHECK_EQ_INT(g_prompt_gpg_m5_calls, expected_runner_calls);
+    CHECK_EQ_INT(reference_error.code, expected_code);
+    CHECK_STR_EQ(reference_error.message, expected_diagnostic);
+
+    if (edit) {
+        CHECK((size_t)snprintf(answers, sizeof(answers),
+                               "\n\n\n\n%s\nlocal\n", selector) <
+              sizeof(answers));
+    } else {
+        CHECK((size_t)snprintf(
+                  answers, sizeof(answers),
+                  "candidate\ncandidate@example.test\n\n\n%s\nlocal\n",
+                  selector) < sizeof(answers));
+    }
+    stream = input_stream(answers);
+    CHECK(stream != NULL);
+    if (!stream) goto cleanup;
+    initialize_prompt_context(&ctx, edit);
+    before = ctx;
+    g_prompt_gpg_m5_calls = 0;
+
+    CHECK_EQ_INT(begin_input(stream, &redirected), 0);
+    flow_generation_before = error_report_generation();
+    if (redirected.saved_fd >= 0) {
+        result = invoke_account_prompt_flow_capture(
+            &ctx, edit, output, sizeof(output));
+    }
+    error = *get_last_error();
+    flow_errno = errno;
+    flow_generation_after = error_report_generation();
+    end_input(&redirected);
+
+    CHECK_EQ_INT(result, -1);
+    CHECK_EQ_INT(g_prompt_gpg_m5_calls, expected_runner_calls);
+    CHECK(memcmp(&error, &reference_error, sizeof(error)) == 0);
+    CHECK_EQ_INT(flow_errno, reference_errno);
+    CHECK(flow_generation_after - flow_generation_before ==
+          reference_generation_after - reference_generation_before);
+    CHECK(memcmp(&ctx, &before, sizeof(ctx)) == 0);
+    CHECK(accounts_transaction_context_release_safe(&ctx));
+    CHECK(strstr(output, "GPG key validation failed:") != NULL);
+    CHECK(strstr(output, expected_diagnostic) != NULL);
+    CHECK(strstr(output, "(try again, or Enter to skip)") == NULL);
+    CHECK(strstr(output, "GPG key not found in keyring") == NULL);
+    CHECK(strstr(output, "Preferred Git Scope") == NULL);
+    CHECK_EQ_INT(count_occurrences(output, "GPG Key ID"), 1);
+
+cleanup:
+    end_input(&redirected);
+    if (stream) fclose(stream);
+    CHECK_EQ_INT(prompt_gpg_m5_fixture_end(&fixture), 0);
+}
+
+TEST(operational_gpg_validation_errors_abort_without_reprompt_or_mutation) {
+    exercise_gpg_operational_prompt_failure(
+        true, false, PROMPT_GPG_M5_SETUP_126, "BADC0FFEE0DDF00D",
+        ERR_GPG_NOT_FOUND, 0,
+        "No trusted GPG executable ('gpg' or 'gpg2') found in PATH");
+    exercise_gpg_operational_prompt_failure(
+        false, true, PROMPT_GPG_M5_SETUP_126, "FEEDFACECAFED00D",
+        ERR_GPG_KEY_FAILED, 1,
+        "GPG secret-key helper failed during child setup or exec (exit 126) "
+        "for FEEDFACECAFED00D");
+}
+
 TEST(account_flow_reprompts_without_accepting_any_prefix) {
     gitswitch_ctx_t ctx;
     char root[] = "/tmp/gsw-prompt-XXXXXX";
@@ -821,6 +1479,7 @@ TEST(account_flow_reprompts_without_accepting_any_prefix) {
     FILE *capture = tmpfile();
     redirected_stream_t redirected_input = { .stream = NULL, .saved_fd = -1 };
     redirected_stream_t redirected_output = { .stream = NULL, .saved_fd = -1 };
+    command_runner_fn old_runner;
     int rc = -1;
     char *fixture_root;
 
@@ -876,13 +1535,17 @@ TEST(account_flow_reprompts_without_accepting_any_prefix) {
     CHECK_EQ_INT(begin_input(input, &redirected_input), 0);
     CHECK_EQ_INT(fflush(stdout), 0);
     CHECK_EQ_INT(redirect_fd(capture, STDOUT_FILENO, &redirected_output), 0);
+    g_unavailable_gpg_runner_calls = 0;
+    old_runner = run_set_runner(unavailable_gpg_runner);
     if (redirected_input.saved_fd >= 0 && redirected_output.saved_fd >= 0) {
         rc = accounts_add_interactive(&ctx);
     }
+    run_set_runner(old_runner);
     CHECK_EQ_INT(fflush(stdout), 0);
     restore_fd(STDOUT_FILENO, &redirected_output);
     end_input(&redirected_input);
 
+    CHECK_EQ_INT(g_unavailable_gpg_runner_calls, 0);
     CHECK_EQ_INT(rc, 0);
     CHECK_EQ_INT(ctx.account_count, 1);
     if (ctx.account_count == 1) {
@@ -930,6 +1593,7 @@ TEST_MAIN_BEGIN()
     RUN_TEST(success_clears_stale_error_state);
     RUN_TEST(empty_line_is_accepted_as_an_empty_answer);
     RUN_TEST(input_error_is_distinct_from_eof);
+    RUN_TEST(readline_pty_input_error_is_distinct_from_eof);
 #if defined(__GLIBC__)
     RUN_TEST(partial_initial_read_error_clears_the_caller_buffer);
     RUN_TEST(drain_error_is_not_reported_as_truncation);
@@ -938,5 +1602,10 @@ TEST_MAIN_BEGIN()
     RUN_TEST(successful_blank_optional_answers_apply_only_documented_defaults);
     RUN_TEST(successful_nested_blank_answers_do_not_invent_alias_or_signing);
     RUN_TEST(successful_blank_edit_answers_preserve_the_account);
+    RUN_TEST(
+        blank_gpg_edit_can_change_only_signing_without_source_resolution);
+    RUN_TEST(structured_gpg_miss_reprompts_and_blank_skip_completes);
+    RUN_TEST(
+        operational_gpg_validation_errors_abort_without_reprompt_or_mutation);
     RUN_TEST(account_flow_reprompts_without_accepting_any_prefix);
 TEST_MAIN_END()

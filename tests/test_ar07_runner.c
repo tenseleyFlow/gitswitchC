@@ -1,16 +1,25 @@
 /* AR-07 T2: subprocess setup, input integrity, capture liveness, and fd close. */
+#define _GNU_SOURCE
 #include "test.h"
 #include "gitswitch.h"
 #include "utils.h"
+#define GITSWITCH_RUNNER_GROUP_TEST_API
+#include "runner_internal.h"
+#undef GITSWITCH_RUNNER_GROUP_TEST_API
 #include "error.h"
+#include "signals.h"
 
 #include <errno.h>
 #include <fcntl.h>
+#include <limits.h>
+#include <poll.h>
 #include <signal.h>
 #include <stdint.h>
 #include <stdlib.h>
 #include <string.h>
 #include <sys/resource.h>
+#include <sys/ioctl.h>
+#include <sys/stat.h>
 #include <sys/time.h>
 #include <sys/wait.h>
 #include <time.h>
@@ -55,6 +64,63 @@ static bool sigactions_semantically_equal(const struct sigaction *left,
         if (left_member != right_member) return false;
     }
     return true;
+}
+
+static int install_default_signal_fixture(
+    int signal_number, struct sigaction *original,
+    struct sigaction *configured) {
+    struct sigaction action;
+
+    if (!original || !configured ||
+        sigaction(signal_number, NULL, original) != 0) {
+        return -1;
+    }
+    memset(&action, 0, sizeof(action));
+    action.sa_handler = SIG_DFL;
+    if (sigemptyset(&action.sa_mask) != 0 ||
+        sigaction(signal_number, &action, NULL) != 0) {
+        return -1;
+    }
+    if (sigaction(signal_number, NULL, configured) != 0) {
+        int saved_errno = errno;
+
+        (void)sigaction(signal_number, original, NULL);
+        errno = saved_errno;
+        return -1;
+    }
+    return 0;
+}
+
+typedef bool (*signal_fixture_check_fn)(void);
+
+static bool ignored_signal_fixture_check_passes(
+    int signal_number, signal_fixture_check_fn check) {
+    struct sigaction original;
+    struct sigaction ignored;
+    struct sigaction configured;
+    struct sigaction after;
+    bool passed;
+    int query_rc;
+    int restore_rc;
+
+    if (!check || sigaction(signal_number, NULL, &original) != 0) {
+        return false;
+    }
+    memset(&ignored, 0, sizeof(ignored));
+    ignored.sa_handler = SIG_IGN;
+    if (sigemptyset(&ignored.sa_mask) != 0 ||
+        sigaction(signal_number, &ignored, NULL) != 0) {
+        return false;
+    }
+    if (sigaction(signal_number, NULL, &configured) != 0) {
+        (void)sigaction(signal_number, &original, NULL);
+        return false;
+    }
+    passed = check();
+    query_rc = sigaction(signal_number, NULL, &after);
+    restore_rc = sigaction(signal_number, &original, NULL);
+    return passed && query_rc == 0 && restore_rc == 0 &&
+           sigactions_semantically_equal(&configured, &after);
 }
 
 static int install_sigpipe_disposition(sigpipe_disposition_t disposition,
@@ -115,19 +181,46 @@ static bool sigpipe_round_trip_passes(sigpipe_disposition_t disposition) {
            WEXITSTATUS(status) == 0;
 }
 
-static bool isolated_runner_check_passes(int (*check)(void)) {
+static bool reap_within(pid_t pid, int timeout_ms, int *status_out);
+
+static bool isolated_runner_check_passes_within(int (*check)(void),
+                                                int timeout_ms) {
     int status = 0;
 
     fflush(NULL);
     pid_t worker = fork();
     if (worker < 0) return false;
     if (worker == 0) _exit(check());
-    if (waitpid(worker, &status, 0) != worker) return false;
+    if (!reap_within(worker, timeout_ms, &status)) return false;
     if (!WIFEXITED(status) || WEXITSTATUS(status) != 0) {
         fprintf(stderr, "  isolated runner worker status=%d\n", status);
         return false;
     }
     return true;
+}
+
+static bool isolated_runner_check_passes(int (*check)(void)) {
+    return isolated_runner_check_passes_within(check, 2000);
+}
+
+static bool isolated_runner_check_returns_normally_within(
+    int (*check)(void), int timeout_ms) {
+    int status = 0;
+
+    fflush(NULL);
+    pid_t worker = fork();
+    if (worker < 0) return false;
+    if (worker == 0) exit(check());
+    if (!reap_within(worker, timeout_ms, &status)) return false;
+    if (!WIFEXITED(status) || WEXITSTATUS(status) != 0) {
+        fprintf(stderr, "  normal-exit runner worker status=%d\n", status);
+        return false;
+    }
+    return true;
+}
+
+static bool isolated_runner_check_returns_normally(int (*check)(void)) {
+    return isolated_runner_check_returns_normally_within(check, 2000);
 }
 
 static bool sigsets_semantically_equal(const sigset_t *left,
@@ -345,13 +438,93 @@ static int quiet_capture_holder_main(void) {
     return 0;
 }
 
+static int deadline_pause_main(bool close_stdout) {
+    struct timespec lifetime = {.tv_sec = 5, .tv_nsec = 0};
+    if (close_stdout && close(STDOUT_FILENO) != 0) return 1;
+    while (nanosleep(&lifetime, &lifetime) != 0 && errno == EINTR) {}
+    return 0;
+}
+
+static int rollback_heartbeat_main(const char *path) {
+    struct sigaction ignored;
+    struct timespec interval = {.tv_sec = 0, .tv_nsec = 10000000L};
+    int fd;
+
+    if (!path || !*path) return 1;
+    memset(&ignored, 0, sizeof(ignored));
+    ignored.sa_handler = SIG_IGN;
+    if (sigemptyset(&ignored.sa_mask) != 0 ||
+        sigaction(SIGTERM, &ignored, NULL) != 0) {
+        return 2;
+    }
+    fd = open(path, O_WRONLY | O_APPEND);
+    if (fd < 0) return 3;
+    for (int i = 0; i < 1000; i++) {
+        ssize_t written;
+        do {
+            written = write(fd, "x", 1U);
+        } while (written < 0 && errno == EINTR);
+        if (written != 1) {
+            close(fd);
+            return 4;
+        }
+        while (nanosleep(&interval, &interval) != 0 && errno == EINTR) {}
+        interval.tv_sec = 0;
+        interval.tv_nsec = 10000000L;
+    }
+    close(fd);
+    return 0;
+}
+
 static int64_t test_monotonic_ms(void) {
     struct timespec now;
     if (clock_gettime(CLOCK_MONOTONIC, &now) != 0) return -1;
     return (int64_t)now.tv_sec * 1000 + now.tv_nsec / 1000000;
 }
 
-static bool reap_within(pid_t pid, int timeout_ms, int *status_out) {
+static bool read_full_within(int fd, void *buffer, size_t length,
+                             int timeout_ms) {
+    int64_t start = test_monotonic_ms();
+    if (fd < 0 || (!buffer && length != 0) || timeout_ms < 0 ||
+        start < 0 || start > INT64_MAX - (int64_t)timeout_ms) {
+        return false;
+    }
+    int64_t deadline = start + timeout_ms;
+    unsigned char *bytes = buffer;
+    size_t offset = 0;
+    while (offset < length) {
+        int64_t now = test_monotonic_ms();
+        if (now < 0 || now > deadline) return false;
+        int64_t remaining = deadline - now;
+        int poll_timeout =
+            remaining > INT_MAX ? INT_MAX : (int)remaining;
+        struct pollfd descriptor = {
+            .fd = fd,
+            .events = POLLIN,
+            .revents = 0
+        };
+        int ready = poll(&descriptor, 1, poll_timeout);
+        if (ready == 0) return false;
+        if (ready < 0) {
+            if (errno == EINTR) continue;
+            return false;
+        }
+        if ((descriptor.revents & (POLLERR | POLLNVAL)) != 0) {
+            return false;
+        }
+        ssize_t got = read(fd, bytes + offset, length - offset);
+        if (got > 0) {
+            offset += (size_t)got;
+        } else if (got == 0) {
+            return false;
+        } else if (errno != EINTR) {
+            return false;
+        }
+    }
+    return true;
+}
+
+static bool waitpid_within(pid_t pid, int timeout_ms, int *status_out) {
     struct timespec pause = {.tv_sec = 0, .tv_nsec = 10000000L};
     int elapsed = 0;
     while (elapsed <= timeout_ms) {
@@ -365,9 +538,31 @@ static bool reap_within(pid_t pid, int timeout_ms, int *status_out) {
         nanosleep(&pause, NULL);
         elapsed += 10;
     }
-    kill(pid, SIGKILL);
-    (void)waitpid(pid, NULL, 0);
     return false;
+}
+
+static bool reap_within(pid_t pid, int timeout_ms, int *status_out) {
+    if (waitpid_within(pid, timeout_ms, status_out)) return true;
+    if (kill(pid, SIGKILL) != 0 && errno != ESRCH) return false;
+    return waitpid_within(pid, 1000, status_out);
+}
+
+TEST(bounded_pipe_read_times_out_while_writer_remains_open) {
+    int held_open[2];
+    if (pipe(held_open) != 0) {
+        CHECK(false);
+        return;
+    }
+    unsigned char byte = 0;
+    int64_t start = test_monotonic_ms();
+    bool read_succeeded =
+        read_full_within(held_open[0], &byte, sizeof(byte), 50);
+    int64_t elapsed = test_monotonic_ms() - start;
+    close(held_open[0]);
+    close(held_open[1]);
+
+    CHECK(!read_succeeded);
+    CHECK(start >= 0 && elapsed >= 0 && elapsed < 1000);
 }
 
 /* M45/T13: with no descriptor available even for trusted-command pinning,
@@ -420,6 +615,265 @@ TEST(child_setup_status_is_reported_explicitly) {
     CHECK(result.spawned);
     CHECK_EQ_INT(result.exit_code, 126);
     CHECK(strstr(get_last_error()->message, "environment setup failed") != NULL);
+}
+
+TEST(process_group_supervisor_setup_failure_is_truthful_and_reaped) {
+    const char *argv[] = {"true", NULL};
+    run_result_t failed;
+    run_result_t retry;
+    int64_t started = test_monotonic_ms();
+
+    run_test_set_child_process_group_failure(EPERM);
+    clear_error();
+    errno = 0;
+    CHECK_EQ_INT(run_argv(argv, NULL, &failed), -1);
+    int returned_errno = errno;
+    int64_t elapsed = test_monotonic_ms() - started;
+
+    CHECK_EQ_INT(returned_errno, EPERM);
+    CHECK(failed.spawned);
+    CHECK_EQ_INT(failed.exit_code, 126);
+    CHECK(elapsed >= 0 && elapsed < 1000);
+    CHECK(strstr(get_last_error()->message,
+                 "process-group supervisor setup failed") != NULL);
+
+    errno = 0;
+    CHECK_EQ_INT(waitpid(-1, NULL, WNOHANG), -1);
+    CHECK_EQ_INT(errno, ECHILD);
+    CHECK_EQ_INT(run_argv(argv, NULL, &retry), 0);
+    CHECK(retry.spawned);
+    CHECK_EQ_INT(retry.exit_code, 0);
+}
+
+static int one_silent_pre_ready_supervisor_death_worker(void) {
+    const char *argv[] = {"true", NULL};
+    run_result_t recovered;
+    int64_t started = test_monotonic_ms();
+
+    run_test_set_supervisor_pending_signal(SIGKILL);
+    clear_error();
+    errno = 0;
+    int run_rc = run_argv(argv, NULL, &recovered);
+    int64_t elapsed = test_monotonic_ms() - started;
+    run_test_set_supervisor_pending_signal(0);
+
+    errno = 0;
+    int unreaped = waitpid(-1, NULL, WNOHANG);
+    int unreaped_errno = errno;
+
+    return run_rc == 0 && recovered.spawned && !recovered.timed_out &&
+                   recovered.exit_code == 0 && recovered.term_signal == 0 &&
+                   elapsed >= 0 && elapsed < 2000 &&
+                   unreaped == -1 && unreaped_errno == ECHILD
+               ? 0 : 1;
+}
+
+TEST(one_silent_pre_ready_supervisor_death_retries_before_execution) {
+    CHECK(isolated_runner_check_passes_within(
+        one_silent_pre_ready_supervisor_death_worker, 4000));
+}
+
+static int g_silent_pre_ready_attempts;
+
+static void rearm_silent_pre_ready_supervisor_death(void) {
+    g_silent_pre_ready_attempts++;
+    run_test_set_supervisor_pending_signal(SIGKILL);
+}
+
+static int repeated_silent_pre_ready_supervisor_death_worker(void) {
+    const char *argv[] = {"true", NULL};
+    run_result_t failed;
+    int64_t started = test_monotonic_ms();
+
+    run_test_set_supervisor_pending_signal(SIGKILL);
+    g_silent_pre_ready_attempts = 0;
+    run_test_set_post_fork_pre_publish_hook(
+        rearm_silent_pre_ready_supervisor_death);
+    clear_error();
+    errno = 0;
+    int run_rc = run_argv(argv, NULL, &failed);
+    int returned_errno = errno;
+    int64_t elapsed = test_monotonic_ms() - started;
+    bool reported_group_failure =
+        strstr(get_last_error()->message,
+               "cannot establish and verify isolated child process group") !=
+        NULL;
+    run_test_set_post_fork_pre_publish_hook(NULL);
+    run_test_set_supervisor_pending_signal(0);
+
+    errno = 0;
+    int unreaped = waitpid(-1, NULL, WNOHANG);
+    int unreaped_errno = errno;
+
+    return run_rc == -1 && returned_errno == EPIPE &&
+                   failed.spawned && !failed.timed_out &&
+                   failed.exit_code == -1 &&
+                   failed.term_signal == SIGKILL &&
+                   elapsed >= 0 && elapsed < 3000 &&
+                   reported_group_failure &&
+                   g_silent_pre_ready_attempts == 2 &&
+                   unreaped == -1 && unreaped_errno == ECHILD
+               ? 0 : 1;
+}
+
+TEST(repeated_silent_pre_ready_supervisor_death_is_bounded_and_truthful) {
+    CHECK(isolated_runner_check_passes_within(
+        repeated_silent_pre_ready_supervisor_death_worker, 5000));
+}
+
+TEST(supervisor_stage_failures_are_truthful_reaped_and_one_shot) {
+    static const struct {
+        run_test_supervisor_failure_stage_t stage;
+        int system_errno;
+    } cases[] = {
+        {RUN_TEST_SUPERVISOR_FAILURE_WORKER_RELEASE_PIPE, EMFILE},
+        {RUN_TEST_SUPERVISOR_FAILURE_INNER_FORK, EAGAIN},
+        {RUN_TEST_SUPERVISOR_FAILURE_REPLAY, EIO},
+        {RUN_TEST_SUPERVISOR_FAILURE_RELEASE_WRITE, EPIPE}
+    };
+    const char *argv[] = {"true", NULL};
+
+    for (size_t i = 0U; i < sizeof(cases) / sizeof(cases[0]); i++) {
+        run_result_t failed;
+        run_result_t retry;
+        int64_t started = test_monotonic_ms();
+
+        run_test_set_supervisor_failure(
+            cases[i].stage, cases[i].system_errno);
+        clear_error();
+        errno = 0;
+        CHECK_EQ_INT(run_argv(argv, NULL, &failed), -1);
+        int returned_errno = errno;
+        int64_t elapsed = test_monotonic_ms() - started;
+
+        CHECK_EQ_INT(returned_errno, cases[i].system_errno);
+        CHECK(failed.spawned);
+        CHECK_EQ_INT(failed.exit_code, 126);
+        CHECK(elapsed >= 0 && elapsed < 1000);
+        CHECK(strstr(get_last_error()->message,
+                     "process-group supervisor setup failed") != NULL);
+
+        errno = 0;
+        CHECK_EQ_INT(waitpid(-1, NULL, WNOHANG), -1);
+        CHECK_EQ_INT(errno, ECHILD);
+        CHECK_EQ_INT(run_argv(argv, NULL, &retry), 0);
+        CHECK(retry.spawned);
+        CHECK_EQ_INT(retry.exit_code, 0);
+    }
+}
+
+static volatile sig_atomic_t g_pre_release_hook_called;
+static volatile sig_atomic_t g_pre_release_hook_rollback_active;
+static volatile sig_atomic_t g_pre_release_hook_waited;
+
+static void kill_gated_supervisor_before_release(pid_t supervisor_pid) {
+    siginfo_t info;
+    struct timespec pause = {.tv_sec = 0, .tv_nsec = 10000000L};
+    int64_t started;
+
+    g_pre_release_hook_called = 1;
+    g_pre_release_hook_rollback_active =
+        signals_rollback_active() ? 1 : 0;
+    if (raise(SIGTERM) != 0 || raise(SIGTERM) != 0) return;
+    started = test_monotonic_ms();
+    while (started >= 0) {
+        int64_t now;
+        int wait_rc;
+
+        memset(&info, 0, sizeof(info));
+        wait_rc = waitid(P_PID, (id_t)supervisor_pid, &info,
+                         WEXITED | WNOWAIT | WNOHANG);
+        if (wait_rc == 0 && info.si_pid == supervisor_pid) {
+            g_pre_release_hook_waited = 1;
+            return;
+        }
+        if (wait_rc != 0 && errno != EINTR) return;
+        now = test_monotonic_ms();
+        if (now < 0 || now - started >= 1000) return;
+        (void)nanosleep(&pause, NULL);
+    }
+}
+
+static int pre_release_sigpipe_worker(void) {
+    const char *argv[] = {"true", NULL};
+    struct sigaction original_action;
+    struct sigaction installed_action;
+    struct sigaction after_action;
+    sigset_t original_mask;
+    sigset_t configured_mask;
+    sigset_t after_mask;
+    sigset_t pending;
+    run_result_t failed;
+    run_result_t retry;
+    int64_t started;
+
+    if (install_sigpipe_disposition(SIGPIPE_DISPOSITION_CUSTOM,
+                                    &original_action,
+                                    &installed_action) != 0 ||
+        sigprocmask(SIG_SETMASK, NULL, &original_mask) != 0) {
+        return 31;
+    }
+    configured_mask = original_mask;
+    if (sigdelset(&configured_mask, SIGPIPE) != 0 ||
+        sigdelset(&configured_mask, SIGTERM) != 0 ||
+        sigaddset(&configured_mask, SIGUSR2) != 0 ||
+        sigprocmask(SIG_SETMASK, &configured_mask, NULL) != 0 ||
+        signals_guard_begin() != 0) {
+        return 32;
+    }
+    signals_rollback_begin();
+    g_pre_release_hook_called = 0;
+    g_pre_release_hook_rollback_active = 0;
+    g_pre_release_hook_waited = 0;
+    g_sigpipe_witness_calls = 0;
+    run_test_set_pre_group_release_hook(
+        kill_gated_supervisor_before_release);
+    clear_error();
+    errno = 0;
+    started = test_monotonic_ms();
+    int run_rc = run_argv(argv, NULL, &failed);
+    int returned_errno = errno;
+    int64_t elapsed = test_monotonic_ms() - started;
+    run_test_set_pre_group_release_hook(NULL);
+    if (sigaction(SIGPIPE, NULL, &after_action) != 0 ||
+        sigprocmask(SIG_SETMASK, NULL, &after_mask) != 0 ||
+        sigpending(&pending) != 0) {
+        return 33;
+    }
+    errno = 0;
+    int unreaped = waitpid(-1, NULL, WNOHANG);
+    int unreaped_errno = errno;
+    int retry_rc = run_argv(argv, NULL, &retry);
+    signals_rollback_end();
+    int guard_rc = signals_guard_end();
+    int action_restore = sigaction(SIGPIPE, &original_action, NULL);
+    int mask_restore =
+        sigprocmask(SIG_SETMASK, &original_mask, NULL);
+
+    return run_rc == -1 && returned_errno == EPIPE &&
+                   failed.spawned &&
+                   elapsed >= 0 && elapsed < 1000 &&
+                   g_pre_release_hook_called == 1 &&
+                   g_pre_release_hook_rollback_active == 1 &&
+                   g_pre_release_hook_waited == 1 &&
+                   strstr(get_last_error()->message,
+                          "cannot release child process-group gate") != NULL &&
+                   sigactions_semantically_equal(
+                       &installed_action, &after_action) &&
+                   sigsets_semantically_equal(
+                       &configured_mask, &after_mask) &&
+                   sigismember(&pending, SIGPIPE) == 0 &&
+                   g_sigpipe_witness_calls == 0 &&
+                   unreaped == -1 && unreaped_errno == ECHILD &&
+                   retry_rc == 0 && retry.spawned &&
+                   retry.exit_code == 0 &&
+                   guard_rc == 0 && action_restore == 0 &&
+                   mask_restore == 0
+               ? 0 : 34;
+}
+
+TEST(pre_release_group_death_cannot_sigpipe_parent) {
+    CHECK(isolated_runner_check_passes(pre_release_sigpipe_worker));
 }
 
 /* M30: accepting only a prefix into the kernel pipe is not successful input
@@ -621,6 +1075,837 @@ TEST(descendant_held_capture_pipe_returns_within_grace) {
     CHECK(WIFEXITED(status) && WEXITSTATUS(status) == 0);
 }
 
+static bool process_gone_within(pid_t pid, int timeout_ms) {
+    int waited = 0;
+    while (waited < timeout_ms) {
+        if (kill(pid, 0) != 0 && errno == ESRCH) return true;
+        struct timespec delay = {.tv_nsec = 10000000L};
+        nanosleep(&delay, NULL);
+        waited += 10;
+    }
+    return kill(pid, 0) != 0 && errno == ESRCH;
+}
+
+static bool file_nonempty_within(const char *path, int timeout_ms) {
+    int waited = 0;
+    while (waited <= timeout_ms) {
+        struct stat st;
+        if (stat(path, &st) == 0 && st.st_size > 0) return true;
+        struct timespec delay = {.tv_nsec = 10000000L};
+        nanosleep(&delay, NULL);
+        waited += 10;
+    }
+    return false;
+}
+
+static bool file_size_stops_changing(const char *path, int observation_ms) {
+    struct stat before;
+    struct stat after;
+    struct timespec delay = {
+        .tv_sec = observation_ms / 1000,
+        .tv_nsec = (long)(observation_ms % 1000) * 1000000L
+    };
+
+    if (stat(path, &before) != 0 || before.st_size <= 0) return false;
+    while (nanosleep(&delay, &delay) != 0 && errno == EINTR) {}
+    return stat(path, &after) == 0 && after.st_size == before.st_size;
+}
+
+TEST(timeout_kills_the_proven_group_grandchild) {
+    const char *argv[] = {
+        "sh", "-c", "sleep 30 & child=$!; echo \"$child\"; wait", NULL
+    };
+    char output[64];
+    run_opts_t opts;
+    run_result_t result;
+
+    memset(&opts, 0, sizeof(opts));
+    opts.out = output;
+    opts.out_size = sizeof(output);
+    opts.stderr_to_devnull = true;
+    /* The deadline proves group cleanup, not shell startup latency. Leave
+     * enough room for Darwin's sanitizer runtime to start the shell and
+     * publish the descendant PID before expiring the group. */
+    CHECK_EQ_INT(run_deadline_after_millis(1000, &opts.deadline_millis), 0);
+    opts.use_deadline = true;
+    CHECK_EQ_INT(run_argv(argv, &opts, &result), -1);
+    pid_t descendant = (pid_t)strtol(output, NULL, 10);
+    CHECK(descendant > 1);
+    if (descendant > 1) CHECK(process_gone_within(descendant, 1000));
+}
+
+TEST(successful_leader_with_stdout_holder_kills_group_before_pid_release) {
+    const char *argv[] = {
+        "sh", "-c", "sleep 30 & echo \"$!\"", NULL
+    };
+    char output[64];
+    run_opts_t opts;
+    run_result_t result;
+    int64_t started = test_monotonic_ms();
+
+    memset(&opts, 0, sizeof(opts));
+    opts.out = output;
+    opts.out_size = sizeof(output);
+    opts.stderr_to_devnull = true;
+    CHECK_EQ_INT(run_argv(argv, &opts, &result), -1);
+    int64_t elapsed = test_monotonic_ms() - started;
+    pid_t descendant = (pid_t)strtol(output, NULL, 10);
+    CHECK(result.spawned);
+    CHECK_EQ_INT(result.exit_code, 0);
+    CHECK(elapsed >= 0 && elapsed < 1000);
+    CHECK(descendant > 1);
+    if (descendant > 1) CHECK(process_gone_within(descendant, 1000));
+}
+
+TEST(closed_stdio_daemon_like_descendant_remains_supported) {
+    const char *argv[] = {
+        "sh", "-c", "sleep 1 </dev/null >/dev/null 2>&1 &", NULL
+    };
+    char output[16];
+    run_opts_t opts;
+    run_result_t result;
+
+    memset(&opts, 0, sizeof(opts));
+    opts.out = output;
+    opts.out_size = sizeof(output);
+    opts.stderr_to_devnull = true;
+    CHECK_EQ_INT(run_argv(argv, &opts, &result), 0);
+    CHECK(result.spawned);
+    CHECK_EQ_INT(result.exit_code, 0);
+}
+
+static int rollback_group_signal_worker(void) {
+    char heartbeat_path[] = "/tmp/gitswitch-ar14-heartbeat-XXXXXX";
+    const char *argv[] = {
+        "sh", "-c",
+        "trap '' TERM; \"$1\" --ar14-rollback-heartbeat \"$2\" & "
+        "echo \"$!\"; wait",
+        "gitswitch-ar14-rollback", g_self_path, heartbeat_path, NULL
+    };
+    char output[64];
+    run_opts_t opts;
+    run_result_t result;
+    pid_t signaler = -1;
+    pid_t descendant = -1;
+    int heartbeat_fd;
+    int outcome = 0;
+    bool rollback_started = false;
+    bool guard_started = false;
+
+    heartbeat_fd = mkstemp(heartbeat_path);
+    if (heartbeat_fd < 0) return 69;
+    close(heartbeat_fd);
+    if (signals_guard_begin() != 0) {
+        outcome = 70;
+        goto cleanup;
+    }
+    guard_started = true;
+    signals_rollback_begin();
+    rollback_started = true;
+    signaler = fork();
+    if (signaler < 0) {
+        outcome = 71;
+        goto cleanup;
+    }
+    if (signaler == 0) {
+        if (!file_nonempty_within(heartbeat_path, 2000)) _exit(20);
+        if (kill(getppid(), SIGTERM) != 0) _exit(21);
+        struct timespec delay = {.tv_nsec = 100000000L};
+        while (nanosleep(&delay, &delay) != 0 && errno == EINTR) {}
+        if (kill(getppid(), SIGTERM) != 0) _exit(22);
+        _exit(0);
+    }
+    memset(&opts, 0, sizeof(opts));
+    opts.out = output;
+    opts.out_size = sizeof(output);
+    opts.stderr_to_devnull = true;
+    int rc = run_argv(argv, &opts, &result);
+    int signaler_status = 0;
+    pid_t waited;
+    do {
+        waited = waitpid(signaler, &signaler_status, 0);
+    } while (waited < 0 && errno == EINTR);
+    descendant = (pid_t)strtol(output, NULL, 10);
+    if (rc == 0) {
+        outcome = 72;
+    } else if (waited != signaler || !WIFEXITED(signaler_status) ||
+               WEXITSTATUS(signaler_status) != 0) {
+        outcome = 73;
+    } else if (descendant <= 1) {
+        outcome = 74;
+    } else if (!file_size_stops_changing(heartbeat_path, 300)) {
+        outcome = 75;
+    }
+
+cleanup:
+    if (outcome != 0 && descendant > 1) {
+        (void)kill(descendant, SIGKILL);
+    }
+    if (signaler > 0) {
+        int ignored_status;
+        (void)waitpid(signaler, &ignored_status, WNOHANG);
+    }
+    if (rollback_started) signals_rollback_end();
+    if (guard_started) (void)signals_guard_end();
+    (void)unlink(heartbeat_path);
+    return outcome;
+}
+
+TEST(repeated_rollback_signal_terminates_group_descendant) {
+    CHECK(isolated_runner_check_passes_within(
+        rollback_group_signal_worker, 5000));
+}
+
+static int supervisor_termination_worker(int signal_number,
+                                         bool post_replay) {
+    const char *argv[] = {"sleep", "30", NULL};
+    struct sigaction original_action;
+    struct sigaction configured_action;
+    struct sigaction after_action;
+    sigset_t original_mask;
+    sigset_t configured_mask;
+    sigset_t after_mask;
+    run_opts_t opts;
+    run_result_t result = {0};
+    int rc = -1;
+    int outcome = 78;
+    int pending_signal = 0;
+    bool action_configured = false;
+    bool mask_configured = false;
+    bool guard_started = false;
+    bool mask_preserved = false;
+
+    if (install_default_signal_fixture(
+            signal_number, &original_action, &configured_action) != 0) {
+        return 73;
+    }
+    action_configured = true;
+    if (sigprocmask(SIG_SETMASK, NULL, &original_mask) != 0) {
+        outcome = 73;
+        goto cleanup;
+    }
+    configured_mask = original_mask;
+    if (sigdelset(&configured_mask, signal_number) != 0 ||
+        sigaddset(&configured_mask, SIGUSR1) != 0 ||
+        sigprocmask(SIG_SETMASK, &configured_mask, NULL) != 0) {
+        outcome = 74;
+        goto cleanup;
+    }
+    mask_configured = true;
+    if (signals_guard_begin() != 0) {
+        outcome = 75;
+        goto cleanup;
+    }
+    guard_started = true;
+    memset(&opts, 0, sizeof(opts));
+    /*
+     * This contract proves delivery and parent observability, not a
+     * one-second latency guarantee. Shared sanitizer runners can occasionally
+     * spend more than one second between the gated forks even though delivery
+     * is correct, so retain a hard bound without coupling the assertion to
+     * scheduler load.
+     */
+    if (run_deadline_after_millis(3000, &opts.deadline_millis) != 0) {
+        outcome = 76;
+        goto cleanup;
+    }
+    opts.use_deadline = true;
+    if (post_replay) {
+        run_test_set_post_replay_signal(signal_number);
+    } else {
+        run_test_set_supervisor_pending_signal(signal_number);
+    }
+    rc = run_argv(argv, &opts, &result);
+    run_test_set_supervisor_pending_signal(0);
+    run_test_set_post_replay_signal(0);
+    if (sigprocmask(SIG_SETMASK, NULL, &after_mask) != 0) {
+        outcome = 77;
+        goto cleanup;
+    }
+    pending_signal = signals_pending_signal();
+    mask_preserved =
+        sigsets_semantically_equal(&configured_mask, &after_mask);
+    if (rc != -1) outcome = 78;
+    else if (!result.spawned) outcome = 79;
+    else if (result.timed_out) outcome = 80;
+    else if (result.exit_code != -1) outcome = 81;
+    else if (result.term_signal != signal_number) outcome = 82;
+    else if (pending_signal != signal_number) outcome = 83;
+    else if (!mask_preserved) outcome = 84;
+    else outcome = 0;
+    if (signals_guard_end() != 0) {
+        outcome = 85;
+        goto cleanup;
+    }
+    guard_started = false;
+    if (sigaction(signal_number, NULL, &after_action) != 0) {
+        outcome = 86;
+        goto cleanup;
+    }
+    if (!sigactions_semantically_equal(
+            &configured_action, &after_action)) {
+        outcome = 87;
+        goto cleanup;
+    }
+
+cleanup:
+    run_test_set_supervisor_pending_signal(0);
+    run_test_set_post_replay_signal(0);
+    if (guard_started && signals_guard_end() != 0 && outcome == 0) {
+        outcome = 78;
+    }
+    if (mask_configured &&
+        sigprocmask(SIG_SETMASK, &original_mask, NULL) != 0 &&
+        outcome == 0) {
+        outcome = 78;
+    }
+    if (action_configured &&
+        sigaction(signal_number, &original_action, NULL) != 0 &&
+        outcome == 0) {
+        outcome = 88;
+    }
+    if (outcome != 0) {
+        fprintf(
+            stderr,
+            "  relay worker outcome=%d signal=%d post_replay=%d "
+            "rc=%d spawned=%d timed_out=%d exit=%d term=%d pending=%d "
+            "mask_preserved=%d\n",
+            outcome, signal_number, post_replay ? 1 : 0, rc,
+            result.spawned ? 1 : 0, result.timed_out ? 1 : 0,
+            result.exit_code, result.term_signal, pending_signal,
+            mask_preserved ? 1 : 0);
+    }
+    return outcome;
+}
+
+static int supervisor_pending_sigterm_worker(void) {
+    return supervisor_termination_worker(SIGTERM, false);
+}
+
+static int supervisor_pending_sigint_worker(void) {
+    return supervisor_termination_worker(SIGINT, false);
+}
+
+static int post_replay_group_sigterm_worker(void) {
+    return supervisor_termination_worker(SIGTERM, true);
+}
+
+static int post_replay_group_sigint_worker(void) {
+    return supervisor_termination_worker(SIGINT, true);
+}
+
+static bool supervisor_pending_sigint_fixture_passes(void) {
+    return isolated_runner_check_passes(
+        supervisor_pending_sigint_worker);
+}
+
+static bool post_replay_group_sigint_fixture_passes(void) {
+    return isolated_runner_check_passes(
+        post_replay_group_sigint_worker);
+}
+
+static int supervisor_pending_sighup_worker(void) {
+    return supervisor_termination_worker(SIGHUP, false);
+}
+
+static int post_replay_group_sigquit_worker(void) {
+    return supervisor_termination_worker(SIGQUIT, true);
+}
+
+TEST(supervisor_only_pending_termination_reaches_gated_worker_once) {
+    CHECK(isolated_runner_check_passes(supervisor_pending_sigterm_worker));
+    CHECK(ignored_signal_fixture_check_passes(
+        SIGINT, supervisor_pending_sigint_fixture_passes));
+}
+
+TEST(post_replay_group_termination_reaches_worker_once) {
+    CHECK(isolated_runner_check_passes(
+        post_replay_group_sigterm_worker));
+    CHECK(ignored_signal_fixture_check_passes(
+        SIGINT, post_replay_group_sigint_fixture_passes));
+}
+
+TEST(hangup_and_quit_relays_are_parent_observable_once) {
+    CHECK(isolated_runner_check_returns_normally_within(
+        supervisor_pending_sighup_worker, 5000));
+    CHECK(isolated_runner_check_returns_normally_within(
+        post_replay_group_sigquit_worker, 5000));
+}
+
+static int pending_replay_failure_worker(void) {
+    const char *argv[] = {"true", NULL};
+    struct sigaction original_action;
+    struct sigaction configured_action;
+    struct sigaction after_action;
+    sigset_t original_mask;
+    sigset_t configured_mask;
+    sigset_t after_mask;
+    run_result_t failed;
+    run_result_t retry;
+    int outcome = 91;
+    bool action_configured = false;
+    bool mask_configured = false;
+    bool guard_started = false;
+    bool reported_group_failure = false;
+    bool pending_signal_published = false;
+    bool mask_preserved = false;
+    bool action_preserved = false;
+
+    if (install_default_signal_fixture(
+            SIGHUP, &original_action, &configured_action) != 0) {
+        return 91;
+    }
+    action_configured = true;
+    if (sigprocmask(SIG_SETMASK, NULL, &original_mask) != 0) goto cleanup;
+    configured_mask = original_mask;
+    if (sigdelset(&configured_mask, SIGHUP) != 0 ||
+        sigaddset(&configured_mask, SIGUSR1) != 0 ||
+        sigprocmask(SIG_SETMASK, &configured_mask, NULL) != 0) {
+        goto cleanup;
+    }
+    mask_configured = true;
+    if (signals_guard_begin() != 0) goto cleanup;
+    guard_started = true;
+
+    run_test_set_supervisor_pending_signal(SIGHUP);
+    run_test_set_supervisor_failure(
+        RUN_TEST_SUPERVISOR_FAILURE_REPLAY, EIO);
+    clear_error();
+    errno = 0;
+    int run_rc = run_argv(argv, NULL, &failed);
+    int returned_errno = errno;
+    reported_group_failure =
+        strstr(get_last_error()->message,
+               "process-group supervisor setup failed") != NULL;
+    pending_signal_published =
+        signals_pending() || signals_pending_signal() != 0;
+    run_test_set_supervisor_pending_signal(0);
+    run_test_set_supervisor_failure(
+        RUN_TEST_SUPERVISOR_FAILURE_NONE, 0);
+    int retry_rc = run_argv(argv, NULL, &retry);
+    int guard_end_rc = signals_guard_end();
+    if (guard_end_rc == 0) guard_started = false;
+    int mask_query_rc =
+        sigprocmask(SIG_SETMASK, NULL, &after_mask);
+    int action_query_rc =
+        sigaction(SIGHUP, NULL, &after_action);
+    if (mask_query_rc == 0) {
+        mask_preserved =
+            sigsets_semantically_equal(&configured_mask, &after_mask);
+    }
+    if (action_query_rc == 0) {
+        action_preserved =
+            sigactions_semantically_equal(
+                &configured_action, &after_action);
+    }
+    errno = 0;
+    int unreaped = waitpid(-1, NULL, WNOHANG);
+    int unreaped_errno = errno;
+
+    outcome =
+        run_rc == -1 && returned_errno == EIO &&
+                failed.spawned && failed.exit_code == 126 &&
+                reported_group_failure && !pending_signal_published &&
+                retry_rc == 0 && retry.spawned && retry.exit_code == 0 &&
+                guard_end_rc == 0 &&
+                mask_query_rc == 0 && action_query_rc == 0 &&
+                mask_preserved && action_preserved &&
+                unreaped == -1 && unreaped_errno == ECHILD
+            ? 0 : 92;
+    if (outcome != 0) {
+        fprintf(
+            stderr,
+            "  pending-replay diagnostics: run=%d errno=%d spawned=%d exit=%d "
+            "reported=%d pending=%d retry=%d retry-spawned=%d retry-exit=%d "
+            "guard-end=%d mask-query=%d action-query=%d mask-equal=%d "
+            "action-equal=%d unreaped=%ld unreaped-errno=%d\n",
+            run_rc, returned_errno, failed.spawned, failed.exit_code,
+            reported_group_failure, pending_signal_published, retry_rc,
+            retry.spawned, retry.exit_code, guard_end_rc, mask_query_rc,
+            action_query_rc, mask_preserved, action_preserved,
+            (long)unreaped, unreaped_errno);
+    }
+
+cleanup:
+    run_test_set_supervisor_pending_signal(0);
+    run_test_set_supervisor_failure(
+        RUN_TEST_SUPERVISOR_FAILURE_NONE, 0);
+    if (guard_started && signals_guard_end() != 0 && outcome == 0) {
+        outcome = 92;
+    }
+    if (mask_configured &&
+        sigprocmask(SIG_SETMASK, &original_mask, NULL) != 0 &&
+        outcome == 0) {
+        outcome = 92;
+    }
+    if (action_configured &&
+        sigaction(SIGHUP, &original_action, NULL) != 0 &&
+        outcome == 0) {
+        outcome = 92;
+    }
+    return outcome;
+}
+
+TEST(pending_signal_is_not_published_when_replay_setup_fails) {
+    CHECK(isolated_runner_check_returns_normally(
+        pending_replay_failure_worker));
+}
+
+static int supervisor_stop_worker(bool post_replay) {
+    const char *argv[] = {"sleep", "30", NULL};
+    struct sigaction original_action;
+    struct sigaction default_action;
+    struct sigaction configured_action;
+    struct sigaction after_action;
+    sigset_t before_mask;
+    sigset_t after_mask;
+    run_opts_t opts;
+    run_result_t result;
+    int64_t started;
+
+    if (sigaction(SIGTSTP, NULL, &original_action) != 0) return 79;
+    memset(&default_action, 0, sizeof(default_action));
+    default_action.sa_handler = SIG_DFL;
+    if (sigemptyset(&default_action.sa_mask) != 0 ||
+        sigaction(SIGTSTP, &default_action, NULL) != 0 ||
+        sigaction(SIGTSTP, NULL, &configured_action) != 0 ||
+        sigprocmask(SIG_SETMASK, NULL, &before_mask) != 0 ||
+        sigdelset(&before_mask, SIGTSTP) != 0 ||
+        sigprocmask(SIG_SETMASK, &before_mask, NULL) != 0) {
+        return 79;
+    }
+    memset(&opts, 0, sizeof(opts));
+    if (run_deadline_after_millis(1000, &opts.deadline_millis) != 0) {
+        return 80;
+    }
+    opts.use_deadline = true;
+    started = test_monotonic_ms();
+    if (post_replay) {
+        run_test_set_post_replay_signal(SIGTSTP);
+    } else {
+        run_test_set_supervisor_pending_signal(SIGTSTP);
+    }
+    int rc = run_argv(argv, &opts, &result);
+    run_test_set_supervisor_pending_signal(0);
+    run_test_set_post_replay_signal(0);
+    int64_t elapsed = test_monotonic_ms() - started;
+    int mask_query_rc = sigprocmask(SIG_SETMASK, NULL, &after_mask);
+    int action_query_rc = sigaction(SIGTSTP, NULL, &after_action);
+    int action_restore_rc =
+        sigaction(SIGTSTP, &original_action, NULL);
+    return rc == -1 && result.spawned && !result.timed_out &&
+                   result.exit_code == -1 &&
+                   result.term_signal == SIGKILL &&
+                   elapsed >= 0 && elapsed < 1000 &&
+                   mask_query_rc == 0 && action_query_rc == 0 &&
+                   action_restore_rc == 0 &&
+                   sigsets_semantically_equal(&before_mask, &after_mask) &&
+                   sigactions_semantically_equal(
+                       &configured_action, &after_action)
+               ? 0 : 82;
+}
+
+static int supervisor_pending_stop_worker(void) {
+    return supervisor_stop_worker(false);
+}
+
+static int supervisor_post_replay_stop_worker(void) {
+    return supervisor_stop_worker(true);
+}
+
+TEST(supervisor_only_pending_stop_fails_closed_without_hanging) {
+    CHECK(isolated_runner_check_passes(supervisor_pending_stop_worker));
+}
+
+TEST(post_replay_supervisor_stop_handler_fails_group_closed) {
+    CHECK(isolated_runner_check_passes(
+        supervisor_post_replay_stop_worker));
+}
+
+static int supervisor_ignored_signal_worker(int signal_number) {
+    const char *argv[] = {"true", NULL};
+    struct sigaction original_action;
+    struct sigaction ignored_action;
+    struct sigaction installed_action;
+    struct sigaction after_action;
+    run_result_t result;
+
+    if (sigaction(signal_number, NULL, &original_action) != 0) return 83;
+    memset(&ignored_action, 0, sizeof(ignored_action));
+    ignored_action.sa_handler = SIG_IGN;
+    if (sigemptyset(&ignored_action.sa_mask) != 0 ||
+        sigaction(signal_number, &ignored_action, NULL) != 0 ||
+        sigaction(signal_number, NULL, &installed_action) != 0) {
+        return 84;
+    }
+    run_test_set_supervisor_pending_signal(signal_number);
+    int rc = run_argv(argv, NULL, &result);
+    run_test_set_supervisor_pending_signal(0);
+    int query_rc = sigaction(signal_number, NULL, &after_action);
+    int restore_rc = sigaction(signal_number, &original_action, NULL);
+    return rc == 0 && result.spawned && result.exit_code == 0 &&
+                   query_rc == 0 && restore_rc == 0 &&
+                   sigactions_semantically_equal(
+                       &installed_action, &after_action)
+               ? 0 : 85;
+}
+
+static int supervisor_ignored_hup_worker(void) {
+    return supervisor_ignored_signal_worker(SIGHUP);
+}
+
+static int supervisor_ignored_stop_worker(void) {
+    return supervisor_ignored_signal_worker(SIGTSTP);
+}
+
+TEST(supervisor_injection_preserves_inherited_ignored_signal) {
+    CHECK(isolated_runner_check_passes(supervisor_ignored_hup_worker));
+    CHECK(isolated_runner_check_passes(supervisor_ignored_stop_worker));
+}
+
+static int pending_signal_mask_probe_main(void) {
+    sigset_t current;
+    sigset_t pending;
+
+    if (sigprocmask(SIG_SETMASK, NULL, &current) != 0 ||
+        sigpending(&pending) != 0) {
+        return 86;
+    }
+    return sigismember(&current, SIGTERM) == 1 &&
+                   sigismember(&current, SIGUSR1) == 1 &&
+                   sigismember(&current, SIGINT) == 0 &&
+                   sigismember(&current, SIGHUP) == 0 &&
+                   sigismember(&current, SIGQUIT) == 0 &&
+                   sigismember(&current, SIGTSTP) == 0 &&
+                   sigismember(&pending, SIGTERM) == 1
+               ? 0 : 87;
+}
+
+static int supervisor_pending_blocked_signal_worker(void) {
+    const char *argv[] = {
+        g_self_path, "--ar14-pending-signal-mask-probe", NULL
+    };
+    sigset_t original_mask;
+    sigset_t configured_mask;
+    sigset_t after_mask;
+    run_opts_t opts;
+    run_result_t result;
+
+    if (sigprocmask(SIG_SETMASK, NULL, &original_mask) != 0) return 88;
+    configured_mask = original_mask;
+    if (sigaddset(&configured_mask, SIGTERM) != 0 ||
+        sigaddset(&configured_mask, SIGUSR1) != 0 ||
+        sigdelset(&configured_mask, SIGINT) != 0 ||
+        sigdelset(&configured_mask, SIGHUP) != 0 ||
+        sigdelset(&configured_mask, SIGQUIT) != 0 ||
+        sigdelset(&configured_mask, SIGTSTP) != 0 ||
+        sigprocmask(SIG_SETMASK, &configured_mask, NULL) != 0) {
+        return 89;
+    }
+    run_test_set_supervisor_pending_signal(SIGTERM);
+    memset(&opts, 0, sizeof(opts));
+    if (run_deadline_after_millis(1000, &opts.deadline_millis) != 0) {
+        run_test_set_supervisor_pending_signal(0);
+        (void)sigprocmask(SIG_SETMASK, &original_mask, NULL);
+        return 90;
+    }
+    opts.use_deadline = true;
+    int rc = run_argv(argv, &opts, &result);
+    run_test_set_supervisor_pending_signal(0);
+    int query_rc = sigprocmask(SIG_SETMASK, NULL, &after_mask);
+    int restore_rc =
+        sigprocmask(SIG_SETMASK, &original_mask, NULL);
+    return rc == 0 && result.spawned && result.exit_code == 0 &&
+                   result.term_signal == 0 && query_rc == 0 &&
+                   restore_rc == 0 &&
+                   sigsets_semantically_equal(
+                       &configured_mask, &after_mask)
+               ? 0 : 90;
+}
+
+TEST(supervisor_only_pending_blocked_signal_survives_exec) {
+    CHECK(isolated_runner_check_passes(
+        supervisor_pending_blocked_signal_worker));
+}
+
+static int pty_foreground_signal_worker(int slave_fd, int ready_fd,
+                                        int expected_signal,
+                                        bool expect_pending) {
+    const char *argv[] = {"sleep", "30", NULL};
+    struct sigaction original_action;
+    struct sigaction configured_action;
+    struct sigaction after_action;
+    run_result_t result;
+    pid_t caller_group;
+    int controlled_signal =
+        expect_pending ? expected_signal : SIGTSTP;
+    int outcome = 84;
+    bool action_configured = false;
+    bool guard_started = false;
+
+    if (install_default_signal_fixture(
+            controlled_signal, &original_action,
+            &configured_action) != 0) {
+        return 79;
+    }
+    action_configured = true;
+    if (setsid() < 0 || ioctl(slave_fd, TIOCSCTTY, 0) != 0) {
+        outcome = 80;
+        goto cleanup;
+    }
+    if (dup2(slave_fd, STDIN_FILENO) != STDIN_FILENO ||
+        dup2(slave_fd, STDOUT_FILENO) != STDOUT_FILENO ||
+        dup2(slave_fd, STDERR_FILENO) != STDERR_FILENO) {
+        outcome = 81;
+        goto cleanup;
+    }
+    if (slave_fd > STDERR_FILENO) close(slave_fd);
+    caller_group = getpgrp();
+    if (tcsetpgrp(STDIN_FILENO, caller_group) != 0 ||
+        write(ready_fd, &caller_group, sizeof(caller_group)) !=
+            (ssize_t)sizeof(caller_group)) {
+        outcome = 82;
+        goto cleanup;
+    }
+    close(ready_fd);
+    ready_fd = -1;
+    if (signals_guard_begin() != 0) {
+        outcome = 83;
+        goto cleanup;
+    }
+    guard_started = true;
+    int rc = run_argv(argv, NULL, &result);
+    bool restored = tcgetpgrp(STDIN_FILENO) == caller_group;
+    bool relayed = expect_pending
+                       ? signals_pending_signal() == expected_signal
+                       : signals_pending_signal() == 0;
+    if (signals_guard_end() != 0) goto cleanup;
+    guard_started = false;
+    if (sigaction(controlled_signal, NULL, &after_action) != 0 ||
+        !sigactions_semantically_equal(
+            &configured_action, &after_action)) {
+        goto cleanup;
+    }
+    outcome = rc != 0 && result.spawned &&
+                      result.term_signal == expected_signal &&
+                      restored && relayed
+                  ? 0 : 84;
+
+cleanup:
+    if (ready_fd >= 0) close(ready_fd);
+    if (guard_started && signals_guard_end() != 0 && outcome == 0) {
+        outcome = 84;
+    }
+    if (action_configured &&
+        sigaction(controlled_signal, &original_action, NULL) != 0 &&
+        outcome == 0) {
+        outcome = 84;
+    }
+    return outcome;
+}
+
+static void abort_pty_worker(pid_t worker, int *master) {
+    int status = 0;
+    if (master && *master >= 0) {
+        close(*master);
+        *master = -1;
+    }
+    (void)reap_within(worker, 0, &status);
+}
+
+static bool pty_control_round_trip(unsigned char control,
+                                   int expected_signal,
+                                   bool expect_pending) {
+    int master = posix_openpt(O_RDWR | O_NOCTTY);
+    if (master < 0 || grantpt(master) != 0 || unlockpt(master) != 0) {
+        if (master >= 0) close(master);
+        return false;
+    }
+    char *slave_name = ptsname(master);
+    if (!slave_name) {
+        close(master);
+        return false;
+    }
+    int slave = open(slave_name, O_RDWR | O_NOCTTY);
+    int ready[2];
+    int pipe_rc = pipe(ready);
+    if (slave < 0 || pipe_rc != 0) {
+        if (slave >= 0) close(slave);
+        close(master);
+        return false;
+    }
+    pid_t worker = fork();
+    if (worker == 0) {
+        close(master);
+        close(ready[0]);
+        _exit(pty_foreground_signal_worker(
+            slave, ready[1], expected_signal, expect_pending));
+    }
+    if (worker < 0) {
+        close(slave);
+        close(master);
+        close(ready[0]);
+        close(ready[1]);
+        return false;
+    }
+    close(slave);
+    close(ready[1]);
+    pid_t caller_group = 0;
+    bool got_ready = read_full_within(
+        ready[0], &caller_group, sizeof(caller_group), 2000);
+    close(ready[0]);
+    if (!got_ready) {
+        abort_pty_worker(worker, &master);
+        return false;
+    }
+    bool transferred = false;
+    for (int elapsed = 0; elapsed < 1000; elapsed += 10) {
+        pid_t foreground = tcgetpgrp(master);
+        if (foreground > 0 && foreground != caller_group) {
+            transferred = true;
+            break;
+        }
+        struct timespec delay = {.tv_nsec = 10000000L};
+        nanosleep(&delay, NULL);
+    }
+    if (!transferred || write(master, &control, 1U) != 1) {
+        abort_pty_worker(worker, &master);
+        return false;
+    }
+    int status = 0;
+    bool reaped = waitpid_within(worker, 2000, &status);
+    if (!reaped) {
+        /* Darwin can retain a controlling-session leader in the exiting
+         * state until the peer releases the PTY master. Do not turn that
+         * teardown interlock into an unbounded post-SIGKILL wait: release the
+         * master, then give the already-completed worker a bounded reap. */
+        close(master);
+        master = -1;
+        reaped = waitpid_within(worker, 1000, &status);
+    }
+    if (!reaped) {
+        (void)kill(worker, SIGKILL);
+        reaped = waitpid_within(worker, 1000, &status);
+    }
+    bool passed =
+        reaped && WIFEXITED(status) && WEXITSTATUS(status) == 0;
+    if (master >= 0) close(master);
+    return passed;
+}
+
+static bool pty_interrupt_fixture_passes(void) {
+    return pty_control_round_trip(0x03U, SIGINT, true);
+}
+
+TEST(pty_interrupt_targets_child_group_and_restores_foreground_owner) {
+    CHECK(ignored_signal_fixture_check_passes(
+        SIGINT, pty_interrupt_fixture_passes));
+}
+
+TEST(pty_stop_fails_closed_without_hanging_and_restores_foreground_owner) {
+    CHECK(pty_control_round_trip(0x1aU, SIGKILL, false));
+}
+
 static volatile sig_atomic_t g_periodic_alarm_calls;
 
 static void periodic_alarm_handler(int signal_number) {
@@ -721,6 +2006,379 @@ TEST(ordinary_buffered_capture_is_fully_drained) {
     CHECK_EQ_INT(run_argv(argv, &opts, &result), 0);
     CHECK_STR_EQ(output, "buffered-output");
     CHECK_EQ_INT((long)result.out_len, 15);
+}
+
+TEST(deadline_helper_rejects_invalid_and_overflowing_durations) {
+    int64_t deadline = 0;
+
+    errno = 0;
+    CHECK_EQ_INT(run_deadline_after_millis(-1, &deadline), -1);
+    CHECK_EQ_INT(errno, EINVAL);
+    errno = 0;
+    CHECK_EQ_INT(run_deadline_after_millis(1, NULL), -1);
+    CHECK_EQ_INT(errno, EINVAL);
+    errno = 0;
+    CHECK_EQ_INT(run_deadline_after_millis(INT64_MAX, &deadline), -1);
+    CHECK_EQ_INT(errno, EOVERFLOW);
+}
+
+TEST(monotonic_millisecond_conversion_checks_quotient_remainder) {
+    const int64_t seconds = INT64_MAX / 1000;
+    const int64_t remainder = INT64_MAX % 1000;
+    int64_t deadline = 0;
+
+    run_test_set_monotonic_timespec(
+        1, seconds, (long)(remainder + 1) * 1000000L);
+    errno = 0;
+    CHECK_EQ_INT(run_deadline_after_millis(0, &deadline), -1);
+    CHECK_EQ_INT(errno, EOVERFLOW);
+
+    run_test_set_monotonic_timespec(
+        1, seconds, (long)remainder * 1000000L);
+    CHECK_EQ_INT(run_deadline_after_millis(0, &deadline), 0);
+    CHECK_EQ_INT(deadline, INT64_MAX);
+}
+
+TEST(expired_and_negative_deadlines_fail_before_spawn) {
+    const char *argv[] = {"true", NULL};
+    run_opts_t opts;
+    run_result_t result;
+
+    memset(&opts, 0, sizeof(opts));
+    opts.use_deadline = true;
+    opts.deadline_millis = -1;
+    errno = 0;
+    CHECK_EQ_INT(run_argv(argv, &opts, &result), -1);
+    CHECK_EQ_INT(errno, EINVAL);
+    CHECK(!result.spawned);
+    CHECK(!result.timed_out);
+
+    opts.deadline_millis = 0;
+    errno = 0;
+    CHECK_EQ_INT(run_argv(argv, &opts, &result), -1);
+    CHECK_EQ_INT(errno, ETIMEDOUT);
+    CHECK(!result.spawned);
+    CHECK(result.timed_out);
+}
+
+TEST(invalid_invocation_precedes_expired_deadline) {
+    const char *argv[] = {"true", NULL};
+    const char input = 'x';
+    run_opts_t opts;
+    run_result_t result;
+
+    memset(&opts, 0, sizeof(opts));
+    opts.use_deadline = true;
+    opts.deadline_millis = 0;
+    clear_error();
+    errno = 0;
+    CHECK_EQ_INT(run_argv(NULL, &opts, &result), -1);
+    CHECK(!result.spawned);
+    CHECK(!result.timed_out);
+    CHECK(strstr(get_last_error()->message, "empty argv") != NULL);
+
+    opts.input = &input;
+    opts.input_len = 1;
+    opts.use_stdin_fd = true;
+    opts.stdin_fd = STDIN_FILENO;
+    clear_error();
+    CHECK_EQ_INT(run_argv(argv, &opts, &result), -1);
+    CHECK(!result.spawned);
+    CHECK(!result.timed_out);
+    CHECK(strstr(get_last_error()->message,
+                 "mutually exclusive") != NULL);
+}
+
+TEST(deadline_covers_child_setup_status_and_reaps_timeout) {
+    const char *argv[] = {"true", NULL};
+    run_opts_t opts;
+    run_result_t result;
+    int64_t started = test_monotonic_ms();
+
+    memset(&opts, 0, sizeof(opts));
+    CHECK_EQ_INT(run_deadline_after_millis(80, &opts.deadline_millis), 0);
+    opts.use_deadline = true;
+    run_test_set_child_setup_delay(2000);
+    clear_error();
+    errno = 0;
+    CHECK_EQ_INT(run_argv(argv, &opts, &result), -1);
+    int returned_errno = errno;
+    int64_t elapsed = test_monotonic_ms() - started;
+    run_test_set_child_setup_delay(0);
+
+    CHECK_EQ_INT(returned_errno, ETIMEDOUT);
+    CHECK(result.spawned);
+    CHECK(result.timed_out);
+    CHECK_EQ_INT(result.term_signal, SIGKILL);
+    CHECK(elapsed >= 0 && elapsed < 1000);
+    CHECK(strstr(get_last_error()->message, "deadline expired") != NULL);
+}
+
+static void check_pause_deadline(bool close_stdout) {
+    const char *argv[] = {
+        g_self_path,
+        close_stdout ? "--ar14-deadline-close-stdout"
+                     : "--ar14-deadline-pause",
+        NULL
+    };
+    char output[32];
+    run_opts_t opts;
+    run_result_t result;
+    int64_t started = test_monotonic_ms();
+
+    memset(&opts, 0, sizeof(opts));
+    opts.out = output;
+    opts.out_size = sizeof(output);
+    CHECK_EQ_INT(run_deadline_after_millis(100, &opts.deadline_millis), 0);
+    opts.use_deadline = true;
+    errno = 0;
+    clear_error();
+    CHECK_EQ_INT(run_argv(argv, &opts, &result), -1);
+    int returned_errno = errno;
+    int64_t elapsed = test_monotonic_ms() - started;
+
+    CHECK_EQ_INT(returned_errno, ETIMEDOUT);
+    CHECK(result.spawned);
+    CHECK(result.timed_out);
+    CHECK_EQ_INT(result.term_signal, SIGKILL);
+    CHECK(elapsed >= 0 && elapsed < 1000);
+}
+
+TEST(deadline_kills_and_reaps_hung_child_with_open_capture) {
+    check_pause_deadline(false);
+}
+
+TEST(deadline_kills_and_reaps_hung_child_after_capture_eof) {
+    check_pause_deadline(true);
+}
+
+TEST(poll_failure_kills_and_reaps_before_reporting_primary_errno) {
+    const char *argv[] = {g_self_path, "--ar14-deadline-pause", NULL};
+    run_opts_t opts;
+    run_result_t result;
+    int64_t started = test_monotonic_ms();
+
+    memset(&opts, 0, sizeof(opts));
+    CHECK_EQ_INT(run_deadline_after_millis(1000, &opts.deadline_millis), 0);
+    opts.use_deadline = true;
+    run_test_set_poll_failure(2, EIO);
+    clear_error();
+    errno = 0;
+    CHECK_EQ_INT(run_argv(argv, &opts, &result), -1);
+    int returned_errno = errno;
+    int64_t elapsed = test_monotonic_ms() - started;
+
+    CHECK_EQ_INT(returned_errno, EIO);
+    CHECK(result.spawned);
+    CHECK(!result.timed_out);
+    CHECK_EQ_INT(result.term_signal, SIGKILL);
+    CHECK(elapsed >= 0 && elapsed < 750);
+    CHECK(strstr(get_last_error()->message,
+                 "subprocess pipe I/O failed") != NULL);
+}
+
+TEST(poll_failure_closes_open_input_and_capture_before_reaping) {
+    static const char input[] = "input remains pending";
+    const char *argv[] = {g_self_path, "--ar14-deadline-pause", NULL};
+    char output[16];
+    run_opts_t opts;
+    run_result_t result;
+    int64_t started = test_monotonic_ms();
+
+    memset(&opts, 0, sizeof(opts));
+    opts.input = input;
+    opts.input_len = sizeof(input) - 1;
+    opts.out = output;
+    opts.out_size = sizeof(output);
+    run_test_set_poll_failure(1, EIO);
+    clear_error();
+    errno = 0;
+    CHECK_EQ_INT(run_argv(argv, &opts, &result), -1);
+    int returned_errno = errno;
+    int64_t elapsed = test_monotonic_ms() - started;
+
+    CHECK_EQ_INT(returned_errno, EIO);
+    CHECK(result.spawned);
+    CHECK_EQ_INT(result.term_signal, SIGKILL);
+    CHECK_EQ_INT(result.out_len, 0);
+    CHECK_STR_EQ(output, "");
+    CHECK(elapsed >= 0 && elapsed < 750);
+    CHECK(strstr(get_last_error()->message,
+                 "subprocess pipe I/O failed") != NULL);
+}
+
+TEST(relay_eof_does_not_hide_descendant_held_capture) {
+    const char *argv[] = {g_self_path, "--ar11-quiet-holder", NULL};
+    char output[16];
+    run_opts_t opts;
+    run_result_t result;
+    int64_t started = test_monotonic_ms();
+
+    memset(&opts, 0, sizeof(opts));
+    opts.out = output;
+    opts.out_size = sizeof(output);
+    clear_error();
+    CHECK_EQ_INT(run_argv(argv, &opts, &result), -1);
+    int64_t elapsed = test_monotonic_ms() - started;
+
+    CHECK(result.spawned);
+    CHECK_EQ_INT(result.exit_code, 0);
+    CHECK_EQ_INT(result.out_len, 0);
+    CHECK(elapsed >= 180 && elapsed < 1000);
+    CHECK(strstr(get_last_error()->message,
+                 "remained open after the direct child") != NULL);
+}
+
+static void fail_final_deadline_observation(pid_t supervisor_pid) {
+    (void)supervisor_pid;
+    /* After release: child-status EOF, one runner-loop observation, then the
+     * final post-loop observation covered by this fault. */
+    run_test_set_monotonic_failure(3, EIO);
+}
+
+TEST(final_deadline_clock_failure_preserves_reaped_exit_status) {
+    const char *argv[] = {"true", NULL};
+    run_opts_t opts;
+    run_result_t result;
+
+    memset(&opts, 0, sizeof(opts));
+    opts.use_deadline = true;
+    opts.deadline_millis = INT64_MAX;
+    run_test_set_pre_group_release_hook(fail_final_deadline_observation);
+    clear_error();
+    errno = 0;
+    CHECK_EQ_INT(run_argv(argv, &opts, &result), -1);
+
+    CHECK_EQ_INT(errno, EIO);
+    CHECK(result.spawned);
+    CHECK(!result.timed_out);
+    CHECK_EQ_INT(result.exit_code, 0);
+    CHECK_EQ_INT(result.term_signal, 0);
+    CHECK(strstr(get_last_error()->message,
+                 "cannot observe monotonic deadline while running child") !=
+          NULL);
+}
+
+/* Leave enough launch headroom for a contended scheduler while remaining
+ * below the runner's 250 ms retained-capture grace that these tests preempt. */
+TEST(global_deadline_preempts_descendant_capture_grace) {
+    const char *argv[] = {"sh", "-c", "sleep 2 &", NULL};
+    char output[32];
+    run_opts_t opts;
+    run_result_t result;
+    int64_t started = test_monotonic_ms();
+
+    memset(&opts, 0, sizeof(opts));
+    opts.out = output;
+    opts.out_size = sizeof(output);
+    opts.stderr_to_devnull = true;
+    CHECK_EQ_INT(run_deadline_after_millis(200, &opts.deadline_millis), 0);
+    opts.use_deadline = true;
+    errno = 0;
+    CHECK_EQ_INT(run_argv(argv, &opts, &result), -1);
+    int returned_errno = errno;
+    int64_t elapsed = test_monotonic_ms() - started;
+
+    CHECK_EQ_INT(returned_errno, ETIMEDOUT);
+    CHECK(result.spawned);
+    CHECK(result.timed_out);
+    CHECK_EQ_INT(result.exit_code, 0);
+    CHECK(elapsed >= 0 && elapsed < 750);
+}
+
+TEST(global_deadline_survives_continuous_descendant_output) {
+    const char *argv[] = {"sh", "-c", "yes x &", NULL};
+    char output[32];
+    run_opts_t opts;
+    run_result_t result;
+    int64_t started = test_monotonic_ms();
+
+    memset(&opts, 0, sizeof(opts));
+    opts.out = output;
+    opts.out_size = sizeof(output);
+    opts.stderr_to_devnull = true;
+    CHECK_EQ_INT(run_deadline_after_millis(200, &opts.deadline_millis), 0);
+    opts.use_deadline = true;
+    errno = 0;
+    CHECK_EQ_INT(run_argv(argv, &opts, &result), -1);
+    int returned_errno = errno;
+    int64_t elapsed = test_monotonic_ms() - started;
+
+    CHECK_EQ_INT(returned_errno, ETIMEDOUT);
+    CHECK(result.spawned);
+    CHECK(result.timed_out);
+    CHECK(result.out_truncated);
+    CHECK_EQ_INT(result.exit_code, 0);
+    CHECK(elapsed >= 0 && elapsed < 750);
+}
+
+TEST(global_deadline_survives_repeated_poll_interruptions) {
+    const char *argv[] = {g_self_path, "--ar14-deadline-pause", NULL};
+    struct sigaction original_action;
+    struct sigaction action;
+    struct itimerval timer;
+    struct itimerval stopped = {{0, 0}, {0, 0}};
+    run_opts_t opts;
+    run_result_t result;
+
+    CHECK_EQ_INT(sigaction(SIGALRM, NULL, &original_action), 0);
+    memset(&action, 0, sizeof(action));
+    action.sa_handler = periodic_alarm_handler;
+    CHECK_EQ_INT(sigemptyset(&action.sa_mask), 0);
+    CHECK_EQ_INT(sigaction(SIGALRM, &action, NULL), 0);
+    memset(&timer, 0, sizeof(timer));
+    timer.it_value.tv_usec = 5000;
+    timer.it_interval.tv_usec = 5000;
+    g_periodic_alarm_calls = 0;
+    CHECK_EQ_INT(setitimer(ITIMER_REAL, &timer, NULL), 0);
+
+    memset(&opts, 0, sizeof(opts));
+    CHECK_EQ_INT(run_deadline_after_millis(100, &opts.deadline_millis), 0);
+    opts.use_deadline = true;
+    errno = 0;
+    CHECK_EQ_INT(run_argv(argv, &opts, &result), -1);
+    int returned_errno = errno;
+    CHECK_EQ_INT(setitimer(ITIMER_REAL, &stopped, NULL), 0);
+    CHECK_EQ_INT(sigaction(SIGALRM, &original_action, NULL), 0);
+
+    CHECK_EQ_INT(returned_errno, ETIMEDOUT);
+    CHECK(result.timed_out);
+    CHECK_EQ_INT(result.term_signal, SIGKILL);
+    CHECK(g_periodic_alarm_calls >= 5);
+}
+
+TEST(clock_failure_and_rollback_fail_closed_without_timeout_claim) {
+    const char *argv[] = {"true", NULL};
+    run_opts_t opts;
+    run_result_t result;
+
+    memset(&opts, 0, sizeof(opts));
+    opts.use_deadline = true;
+    opts.deadline_millis = INT64_MAX;
+    run_test_set_monotonic_failure(1, EIO);
+    errno = 0;
+    CHECK_EQ_INT(run_argv(argv, &opts, &result), -1);
+    CHECK_EQ_INT(errno, EIO);
+    CHECK(!result.spawned);
+    CHECK(!result.timed_out);
+    CHECK(strstr(get_last_error()->message,
+                 "cannot observe monotonic deadline") != NULL);
+
+    run_test_set_monotonic_rollback(2, 10000);
+    errno = 0;
+    CHECK_EQ_INT(run_argv(argv, &opts, &result), -1);
+    CHECK_EQ_INT(errno, ERANGE);
+    CHECK(!result.spawned);
+    CHECK(!result.timed_out);
+    CHECK(strstr(get_last_error()->message,
+                 "monotonic clock moved backwards") != NULL);
+
+    /* Both one-shot hooks self-clear; an ordinary deadline remains usable. */
+    CHECK_EQ_INT(run_deadline_after_millis(1000, &opts.deadline_millis), 0);
+    CHECK_EQ_INT(run_argv(argv, &opts, &result), 0);
+    CHECK(result.spawned);
+    CHECK(!result.timed_out);
+    CHECK_EQ_INT(result.exit_code, 0);
 }
 
 /* L21 safety matrix: sparse inherited descriptors must be absent under every
@@ -1120,6 +2778,24 @@ int main(int argc, char **argv) {
     if (argc == 2 && strcmp(argv[1], "--ar11-quiet-holder") == 0) {
         return quiet_capture_holder_main();
     }
+    if (argc == 2 && strcmp(argv[1], "--ar14-deadline-pause") == 0) {
+        return deadline_pause_main(false);
+    }
+    if (argc == 2 &&
+        strcmp(argv[1], "--ar14-deadline-close-stdout") == 0) {
+        return deadline_pause_main(true);
+    }
+    if (argc == 3 &&
+        strcmp(argv[1], "--ar14-rollback-heartbeat") == 0) {
+        return rollback_heartbeat_main(argv[2]);
+    }
+    if (argc == 2 &&
+        strcmp(argv[1], "--ar14-pending-signal-mask-probe") == 0) {
+        /* This probe observes signal state at executable entry. Bypass
+         * sanitizer/stdio exit finalizers so they cannot alter or wait on the
+         * deliberately blocked pending signal after the observation. */
+        _exit(pending_signal_mask_probe_main());
+    }
 
     error_init(LOG_LEVEL_WARNING, NULL);
     if (argc != 1 || !realpath(argv[0], g_self_path)) {
@@ -1132,17 +2808,52 @@ int main(int argc, char **argv) {
     RUN_TEST(sigpipe_initial_pending_instance_survives_no_input_execution);
     RUN_TEST(sigpipe_initial_pending_instance_survives_epipe);
     RUN_TEST(sigpipe_runner_generated_epipe_leaves_no_pending_instance);
+    RUN_TEST(bounded_pipe_read_times_out_while_writer_remains_open);
     RUN_TEST(runner_fails_before_spawn_under_fd_exhaustion);
     RUN_TEST(child_setup_status_is_reported_explicitly);
+    RUN_TEST(process_group_supervisor_setup_failure_is_truthful_and_reaped);
+    RUN_TEST(one_silent_pre_ready_supervisor_death_retries_before_execution);
+    RUN_TEST(repeated_silent_pre_ready_supervisor_death_is_bounded_and_truthful);
+    RUN_TEST(supervisor_stage_failures_are_truthful_reaped_and_one_shot);
+    RUN_TEST(pre_release_group_death_cannot_sigpipe_parent);
     RUN_TEST(early_stdin_close_is_a_runner_failure);
     RUN_TEST(full_binary_stdin_delivery_remains_successful);
     RUN_TEST(intentional_zero_byte_input_delivers_eof_successfully);
     RUN_TEST(default_stdin_is_devnull_and_parent_input_is_preserved);
     RUN_TEST(default_stdout_is_devnull_not_parent_stdout);
     RUN_TEST(descendant_held_capture_pipe_returns_within_grace);
+    RUN_TEST(timeout_kills_the_proven_group_grandchild);
+    RUN_TEST(successful_leader_with_stdout_holder_kills_group_before_pid_release);
+    RUN_TEST(closed_stdio_daemon_like_descendant_remains_supported);
+    RUN_TEST(repeated_rollback_signal_terminates_group_descendant);
+    RUN_TEST(supervisor_only_pending_termination_reaches_gated_worker_once);
+    RUN_TEST(post_replay_group_termination_reaches_worker_once);
+    RUN_TEST(hangup_and_quit_relays_are_parent_observable_once);
+    RUN_TEST(pending_signal_is_not_published_when_replay_setup_fails);
+    RUN_TEST(supervisor_only_pending_stop_fails_closed_without_hanging);
+    RUN_TEST(post_replay_supervisor_stop_handler_fails_group_closed);
+    RUN_TEST(supervisor_injection_preserves_inherited_ignored_signal);
+    RUN_TEST(supervisor_only_pending_blocked_signal_survives_exec);
+    RUN_TEST(pty_interrupt_targets_child_group_and_restores_foreground_owner);
+    RUN_TEST(pty_stop_fails_closed_without_hanging_and_restores_foreground_owner);
     RUN_TEST(interrupted_poll_still_advances_child_capture_deadline);
     RUN_TEST(continuous_descendant_output_cannot_starve_capture_deadline);
     RUN_TEST(ordinary_buffered_capture_is_fully_drained);
+    RUN_TEST(deadline_helper_rejects_invalid_and_overflowing_durations);
+    RUN_TEST(monotonic_millisecond_conversion_checks_quotient_remainder);
+    RUN_TEST(expired_and_negative_deadlines_fail_before_spawn);
+    RUN_TEST(invalid_invocation_precedes_expired_deadline);
+    RUN_TEST(deadline_covers_child_setup_status_and_reaps_timeout);
+    RUN_TEST(deadline_kills_and_reaps_hung_child_with_open_capture);
+    RUN_TEST(deadline_kills_and_reaps_hung_child_after_capture_eof);
+    RUN_TEST(poll_failure_kills_and_reaps_before_reporting_primary_errno);
+    RUN_TEST(poll_failure_closes_open_input_and_capture_before_reaping);
+    RUN_TEST(relay_eof_does_not_hide_descendant_held_capture);
+    RUN_TEST(final_deadline_clock_failure_preserves_reaped_exit_status);
+    RUN_TEST(global_deadline_preempts_descendant_capture_grace);
+    RUN_TEST(global_deadline_survives_continuous_descendant_output);
+    RUN_TEST(global_deadline_survives_repeated_poll_interruptions);
+    RUN_TEST(clock_failure_and_rollback_fail_closed_without_timeout_claim);
     RUN_TEST(sparse_parent_descriptors_close_in_auto_branch);
     RUN_TEST(sparse_parent_descriptors_close_in_snapshot_branch);
     RUN_TEST(sparse_parent_descriptors_close_in_numeric_branch);

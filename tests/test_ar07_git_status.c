@@ -1,6 +1,6 @@
 /* AR-07 T14: trusted persisted SSH command and truthful Git status. */
 #ifdef __linux__
-#define _POSIX_C_SOURCE 200809L
+#define _XOPEN_SOURCE 700
 #endif
 
 #include "test.h"
@@ -126,6 +126,7 @@ static int restore_trusted_gpg(void) {
  * run the already-provisioned GnuPG binary from a private trusted fixture.
  * This preserves the real process and only changes its executable pathname. */
 static int activate_trusted_gpg_copy(const char *source_path) {
+    char canonical_source[MAX_PATH_LEN];
     char destination[MAX_PATH_LEN];
     char resolved[MAX_PATH_LEN];
     struct stat source_stat;
@@ -155,6 +156,9 @@ static int activate_trusted_gpg_copy(const char *source_path) {
         errno = ENOEXEC;
         return -1;
     }
+    /* copy_file() deliberately rejects a symlink source. Resolve the
+     * package-manager link as data, then copy without executing it. */
+    if (!realpath(source_path, canonical_source)) return -1;
     if (path) {
         saved_path = strdup(path);
         if (!saved_path) return -1;
@@ -163,7 +167,7 @@ static int activate_trusted_gpg_copy(const char *source_path) {
                             "gsw-ar11-gpg-bin") ||
         safe_snprintf(destination, sizeof(destination), "%s/gpg",
                       trusted_gpg_dir) != 0 ||
-        copy_file(source_path, destination) != 0 ||
+        copy_file(canonical_source, destination) != 0 ||
         chmod(destination, 0700) != 0) {
         free(saved_path);
         remove_trusted_gpg_fixture();
@@ -1859,6 +1863,116 @@ static int capture_signing_status(const account_t *account,
         status_size);
 }
 
+TEST(active_status_requires_managed_openpgp_program_origin) {
+    static const char canonical_key[] =
+        "0123456789ABCDEF0123456789ABCDEF89ABCDEF";
+    static const struct {
+        const char *scope;
+        const char *origin;
+        bool append_override;
+        bool expected_match;
+    } cases[] = {
+        { NULL, NULL, false, true },
+        { "command", "command line:", true, false },
+        { "local", NULL, true, false },
+        { "worktree", NULL, true, false },
+        { "global", "file:/ar14/foreign-global.gitconfig", true, false }
+    };
+    account_t account;
+    char expected_program[MAX_PATH_LEN];
+
+    if (gpg_manager_resolve_executable(expected_program,
+                                       sizeof(expected_program)) != 0) {
+        TS_SKIP("gpg", "no trusted OpenPGP executable on this host");
+    }
+
+    memset(&account, 0, sizeof(account));
+    account.id = 14;
+    bind_status_test_incarnation(&account);
+    CHECK_EQ_INT(safe_strncpy(account.name, "Origin Bound Signing",
+                              sizeof(account.name)), 0);
+    CHECK_EQ_INT(safe_strncpy(account.email,
+                              "origin-bound@example.test",
+                              sizeof(account.email)), 0);
+    account.gpg_enabled = true;
+    account.gpg_signing_enabled = true;
+    CHECK_EQ_INT(safe_strncpy(account.gpg_key_id, "0x89abcdef",
+                              sizeof(account.gpg_key_id)), 0);
+
+    for (size_t i = 0; i < sizeof(cases) / sizeof(cases[0]); i++) {
+        gitswitch_ctx_t context;
+        command_runner_fn previous;
+        char managed_origin[MAX_PATH_LEN] = "";
+        char status[8192];
+        const char *override_origin;
+        int install_rc;
+        int status_rc;
+
+        memset(&context, 0, sizeof(context));
+        context.account_count = 1;
+        context.accounts[0] = account;
+        context.current_account = &context.accounts[0];
+        install_rc = install_signing_publication(
+            &context, &context.accounts[0], canonical_key,
+            expected_program, PUBLICATION_STATE_PUBLISHED, managed_origin,
+            sizeof(managed_origin));
+        CHECK_EQ_INT(install_rc, 0);
+        if (install_rc != 0) continue;
+
+        fake_listing_len = 0;
+        fake_listing_calls = 0;
+        fake_git_calls = 0;
+        fake_non_git_calls = 0;
+        fake_execution_failure = false;
+        fake_repository = false;
+        CHECK(fake_append_record("global", managed_origin, "user.name",
+                                 account.name, strlen(account.name)));
+        CHECK(fake_append_record("global", managed_origin, "user.email",
+                                 account.email, strlen(account.email)));
+        CHECK(fake_append_record("global", managed_origin,
+                                 "user.signingkey", canonical_key,
+                                 strlen(canonical_key)));
+        CHECK(fake_append_record("global", managed_origin,
+                                 "commit.gpgsign", "true",
+                                 strlen("true")));
+        CHECK(fake_append_record("global", managed_origin,
+                                 GIT_CONFIG_GPG_OPENPGP_PROGRAM,
+                                 expected_program,
+                                 strlen(expected_program)));
+        if (cases[i].append_override) {
+            /* Local/worktree reuse the managed path deliberately: those
+             * rows fail only if scope attribution is enforced. The foreign
+             * global row fails only if origin attribution is enforced. */
+            override_origin =
+                cases[i].origin ? cases[i].origin : managed_origin;
+            CHECK(fake_append_record(
+                cases[i].scope, override_origin,
+                GIT_CONFIG_GPG_OPENPGP_PROGRAM, expected_program,
+                strlen(expected_program)));
+        }
+
+        git_ops_test_reset_caches();
+        previous = run_set_runner(status_fake_runner);
+        status_rc =
+            capture_status_output_for(&context, status, sizeof(status));
+        run_set_runner(previous);
+        git_ops_test_reset_caches();
+
+        CHECK_EQ_INT(status_rc, 0);
+        CHECK(strstr(status, "Match Status: [ERROR]") == NULL);
+        if (cases[i].expected_match) {
+            CHECK(strstr(status, "Match Status: [OK]") != NULL);
+            CHECK(strstr(status,
+                         "Effective OpenPGP Program: [MATCH]") != NULL);
+        } else {
+            CHECK(strstr(status, "Match Status: [WARN]") != NULL);
+            CHECK(strstr(status,
+                         "Effective OpenPGP Program: [MISMATCH]") != NULL);
+        }
+        CHECK_EQ_INT(fake_non_git_calls, 0);
+    }
+}
+
 TEST(active_status_includes_every_selected_signing_field) {
     static const char canonical_key[] =
         "0123456789ABCDEF0123456789ABCDEF89ABCDEF";
@@ -2955,6 +3069,7 @@ TEST_MAIN_BEGIN()
     RUN_TEST(active_ssh_without_publication_fails_before_any_git_probe);
     RUN_TEST(active_ssh_status_uses_saved_program_and_exact_destination);
     RUN_TEST(active_status_propagates_required_key_inspection_failure);
+    RUN_TEST(active_status_requires_managed_openpgp_program_origin);
     RUN_TEST(active_status_includes_every_selected_signing_field);
     RUN_TEST(edited_short_selector_cannot_reuse_historical_fingerprint);
     RUN_TEST(historical_short_selector_without_publication_is_incomplete);

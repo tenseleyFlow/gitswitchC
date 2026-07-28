@@ -1,6 +1,6 @@
 /* AR-09 M15: real-GnuPG evidence that exit status 2 is not a result type. */
 #ifdef __linux__
-#define _POSIX_C_SOURCE 200809L
+#define _XOPEN_SOURCE 700
 #endif
 
 #include "test.h"
@@ -62,6 +62,7 @@ static int restore_trusted_gpg(void) {
  * private trusted fixture class used by the other external-runtime tests.
  * The copy remains a real GnuPG process; only its executable pathname changes. */
 static int activate_trusted_gpg_copy(const char *source_path) {
+    char canonical_source[MAX_PATH_LEN];
     char destination[MAX_PATH_LEN];
     const char *path = getenv("PATH");
     char *saved_path = NULL;
@@ -77,6 +78,10 @@ static int activate_trusted_gpg_copy(const char *source_path) {
     }
     preflight_rc = run_gpg_version_path(source_path);
     if (preflight_rc <= 0) return preflight_rc;
+    /* Homebrew command entries may be symlinks, while copy_file()
+     * intentionally rejects symlink sources. Resolve the already-executed
+     * fixture command to a regular byte source before copying it. */
+    if (!realpath(source_path, canonical_source)) return -1;
     if (path) {
         saved_path = strdup(path);
         if (!saved_path) return -1;
@@ -86,7 +91,7 @@ static int activate_trusted_gpg_copy(const char *source_path) {
                             "gsw-ar09-gpg-bin") ||
         safe_snprintf(destination, sizeof(destination), "%s/gpg",
                       g_trusted_gpg_dir) != 0 ||
-        copy_file(source_path, destination) != 0 ||
+        copy_file(canonical_source, destination) != 0 ||
         chmod(destination, 0700) != 0) {
         free(saved_path);
         return -1;

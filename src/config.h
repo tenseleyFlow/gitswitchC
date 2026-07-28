@@ -58,7 +58,10 @@ typedef enum {
     /* Exact-byte reproof checkpoint immediately before its final descriptor
      * generation observation. A test callback may expose a ctime-only step
      * and return false. */
-    CONFIG_IO_DOCUMENT_REPROOF_AFTER_BYTES
+    CONFIG_IO_DOCUMENT_REPROOF_AFTER_BYTES,
+    /* Rollback checkpoint after the before-image rename or unlink and the
+     * successful parent-directory sync, but before final verification. */
+    CONFIG_IO_STATE_ROLLBACK_AFTER_DIR_SYNC
 } config_io_boundary_t;
 
 typedef bool (*config_io_fault_fn)(config_io_boundary_t boundary);
@@ -142,6 +145,12 @@ int config_init_names(gitswitch_ctx_t *ctx);
  */
 int config_load(gitswitch_ctx_t *ctx, const char *config_path);
 
+/* Re-prove that the path recorded in `ctx` still names the exact accounts
+ * document loaded into it. This is observational: it neither locks nor writes
+ * any path. Recovery callers that require serialization must hold the ordinary
+ * config write lock across this check and the operation it authorizes. */
+int config_revalidate_loaded_source(const gitswitch_ctx_t *ctx);
+
 /**
  * Save configuration to TOML file
  * - Creates backup of existing config
@@ -162,11 +171,13 @@ int config_load(gitswitch_ctx_t *ctx, const char *config_path);
  * explicitly bounded to the last check-to-rename interval.
  */
 int config_save(gitswitch_ctx_t *ctx, const char *config_path);
-/* Full-document transactional save. `config_installed` becomes true once the
- * new accounts.toml inode is renamed into place, including a later directory-
- * sync failure whose visible result must be treated as installed/uncertain.
- * On complete durable success, the mutable context is rebound to the exact
- * installed source generation so another save from that context is admitted. */
+/* Full-document transactional save. `config_installed` latches true when the
+ * accounts.toml rename commits and no later canonical reproof, substitution,
+ * or directory-sync failure revokes that fact. Such failures distinguish an
+ * installed-but-no-longer-current or installed-but-durability-uncertain result
+ * from a pre-install failure. Only complete durable success rebinds the mutable
+ * context to the exact installed source generation so another save from that
+ * context is admitted. */
 int config_save_transactional(gitswitch_ctx_t *ctx,
                               const char *config_path,
                               bool *config_installed);
@@ -233,12 +244,41 @@ typedef struct {
     char account_incarnation[ACCOUNT_INCARNATION_LEN];
 } config_retirement_owner_t;
 
+/* Optional, remove-only durable obligation to retire one managed OpenSSH
+ * alias from the exact HOME namespace in which it was installed. `known`
+ * distinguishes an explicit no-obligation marker (including legacy RESET)
+ * from a v1 REMOVE projection whose SSH obligation is unknowable. */
+typedef struct {
+    bool known;
+    bool present;
+    char ssh_host_alias[MAX_NAME_LEN];
+    char home_path[MAX_PATH_LEN];
+    publication_identity_t home_identity;
+    publication_identity_t ssh_directory_identity;
+} config_retirement_ssh_alias_obligation_t;
+
 typedef struct {
     char config_path[MAX_PATH_LEN];
+    /* A present identity replaces matching PUBLISHED records' post_config.
+     * A canonical all-zero absent identity participates in exact-set
+     * accounting while preserving each matching record's prior identity. */
     publication_identity_t post_config;
 } config_retirement_destination_t;
 
 typedef struct config_retirement_guard config_retirement_guard_t;
+typedef int (*config_retirement_guard_precommit_fn)(void *context);
+
+/* Token-free projection of one active retirement marker. `valid` is true
+ * only for a stable canonical incomplete generation; absent namespaces and
+ * exact completed marker/certificate pairs return a zeroed projection. */
+typedef struct {
+    bool valid;
+    unsigned int marker_version;
+    config_retirement_kind_t kind;
+    config_retirement_owner_t owners[MAX_ACCOUNTS];
+    size_t owner_count;
+    config_retirement_ssh_alias_obligation_t ssh_alias_obligation;
+} config_retirement_recovery_t;
 
 /* Under an internally owned retirement lifecycle lock, install a fresh
  * incomplete generation or adopt an active generation only when its kind and
@@ -255,6 +295,40 @@ typedef struct config_retirement_guard config_retirement_guard_t;
 int config_retirement_guard_install_or_adopt(
     const char *config_path, config_retirement_kind_t kind,
     const config_retirement_owner_t *owners, size_t owner_count,
+    config_retirement_guard_t **guard);
+
+int config_retirement_guard_install_or_adopt_with_ssh_alias_obligation(
+    const char *config_path, config_retirement_kind_t kind,
+    const config_retirement_owner_t *owners, size_t owner_count,
+    const config_retirement_ssh_alias_obligation_t *obligation,
+    config_retirement_guard_t **guard);
+
+/* Read one stable, token-free recovery projection without creating, locking,
+ * chmod'ing, synchronizing, or repairing any namespace object. An exact
+ * byte-identical transition copy remains projectable so adopt() can converge
+ * an interrupted clear; foreign/malformed stages, unsafe or unstable state,
+ * and legacy residue fail closed. */
+int config_retirement_guard_recovery_probe(
+    const char *config_path,
+    config_retirement_recovery_t *recovery);
+
+/* Adopt only an already-active canonical marker whose operation and complete
+ * canonical owner set match exactly. This entry point never creates or rotates
+ * a marker. Its only reconciliation is removing a jointly revalidated stage
+ * that is byte-identical to that exact marker under the existing lifecycle
+ * lock; foreign/malformed stages remain untouched. Absence, an already-settled
+ * pair without such a stage, legacy residue, mismatched state, or namespace
+ * replacement fails closed. The returned handle owns the lifecycle lock and
+ * must be passed to clear() or abandon(). */
+int config_retirement_guard_adopt(
+    const char *config_path, config_retirement_kind_t kind,
+    const config_retirement_owner_t *owners, size_t owner_count,
+    config_retirement_guard_t **guard);
+
+int config_retirement_guard_adopt_with_ssh_alias_obligation(
+    const char *config_path, config_retirement_kind_t kind,
+    const config_retirement_owner_t *owners, size_t owner_count,
+    const config_retirement_ssh_alias_obligation_t *obligation,
     config_retirement_guard_t **guard);
 
 /* Read-only retirement gate. On return 0, `blocked` is false only when both
@@ -275,6 +349,25 @@ int config_retirement_guard_probe(const char *config_path, bool *blocked);
 bool config_retirement_guard_was_created(
     const config_retirement_guard_t *guard);
 
+/* Re-prove that a lock-owning handle still names its exact incomplete marker
+ * generation. This is read-only: it neither reacquires the lifecycle lock nor
+ * mutates, clears, or frees the handle or any retirement namespace record.
+ * Replacement, byte/token change, stage/certificate insertion, removal or
+ * replacement, settlement, or directory namespace replacement fails closed.
+ * A pre-existing completion certificate is bound as part of the observed
+ * namespace generation, and a handle that successfully prepared its exact
+ * completion stage revalidates that stage as part of the owned generation. */
+int config_retirement_guard_revalidate(
+    const config_retirement_guard_t *guard);
+
+/* Durably materialize and jointly re-prove the exact owned completion stage
+ * while the fixed transition name keeps probes blocked. On success the handle
+ * is prepared for a final clear whose stage-to-certificate rename is the
+ * logical commit. Any failure retains the handle and any created blocking
+ * stage for retry or normal fresh-process adoption. */
+int config_retirement_guard_prepare_clear(
+    config_retirement_guard_t *guard);
+
 /* Complete only the exact owned marker generation (inode, complete bytes, and
  * embedded token) by atomically replacing the fixed completion certificate;
  * the canonical blocker is never renamed or deleted. Before certificate
@@ -286,10 +379,117 @@ bool config_retirement_guard_was_created(
  */
 int config_retirement_guard_clear(config_retirement_guard_t **guard);
 
+/* As clear(), with an optional prepared-generation commit barrier. A non-NULL
+ * barrier is valid only after prepare_clear() succeeds. The exact marker,
+ * completion, stage, named lifecycle lock, and pinned-directory proof runs
+ * before the callback. Returning zero authorizes the terminal
+ * stage-to-certificate rename; returning nonzero preserves the callback's
+ * diagnostic and errno and retains the prepared handle and blocking stage for
+ * retry. `context` is borrowed only for the synchronous call. The callback
+ * must not mutate the retirement namespace, call retirement-guard lifecycle
+ * APIs, or retain the borrowed context. A later pre-rename failure can cause a
+ * successful callback to be invoked again on retry, so it must be idempotent.
+ * After callback success, publication uses a no-overwrite namespace
+ * operation and exact generation proof; a raced stage or certificate is
+ * preserved and the prepared handle remains blocking. Once that proof
+ * succeeds, no additional callback or fallible acknowledgement intervenes
+ * before destruction of the in-memory capability. A NULL barrier retains
+ * clear() compatibility for both prepared and unprepared handles. */
+int config_retirement_guard_clear_with_barrier(
+    config_retirement_guard_t **guard,
+    config_retirement_guard_precommit_fn barrier, void *context);
+
 /* Release the lifecycle lock and free/NULL the handle without namespace
- * repair. clear() never removes the canonical marker; a failed transition may
- * retain the one fixed stage, and both states remain probe-blocking. */
+ * repair. A fork child disposing an inherited handle closes only its
+ * descriptor references and child-local owner token; it never unlocks the
+ * parent's shared flock description. This foreign-child disposal remains
+ * valid when fork occurred inside a commit barrier; the creating process
+ * still cannot abandon or reenter its own barrier. clear() never removes the
+ * canonical marker; a failed transition may retain the one fixed stage, and
+ * both states remain probe-blocking. */
 void config_retirement_guard_abandon(config_retirement_guard_t **guard);
+
+/* Durable recovery owner for a switch whose active-state before/post image
+ * could not be classified. The canonical private marker binds the exact
+ * accounts.toml generation, all target fields that affect Git/SSH/GPG live
+ * state, the effective Git scope, and the complete destination set captured
+ * by git_config_snapshot_export_destinations(). */
+typedef struct config_switch_guard config_switch_guard_t;
+
+#define CONFIG_SWITCH_DESTINATION_MAX 3U
+
+typedef struct {
+    bool valid;
+    publication_identity_t source_generation;
+    account_t target;
+    git_scope_t effective_scope;
+    publication_record_t destinations[CONFIG_SWITCH_DESTINATION_MAX];
+    size_t destination_count;
+} config_switch_guard_recovery_t;
+
+/* Install a fresh `.switch-incomplete` generation, or adopt an existing one
+ * only when every account/scope/path field matches and the current destination
+ * still has the recorded directory authority. Mutable directory timestamps
+ * are not identity. `target` must be the exact persisted incarnation in `ctx`;
+ * `destinations` must be the complete, canonical pre-mutation Git destination
+ * set for `effective_scope`: primary first, then any local and worktree
+ * secondary scopes in precedence order. The returned opaque handle owns
+ * `.switch.lock` until clear() or abandon(). */
+int config_switch_guard_install_or_adopt(
+    const gitswitch_ctx_t *ctx, const account_t *target,
+    git_scope_t effective_scope,
+    const publication_record_t *destinations, size_t destination_count,
+    config_switch_guard_t **guard);
+
+/* True only when this invocation durably installed the marker. Adoption of a
+ * pre-existing recovery fence returns false, so rollback cannot accidentally
+ * clear an older unresolved operation. */
+bool config_switch_guard_was_created(
+    const config_switch_guard_t *guard);
+
+/* Reconcile only the two restart-safe pre-intent namespace shapes under the
+ * private switch lifecycle lock: a lone stable private stage is removed, and
+ * an exact stage/marker hard-link pair left by the portable no-replace
+ * fallback is reduced to the canonical marker. No live identity mutation can
+ * precede either shape. A normalized distinct pair is accepted only when both
+ * entries are independently canonical and their complete serialized bytes
+ * and decoded models are equal. Unsafe, changing, or unequal pairs fail
+ * closed.
+ * Callers that mutate account state must serialize this operation with the
+ * ordinary configuration write lock and probe again before mutation. */
+int config_switch_guard_reconcile_preintent(
+    const char *config_path);
+
+/* Read-only, fail-closed startup gate. `blocked` remains true for a canonical
+ * marker or malformed/unsafe/unstable state. A stable private stage-only
+ * generation, an exact stage/marker hard-link pair, and an independently
+ * canonical normalized pair with byte-identical serialized contents and equal
+ * decoded models are reported unblocked only so a real mutating entry can
+ * acquire the configuration lock, call
+ * config_switch_guard_reconcile_preintent(), and probe again; none of these
+ * shapes authorizes resume. A stable canonical marker is decoded into
+ * `recovery`; absent state returns blocked=false and recovery.valid=false.
+ * This call never creates or repairs filesystem state. */
+int config_switch_guard_probe(
+    const char *config_path, bool *blocked,
+    config_switch_guard_recovery_t *recovery);
+
+/* Remove only the exact marker generation owned by `guard`, synchronize the
+ * pinned directory, and re-prove marker absence before releasing the lock.
+ * Failure retains the handle for checked cleanup or abandon(). */
+int config_switch_guard_clear(config_switch_guard_t **guard);
+
+/* Re-establish and durably prove the exact canonical marker owned by `guard`
+ * after a failed clear may already have unlinked it, then release and NULL the
+ * handle. This is the checked failure-settlement path: success guarantees a
+ * restart can adopt the marker; failure retains the callable handle. */
+int config_switch_guard_retain(config_switch_guard_t **guard);
+
+/* Release the lifecycle lock and free/NULL the handle without changing either
+ * fixed switch-guard namespace entry. A fork child disposing an inherited
+ * handle closes only descriptor references and its child-local owner token;
+ * it cannot unlock the parent's shared flock description. */
+void config_switch_guard_abandon(config_switch_guard_t **guard);
 
 /* Refresh only the Git post-config generation witnesses for PUBLISHED ledger
  * records owned by `owners`. Every matching record must find exactly one
@@ -329,6 +529,16 @@ typedef struct {
     size_t post_image_length;
 } config_resume_hint_snapshot_t;
 
+/* A guarded active-state rollback can fail after either image has become the
+ * stable namespace occupant.  Callers that also own Git/runtime settlement
+ * must branch on the image that is durably current instead of treating every
+ * restore error as permission to roll those other layers back. */
+typedef enum {
+    CONFIG_ACTIVE_ROLLBACK_UNRESOLVED = 0,
+    CONFIG_ACTIVE_ROLLBACK_BEFORE_DURABLE,
+    CONFIG_ACTIVE_ROLLBACK_POST_DURABLE
+} config_active_rollback_state_t;
+
 int config_resume_hint_snapshot_capture(config_resume_hint_snapshot_t *snapshot);
 /* Restore accepts only a snapshot subsequently bound by
  * config_save_active_account_transactional_guarded (or the internal full-save
@@ -336,6 +546,13 @@ int config_resume_hint_snapshot_capture(config_resume_hint_snapshot_t *snapshot)
  * to its caller and is rejected instead of overwriting it. */
 int config_resume_hint_snapshot_restore(
     const config_resume_hint_snapshot_t *snapshot);
+/* Attempt the guarded restore, then prove and synchronize whichever complete
+ * image is currently installed.  Success means state is BEFORE_DURABLE or
+ * POST_DURABLE; UNRESOLVED is always returned with -1 and authorizes neither
+ * the matching account abort nor commit. */
+int config_resume_hint_snapshot_settle(
+    const config_resume_hint_snapshot_t *snapshot,
+    config_active_rollback_state_t *state);
 void config_resume_hint_snapshot_clear(config_resume_hint_snapshot_t *snapshot);
 
 /* Transaction-aware active-account save. config_installed is true once the

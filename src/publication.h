@@ -121,8 +121,11 @@ int publication_record_verify_live_destination(
     const publication_record_t **live_generation);
 bool publication_record_same_destination(const publication_record_t *left,
                                          const publication_record_t *right);
-/* AR-12 H2: capacity reclamation for destinations that provably no longer
- * exist (ENOENT or changed object identity on the recorded anchor). */
+/* Retained for source compatibility with the v1 publication-ledger API.
+ * A live filesystem observation cannot prove that a recorded destination was
+ * permanently deleted: ENOENT and changed identity are both reproducible by
+ * rename-away/restore.  Consequently v1 records are never automatically
+ * classified as absent or reclaimed. */
 bool publication_record_destination_provably_absent(
     const publication_record_t *record);
 size_t publication_ledger_reclaim_absent(publication_ledger_t *ledger);
@@ -151,5 +154,11 @@ int publication_ledger_parse(const unsigned char *data, size_t length,
                              publication_ledger_t *ledger);
 int publication_ledger_serialize(const publication_ledger_t *ledger,
                                  unsigned char **data, size_t *length);
+
+#if defined(GITSWITCH_TESTING) && \
+    defined(GITSWITCH_PUBLICATION_SERIALIZER_TEST_API)
+/* Peak backing allocation used by the most recent serializer call. */
+size_t publication_test_last_serializer_peak_capacity(void);
+#endif
 
 #endif /* PUBLICATION_H */

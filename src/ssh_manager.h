@@ -3,7 +3,9 @@
 #ifndef SSH_MANAGER_H
 #define SSH_MANAGER_H
 
+#include <stdbool.h>
 #include <stdint.h>
+#include <sys/stat.h>
 #include <sys/types.h> /* pid_t: don't rely on the includer's chain for it */
 
 #include "gitswitch.h"
@@ -26,12 +28,44 @@ typedef enum {
     SSH_AGENT_NONE         /* No SSH agent management */
 } ssh_agent_mode_t;
 
+typedef enum {
+    SSH_PROCESS_GENERATION_NONE = 0,
+    SSH_PROCESS_GENERATION_LINUX = 1,
+    SSH_PROCESS_GENERATION_DARWIN = 2,
+    SSH_PROCESS_GENERATION_FREEBSD = 3
+} ssh_process_generation_kind_t;
+
+typedef struct {
+    uint64_t kind;
+    uint64_t boot_hi;
+    uint64_t boot_lo;
+    uint64_t start_hi;
+    uint64_t start_lo;
+} ssh_process_generation_t;
+
+typedef struct {
+    bool valid;
+    struct stat executable_identity;
+    uid_t effective_uid;
+    pid_t socket_peer_pid;
+    uid_t socket_peer_uid;
+    char executable_path[MAX_PATH_LEN];
+} ssh_process_image_t;
+
+typedef struct {
+    pid_t pid;
+    ssh_process_generation_t generation;
+    ssh_process_image_t image;
+} ssh_agent_record_t;
+
 /* SSH configuration structure */
 typedef struct {
     ssh_agent_mode_t mode;
     char agent_socket_path[MAX_PATH_LEN];
     char agent_socket_arg[MAX_PATH_LEN]; /* exact -a argument used to start it */
     pid_t agent_pid;
+    ssh_process_generation_t agent_generation;
+    ssh_process_image_t agent_image;
     bool agent_owned;      /* Whether we started this agent */
     bool key_already_loaded; /* The isolated agent already holds the account key;
                               * reuse avoids a passphrase re-prompt. */
@@ -43,29 +77,44 @@ typedef struct {
  * OWNED means the recorded PID is conclusively the managed ssh-agent and is
  * still alive. UNRELATED means a live PID was conclusively proved to be a
  * different process. GONE means no process remains at that PID. Every failed,
- * inaccessible, truncated, or permission-denied inspection is INDETERMINATE.
- * Only UNRELATED and GONE authorize consuming a recovery sidecar. */
+ * inaccessible or truncated inspection is INDETERMINATE. Linux may still
+ * classify a nondumpable OpenSSH agent as OWNED when its complete durable
+ * launch tuple, process generation, argv, and kernel socket peer all match.
+ * REPLACED means the numeric PID now denotes a different process generation;
+ * it never authorizes signaling, adoption, or recovery-name cleanup. Only
+ * UNRELATED and GONE can authorize process-record cleanup, and callers must
+ * separately prove the paired socket generation dead before consuming it. */
 typedef enum {
     SSH_PROCESS_OWNED,
     SSH_PROCESS_UNRELATED,
     SSH_PROCESS_GONE,
+    SSH_PROCESS_REPLACED,
     SSH_PROCESS_INDETERMINATE
 } ssh_process_outcome_t;
 
 typedef int (*ssh_setenv_fn)(const char *name, const char *value, int overwrite);
-typedef ssh_process_outcome_t (*ssh_reap_fn)(pid_t pid,
+typedef ssh_process_outcome_t (*ssh_reap_fn)(const ssh_agent_record_t *record,
                                              const char *socket_arg,
                                              int runtime_dir_fd);
 typedef ssh_process_outcome_t (*ssh_process_identity_fn)(
-    pid_t pid, const char *socket_arg, int runtime_dir_fd);
+    const ssh_agent_record_t *record, const char *socket_arg,
+    int runtime_dir_fd);
+typedef int (*ssh_process_generation_fn)(
+    pid_t pid, ssh_process_generation_t *generation);
+typedef int (*ssh_process_image_fn)(pid_t pid, ssh_process_image_t *image);
 typedef int (*ssh_process_signal_fn)(pid_t pid, int signal_number);
 typedef int (*ssh_pidfd_open_fn)(pid_t pid);
 typedef int (*ssh_pidfd_signal_fn)(int pidfd, int signal_number);
+typedef int (*ssh_pidfd_poll_fn)(int pidfd, int timeout_ms,
+                                 short *revents);
 typedef struct {
     ssh_process_identity_fn identity;
+    ssh_process_generation_fn generation;
+    ssh_process_image_fn image;
     ssh_process_signal_fn signal;
     ssh_pidfd_open_fn pidfd_open;
     ssh_pidfd_signal_fn pidfd_signal;
+    ssh_pidfd_poll_fn pidfd_poll;
 } ssh_reap_test_ops_t;
 typedef int (*ssh_pid_commit_hook_fn)(int dir_fd, const char *temp_name);
 typedef int (*ssh_namespace_commit_hook_fn)(int dir_fd);
@@ -81,7 +130,9 @@ typedef enum {
     SSH_METADATA_TEST_RESET_QUARANTINE,
     SSH_METADATA_TEST_CONFIG_HOME_CREATE,
     SSH_METADATA_TEST_CONFIG_UNCHANGED_RECHECK,
-    SSH_METADATA_TEST_CONFIG_UNCHANGED_FINAL_RECHECK
+    SSH_METADATA_TEST_CONFIG_UNCHANGED_FINAL_RECHECK,
+    SSH_METADATA_TEST_CONFIG_TEMP_INITIAL_FSTAT,
+    SSH_METADATA_TEST_CONFIG_TEMP_CLEANUP_PREPROOF
 } ssh_metadata_test_stage_t;
 typedef bool (*ssh_metadata_test_hook_fn)(ssh_metadata_test_stage_t stage);
 typedef int (*ssh_key_open_fn)(const char *path, int flags);
@@ -255,7 +306,9 @@ int ssh_inspect_key_file(const char *key_path,
 bool ssh_manager_test_socket_has_key(int dir_fd, const char *socket_arg,
                                      const char *key_path);
 int ssh_manager_test_write_pid_sidecar(int dir_fd, const char *name,
-                                       pid_t pid);
+                                       const ssh_agent_record_t *record);
+int ssh_manager_test_capture_process_generation(
+    pid_t pid, ssh_process_generation_t *generation);
 int ssh_manager_test_publish_current_link(int dir_fd, const char *target);
 int ssh_manager_test_cleanup_current_link(int dir_fd);
 int ssh_manager_test_probe_socket(const char *path, bool *reachable);
@@ -273,6 +326,17 @@ int ssh_configure_host_alias(const account_t *account);
  * committed-state warning, not authorization to roll back adjacent state. */
 int ssh_configure_host_alias_result(
     const account_t *account,
+    ssh_config_publication_state_t *publication);
+
+/* Structured alias-removal result. Always initializes `publication` when it
+ * is non-NULL and rejects a NULL/empty alias as PREINSTALL_FAILED; the legacy
+ * wrapper retains its historical NULL/empty no-op. UNCHANGED means the alias
+ * was already absent and that observed state passed the applicable durability
+ * and final public-namespace checks. A nonzero return with an
+ * installed/uncertain publication is a committed-state warning, not
+ * authorization to restore the removed alias. */
+int ssh_remove_host_alias_result(
+    const char *alias,
     ssh_config_publication_state_t *publication);
 
 /**
@@ -330,11 +394,18 @@ int ssh_manager_current_is_live_for_account(const account_t *account,
                                             bool *live);
 
 /**
- * Tear down isolated SSH agents (kill by recorded PID and remove sockets/PID
- * sidecars). Resets a single account when `account` is a nonempty name
- * accepted by validate_name(); callers must pass the canonical stored account
- * name. Resets all accounts only when `account` is NULL. Invalid non-NULL
- * input fails with ERR_INVALID_ARGS before runtime I/O. Returns 0 on success.
+ * Tear down isolated SSH agent state. Recorded processes are terminated only
+ * when their exact identity and a descriptor-backed signaling path are safely
+ * proved. An exact native BSD v2 endpoint may instead have all identities
+ * cleared and its managed names detached without proving process death; that
+ * recorded process and its preexisting connections may remain. A reachable
+ * sidecar-less endpoint has no trusted process identity that can authorize
+ * bounded termination or namespace removal: reset fails and retains its
+ * socket and matching current.sock as retry evidence. Resets a single account
+ * when `account` is a nonempty name accepted by validate_name(); callers must
+ * pass the canonical stored account name. Resets all accounts only when
+ * `account` is NULL. Invalid non-NULL input fails with ERR_INVALID_ARGS before
+ * runtime I/O. Returns 0 on success.
  */
 int ssh_manager_reset(const char *account);
 

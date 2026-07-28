@@ -19,6 +19,7 @@
 #include <sys/wait.h>
 #include <sys/stat.h>
 #include <sys/file.h>
+#include <sys/resource.h>
 #include <signal.h>
 #include <errno.h>
 #include <fcntl.h>
@@ -26,10 +27,22 @@
 #include <ctype.h>
 #include <limits.h>
 #include <time.h>
+#include <stdarg.h>
+#include <stdint.h>
 #ifdef __linux__
 #include <sys/syscall.h>
 #include <sys/vfs.h>
 #include <linux/stat.h>
+#elif defined(__APPLE__) || defined(__FreeBSD__)
+#include <sys/param.h>
+#include <sys/mount.h>
+#include <sys/sysctl.h>
+#include <sys/time.h>
+#if defined(__APPLE__)
+#include <sys/proc.h>
+#else
+#include <sys/user.h>
+#endif
 #else
 #include <sys/param.h>
 #include <sys/mount.h>
@@ -40,6 +53,10 @@
 #include "utils.h"
 #include "display.h"
 #include "git_ops.h"
+#define GITSWITCH_INTERNAL_API
+#include "git_ops_internal.h"
+#undef GITSWITCH_INTERNAL_API
+#include "runner_internal.h"
 #include "signals.h"
 
 /* When set, gpg_get_base_dir suppresses the "XDG_RUNTIME_DIR unset / not
@@ -80,6 +97,8 @@ typedef struct {
     int marker_fd;
     struct stat marker_identity;
     char gpgconf_path[MAX_PATH_LEN];
+    run_launch_witness_t gpgconf_witness;
+    const gpg_config_t *gpg_config;
 } gpg_agent_config_update_t;
 typedef struct {
     bool injected;
@@ -105,14 +124,38 @@ typedef enum {
     GPG_SOURCE_PATH_MANAGED_CANONICAL = 1,
     GPG_SOURCE_PATH_MANAGED_DESCENDANT = 2
 } gpg_source_path_class_t;
+
+enum { GPG_HELPER_DIAGNOSTIC_CAP = 256 };
+
+static void gpg_set_helper_failure(error_code_t code, const char *operation,
+                                   const char *diagnostic,
+                                   const run_result_t *result) {
+    const char *captured =
+        diagnostic && diagnostic[0] != '\0'
+            ? diagnostic
+            : "<no diagnostic output captured>";
+
+    if (!operation || !result) {
+        set_error(code, "GPG helper failed without outcome metadata");
+        return;
+    }
+    set_error(code,
+              "%s [spawned=%s exit=%d signal=%d output-truncated=%s]: %s",
+              operation, result->spawned ? "yes" : "no",
+              result->exit_code, result->term_signal,
+              result->out_truncated ? "yes" : "no", captured);
+}
+
 static int copy_key_from_system_keyring(const gpg_config_t *gpg_config,
                                         const gpg_pinned_home_t *home,
                                         const char *selector,
                                         bool require_signing,
                                         char *fingerprint,
                                         size_t fingerprint_size);
-static int setup_gpg_agent_config(int home_fd, const char *gnupg_home,
-                                  gpg_agent_config_update_t *update);
+static int setup_gpg_agent_config(const gpg_config_t *gpg_config,
+                                  int home_fd, const char *gnupg_home,
+                                  gpg_agent_config_update_t *update,
+                                  bool bind_toolchain);
 static int gpg_reload_agent_config(const gpg_pinned_home_t *home,
                                    gpg_agent_config_update_t *update);
 static int gpg_prepare_isolated_home_at(gpg_config_t *gpg_config,
@@ -123,9 +166,19 @@ static int gpg_validate_pinned_home(const gpg_pinned_home_t *home);
 static int gpg_mount_identity_fd(int fd, gpg_mount_identity_t *identity);
 static bool gpg_same_mount(const gpg_mount_identity_t *left,
                            const gpg_mount_identity_t *right);
+static bool gpg_same_file_version(const struct stat *left,
+                                  const struct stat *right);
+static bool gpg_file_ctime_only_change(const struct stat *before,
+                                       const struct stat *after);
 static int gpg_user_source_home(char *buf, size_t size);
 static int gpg_open_user_source_home(gpg_source_home_t *source);
 static int gpg_validate_source_home(const gpg_source_home_t *source);
+static int gpg_run_source_helper(
+    const gpg_source_home_t *source, const char *const argv[],
+    const run_opts_t *opts, const run_launch_witness_t *witness,
+    run_result_t *result, int *helper_rc);
+static int gpg_validate_source_home_binding(
+    const gpg_source_home_t *source);
 static void gpg_close_source_home(gpg_source_home_t *source);
 static int gpg_resolve_source_key(const gpg_config_t *gpg_config,
                                   const char *selector, bool require_signing,
@@ -138,6 +191,9 @@ static int gpg_resolve_pinned_key(const gpg_config_t *gpg_config,
                                   size_t fingerprint_size);
 static int gpg_open_base_dir(char *base, size_t size, bool create,
                              bool *absent);
+static int gpg_default_memory_backed_probe(int base_fd,
+                                           bool *memory_backed);
+static bool base_is_memory_backed(const char *base);
 static int lock_gpg_dir(int base_fd);
 static void unlock_gpg_dir(int base_fd, int lock_fd);
 static int gpg_native_rename_noreplace(int old_dir_fd, const char *old_name,
@@ -150,6 +206,7 @@ static gpg_agent_conf_preopen_fn g_agent_conf_preopen;
 static gpg_agent_conf_precommit_fn g_agent_conf_precommit;
 static gpg_retarget_commit_hook_fn g_retarget_commit_hook;
 static gpg_retarget_restore_hook_fn g_retarget_restore_hook;
+static gpg_retarget_forward_hook_fn g_retarget_forward_hook;
 static gpg_rollback_hook_fn g_rollback_hook;
 static gpg_sync_base_fn g_sync_base = gpg_default_sync_base;
 static gpg_rename_noreplace_fn g_rename_noreplace =
@@ -158,15 +215,39 @@ static gpg_setenv_fn g_gpg_setenv = setenv;
 static gpg_unsetenv_fn g_gpg_unsetenv = unsetenv;
 static const char *const g_gpg_child_unset_env[] = {
     "GPG_AGENT_INFO",
+    "GNUPG_BUILDDIR",
+    "GNUPG_BUILD_ROOT",
     NULL
 };
 static gpg_cleanup_predelete_fn g_cleanup_predelete;
 static gpg_reset_final_hook_fn g_reset_final_hook;
 static gpg_reset_current_hook_fn g_reset_current_hook;
 static gpg_reset_quarantine_hook_fn g_reset_quarantine_hook;
+static gpg_reset_retire_hook_fn g_reset_retire_hook;
+static gpg_reset_postvalidate_hook_fn g_reset_postvalidate_hook;
+static gpg_identity_unlink_fn g_identity_unlink;
+static bool g_process_generation_failure_for_test;
 static gpg_mount_identity_probe_fn g_mount_identity_probe;
 static gpg_agent_conf_sync_fn g_agent_conf_sync =
     gpg_default_agent_conf_sync;
+#ifdef GITSWITCH_TESTING
+static gpg_agent_conf_publication_hook_fn
+    g_agent_conf_publication_hook;
+static gpg_agent_conf_terminal_preopen_fn
+    g_agent_conf_terminal_preopen;
+static gpg_agent_conf_postclose_fn g_agent_conf_postclose;
+#endif
+static gpg_memory_backed_probe_fn g_memory_backed_probe =
+    gpg_default_memory_backed_probe;
+static gpg_base_warning_probe_fn g_base_warning_probe =
+    base_is_memory_backed;
+static bool g_base_warning_probe_checked;
+static bool g_base_warning_memory_backed;
+static bool g_base_warning_emitted;
+/* Narrow in-process exception while the rollback state machine settles the
+ * publication belonging to this exact forward transaction. */
+static const char *g_allowed_forward_stem;
+static gpg_key_cache_post_scan_hook_fn g_key_cache_post_scan_hook;
 
 static void gpg_agent_config_update_init(gpg_agent_config_update_t *update) {
     if (!update) return;
@@ -233,6 +314,13 @@ gpg_manager_set_retarget_restore_hook_fn(gpg_retarget_restore_hook_fn fn) {
     return previous;
 }
 
+gpg_retarget_forward_hook_fn
+gpg_manager_set_retarget_forward_hook_fn(gpg_retarget_forward_hook_fn fn) {
+    gpg_retarget_forward_hook_fn previous = g_retarget_forward_hook;
+    g_retarget_forward_hook = fn;
+    return previous;
+}
+
 gpg_rollback_hook_fn
 gpg_manager_set_rollback_hook_fn(gpg_rollback_hook_fn fn) {
     gpg_rollback_hook_fn previous = g_rollback_hook;
@@ -293,6 +381,34 @@ gpg_manager_set_reset_quarantine_hook_fn(gpg_reset_quarantine_hook_fn fn) {
     return previous;
 }
 
+gpg_reset_retire_hook_fn
+gpg_manager_set_reset_retire_hook_fn(gpg_reset_retire_hook_fn fn) {
+    gpg_reset_retire_hook_fn previous = g_reset_retire_hook;
+    g_reset_retire_hook = fn;
+    return previous;
+}
+
+gpg_reset_postvalidate_hook_fn
+gpg_manager_set_reset_postvalidate_hook_fn(
+    gpg_reset_postvalidate_hook_fn fn) {
+    gpg_reset_postvalidate_hook_fn previous = g_reset_postvalidate_hook;
+    g_reset_postvalidate_hook = fn;
+    return previous;
+}
+
+gpg_identity_unlink_fn
+gpg_manager_set_identity_unlink_fn(gpg_identity_unlink_fn fn) {
+    gpg_identity_unlink_fn previous = g_identity_unlink;
+    g_identity_unlink = fn;
+    return previous;
+}
+
+bool gpg_manager_set_process_generation_failure_for_test(bool fail) {
+    bool previous = g_process_generation_failure_for_test;
+    g_process_generation_failure_for_test = fail;
+    return previous;
+}
+
 gpg_mount_identity_probe_fn
 gpg_manager_set_mount_identity_probe_fn(gpg_mount_identity_probe_fn fn) {
     gpg_mount_identity_probe_fn previous = g_mount_identity_probe;
@@ -307,16 +423,67 @@ gpg_manager_set_agent_conf_sync_fn(gpg_agent_conf_sync_fn fn) {
     return previous;
 }
 
-/* Process-lifetime memo of GPG key ids whose secret-key presence a gpg spawn
- * already proved this run (AR-02 #14). A single GPG switch used to spawn gpg
- * 4-6 times re-proving the same key — the up-front availability probe, the
- * import idempotency check, the signing-capability test, and git_test_config's
- * read-back check each ran their own listing. The memo lets the later sanity
- * checks reuse the earlier proof. Deliberately coarse: it says "a keyring this
- * process consulted holds the secret key", which is exactly the availability
- * question those redundant spawns re-asked; the strict per-home validation on
- * the switch path still runs against the isolated home itself. Same
- * short-lived, single-threaded caching assumptions as git_ops.c's exec caches. */
+#ifdef GITSWITCH_TESTING
+gpg_agent_conf_publication_hook_fn
+gpg_manager_set_agent_conf_publication_hook_fn(
+    gpg_agent_conf_publication_hook_fn fn) {
+    gpg_agent_conf_publication_hook_fn previous =
+        g_agent_conf_publication_hook;
+    g_agent_conf_publication_hook = fn;
+    return previous;
+}
+
+gpg_agent_conf_terminal_preopen_fn
+gpg_manager_set_agent_conf_terminal_preopen_fn(
+    gpg_agent_conf_terminal_preopen_fn fn) {
+    gpg_agent_conf_terminal_preopen_fn previous =
+        g_agent_conf_terminal_preopen;
+    g_agent_conf_terminal_preopen = fn;
+    return previous;
+}
+
+gpg_agent_conf_postclose_fn
+gpg_manager_set_agent_conf_postclose_fn(
+    gpg_agent_conf_postclose_fn fn) {
+    gpg_agent_conf_postclose_fn previous = g_agent_conf_postclose;
+    g_agent_conf_postclose = fn;
+    return previous;
+}
+#endif
+
+gpg_memory_backed_probe_fn
+gpg_manager_set_memory_backed_probe_fn(gpg_memory_backed_probe_fn fn) {
+    gpg_memory_backed_probe_fn previous = g_memory_backed_probe;
+    g_memory_backed_probe = fn ? fn : gpg_default_memory_backed_probe;
+    return previous;
+}
+
+gpg_base_warning_probe_fn
+gpg_manager_set_base_warning_probe_fn(gpg_base_warning_probe_fn fn) {
+    gpg_base_warning_probe_fn previous = g_base_warning_probe;
+
+    g_base_warning_probe = fn ? fn : base_is_memory_backed;
+    g_base_warning_probe_checked = false;
+    g_base_warning_memory_backed = false;
+    g_base_warning_emitted = false;
+    return previous;
+}
+
+gpg_key_cache_post_scan_hook_fn
+gpg_manager_set_key_cache_post_scan_hook_fn(
+    gpg_key_cache_post_scan_hook_fn fn) {
+    gpg_key_cache_post_scan_hook_fn previous =
+        g_key_cache_post_scan_hook;
+    g_key_cache_post_scan_hook = fn;
+    return previous;
+}
+
+/* The original AR-02 availability memo retained only caller-supplied key
+ * spellings. It remains as a compatibility surface for deterministic mock
+ * runners, but a production runner must never treat a post-hoc note as
+ * executable, home, capability, or key evidence. Real reuse is owned by the
+ * proof cache below and can be produced only by a successful structured
+ * secret-key listing. */
 #define GPG_SEEN_KEYS_MAX 8
 static char g_seen_keys[GPG_SEEN_KEYS_MAX][GPG_FINGERPRINT_BUFSIZE];
 static size_t g_seen_key_count;
@@ -334,7 +501,7 @@ void gpg_manager_note_key_available(const char *key_id) {
 }
 
 bool gpg_manager_key_available_cached(const char *key_id) {
-    if (!key_id) {
+    if (!key_id || run_uses_default_runner()) {
         return false;
     }
     for (size_t i = 0; i < g_seen_key_count; i++) {
@@ -343,6 +510,567 @@ bool gpg_manager_key_available_cached(const char *key_id) {
         }
     }
     return false;
+}
+
+typedef enum {
+    GPG_KEY_CACHE_HOME_SYSTEM = 1,
+    GPG_KEY_CACHE_HOME_ISOLATED = 2
+} gpg_key_cache_home_kind_t;
+
+typedef struct {
+    char *relative_path;
+    struct stat identity;
+} gpg_key_cache_home_entry_t;
+
+typedef struct {
+    bool valid;
+    gpg_key_cache_home_kind_t kind;
+    char path[MAX_PATH_LEN];
+    struct stat root_identity;
+    gpg_mount_identity_t root_mount;
+    gpg_key_cache_home_entry_t *entries;
+    size_t count;
+    size_t capacity;
+} gpg_key_cache_home_generation_t;
+
+typedef struct {
+    bool valid;
+    bool signing_capability;
+    uint64_t sequence;
+    uint32_t listing_contract;
+    char fingerprint[GPG_FINGERPRINT_BUFSIZE];
+    char program[MAX_PATH_LEN];
+    run_launch_witness_t launch;
+    gpg_key_cache_home_generation_t home;
+} gpg_key_cache_entry_t;
+
+enum {
+    GPG_KEY_CACHE_MAX = 8,
+    GPG_KEY_CACHE_MAX_DEPTH = 16,
+    GPG_KEY_CACHE_MAX_HOME_ENTRIES = 512,
+    GPG_KEY_CACHE_LISTING_CONTRACT = 1
+};
+
+static gpg_key_cache_entry_t g_key_cache[GPG_KEY_CACHE_MAX];
+static uint64_t g_key_cache_sequence;
+
+static void gpg_key_cache_home_generation_clear(
+    gpg_key_cache_home_generation_t *generation) {
+    size_t index;
+
+    if (!generation) return;
+    for (index = 0; index < generation->count; index++) {
+        free(generation->entries[index].relative_path);
+    }
+    free(generation->entries);
+    memset(generation, 0, sizeof(*generation));
+}
+
+static bool gpg_key_cache_stat_equal(const struct stat *left,
+                                     const struct stat *right) {
+    return left && right && gpg_same_file_version(left, right) &&
+           left->st_gid == right->st_gid &&
+           left->st_rdev == right->st_rdev;
+}
+
+static int gpg_key_cache_home_entry_compare(const void *left,
+                                            const void *right) {
+    const gpg_key_cache_home_entry_t *a = left;
+    const gpg_key_cache_home_entry_t *b = right;
+
+    return strcmp(a->relative_path, b->relative_path);
+}
+
+static int gpg_key_cache_home_generation_append(
+    gpg_key_cache_home_generation_t *generation, const char *relative_path,
+    const struct stat *identity) {
+    gpg_key_cache_home_entry_t *grown;
+    gpg_key_cache_home_entry_t *entry;
+    size_t capacity;
+
+    if (!generation || !relative_path || !*relative_path || !identity) {
+        errno = EINVAL;
+        return -1;
+    }
+    if (generation->count >= GPG_KEY_CACHE_MAX_HOME_ENTRIES) {
+        errno = E2BIG;
+        return -1;
+    }
+    if (generation->count == generation->capacity) {
+        capacity = generation->capacity == 0
+                       ? 32U
+                       : generation->capacity * 2U;
+        if (capacity > GPG_KEY_CACHE_MAX_HOME_ENTRIES) {
+            capacity = GPG_KEY_CACHE_MAX_HOME_ENTRIES;
+        }
+        grown = realloc(generation->entries,
+                        capacity * sizeof(*generation->entries));
+        if (!grown) return -1;
+        generation->entries = grown;
+        generation->capacity = capacity;
+    }
+    entry = &generation->entries[generation->count];
+    memset(entry, 0, sizeof(*entry));
+    entry->relative_path = strdup(relative_path);
+    if (!entry->relative_path) return -1;
+    entry->identity = *identity;
+    generation->count++;
+    return 0;
+}
+
+static int gpg_key_cache_capture_directory(
+    int directory_fd, const char *relative_prefix, unsigned int depth,
+    const gpg_mount_identity_t *root_mount,
+    gpg_key_cache_home_generation_t *generation) {
+    struct stat directory_before;
+    struct stat directory_after;
+    gpg_mount_identity_t directory_mount;
+    int scan_fd;
+    DIR *directory;
+    struct dirent *dirent;
+
+    if (directory_fd < 0 || !relative_prefix || !root_mount || !generation ||
+        depth > GPG_KEY_CACHE_MAX_DEPTH ||
+        fstat(directory_fd, &directory_before) != 0 ||
+        !S_ISDIR(directory_before.st_mode) ||
+        gpg_mount_identity_fd(directory_fd, &directory_mount) != 0 ||
+        !gpg_same_mount(root_mount, &directory_mount)) {
+        if (errno == 0) errno = depth > GPG_KEY_CACHE_MAX_DEPTH ? E2BIG : EXDEV;
+        return -1;
+    }
+    scan_fd = openat(directory_fd, ".",
+                     O_RDONLY | O_DIRECTORY | O_CLOEXEC | O_NOFOLLOW);
+    if (scan_fd < 0) return -1;
+    directory = fdopendir(scan_fd);
+    if (!directory) {
+        int saved_errno = errno;
+
+        close(scan_fd);
+        errno = saved_errno;
+        return -1;
+    }
+    for (;;) {
+        char relative_path[MAX_PATH_LEN];
+        struct stat named_before;
+        struct stat named_after;
+
+        errno = 0;
+        dirent = readdir(directory);
+        if (!dirent) {
+            if (errno != 0) {
+                int saved_errno = errno;
+
+                closedir(directory);
+                errno = saved_errno;
+                return -1;
+            }
+            break;
+        }
+        if (strcmp(dirent->d_name, ".") == 0 ||
+            strcmp(dirent->d_name, "..") == 0) {
+            continue;
+        }
+        if ((relative_prefix[0]
+                 ? safe_snprintf(relative_path, sizeof(relative_path),
+                                 "%s/%s", relative_prefix, dirent->d_name)
+                 : safe_snprintf(relative_path, sizeof(relative_path), "%s",
+                                 dirent->d_name)) != 0 ||
+            fstatat(directory_fd, dirent->d_name, &named_before,
+                    AT_SYMLINK_NOFOLLOW) != 0) {
+            int saved_errno = errno;
+
+            closedir(directory);
+            errno = saved_errno;
+            return -1;
+        }
+        /* A symlink's inode metadata does not bind the content reached by
+         * GnuPG. Decline caching instead of turning an unobserved target into
+         * reusable key evidence; the authoritative listing still runs. */
+        if (S_ISLNK(named_before.st_mode)) {
+            closedir(directory);
+            errno = ELOOP;
+            return -1;
+        }
+        if (gpg_key_cache_home_generation_append(
+                generation, relative_path, &named_before) != 0) {
+            int saved_errno = errno;
+
+            closedir(directory);
+            errno = saved_errno;
+            return -1;
+        }
+        if (S_ISDIR(named_before.st_mode)) {
+            struct stat opened;
+            gpg_mount_identity_t child_mount;
+            int child_fd = openat(
+                directory_fd, dirent->d_name,
+                O_RDONLY | O_DIRECTORY | O_CLOEXEC | O_NOFOLLOW);
+
+            if (child_fd < 0 || fstat(child_fd, &opened) != 0 ||
+                gpg_mount_identity_fd(child_fd, &child_mount) != 0 ||
+                !gpg_same_mount(root_mount, &child_mount) ||
+                !gpg_key_cache_stat_equal(&named_before, &opened) ||
+                gpg_key_cache_capture_directory(
+                    child_fd, relative_path, depth + 1U, root_mount,
+                    generation) != 0 ||
+                fstatat(directory_fd, dirent->d_name, &named_after,
+                        AT_SYMLINK_NOFOLLOW) != 0 ||
+                !gpg_key_cache_stat_equal(&opened, &named_after)) {
+                int saved_errno = errno ? errno : ESTALE;
+
+                if (child_fd >= 0) close(child_fd);
+                closedir(directory);
+                errno = saved_errno;
+                return -1;
+            }
+            close(child_fd);
+        } else {
+            if (fstatat(directory_fd, dirent->d_name, &named_after,
+                        AT_SYMLINK_NOFOLLOW) != 0 ||
+                !gpg_key_cache_stat_equal(&named_before, &named_after)) {
+                int saved_errno = errno ? errno : ESTALE;
+
+                closedir(directory);
+                errno = saved_errno;
+                return -1;
+            }
+        }
+    }
+    if (fstat(directory_fd, &directory_after) != 0 ||
+        !gpg_key_cache_stat_equal(&directory_before, &directory_after)) {
+        int saved_errno = errno ? errno : ESTALE;
+
+        closedir(directory);
+        errno = saved_errno;
+        return -1;
+    }
+    closedir(directory);
+    return 0;
+}
+
+static int gpg_key_cache_home_generation_capture_once(
+    int home_fd, const char *path, gpg_key_cache_home_kind_t kind,
+    gpg_key_cache_home_generation_t *generation) {
+    struct stat root_after;
+
+    if (home_fd < 0 || !path || path[0] != '/' || !generation) {
+        errno = EINVAL;
+        return -1;
+    }
+    memset(generation, 0, sizeof(*generation));
+    generation->kind = kind;
+    if (safe_strncpy(generation->path, path,
+                     sizeof(generation->path)) != 0 ||
+        fstat(home_fd, &generation->root_identity) != 0 ||
+        !S_ISDIR(generation->root_identity.st_mode) ||
+        gpg_mount_identity_fd(home_fd, &generation->root_mount) != 0 ||
+        gpg_key_cache_capture_directory(
+            home_fd, "", 0, &generation->root_mount, generation) != 0 ||
+        fstat(home_fd, &root_after) != 0 ||
+        !gpg_key_cache_stat_equal(&generation->root_identity, &root_after)) {
+        int saved_errno = errno ? errno : ESTALE;
+
+        gpg_key_cache_home_generation_clear(generation);
+        errno = saved_errno;
+        return -1;
+    }
+    if (generation->count > 1) {
+        qsort(generation->entries, generation->count,
+              sizeof(*generation->entries),
+              gpg_key_cache_home_entry_compare);
+    }
+    generation->valid = true;
+    return 0;
+}
+
+static bool gpg_key_cache_home_generation_equal(
+    const gpg_key_cache_home_generation_t *left,
+    const gpg_key_cache_home_generation_t *right) {
+    size_t index;
+
+    if (!left || !right || !left->valid || !right->valid ||
+        left->kind != right->kind || strcmp(left->path, right->path) != 0 ||
+        !gpg_key_cache_stat_equal(&left->root_identity,
+                                  &right->root_identity) ||
+        !gpg_same_mount(&left->root_mount, &right->root_mount) ||
+        left->count != right->count) {
+        return false;
+    }
+    for (index = 0; index < left->count; index++) {
+        if (strcmp(left->entries[index].relative_path,
+                   right->entries[index].relative_path) != 0 ||
+            !gpg_key_cache_stat_equal(&left->entries[index].identity,
+                                      &right->entries[index].identity)) {
+            return false;
+        }
+    }
+    return true;
+}
+
+static int gpg_key_cache_home_generation_capture(
+    int home_fd, const char *path, gpg_key_cache_home_kind_t kind,
+    gpg_key_cache_home_generation_t *generation) {
+    gpg_key_cache_home_generation_t first;
+    gpg_key_cache_home_generation_t second;
+
+    memset(&first, 0, sizeof(first));
+    memset(&second, 0, sizeof(second));
+    if (gpg_key_cache_home_generation_capture_once(
+            home_fd, path, kind, &first) != 0 ||
+        gpg_key_cache_home_generation_capture_once(
+            home_fd, path, kind, &second) != 0 ||
+        !gpg_key_cache_home_generation_equal(&first, &second)) {
+        int saved_errno = errno ? errno : ESTALE;
+
+        gpg_key_cache_home_generation_clear(&first);
+        gpg_key_cache_home_generation_clear(&second);
+        errno = saved_errno;
+        return -1;
+    }
+    gpg_key_cache_home_generation_clear(&second);
+    *generation = first;
+    return 0;
+}
+
+static bool gpg_key_cache_normalize_fingerprint(
+    const char *selector, char fingerprint[GPG_FINGERPRINT_BUFSIZE]) {
+    const char *digits;
+    size_t length;
+    size_t index;
+
+    if (!selector || !fingerprint) return false;
+    digits = selector;
+    if (digits[0] == '0' && (digits[1] == 'x' || digits[1] == 'X')) {
+        digits += 2;
+    }
+    length = strlen(digits);
+    if (length != 40 && length != 64) return false;
+    for (index = 0; index < length; index++) {
+        if (!isxdigit((unsigned char)digits[index])) return false;
+        fingerprint[index] =
+            (char)toupper((unsigned char)digits[index]);
+    }
+    fingerprint[length] = '\0';
+    return true;
+}
+
+static int gpg_key_cache_home_coordinates(
+    const gpg_pinned_home_t *home, const gpg_source_home_t *source,
+    int *home_fd, const char **path, gpg_key_cache_home_kind_t *kind) {
+    if (!home_fd || !path || !kind || (!home && !source) ||
+        (home && source)) {
+        errno = EINVAL;
+        return -1;
+    }
+    if (home) {
+        *home_fd = home->home_fd;
+        *path = home->path;
+        *kind = GPG_KEY_CACHE_HOME_ISOLATED;
+    } else {
+        *home_fd = source->fd;
+        *path = source->path;
+        *kind = GPG_KEY_CACHE_HOME_SYSTEM;
+    }
+    if (*home_fd < 0 || !*path || (*path)[0] != '/') {
+        errno = EINVAL;
+        return -1;
+    }
+    return 0;
+}
+
+/* Return 1 for a reusable proof, 0 for an ordinary cache miss, and -1 when a
+ * candidate's final public namespace binding changed during lookup. */
+static int gpg_key_cache_lookup(
+    const gpg_config_t *gpg_config, const gpg_pinned_home_t *home,
+    const gpg_source_home_t *source, const char *selector,
+    bool require_signing, char *fingerprint, size_t fingerprint_size) {
+    error_context_t prior_error = g_last_error;
+    int prior_errno = errno;
+    char canonical[GPG_FINGERPRINT_BUFSIZE];
+    gpg_key_cache_home_generation_t current;
+    gpg_key_cache_home_generation_t confirmed;
+    gpg_key_cache_home_kind_t kind;
+    const char *path;
+    int home_fd;
+    size_t index;
+    bool have_candidate = false;
+    bool matched = false;
+    bool fatal_binding = false;
+    error_context_t fatal_error = {0};
+    int fatal_errno = 0;
+    bool post_scan_checked = false;
+    bool post_scan_failed = false;
+
+    memset(&current, 0, sizeof(current));
+    memset(&confirmed, 0, sizeof(confirmed));
+    if (!gpg_config || gpg_config->executable_path[0] != '/' ||
+        !fingerprint || fingerprint_size == 0 ||
+        !gpg_key_cache_normalize_fingerprint(selector, canonical) ||
+        strlen(canonical) + 1U > fingerprint_size ||
+        gpg_key_cache_home_coordinates(home, source, &home_fd, &path,
+                                       &kind) != 0) {
+        g_last_error = prior_error;
+        errno = prior_errno;
+        return 0;
+    }
+    for (index = 0; index < GPG_KEY_CACHE_MAX; index++) {
+        const gpg_key_cache_entry_t *entry = &g_key_cache[index];
+
+        if (entry->valid &&
+            entry->listing_contract == GPG_KEY_CACHE_LISTING_CONTRACT &&
+            strcmp(entry->fingerprint, canonical) == 0 &&
+            strcmp(entry->program, gpg_config->executable_path) == 0 &&
+            entry->home.kind == kind &&
+            strcmp(entry->home.path, path) == 0 &&
+            (!require_signing || entry->signing_capability)) {
+            have_candidate = true;
+            break;
+        }
+    }
+    if (have_candidate &&
+        gpg_key_cache_home_generation_capture(home_fd, path, kind,
+                                              &current) == 0) {
+        for (index = 0; index < GPG_KEY_CACHE_MAX; index++) {
+            gpg_key_cache_entry_t *entry = &g_key_cache[index];
+
+            if (!entry->valid ||
+                entry->listing_contract !=
+                    GPG_KEY_CACHE_LISTING_CONTRACT ||
+                strcmp(entry->fingerprint, canonical) != 0 ||
+                strcmp(entry->program,
+                       gpg_config->executable_path) != 0 ||
+                entry->home.kind != kind ||
+                strcmp(entry->home.path, path) != 0 ||
+                (require_signing && !entry->signing_capability)) {
+                continue;
+            }
+            if (!gpg_key_cache_home_generation_equal(&entry->home,
+                                                     &current) ||
+                !run_launch_witness_revalidate(
+                    gpg_config->executable_path, &entry->launch)) {
+                gpg_key_cache_home_generation_clear(&entry->home);
+                memset(entry, 0, sizeof(*entry));
+                continue;
+            }
+            if (!post_scan_checked) {
+                post_scan_checked = true;
+                post_scan_failed =
+                    g_key_cache_post_scan_hook &&
+                    g_key_cache_post_scan_hook(
+                        path,
+                        kind == GPG_KEY_CACHE_HOME_ISOLATED) != 0;
+            }
+            /* The executable check above is deliberately not the last proof:
+             * recapture the complete home generation afterwards, then bind
+             * the public source/managed-home namespace to the retained fd.
+             * A rename/rebind during the first scan therefore cannot be
+             * erased by the unchanged descriptor-backed tree. */
+            {
+                int generation_rc =
+                    gpg_key_cache_home_generation_capture(
+                        home_fd, path, kind, &confirmed);
+                int binding_rc =
+                    home ? gpg_validate_pinned_home(home)
+                         : gpg_validate_source_home_binding(source);
+
+                if (binding_rc != 0) {
+                    fatal_error = g_last_error;
+                    fatal_errno = errno;
+                    fatal_binding = true;
+                    gpg_key_cache_home_generation_clear(&confirmed);
+                    gpg_key_cache_home_generation_clear(&entry->home);
+                    memset(entry, 0, sizeof(*entry));
+                    break;
+                }
+                if (post_scan_failed || generation_rc != 0 ||
+                    !gpg_key_cache_home_generation_equal(
+                        &entry->home, &confirmed)) {
+                    gpg_key_cache_home_generation_clear(&confirmed);
+                    gpg_key_cache_home_generation_clear(&entry->home);
+                    memset(entry, 0, sizeof(*entry));
+                    continue;
+                }
+            }
+            gpg_key_cache_home_generation_clear(&confirmed);
+            memcpy(fingerprint, canonical, strlen(canonical) + 1U);
+            entry->sequence = ++g_key_cache_sequence;
+            matched = true;
+            break;
+        }
+    }
+    gpg_key_cache_home_generation_clear(&current);
+    gpg_key_cache_home_generation_clear(&confirmed);
+    if (fatal_binding) {
+        g_last_error = fatal_error;
+        errno = fatal_errno;
+        return -1;
+    }
+    g_last_error = prior_error;
+    errno = prior_errno;
+    return matched ? 1 : 0;
+}
+
+static void gpg_key_cache_store(
+    const gpg_config_t *gpg_config, const gpg_pinned_home_t *home,
+    const gpg_source_home_t *source, const char *fingerprint,
+    bool require_signing, const run_launch_witness_t *launch) {
+    error_context_t prior_error = g_last_error;
+    int prior_errno = errno;
+    char canonical[GPG_FINGERPRINT_BUFSIZE];
+    gpg_key_cache_home_generation_t generation;
+    gpg_key_cache_home_kind_t kind;
+    const char *path;
+    int home_fd;
+    size_t selected = 0;
+    uint64_t oldest = UINT64_MAX;
+    size_t index;
+
+    memset(&generation, 0, sizeof(generation));
+    if (!run_uses_default_runner() || !launch || !launch->valid ||
+        !gpg_config || gpg_config->executable_path[0] != '/' ||
+        !gpg_key_cache_normalize_fingerprint(fingerprint, canonical) ||
+        gpg_key_cache_home_coordinates(home, source, &home_fd, &path,
+                                       &kind) != 0 ||
+        gpg_key_cache_home_generation_capture(
+            home_fd, path, kind, &generation) != 0) {
+        gpg_key_cache_home_generation_clear(&generation);
+        g_last_error = prior_error;
+        errno = prior_errno;
+        return;
+    }
+    for (index = 0; index < GPG_KEY_CACHE_MAX; index++) {
+        if (!g_key_cache[index].valid) {
+            selected = index;
+            oldest = 0;
+            break;
+        }
+        if (g_key_cache[index].sequence < oldest) {
+            selected = index;
+            oldest = g_key_cache[index].sequence;
+        }
+    }
+    gpg_key_cache_home_generation_clear(&g_key_cache[selected].home);
+    memset(&g_key_cache[selected], 0, sizeof(g_key_cache[selected]));
+    g_key_cache[selected].valid = true;
+    g_key_cache[selected].signing_capability = require_signing;
+    g_key_cache[selected].sequence = ++g_key_cache_sequence;
+    g_key_cache[selected].listing_contract =
+        GPG_KEY_CACHE_LISTING_CONTRACT;
+    memcpy(g_key_cache[selected].fingerprint, canonical,
+           strlen(canonical) + 1U);
+    if (safe_strncpy(g_key_cache[selected].program,
+                     gpg_config->executable_path,
+                     sizeof(g_key_cache[selected].program)) != 0) {
+        gpg_key_cache_home_generation_clear(&generation);
+        memset(&g_key_cache[selected], 0, sizeof(g_key_cache[selected]));
+        g_last_error = prior_error;
+        errno = prior_errno;
+        return;
+    }
+    g_key_cache[selected].launch = *launch;
+    g_key_cache[selected].home = generation;
+    g_last_error = prior_error;
+    errno = prior_errno;
 }
 
 static bool gpg_executable_may_try_compat_name(int resolve_errno) {
@@ -419,10 +1147,36 @@ static int gpg_bind_executable_if_needed(gpg_config_t *gpg_config) {
                       "GPG manager executable binding is not absolute");
             return -1;
         }
+        if (!gpg_config->executable_witness.valid &&
+            !run_launch_witness_capture(gpg_config->executable_path,
+                                        &gpg_config->executable_witness)) {
+            set_error(ERR_GPG_NOT_FOUND,
+                      "Cannot bind exact GPG executable generation");
+            return -1;
+        }
+        if (!run_launch_witness_revalidate(
+                gpg_config->executable_path,
+                &gpg_config->executable_witness)) {
+            set_error(ERR_GPG_NOT_FOUND,
+                      "GPG executable generation changed during transaction");
+            return -1;
+        }
         return 0;
     }
-    return gpg_manager_resolve_executable(gpg_config->executable_path,
-                                          sizeof(gpg_config->executable_path));
+    if (gpg_manager_resolve_executable(
+            gpg_config->executable_path,
+            sizeof(gpg_config->executable_path)) != 0) {
+        gpg_config->executable_path[0] = '\0';
+        return -1;
+    }
+    if (!run_launch_witness_capture(gpg_config->executable_path,
+                                    &gpg_config->executable_witness)) {
+        gpg_config->executable_path[0] = '\0';
+        set_error(ERR_GPG_NOT_FOUND,
+                  "Cannot bind exact GPG executable generation");
+        return -1;
+    }
+    return 0;
 }
 
 /* Initialize GPG manager with specified mode */
@@ -669,14 +1423,11 @@ int gpg_switch_account(gpg_config_t *gpg_config, const account_t *account) {
              * import and the retarget, leaving a dangling `current` behind a
              * switch that reported success. Fail closed if the lock cannot be
              * taken: proceeding unlocked would reopen exactly that window. */
-            if (gpg_prepare_base_dir(locked_base, sizeof(locked_base)) != 0) {
+            base_fd = gpg_prepare_base_dir(locked_base,
+                                           sizeof(locked_base));
+            if (base_fd < 0) {
                 set_error(ERR_GPG_KEY_FAILED, "Failed to create isolated GPG environment: %s",
                          get_last_error()->message);
-                goto out;
-            }
-            base_fd = gpg_open_base_dir(locked_base, sizeof(locked_base),
-                                        false, NULL);
-            if (base_fd < 0) {
                 goto out;
             }
             lock_fd = lock_gpg_dir(base_fd);
@@ -782,11 +1533,6 @@ int gpg_switch_account(gpg_config_t *gpg_config, const account_t *account) {
         gpg_config->published_link_valid = retarget.published_link.valid;
     }
     gpg_config->signing_enabled = account->gpg_signing_enabled;
-    gpg_manager_note_key_available(fingerprint);
-    /* The selector is now an alias backed by the strict fingerprint proof.
-     * Memoizing it prevents downstream validation from re-running gpg with
-     * the less-specific account input. */
-    gpg_manager_note_key_available(account->gpg_key_id);
 
     log_info("Successfully switched to GPG configuration for account: %s", account->name);
     rc = 0;
@@ -857,32 +1603,6 @@ static bool base_is_memory_backed(const char *base) {
     }
 }
 
-/* Process-lifetime memo of base_is_memory_backed(), keyed by the base path
- * (AR-03 L20). The probe walks statfs over the base's nearest existing
- * ancestor, and gpg_get_base_dir + gpg_create_isolated_home together re-ran it
- * on every call — 4-6 ancestor walks per GPG switch — because the old
- * warn-once latch only latched when the answer was BAD; the good/tmpfs path
- * re-probed forever. A mount's memory-backed-ness cannot change under us for
- * a fixed path within one short-lived invocation (the base, once created by
- * ensure_private_dir, stays on the mount the first probe saw), so one answer
- * per base path is authoritative. Keyed rather than a bare boolean because
- * the base path itself CAN change within a process when XDG_RUNTIME_DIR
- * changes (the test suite does exactly that); a stale answer for a different
- * base would defeat the no-persistent-disk fail-closed guard. Same
- * single-threaded, process-lifetime caching assumptions as g_seen_keys. */
-static bool base_memory_backed_cached(const char *base) {
-    static int cached = -1; /* -1 unknown; else the 0/1 answer for cached_base */
-    static char cached_base[MAX_PATH_LEN];
-
-    if (cached < 0 || strcmp(cached_base, base) != 0) {
-        if (safe_strncpy(cached_base, base, sizeof(cached_base)) != 0) {
-            return base_is_memory_backed(base); /* unkeyable: answer uncached */
-        }
-        cached = base_is_memory_backed(base) ? 1 : 0;
-    }
-    return cached == 1;
-}
-
 /* Compute the base directory that holds per-account isolated GNUPGHOMEs and the
  * stable `current` symlink. Two-way like the SSH side: use a configured,
  * valid XDG_RUNTIME_DIR, or /tmp/gitswitch-gpg-<uid> only when that variable
@@ -920,13 +1640,9 @@ static int gpg_get_base_dir(char *buf, size_t size) {
          * export XDG_RUNTIME_DIR or accept the risk knowingly. Probes the
          * actual base (nearest existing ancestor when absent), not a hardcoded
          * "/tmp": the base could be a distinct persistent mount under a tmpfs
-         * /tmp (AR-02 #22). The probe result is memoized per base path
-         * (AR-03 L20): this function runs 4-6 times per switch, and the
-         * statfs ancestor walk used to repeat on every call whenever the
-         * answer was GOOD (the warn latch below only stops repeat WARNINGS).
-         * The create path (gpg_prepare_base_dir) additionally refuses to
-         * write secret material to any non-memory-backed base unless the
-         * user opts in, sharing the same memoized answer. */
+         * /tmp (AR-02 #22). This pathname probe is diagnostic only. The
+         * create path separately enforces policy from the exact retained base
+         * descriptor and never treats this warning latch as authorization. */
         written = snprintf(child, sizeof(child), "gitswitch-gpg-%d", getuid());
     }
     if (written < 0 || (size_t)written >= sizeof(child)) {
@@ -935,10 +1651,16 @@ static int gpg_get_base_dir(char *buf, size_t size) {
     }
     written = snprintf(buf, size, "%s/%s", runtime_parent, child);
     if (strcmp(runtime_parent, "/tmp") == 0) {
-        static bool warned = false;
-        if (!warned && !g_gpg_suppress_base_warning && written > 0 &&
-            (size_t)written < size && !base_memory_backed_cached(buf)) {
-            warned = true;
+        if (!g_gpg_suppress_base_warning && written > 0 &&
+            (size_t)written < size && !g_base_warning_probe_checked) {
+            g_base_warning_memory_backed = g_base_warning_probe(buf);
+            g_base_warning_probe_checked = true;
+        }
+        if (!g_gpg_suppress_base_warning &&
+            g_base_warning_probe_checked &&
+            !g_base_warning_memory_backed &&
+            !g_base_warning_emitted) {
+            g_base_warning_emitted = true;
             display_warning("XDG_RUNTIME_DIR is unset; isolated GPG homes will use "
                             "%s, which is not memory-backed. Exported "
                             "secret keys could remain recoverable on disk after exit. Set "
@@ -980,6 +1702,41 @@ static int gpg_open_base_dir(char *base, size_t size, bool create,
     base_fd = open_private_subdir_at(parent_fd, child, create, absent);
     close(parent_fd);
     return base_fd;
+}
+
+/* Determine the storage type of the exact directory descriptor that will
+ * contain isolated secret-key material. Unknown platforms and syscall errors
+ * fail closed; pathname observations are intentionally not accepted here. */
+static int gpg_default_memory_backed_probe(int base_fd,
+                                           bool *memory_backed) {
+    struct statfs mounted;
+
+    if (base_fd < 0 || !memory_backed) {
+        errno = EINVAL;
+        return -1;
+    }
+    *memory_backed = false;
+    if (fstatfs(base_fd, &mounted) != 0) {
+        return -1;
+    }
+#ifdef __linux__
+    {
+        unsigned long type = (unsigned long)mounted.f_type;
+        *memory_backed =
+            type == 0x01021994UL /* TMPFS_MAGIC */ ||
+            type == 0x858458f6UL /* RAMFS_MAGIC */;
+    }
+#elif defined(__APPLE__) || defined(__FreeBSD__)
+    *memory_backed =
+        memchr(mounted.f_fstypename, '\0',
+               sizeof(mounted.f_fstypename)) != NULL &&
+        strcmp(mounted.f_fstypename, "tmpfs") == 0;
+#else
+    (void)mounted;
+    errno = ENOTSUP;
+    return -1;
+#endif
+    return 0;
 }
 
 /* Public: compute the stable GNUPGHOME path that `gitswitch init` exports and
@@ -1096,13 +1853,31 @@ static int gpg_native_rename_noreplace(int old_dir_fd, const char *old_name,
 #endif
 }
 
+/* AR-14 L22: fsync(2) does not request a drive-cache flush on Darwin, so the
+ * base-directory and agent-config barriers use F_FULLFSYNC there.  A volume
+ * or descriptor may not support that command; only the documented
+ * unsupported-command errors fall back to fsync.  Other errors must remain
+ * visible to callers rather than being masked as durable success. */
+static int gpg_full_fsync(int fd) {
+#if defined(__APPLE__)
+    int rc;
+
+    do {
+        rc = fcntl(fd, F_FULLFSYNC);
+    } while (rc != 0 && errno == EINTR);
+    if (rc == 0) return 0;
+    if (errno != ENOTSUP && errno != ENOTTY && errno != EINVAL) return -1;
+#endif
+    return fsync(fd);
+}
+
 static int gpg_default_sync_base(int base_fd) {
-    return fsync(base_fd);
+    return gpg_full_fsync(base_fd);
 }
 
 static int gpg_default_agent_conf_sync(int fd, bool directory) {
     (void)directory;
-    return fsync(fd);
+    return gpg_full_fsync(fd);
 }
 
 static int gpg_current_path_from_base(const char *base, char *buf, size_t size) {
@@ -1124,11 +1899,14 @@ enum {
     GPG_SOURCE_PROOF_MAX_DEPTH = 64,
     GPG_SOURCE_PROOF_MAX_DIRECTORIES = 16384,
     GPG_SOURCE_PROOF_MAX_ENTRIES = 65536,
-    GPG_SOURCE_PROOF_MAX_NULLFS_HOPS = 32
+    GPG_SOURCE_PROOF_MAX_NULLFS_HOPS = 32,
+    GPG_SOURCE_PROOF_HELPER_FD_RESERVE = 8,
+    GPG_SOURCE_PROOF_VALIDATION_FD_HEADROOM = 2
 };
 
 #define GPG_ROLLBACK_PREFIX ".gitswitch-gpg-rollback."
 #define GPG_PUBLISH_PREFIX ".gitswitch-gpg-publish."
+#define GPG_FORWARD_PREFIX ".gitswitch-gpg-forward."
 #define GPG_RESET_PREFIX ".gitswitch-gpg-reset."
 #define GPG_RESET_WITNESS_SUFFIX ".witness"
 
@@ -1207,6 +1985,360 @@ static bool gpg_name_has_prefix(const char *name, const char *prefix) {
     return name && prefix && strncmp(name, prefix, strlen(prefix)) == 0;
 }
 
+static bool gpg_forward_name_belongs_to_stem(const char *name,
+                                             const char *stem) {
+    size_t stem_length;
+
+    if (!name || !stem) return false;
+    stem_length = strlen(stem);
+    return strncmp(name, stem, stem_length) == 0 &&
+           name[stem_length] == '.' &&
+           (name[stem_length + 1U] == 'p' ||
+            name[stem_length + 1U] == 'w' ||
+            name[stem_length + 1U] == 'q') &&
+           name[stem_length + 2U] == '\0';
+}
+
+typedef enum {
+    GPG_PRIVATE_NAME_INVALID = 0,
+    GPG_PRIVATE_NAME_LEGACY,
+    GPG_PRIVATE_NAME_GENERATION
+} gpg_private_name_format_t;
+
+typedef struct {
+    uint8_t kind;
+    uint64_t boot_hi;
+    uint64_t boot_lo;
+    uint64_t start_hi;
+    uint64_t start_lo;
+} gpg_process_generation_t;
+
+static void gpg_store_u64_be(unsigned char *destination, uint64_t value) {
+    for (size_t i = 0; i < 8U; i++) {
+        destination[7U - i] = (unsigned char)(value & 0xffU);
+        value >>= 8U;
+    }
+}
+
+static uint64_t gpg_load_u64_be(const unsigned char *source) {
+    uint64_t value = 0U;
+    for (size_t i = 0; i < 8U; i++) {
+        value = (value << 8U) | source[i];
+    }
+    return value;
+}
+
+static int gpg_base64url_value(unsigned char c) {
+    if (c >= 'A' && c <= 'Z') return (int)(c - 'A');
+    if (c >= 'a' && c <= 'z') return (int)(c - 'a') + 26;
+    if (c >= '0' && c <= '9') return (int)(c - '0') + 52;
+    if (c == '-') return 62;
+    if (c == '_') return 63;
+    return -1;
+}
+
+static void gpg_encode_generation_bytes(const unsigned char bytes[33],
+                                        char token[45]) {
+    static const char alphabet[] =
+        "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789-_";
+    size_t input = 0U;
+    size_t output = 0U;
+
+    while (input + 2U < 33U) {
+        uint32_t value = ((uint32_t)bytes[input] << 16U) |
+                         ((uint32_t)bytes[input + 1U] << 8U) |
+                         bytes[input + 2U];
+        token[output++] = alphabet[(value >> 18U) & 0x3fU];
+        token[output++] = alphabet[(value >> 12U) & 0x3fU];
+        token[output++] = alphabet[(value >> 6U) & 0x3fU];
+        token[output++] = alphabet[value & 0x3fU];
+        input += 3U;
+    }
+    token[output] = '\0';
+}
+
+static bool gpg_valid_generation_token(const char *token) {
+    unsigned char bytes[33];
+    char canonical[45];
+    size_t input = 0U;
+    size_t output = 0U;
+
+    if (!token) return false;
+    while (input < 44U) {
+        int a = gpg_base64url_value((unsigned char)token[input++]);
+        int b = gpg_base64url_value((unsigned char)token[input++]);
+        int c = gpg_base64url_value((unsigned char)token[input++]);
+        int d = gpg_base64url_value((unsigned char)token[input++]);
+        uint32_t value;
+        if (a < 0 || b < 0 || c < 0 || d < 0) return false;
+        value = ((uint32_t)a << 18U) | ((uint32_t)b << 12U) |
+                ((uint32_t)c << 6U) | (uint32_t)d;
+        bytes[output++] = (unsigned char)(value >> 16U);
+        bytes[output++] = (unsigned char)(value >> 8U);
+        bytes[output++] = (unsigned char)value;
+    }
+    if (output != sizeof(bytes) ||
+        bytes[0] < 1U || bytes[0] > 3U ||
+        (gpg_load_u64_be(bytes + 1U) |
+         gpg_load_u64_be(bytes + 9U)) == 0U ||
+        (gpg_load_u64_be(bytes + 17U) |
+         gpg_load_u64_be(bytes + 25U)) == 0U) {
+        return false;
+    }
+    gpg_encode_generation_bytes(bytes, canonical);
+    return memcmp(token, canonical, 44U) == 0;
+}
+
+static int gpg_encode_process_generation(
+    const gpg_process_generation_t *generation, char *token, size_t size) {
+    unsigned char bytes[33];
+
+    if (!generation || !token || size < 45U || generation->kind == 0U ||
+        (generation->boot_hi | generation->boot_lo) == 0U ||
+        (generation->start_hi | generation->start_lo) == 0U) {
+        errno = EINVAL;
+        return -1;
+    }
+    bytes[0] = generation->kind;
+    gpg_store_u64_be(bytes + 1U, generation->boot_hi);
+    gpg_store_u64_be(bytes + 9U, generation->boot_lo);
+    gpg_store_u64_be(bytes + 17U, generation->start_hi);
+    gpg_store_u64_be(bytes + 25U, generation->start_lo);
+    gpg_encode_generation_bytes(bytes, token);
+    return 0;
+}
+
+#ifdef __linux__
+static int gpg_read_process_file(const char *path, char *buffer, size_t size,
+                                 size_t *used_out) {
+    int fd;
+    size_t used = 0U;
+
+    if (!path || !buffer || size < 2U || !used_out) {
+        errno = EINVAL;
+        return -1;
+    }
+    fd = open(path, O_RDONLY | O_CLOEXEC);
+    if (fd < 0) return -1;
+    while (used + 1U < size) {
+        ssize_t count = read(fd, buffer + used, size - used - 1U);
+        if (count > 0) {
+            used += (size_t)count;
+            continue;
+        }
+        if (count == 0) break;
+        if (errno == EINTR) continue;
+        {
+            int saved_errno = errno;
+            close(fd);
+            errno = saved_errno;
+            return -1;
+        }
+    }
+    if (used + 1U == size) {
+        char extra;
+        ssize_t count;
+        do {
+            count = read(fd, &extra, 1U);
+        } while (count < 0 && errno == EINTR);
+        if (count != 0) {
+            close(fd);
+            errno = EOVERFLOW;
+            return -1;
+        }
+    }
+    if (close(fd) != 0) return -1;
+    buffer[used] = '\0';
+    *used_out = used;
+    return 0;
+}
+
+static int gpg_parse_hex_u64(const char *text, uint64_t *value_out) {
+    uint64_t value = 0U;
+    if (!text || !value_out) return -1;
+    for (size_t i = 0; i < 16U; i++) {
+        unsigned char c = (unsigned char)text[i];
+        unsigned int digit;
+        if (c >= '0' && c <= '9') {
+            digit = (unsigned int)(c - '0');
+        } else if (c >= 'a' && c <= 'f') {
+            digit = (unsigned int)(c - 'a') + 10U;
+        } else {
+            return -1;
+        }
+        value = (value << 4U) | digit;
+    }
+    *value_out = value;
+    return 0;
+}
+#endif
+
+static int gpg_capture_process_generation(
+    pid_t pid, gpg_process_generation_t *generation) {
+    if (g_process_generation_failure_for_test) {
+        errno = EIO;
+        return -1;
+    }
+    if (pid <= 1 || !generation) {
+        errno = EINVAL;
+        return -1;
+    }
+    memset(generation, 0, sizeof(*generation));
+#ifdef __linux__
+    {
+        char boot[64];
+        char compact[33];
+        char stat_path[64];
+        char stat_data[4096];
+        char *cursor;
+        char *end;
+        size_t boot_size;
+        size_t stat_size;
+        size_t compact_size = 0U;
+        unsigned long long start;
+
+        if (gpg_read_process_file("/proc/sys/kernel/random/boot_id",
+                                  boot, sizeof(boot), &boot_size) != 0) {
+            return -1;
+        }
+        for (size_t i = 0; i < boot_size; i++) {
+            if (boot[i] == '-' || boot[i] == '\n') continue;
+            if (compact_size >= 32U ||
+                !((boot[i] >= '0' && boot[i] <= '9') ||
+                  (boot[i] >= 'a' && boot[i] <= 'f'))) {
+                errno = EINVAL;
+                return -1;
+            }
+            compact[compact_size++] = boot[i];
+        }
+        compact[compact_size] = '\0';
+        if (compact_size != 32U ||
+            gpg_parse_hex_u64(compact, &generation->boot_hi) != 0 ||
+            gpg_parse_hex_u64(compact + 16U, &generation->boot_lo) != 0) {
+            errno = EINVAL;
+            return -1;
+        }
+        snprintf(stat_path, sizeof(stat_path), "/proc/%ld/stat", (long)pid);
+        if (gpg_read_process_file(stat_path, stat_data, sizeof(stat_data),
+                                  &stat_size) != 0 ||
+            stat_size == 0U) {
+            return -1;
+        }
+        cursor = stat_data + stat_size;
+        while (cursor > stat_data && cursor[-1] != ')') cursor--;
+        if (cursor == stat_data || cursor >= stat_data + stat_size ||
+            *cursor != ' ') {
+            errno = EINVAL;
+            return -1;
+        }
+        cursor++;
+        for (unsigned int field = 3U; field < 22U; field++) {
+            while (cursor < stat_data + stat_size &&
+                   *cursor != ' ' && *cursor != '\n') {
+                cursor++;
+            }
+            while (cursor < stat_data + stat_size && *cursor == ' ') cursor++;
+            if (cursor >= stat_data + stat_size) {
+                errno = EINVAL;
+                return -1;
+            }
+        }
+        errno = 0;
+        start = strtoull(cursor, &end, 10);
+        if (errno != 0 || end == cursor || start == 0ULL ||
+            (*end != ' ' && *end != '\n' && *end != '\0')) {
+            errno = EINVAL;
+            return -1;
+        }
+        generation->kind = 1U;
+        generation->start_lo = (uint64_t)start;
+        return 0;
+    }
+#elif defined(__APPLE__) || defined(__FreeBSD__)
+    {
+        int boot_mib[2] = {CTL_KERN, KERN_BOOTTIME};
+        struct timeval boot;
+        size_t boot_size = sizeof(boot);
+        if (sysctl(boot_mib, 2, &boot, &boot_size, NULL, 0) != 0) {
+            return -1;
+        }
+        if (boot_size != sizeof(boot) || boot.tv_sec <= 0 ||
+            boot.tv_usec < 0 || boot.tv_usec > 999999) {
+            errno = EIO;
+            return -1;
+        }
+        generation->boot_hi = (uint64_t)boot.tv_sec;
+        generation->boot_lo = (uint64_t)boot.tv_usec;
+#if defined(__APPLE__)
+        {
+            int mib[4] = {CTL_KERN, KERN_PROC, KERN_PROC_PID, (int)pid};
+            struct kinfo_proc info;
+            size_t length = sizeof(info);
+            if (sysctl(mib, 4, &info, &length, NULL, 0) != 0) {
+                memset(generation, 0, sizeof(*generation));
+                return -1;
+            }
+            if (length == 0U) {
+                memset(generation, 0, sizeof(*generation));
+                errno = ESRCH;
+                return -1;
+            }
+            if (length != sizeof(info) || info.kp_proc.p_pid != pid ||
+                info.kp_proc.p_starttime.tv_sec <= 0 ||
+                info.kp_proc.p_starttime.tv_usec < 0 ||
+                info.kp_proc.p_starttime.tv_usec > 999999) {
+                memset(generation, 0, sizeof(*generation));
+                errno = EIO;
+                return -1;
+            }
+            generation->kind = 2U;
+            generation->start_hi =
+                (uint64_t)info.kp_proc.p_starttime.tv_sec;
+            generation->start_lo =
+                (uint64_t)info.kp_proc.p_starttime.tv_usec;
+        }
+#else
+        {
+            int mib[4] = {CTL_KERN, KERN_PROC, KERN_PROC_PID, (int)pid};
+            struct kinfo_proc info;
+            size_t length = sizeof(info);
+            if (sysctl(mib, 4, &info, &length, NULL, 0) != 0) {
+                memset(generation, 0, sizeof(*generation));
+                return -1;
+            }
+            if (length == 0U) {
+                memset(generation, 0, sizeof(*generation));
+                errno = ESRCH;
+                return -1;
+            }
+            if (length != sizeof(info) || info.ki_pid != pid ||
+                info.ki_start.tv_sec <= 0 || info.ki_start.tv_usec < 0 ||
+                info.ki_start.tv_usec > 999999) {
+                memset(generation, 0, sizeof(*generation));
+                errno = EIO;
+                return -1;
+            }
+            generation->kind = 3U;
+            generation->start_hi = (uint64_t)info.ki_start.tv_sec;
+            generation->start_lo = (uint64_t)info.ki_start.tv_usec;
+        }
+#endif
+        return 0;
+    }
+#else
+    (void)pid;
+    errno = ENOTSUP;
+    return -1;
+#endif
+}
+
+static int gpg_capture_process_generation_token(pid_t pid, char *token,
+                                                size_t size) {
+    gpg_process_generation_t generation;
+    if (gpg_capture_process_generation(pid, &generation) != 0) return -1;
+    return gpg_encode_process_generation(&generation, token, size);
+}
+
 /* A quarantine without an in-memory transaction token may contain a symlink
  * displaced by an interrupted process. Never guess at its ownership. */
 static int gpg_reject_stale_quarantines_locked(int base_fd,
@@ -1245,7 +2377,11 @@ static int gpg_reject_stale_quarantines_locked(int base_fd,
         }
         if ((gpg_name_has_prefix(entry->d_name, GPG_ROLLBACK_PREFIX) ||
              gpg_name_has_prefix(entry->d_name, GPG_PUBLISH_PREFIX) ||
+             gpg_name_has_prefix(entry->d_name, GPG_FORWARD_PREFIX) ||
              gpg_name_has_prefix(entry->d_name, GPG_RESET_PREFIX)) &&
+            !(g_allowed_forward_stem &&
+              gpg_forward_name_belongs_to_stem(entry->d_name,
+                                               g_allowed_forward_stem)) &&
             (!allowed_name || strcmp(entry->d_name, allowed_name) != 0)) {
             char stale[GPG_QUARANTINE_NAME_LEN];
             safe_strncpy(stale, entry->d_name, sizeof(stale));
@@ -1266,145 +2402,25 @@ static int gpg_reject_stale_quarantines_locked(int base_fd,
     return 0;
 }
 
-/* AR-12 L11: a SIGKILL/power loss between quarantine creation and its
- * unlink orphans a .gitswitch-gpg-rollback.* / .gitswitch-gpg-publish.*
- * symlink with no in-memory token, and the stale-quarantine gate then
- * blocks every switch, drop, AND reset forever. Full reset deletes every
- * managed home anyway, so an owned orphaned quarantine SYMLINK preserves
- * nothing — retire it. Anything that is not an owned symlink stays fatal. */
-static int gpg_retire_orphan_quarantines_locked(int base_fd) {
-    int scan_flags = O_RDONLY | O_CLOEXEC;
-    int scan_fd;
-    DIR *dir;
-    struct dirent *entry;
-
-#ifdef O_DIRECTORY
-    scan_flags |= O_DIRECTORY;
-#endif
-#ifdef O_NOFOLLOW
-    scan_flags |= O_NOFOLLOW;
-#endif
-    scan_fd = openat(base_fd, ".", scan_flags);
-    if (scan_fd < 0 || !(dir = fdopendir(scan_fd))) {
-        if (scan_fd >= 0) close(scan_fd);
-        set_system_error(ERR_FILE_IO,
-                         "Cannot inspect GPG quarantine residue");
-        return -1;
-    }
-    for (;;) {
-        struct stat orphan;
-
-        errno = 0;
-        entry = readdir(dir);
-        if (!entry) {
-            if (errno != 0) {
-                int saved_errno = errno;
-                closedir(dir);
-                errno = saved_errno;
-                set_system_error(ERR_FILE_IO,
-                                 "Cannot enumerate GPG quarantine residue");
-                return -1;
-            }
-            break;
-        }
-        /* AR-13 L4: also retire orphaned reset-prefix residue. Full reset runs
-         * gpg_reconcile_reset_retry_locked first (and fails closed if it does
-         * not succeed), which retires every VALID witnessed reset retry, so any
-         * reset-prefix name still present here is a malformed or unwitnessed
-         * orphan — previously it had no auto-clear path and bricked switch,
-         * drop AND reset via the stale-quarantine gate. The S_ISLNK/uid gate
-         * and the live-owner (pid) guard below apply to it exactly as to the
-         * rollback/publish residue. */
-        if (!gpg_name_has_prefix(entry->d_name, GPG_ROLLBACK_PREFIX) &&
-            !gpg_name_has_prefix(entry->d_name, GPG_PUBLISH_PREFIX) &&
-            !gpg_name_has_prefix(entry->d_name, GPG_RESET_PREFIX)) {
-            continue;
-        }
-        if (fstatat(base_fd, entry->d_name, &orphan,
-                    AT_SYMLINK_NOFOLLOW) != 0) {
-            if (errno == ENOENT) continue;
-            set_system_error(ERR_FILE_IO,
-                             "Cannot inspect GPG quarantine residue: %s",
-                             entry->d_name);
-            closedir(dir);
-            return -1;
-        }
-        if (!S_ISLNK(orphan.st_mode) || orphan.st_uid != getuid()) {
-            set_error(ERR_PERMISSION_DENIED,
-                      "Refusing foreign GPG quarantine residue: %s",
-                      entry->d_name);
-            closedir(dir);
-            return -1;
-        }
-        /* AR-13 M8: a quarantine name is {prefix}{pid}.{16-hex}. If that pid is
-         * a DIFFERENT still-live process of ours, this is not a crash orphan
-         * but the live retry handle of a concurrent gitswitch (a rollback token
-         * retained across lock releases after an I/O/hook failure). Retiring it
-         * here — before the destructive pass, and even if the all-or-nothing
-         * preflight later aborts and deletes nothing else — would strand that
-         * owner's recovery. Fail the reset instead of deleting live-owned state;
-         * the user can retry once the other process completes. A genuine crash
-         * orphan has a dead pid (kill -> ESRCH), and this process's own residue
-         * (pid == getpid()) is still cleared, so L11's wedge-clearing holds. */
-        {
-            const char *pid_str = entry->d_name +
-                (gpg_name_has_prefix(entry->d_name, GPG_ROLLBACK_PREFIX)
-                     ? strlen(GPG_ROLLBACK_PREFIX)
-                 : gpg_name_has_prefix(entry->d_name, GPG_PUBLISH_PREFIX)
-                     ? strlen(GPG_PUBLISH_PREFIX)
-                     : strlen(GPG_RESET_PREFIX));
-
-            if (*pid_str >= '1' && *pid_str <= '9') {
-                long pid = 0;
-                bool parsed = true;
-
-                for (; *pid_str && *pid_str != '.'; pid_str++) {
-                    if (!isdigit((unsigned char)*pid_str) ||
-                        pid > (LONG_MAX - 9) / 10) {
-                        parsed = false;
-                        break;
-                    }
-                    pid = pid * 10 + (*pid_str - '0');
-                }
-                if (parsed && pid > 0 && (pid_t)pid != getpid()) {
-                    errno = 0;
-                    if (kill((pid_t)pid, 0) == 0 || errno == EPERM) {
-                        set_error(ERR_FILE_IO,
-                                  "Refusing to retire a GPG quarantine held by "
-                                  "a live gitswitch process (pid %ld): %s; "
-                                  "retry reset after it completes",
-                                  pid, entry->d_name);
-                        closedir(dir);
-                        return -1;
-                    }
-                }
-            }
-        }
-        if (unlinkat(base_fd, entry->d_name, 0) != 0 && errno != ENOENT) {
-            set_system_error(ERR_FILE_IO,
-                             "Cannot retire orphaned GPG quarantine: %s",
-                             entry->d_name);
-            closedir(dir);
-            return -1;
-        }
-        log_warning("Retired orphaned GPG quarantine residue: %s",
-                    entry->d_name);
-    }
-    closedir(dir);
-    return 0;
-}
-
 static int gpg_make_private_name(char *name, size_t size,
                                  const char *prefix) {
+    char generation[45];
     char random[17];
     int written;
 
-    if (!name || size == 0 || !prefix ||
-        generate_random_string(random, sizeof(random),
+    if (!name || size == 0 || !prefix) return -1;
+    if (gpg_capture_process_generation_token(getpid(), generation,
+                                             sizeof(generation)) != 0) {
+        set_system_error(ERR_FILE_IO,
+                         "Cannot capture GPG private-name process generation");
+        return -1;
+    }
+    if (generate_random_string(random, sizeof(random),
                                "0123456789abcdef") != 0) {
         return -1;
     }
-    written = snprintf(name, size, "%s%ld.%s", prefix, (long)getpid(), random);
+    written = snprintf(name, size, "%s%ld.v1.%s.%s", prefix,
+                       (long)getpid(), generation, random);
     if (written < 0 || (size_t)written >= size) {
         set_error(ERR_INVALID_PATH, "GPG private runtime name is too long");
         return -1;
@@ -1419,24 +2435,124 @@ typedef struct {
     char witness[GPG_QUARANTINE_NAME_LEN];
 } gpg_reset_retry_state_t;
 
-static bool gpg_valid_private_name(const char *name, const char *prefix) {
+static gpg_private_name_format_t gpg_parse_private_name(
+    const char *name, const char *prefix, pid_t *pid_out,
+    const char **generation_out) {
     const char *cursor;
+    const char *token;
     const char *random;
+    uintmax_t value = 0U;
     size_t prefix_len;
 
-    if (!name || !prefix) return false;
+    if (!name || !prefix) return GPG_PRIVATE_NAME_INVALID;
     prefix_len = strlen(prefix);
-    if (strncmp(name, prefix, prefix_len) != 0) return false;
-    cursor = name + prefix_len;
-    if (*cursor < '1' || *cursor > '9') return false;
-    while (isdigit((unsigned char)*cursor)) cursor++;
-    if (*cursor != '.') return false;
-    random = ++cursor;
-    if (strlen(random) != 16U) return false;
-    for (size_t i = 0; i < 16U; i++) {
-        if (!strchr("0123456789abcdef", random[i])) return false;
+    if (strncmp(name, prefix, prefix_len) != 0) {
+        return GPG_PRIVATE_NAME_INVALID;
     }
-    return true;
+    cursor = name + prefix_len;
+    if (*cursor < '1' || *cursor > '9') return GPG_PRIVATE_NAME_INVALID;
+    while (isdigit((unsigned char)*cursor)) {
+        unsigned int digit = (unsigned int)(*cursor - '0');
+        if (value > (UINTMAX_MAX - digit) / 10U) {
+            return GPG_PRIVATE_NAME_INVALID;
+        }
+        value = value * 10U + digit;
+        cursor++;
+    }
+    if (*cursor != '.' || (pid_t)value <= 0 ||
+        (uintmax_t)(pid_t)value != value) {
+        return GPG_PRIVATE_NAME_INVALID;
+    }
+    if (pid_out) *pid_out = (pid_t)value;
+    random = ++cursor;
+    if (strlen(random) == 16U) {
+        for (size_t i = 0; i < 16U; i++) {
+            if (!strchr("0123456789abcdef", random[i])) {
+                return GPG_PRIVATE_NAME_INVALID;
+            }
+        }
+        if (generation_out) *generation_out = NULL;
+        return GPG_PRIVATE_NAME_LEGACY;
+    }
+    if (strncmp(random, "v1.", 3U) != 0) {
+        return GPG_PRIVATE_NAME_INVALID;
+    }
+    token = random + 3U;
+    if (strlen(token) != 44U + 1U + 16U || token[44] != '.') {
+        return GPG_PRIVATE_NAME_INVALID;
+    }
+    if (!gpg_valid_generation_token(token)) {
+        return GPG_PRIVATE_NAME_INVALID;
+    }
+    random = token + 45U;
+    if (strlen(random) != 16U) return GPG_PRIVATE_NAME_INVALID;
+    for (size_t i = 0; i < 16U; i++) {
+        if (!strchr("0123456789abcdef", random[i])) {
+            return GPG_PRIVATE_NAME_INVALID;
+        }
+    }
+    if (generation_out) *generation_out = token;
+    return GPG_PRIVATE_NAME_GENERATION;
+}
+
+static bool gpg_valid_private_name(const char *name, const char *prefix) {
+    return gpg_parse_private_name(name, prefix, NULL, NULL) ==
+           GPG_PRIVATE_NAME_GENERATION;
+}
+
+/* Generation-bound names remain live only while both the PID and its freshly
+ * captured kernel generation match. PID reuse therefore proves the original
+ * owner gone. Legacy names are admitted only by explicit full reset: the held
+ * GPG lock permits this process's own legacy residue, while another live PID
+ * remains fail-closed. */
+static int gpg_private_name_owner_is_live(const char *name,
+                                          const char *prefix,
+                                          bool allow_legacy,
+                                          bool *live) {
+    char observed[45];
+    const char *recorded = NULL;
+    gpg_private_name_format_t format;
+    pid_t pid;
+
+    if (!live) {
+        set_error(ERR_INVALID_ARGS, "Invalid GPG private owner result");
+        return -1;
+    }
+    *live = false;
+    format = gpg_parse_private_name(name, prefix, &pid, &recorded);
+    if (format == GPG_PRIVATE_NAME_INVALID ||
+        (format == GPG_PRIVATE_NAME_LEGACY && !allow_legacy)) {
+        set_error(ERR_INVALID_ARGS, "Invalid GPG private runtime name");
+        return -1;
+    }
+    if (format == GPG_PRIVATE_NAME_LEGACY) {
+        if (pid == getpid()) return 0;
+        errno = 0;
+        if (kill(pid, 0) == 0 || errno == EPERM) {
+            *live = true;
+            return 0;
+        }
+        if (errno == ESRCH) return 0;
+        set_system_error(ERR_FILE_IO,
+                         "Cannot determine legacy GPG runtime owner state: %s",
+                         name);
+        return -1;
+    }
+    /* The held private GPG lock is explicit authority for this process to
+     * reconcile a retry artifact left by its own preceding failed operation.
+     * Generation matching protects a different live process, not stale
+     * in-process retry state that only this lock holder can settle. */
+    if (pid == getpid()) return 0;
+    errno = 0;
+    if (gpg_capture_process_generation_token(pid, observed,
+                                             sizeof(observed)) == 0) {
+        *live = strncmp(recorded, observed, 44U) == 0;
+        return 0;
+    }
+    if (errno == ENOENT || errno == ESRCH) return 0;
+    set_system_error(ERR_FILE_IO,
+                     "Cannot verify GPG runtime owner generation: %s", name);
+    return -1;
 }
 
 static int gpg_reset_witness_name(const char *quarantine,
@@ -2427,15 +3543,366 @@ static int gpg_finish_failed_retarget(int base_fd, const char *base,
     return -1;
 }
 
+typedef struct {
+    char stem[GPG_QUARANTINE_NAME_LEN];
+    char candidate[GPG_QUARANTINE_NAME_LEN];
+    char witness[GPG_QUARANTINE_NAME_LEN];
+    char quarantine[GPG_QUARANTINE_NAME_LEN];
+    bool candidate_present;
+    bool witness_present;
+    bool quarantine_present;
+} gpg_forward_state_t;
+
+static int gpg_forward_names(gpg_forward_state_t *state) {
+    if (!state ||
+        gpg_make_private_name(state->stem, sizeof(state->stem),
+                              GPG_FORWARD_PREFIX) != 0 ||
+        safe_snprintf(state->candidate, sizeof(state->candidate), "%s.p",
+                      state->stem) != 0 ||
+        safe_snprintf(state->witness, sizeof(state->witness), "%s.w",
+                      state->stem) != 0 ||
+        safe_snprintf(state->quarantine, sizeof(state->quarantine), "%s.q",
+                      state->stem) != 0) {
+        set_error(ERR_INVALID_PATH,
+                  "Cannot allocate GPG forward-transaction names");
+        return -1;
+    }
+    return 0;
+}
+
+static int gpg_forward_retire_if_present(
+    int base_fd, const char *name, const gpg_link_identity_t *expected,
+    const char *description) {
+    gpg_link_identity_t observed;
+    int rc = gpg_capture_link_at(base_fd, name, &observed);
+
+    if (rc < 0) return -1;
+    if (rc > 0) return 0;
+    if (!gpg_same_link(&observed, expected)) {
+        set_error(ERR_FILE_IO, "%s changed; preserving replacement: %s",
+                  description, name);
+        return -1;
+    }
+    return gpg_discard_prepared_link_locked(base_fd, name, expected);
+}
+
+static int gpg_forward_cleanup_locked(
+    int base_fd, const gpg_forward_state_t *state,
+    const gpg_link_identity_t *candidate,
+    const gpg_link_identity_t *witness,
+    const gpg_link_identity_t *quarantine) {
+    if (quarantine && quarantine->valid &&
+        gpg_forward_retire_if_present(base_fd, state->quarantine, quarantine,
+                                      "GPG forward quarantine") != 0) {
+        return -1;
+    }
+    if (witness && witness->valid &&
+        gpg_forward_retire_if_present(base_fd, state->witness, witness,
+                                      "GPG forward expected witness") != 0) {
+        return -1;
+    }
+    if (candidate && candidate->valid &&
+        gpg_forward_retire_if_present(base_fd, state->candidate, candidate,
+                                      "GPG forward candidate witness") != 0) {
+        return -1;
+    }
+    return 0;
+}
+
+/* Restore a displaced writer only into an absent public name. A concurrent
+ * occupant always wins. FreeBSD's retained source alias is retired only after
+ * the public name is proven to be the exact displaced inode. */
+static int gpg_forward_restore_quarantine_locked(
+    int base_fd, const char *name, const gpg_link_identity_t *quarantine,
+    bool *blocked) {
+    gpg_link_identity_t current;
+    int current_rc;
+
+    *blocked = false;
+    current_rc = gpg_capture_link_at(base_fd, "current", &current);
+    if (current_rc < 0) return -1;
+    if (current_rc == 0) {
+        *blocked = true;
+        return 0;
+    }
+    if (g_rename_noreplace(base_fd, name, base_fd, "current") != 0) {
+        set_system_error(ERR_FILE_IO,
+                         "Cannot restore displaced GNUPGHOME writer");
+        return -1;
+    }
+    if (gpg_capture_link_at(base_fd, "current", &current) != 0 ||
+        !gpg_same_link(&current, quarantine)) {
+        set_error(ERR_FILE_IO,
+                  "Restored GNUPGHOME writer changed during recovery");
+        return -1;
+    }
+    if (gpg_forward_retire_if_present(base_fd, name, quarantine,
+                                      "restored GPG forward quarantine") != 0) {
+        return -1;
+    }
+    if (g_sync_base(base_fd) != 0) {
+        set_system_error(ERR_FILE_IO,
+                         "Cannot synchronize restored GNUPGHOME writer");
+        return -1;
+    }
+    return 0;
+}
+
+static int gpg_scan_forward_state_locked(int base_fd,
+                                         gpg_forward_state_t *state) {
+    int flags = O_RDONLY | O_CLOEXEC;
+    int scan_fd;
+    DIR *dir;
+    struct dirent *entry;
+
+    memset(state, 0, sizeof(*state));
+#ifdef O_DIRECTORY
+    flags |= O_DIRECTORY;
+#endif
+#ifdef O_NOFOLLOW
+    flags |= O_NOFOLLOW;
+#endif
+    scan_fd = openat(base_fd, ".", flags);
+    dir = scan_fd >= 0 ? fdopendir(scan_fd) : NULL;
+    if (!dir) {
+        if (scan_fd >= 0) close(scan_fd);
+        set_system_error(ERR_FILE_IO,
+                         "Cannot inspect GPG forward retry state");
+        return -1;
+    }
+    for (;;) {
+        char stem[GPG_QUARANTINE_NAME_LEN];
+        size_t length;
+        char kind;
+        bool *present;
+        char *destination;
+
+        errno = 0;
+        entry = g_gpg_readdir(dir);
+        if (!entry) {
+            if (errno != 0) {
+                int saved_errno = errno;
+                closedir(dir);
+                errno = saved_errno;
+                set_system_error(ERR_FILE_IO,
+                                 "Cannot enumerate GPG forward retry state");
+                return -1;
+            }
+            break;
+        }
+        if (!gpg_name_has_prefix(entry->d_name, GPG_FORWARD_PREFIX)) continue;
+        length = strlen(entry->d_name);
+        if (length < 3U || entry->d_name[length - 2U] != '.' ||
+            !strchr("pwq", entry->d_name[length - 1U]) ||
+            length - 2U >= sizeof(stem) ||
+            length >= GPG_QUARANTINE_NAME_LEN) {
+            set_error(ERR_FILE_IO,
+                      "Malformed GPG forward retry entry blocks mutation: %s",
+                      entry->d_name);
+            closedir(dir);
+            return -1;
+        }
+        memcpy(stem, entry->d_name, length - 2U);
+        stem[length - 2U] = '\0';
+        if (!gpg_valid_private_name(stem, GPG_FORWARD_PREFIX) ||
+            (state->stem[0] && strcmp(state->stem, stem) != 0)) {
+            closedir(dir);
+            set_error(ERR_FILE_IO,
+                      "Ambiguous GPG forward retry state blocks mutation");
+            return -1;
+        }
+        if (safe_strncpy(state->stem, stem, sizeof(state->stem)) != 0) {
+            closedir(dir);
+            set_error(ERR_INVALID_PATH,
+                      "GPG forward retry stem exceeds its bounded grammar");
+            return -1;
+        }
+        kind = entry->d_name[length - 1U];
+        if (kind == 'p') {
+            present = &state->candidate_present;
+            destination = state->candidate;
+        } else if (kind == 'w') {
+            present = &state->witness_present;
+            destination = state->witness;
+        } else {
+            present = &state->quarantine_present;
+            destination = state->quarantine;
+        }
+        if (*present) {
+            closedir(dir);
+            set_error(ERR_FILE_IO,
+                      "Duplicate GPG forward retry entry blocks mutation");
+            return -1;
+        }
+        *present = true;
+        if (safe_strncpy(destination, entry->d_name,
+                         GPG_QUARANTINE_NAME_LEN) != 0) {
+            closedir(dir);
+            set_error(ERR_INVALID_PATH,
+                      "GPG forward retry name exceeds its bounded grammar");
+            return -1;
+        }
+    }
+    if (closedir(dir) != 0) {
+        set_system_error(ERR_FILE_IO,
+                         "Cannot close GPG forward retry scan");
+        return -1;
+    }
+    return 0;
+}
+
+static int gpg_reconcile_forward_state_locked(int base_fd) {
+    gpg_forward_state_t state;
+    gpg_link_identity_t candidate;
+    gpg_link_identity_t witness;
+    gpg_link_identity_t quarantine;
+    gpg_link_identity_t current;
+    bool blocked;
+    int current_rc;
+
+    if (gpg_scan_forward_state_locked(base_fd, &state) != 0) return -1;
+    if (!state.candidate_present && !state.witness_present &&
+        !state.quarantine_present) {
+        return 0;
+    }
+    if (!state.candidate_present ||
+        (state.quarantine_present && !state.witness_present) ||
+        gpg_capture_link_at(base_fd, state.candidate, &candidate) != 0) {
+        set_error(ERR_FILE_IO,
+                  "Malformed GPG forward retry group blocks mutation");
+        return -1;
+    }
+    if (!state.witness_present) {
+        return gpg_forward_cleanup_locked(base_fd, &state, &candidate,
+                                          NULL, NULL);
+    }
+    if (gpg_capture_link_at(base_fd, state.witness, &witness) != 0) {
+        set_error(ERR_FILE_IO,
+                  "Cannot identify GPG forward expected witness");
+        return -1;
+    }
+    current_rc = gpg_capture_link_at(base_fd, "current", &current);
+    if (current_rc < 0) return -1;
+    if (!state.quarantine_present) {
+        /* Before quarantine, W and P are private hard-link witnesses and no
+         * public generation has been displaced. After successful publication,
+         * this is also the durable cleanup state reached once Q has retired.
+         * Any still-present current therefore remains authoritative: remove
+         * only the exact private aliases, whether it names W, P, or a later
+         * writer. Absence is ambiguous because the missing Q may have held a
+         * displaced generation. */
+        if (current_rc == 0) {
+            return gpg_forward_cleanup_locked(base_fd, &state, &candidate,
+                                              &witness, NULL);
+        }
+        set_error(ERR_FILE_IO,
+                  "Ambiguous GPG forward retry group preserved");
+        return -1;
+    }
+    if (gpg_capture_link_at(base_fd, state.quarantine, &quarantine) != 0) {
+        set_error(ERR_FILE_IO, "Cannot identify GPG forward quarantine");
+        return -1;
+    }
+    if (!gpg_same_link(&quarantine, &witness)) {
+        if (current_rc == 0 &&
+            gpg_same_link(&current, &quarantine)) {
+            /* FreeBSD may have linked Q without retiring its source alias.
+             * Q is the newer generation in this mismatch state, but current
+             * already preserves that exact inode. The private group is now
+             * disposable; fail this attempt so the caller takes a clean new
+             * snapshot on retry. */
+            if (gpg_forward_cleanup_locked(base_fd, &state, &candidate,
+                                           &witness, &quarantine) != 0) {
+                return -1;
+            }
+            set_error(ERR_FILE_IO,
+                      "A displaced newer GNUPGHOME writer was preserved; retry required");
+            return -1;
+        }
+        if (gpg_forward_restore_quarantine_locked(
+                base_fd, state.quarantine, &quarantine, &blocked) != 0) {
+            return -1;
+        }
+        if (!blocked &&
+            gpg_forward_cleanup_locked(base_fd, &state, &candidate,
+                                       &witness, &quarantine) != 0) {
+            return -1;
+        }
+        set_error(ERR_FILE_IO,
+                  blocked
+                      ? "A later GNUPGHOME writer blocks forward recovery"
+                      : "A displaced newer GNUPGHOME writer was restored; retry required");
+        return -1;
+    }
+    if (current_rc > 0) {
+        if (gpg_forward_restore_quarantine_locked(
+                base_fd, state.quarantine, &quarantine, &blocked) != 0 ||
+            blocked) {
+            set_error(ERR_FILE_IO,
+                      "Cannot restore interrupted GPG forward transaction");
+            return -1;
+        }
+        return gpg_forward_cleanup_locked(base_fd, &state, &candidate,
+                                          &witness, &quarantine);
+    }
+    /* Q==W proves the private quarantine contains only the expected old
+     * generation. A present current is therefore authoritative: it can be the
+     * published P, FreeBSD's retained W/Q source alias, or a distinct later
+     * writer. In every case retire only the exact private group and preserve
+     * current, allowing the caller's new transaction to snapshot it cleanly. */
+    return gpg_forward_cleanup_locked(base_fd, &state, &candidate,
+                                      &witness, &quarantine);
+}
+
+/* A retained rollback token may legitimately coexist with the durable forward
+ * witnesses from the publication it is undoing. Bind that group to the exact
+ * published inode before temporarily exempting its three names from the stale
+ * quarantine gate. */
+static int gpg_forward_state_for_publication_locked(
+    int base_fd, const gpg_link_identity_t *published,
+    gpg_forward_state_t *state, gpg_link_identity_t *candidate,
+    gpg_link_identity_t *witness, gpg_link_identity_t *quarantine) {
+    if (gpg_scan_forward_state_locked(base_fd, state) != 0) return -1;
+    memset(candidate, 0, sizeof(*candidate));
+    memset(witness, 0, sizeof(*witness));
+    memset(quarantine, 0, sizeof(*quarantine));
+    if (!state->candidate_present && !state->witness_present &&
+        !state->quarantine_present) {
+        return 1;
+    }
+    if (!published || !published->valid || !state->candidate_present ||
+        state->witness_present != state->quarantine_present ||
+        gpg_capture_link_at(base_fd, state->candidate, candidate) != 0 ||
+        !gpg_same_link(candidate, published)) {
+        set_error(ERR_FILE_IO,
+                  "Forward retry state does not match retained GPG publication");
+        return -1;
+    }
+    if (!state->witness_present) return 0;
+    if (gpg_capture_link_at(base_fd, state->witness, witness) != 0 ||
+        gpg_capture_link_at(base_fd, state->quarantine, quarantine) != 0 ||
+        !gpg_same_link(witness, quarantine)) {
+        set_error(ERR_FILE_IO,
+                  "Forward retry witnesses do not match retained GPG publication");
+        return -1;
+    }
+    return 0;
+}
+
 static int gpg_retarget_current_locked(int base_fd, const char *base,
                                        const char *real_home,
                                        gpg_retarget_result_t *result) {
     char link_path[MAX_PATH_LEN];
     char prev_target[MAX_PATH_LEN];
-    char publish_name[GPG_QUARANTINE_NAME_LEN] = "";
-    gpg_link_identity_t prepared;
-    gpg_link_identity_t committed;
+    gpg_forward_state_t forward;
+    gpg_link_identity_t expected;
+    gpg_link_identity_t candidate;
+    gpg_link_identity_t witness;
+    gpg_link_identity_t quarantine;
+    gpg_link_identity_t current;
     gpg_retarget_result_t local_result;
+    bool blocked = false;
+    bool restore_present;
     bool prev_existed;
     int prev_rc;
     int live_rc;
@@ -2464,22 +3931,21 @@ static int gpg_retarget_current_locked(int base_fd, const char *base,
     if (gpg_current_path_from_base(base, link_path, sizeof(link_path)) != 0) {
         return -1;
     }
-    if (gpg_reject_stale_quarantines_locked(base_fd, NULL) != 0) {
+    if (gpg_reconcile_forward_state_locked(base_fd) != 0 ||
+        gpg_reject_stale_quarantines_locked(base_fd, NULL) != 0) {
         return -1;
     }
 
-    /* Capture the target `current` names right now, before the atomic rename
-     * overwrites it, so a failed retarget can restore it (AR-06 F41). A
-     * malformed/absent link means there is nothing to restore. */
-    prev_rc = gpg_read_current_locked(base_fd, base, prev_target,
-                                      sizeof(prev_target));
+    prev_rc = gpg_capture_link_at(base_fd, "current", &expected);
     if (prev_rc < 0) {
         return -1;
     }
     prev_existed = prev_rc == 0;
+    restore_present = prev_existed;
     if (prev_existed) {
         int prev_live = -1;
 
+        safe_strncpy(prev_target, expected.target, sizeof(prev_target));
         if (gpg_target_is_managed_child(base, prev_target)) {
             prev_live = gpg_live_private_home(base_fd, base, prev_target);
         }
@@ -2493,7 +3959,7 @@ static int gpg_retarget_current_locked(int base_fd, const char *base,
                 "Previous GNUPGHOME target no longer exists; replacing the dangling current link: %s",
                 prev_target);
             clear_error();
-            prev_existed = false;
+            restore_present = false;
         } else if (prev_live != 0) {
             set_error(
                 ERR_INVALID_PATH,
@@ -2502,79 +3968,231 @@ static int gpg_retarget_current_locked(int base_fd, const char *base,
             return -1;
         }
     }
-    result->previous_present = prev_existed;
-    if (prev_existed) {
+    result->previous_present = restore_present;
+    if (restore_present) {
         safe_strncpy(result->previous_target, prev_target,
                      sizeof(result->previous_target));
     }
     safe_strncpy(result->published_target, real_home,
                  sizeof(result->published_target));
 
-    /* Capture the private symlink inode BEFORE rename makes it public. A stat
-     * performed only after rename cannot distinguish our link from a same-
-     * target replacement installed by another same-uid process (ABA). */
-    if (gpg_make_private_name(publish_name, sizeof(publish_name),
-                              GPG_PUBLISH_PREFIX) != 0 ||
-        symlinkat(real_home, base_fd, publish_name) != 0) {
-        if (publish_name[0] != '\0') {
-            set_system_error(ERR_FILE_IO,
-                             "Failed to prepare stable GNUPGHOME symlink");
-        }
+    if (g_retarget_forward_hook &&
+        g_retarget_forward_hook(
+            base_fd, GPG_RETARGET_FORWARD_AFTER_SNAPSHOT) != 0) {
+        set_error(ERR_FILE_IO, "GPG forward snapshot hook failed");
         return -1;
     }
-    if (gpg_capture_link_at(base_fd, publish_name, &prepared) != 0) {
-        /* Without the first stable capture there is no ownership proof for
-         * unlinking this path. Leave the unpredictable private name visible
-         * for diagnosis rather than risk deleting a raced replacement. */
-        return -1;
-    }
-    if (renameat(base_fd, publish_name, base_fd, "current") != 0) {
-        int saved_errno = errno;
-        gpg_link_identity_t retry;
-        if (gpg_capture_link_at(base_fd, publish_name, &retry) == 0 &&
-            gpg_same_link(&retry, &prepared)) {
-            (void)unlinkat(base_fd, publish_name, 0);
-            (void)g_sync_base(base_fd);
-        }
-        errno = saved_errno;
+
+    memset(&forward, 0, sizeof(forward));
+    memset(&witness, 0, sizeof(witness));
+    memset(&quarantine, 0, sizeof(quarantine));
+    if (gpg_forward_names(&forward) != 0 ||
+        symlinkat(real_home, base_fd, forward.candidate) != 0) {
         set_system_error(ERR_FILE_IO,
-                         "Failed to install stable GNUPGHOME symlink: %s",
-                         link_path);
-        log_warning("Failed to create GNUPGHOME symlink %s -> %s",
-                    link_path, real_home);
+                         "Failed to prepare stable GNUPGHOME candidate");
+        return -1;
+    }
+    forward.candidate_present = true;
+    if (gpg_capture_link_at(base_fd, forward.candidate, &candidate) != 0) {
+        return -1;
+    }
+    if (prev_existed) {
+        if (linkat(base_fd, "current", base_fd, forward.witness, 0) != 0) {
+            set_system_error(ERR_FILE_IO,
+                             "Cannot publish expected GNUPGHOME witness");
+            return -1;
+        }
+        forward.witness_present = true;
+        if (gpg_capture_link_at(base_fd, forward.witness, &witness) != 0) {
+            return -1;
+        }
+        if (!gpg_same_link(&witness, &expected)) {
+            if (gpg_forward_cleanup_locked(base_fd, &forward, &candidate,
+                                           &witness, NULL) != 0) {
+                return -1;
+            }
+            set_error(ERR_FILE_IO,
+                      "Stable GNUPGHOME changed after forward snapshot; later writer preserved");
+            return -1;
+        }
+    }
+    if (g_sync_base(base_fd) != 0) {
+        set_system_error(
+            ERR_FILE_IO,
+            "Cannot synchronize GPG forward witnesses; retry state retained");
+        return -1;
+    }
+    if (g_retarget_forward_hook &&
+        g_retarget_forward_hook(
+            base_fd, GPG_RETARGET_FORWARD_AFTER_WITNESS_SYNC) != 0) {
+        set_error(ERR_FILE_IO,
+                  "GPG forward witness hook failed; retry state retained");
+        return -1;
+    }
+
+    if (prev_existed) {
+        if (g_rename_noreplace(base_fd, "current", base_fd,
+                               forward.quarantine) != 0) {
+            int saved_errno = errno;
+            errno = saved_errno;
+            if (saved_errno == ENOTSUP ||
+#if EOPNOTSUPP != ENOTSUP
+                saved_errno == EOPNOTSUPP ||
+#endif
+                saved_errno == ENOSYS || saved_errno == EINVAL) {
+                set_error(
+                    ERR_FILE_IO,
+                    "Platform lacks atomic no-replace GPG forward quarantine");
+            } else {
+                set_system_error(
+                    ERR_FILE_IO,
+                    "Cannot quarantine expected GNUPGHOME generation");
+            }
+            return -1;
+        }
+        forward.quarantine_present = true;
+        if (gpg_capture_link_at(base_fd, forward.quarantine,
+                                &quarantine) != 0) {
+            set_error(ERR_FILE_IO,
+                      "Cannot capture GPG forward quarantine; retry state retained");
+            return -1;
+        }
+        prev_rc = gpg_capture_link_at(base_fd, "current", &current);
+        if (prev_rc < 0) return -1;
+        if (prev_rc == 0 && gpg_same_link(&current, &quarantine) &&
+            gpg_discard_prepared_link_locked(
+                base_fd, "current", &quarantine) != 0) {
+            return -1;
+        }
+        if (g_sync_base(base_fd) != 0) {
+            set_system_error(
+                ERR_FILE_IO,
+                "Cannot synchronize GPG forward quarantine; retry state retained");
+            return -1;
+        }
+        if (g_retarget_forward_hook &&
+            g_retarget_forward_hook(
+                base_fd, GPG_RETARGET_FORWARD_AFTER_QUARANTINE_SYNC) != 0) {
+            set_error(ERR_FILE_IO,
+                      "GPG forward quarantine hook failed; retry state retained");
+            return -1;
+        }
+        if (gpg_capture_link_at(base_fd, forward.quarantine,
+                                &quarantine) != 0 ||
+            gpg_capture_link_at(base_fd, forward.witness, &witness) != 0) {
+            return -1;
+        }
+        if (!gpg_same_link(&quarantine, &witness)) {
+            if (gpg_forward_restore_quarantine_locked(
+                    base_fd, forward.quarantine, &quarantine,
+                    &blocked) != 0) {
+                return -1;
+            }
+            if (!blocked &&
+                gpg_forward_cleanup_locked(
+                    base_fd, &forward, &candidate, &witness,
+                    &quarantine) != 0) {
+                return -1;
+            }
+            set_error(
+                ERR_FILE_IO,
+                blocked
+                    ? "A later GNUPGHOME writer blocks displaced-writer restoration"
+                    : "GNUPGHOME changed during forward quarantine; newer writer restored");
+            return -1;
+        }
+    }
+
+    if (linkat(base_fd, forward.candidate, base_fd, "current", 0) != 0) {
+        int saved_errno = errno;
+        errno = saved_errno;
+        if (saved_errno == EEXIST) {
+            set_error(ERR_FILE_IO,
+                      "A newer GNUPGHOME writer won forward publication; writer preserved");
+        } else {
+            set_system_error(ERR_FILE_IO,
+                             "Cannot publish stable GNUPGHOME candidate");
+        }
         return -1;
     }
     result->publication_occurred = true;
-    result->published_link = prepared;
+    result->published_link = candidate;
     result->rollback.phase = GPG_ROLLBACK_EXPECTED_CURRENT;
-    result->rollback.published = prepared;
-    result->rollback.restore_present = prev_existed;
-    if (prev_existed) {
+    result->rollback.published = candidate;
+    result->rollback.restore_present = restore_present;
+    if (restore_present) {
         safe_strncpy(result->rollback.restore_target, prev_target,
                      sizeof(result->rollback.restore_target));
     }
-
-    if (gpg_capture_link_at(base_fd, "current", &committed) != 0 ||
-        !gpg_same_link(&committed, &prepared)) {
+    if (gpg_capture_link_at(base_fd, "current", &current) != 0 ||
+        !gpg_same_link(&current, &candidate)) {
         set_error(ERR_FILE_IO,
-                  "Cannot verify committed GNUPGHOME link: %s", link_path);
-        return gpg_finish_failed_retarget(base_fd, base, result);
+                  "Cannot verify committed GNUPGHOME generation: %s",
+                  link_path);
+        goto published_failure;
     }
     if (g_sync_base(base_fd) != 0) {
-        set_system_error(ERR_FILE_IO,
-                         "Cannot synchronize stable GNUPGHOME publication");
-        return gpg_finish_failed_retarget(base_fd, base, result);
+        set_system_error(
+            ERR_FILE_IO,
+            "Cannot synchronize stable GNUPGHOME publication; retry state retained");
+        goto published_failure;
+    }
+    if (g_retarget_forward_hook &&
+        g_retarget_forward_hook(
+            base_fd, GPG_RETARGET_FORWARD_AFTER_PUBLICATION_SYNC) != 0) {
+        set_error(ERR_FILE_IO,
+                  "GPG forward publication hook failed; retry state retained");
+        goto published_failure;
+    }
+    if (gpg_capture_link_at(base_fd, "current", &current) != 0 ||
+        !gpg_same_link(&current, &candidate)) {
+        set_error(ERR_FILE_IO,
+                  "Stable GNUPGHOME changed before final commit validation");
+        goto published_failure;
     }
     if (g_retarget_commit_hook && g_retarget_commit_hook(base_fd) != 0) {
         set_error(ERR_FILE_IO, "GPG retarget commit hook failed");
-        return gpg_finish_failed_retarget(base_fd, base, result);
+        goto published_failure;
     }
     if (gpg_live_private_home(base_fd, base, real_home) != 0) {
-        return gpg_finish_failed_retarget(base_fd, base, result);
+        goto published_failure;
+    }
+    if (gpg_capture_link_at(base_fd, "current", &current) != 0 ||
+        !gpg_same_link(&current, &candidate)) {
+        set_error(ERR_FILE_IO,
+                  "Stable GNUPGHOME changed after final commit validation");
+        goto published_failure;
+    }
+    if (gpg_forward_cleanup_locked(base_fd, &forward, &candidate,
+                                   prev_existed ? &witness : NULL,
+                                   prev_existed ? &quarantine : NULL) != 0) {
+        goto published_failure;
     }
 
     log_debug("Created GNUPGHOME symlink: %s -> %s", link_path, real_home);
     return 0;
+
+published_failure:
+    g_allowed_forward_stem = forward.stem;
+    (void)gpg_finish_failed_retarget(base_fd, base, result);
+    g_allowed_forward_stem = NULL;
+    if (result->restoration_succeeded) {
+        char primary[sizeof(g_last_error.message)];
+
+        safe_strncpy(primary, get_last_error()->message, sizeof(primary));
+        if (gpg_forward_cleanup_locked(
+                base_fd, &forward, &candidate,
+                prev_existed ? &witness : NULL,
+                prev_existed ? &quarantine : NULL) != 0) {
+            char cleanup[sizeof(g_last_error.message)];
+            safe_strncpy(cleanup, get_last_error()->message, sizeof(cleanup));
+            set_error(ERR_FILE_IO, "%s; forward-state cleanup failed: %s",
+                      primary, cleanup);
+        } else {
+            set_error(ERR_FILE_IO, "%s", primary);
+        }
+    }
+    return -1;
 }
 
 /* Point the stable <base>/current symlink at the active account's real
@@ -2637,7 +4255,8 @@ int gpg_manager_drop_current(void) {
     if (base_rc != 0) {
         return base_rc > 0 ? 0 : -1;
     }
-    if (gpg_reject_stale_quarantines_locked(base_fd, NULL) != 0) {
+    if (gpg_reconcile_forward_state_locked(base_fd) != 0 ||
+        gpg_reject_stale_quarantines_locked(base_fd, NULL) != 0) {
         unlock_gpg_dir(base_fd, lock_fd);
         return -1;
     }
@@ -2794,13 +4413,19 @@ int gpg_manager_restore_current_if(gpg_config_t *gpg_config,
                                    bool *changed) {
     char base[MAX_PATH_LEN];
     gpg_link_identity_t actual;
+    gpg_forward_state_t forward;
+    gpg_link_identity_t forward_candidate;
+    gpg_link_identity_t forward_witness;
+    gpg_link_identity_t forward_quarantine;
     int base_fd = -1;
     int lock_fd = -1;
     int base_rc;
     int actual_rc;
+    int forward_rc = 1;
     int rc = -1;
     bool expect_present = expected_target && *expected_target;
     bool restore_present = restore_target && *restore_target;
+    bool rollback_completed = false;
 
     if (!gpg_config || !changed) {
         set_error(ERR_INVALID_ARGS, "Invalid GPG restore arguments");
@@ -2857,9 +4482,27 @@ int gpg_manager_restore_current_if(gpg_config_t *gpg_config,
                       "GPG restore arguments do not match retained rollback state");
             goto out;
         }
+        forward_rc = gpg_forward_state_for_publication_locked(
+            base_fd, &gpg_config->rollback.published, &forward,
+            &forward_candidate, &forward_witness, &forward_quarantine);
+        if (forward_rc < 0) goto out;
+        if (forward_rc == 0) g_allowed_forward_stem = forward.stem;
         rc = gpg_finish_rollback_locked(base_fd, base,
                                         &gpg_config->rollback, changed);
+        g_allowed_forward_stem = NULL;
         if (rc == 0) {
+            rollback_completed = true;
+            if (forward_rc == 0 &&
+                gpg_forward_cleanup_locked(
+                    base_fd, &forward, &forward_candidate,
+                    forward.witness_present ? &forward_witness : NULL,
+                    forward.quarantine_present
+                        ? &forward_quarantine
+                        : NULL) != 0) {
+                rc = -1;
+            }
+        }
+        if (rollback_completed) {
             gpg_config->runtime_restore_pending = false;
             gpg_config->published_link_valid = false;
             memset(&gpg_config->published_link, 0,
@@ -2872,7 +4515,8 @@ int gpg_manager_restore_current_if(gpg_config_t *gpg_config,
                   "GPG rollback token exists without pending ownership");
         goto out;
     }
-    if (gpg_reject_stale_quarantines_locked(base_fd, NULL) != 0) {
+    if (gpg_reconcile_forward_state_locked(base_fd) != 0 ||
+        gpg_reject_stale_quarantines_locked(base_fd, NULL) != 0) {
         goto out;
     }
 
@@ -3260,7 +4904,8 @@ static int gpg_walk_tree_contents_fd(
  * pass, so a hazard in a later account cannot be discovered only after an
  * earlier account has already been erased. */
 static int gpg_preflight_home_at(int base_fd, const char *base,
-                                 const char *name) {
+                                 const char *name,
+                                 struct stat *identity) {
     char home[MAX_PATH_LEN];
     struct stat named;
     struct stat opened;
@@ -3275,7 +4920,7 @@ static int gpg_preflight_home_at(int base_fd, const char *base,
 #ifdef O_NOFOLLOW
     flags |= O_NOFOLLOW;
 #endif
-    if (!validate_name(name) ||
+    if (!identity || !validate_name(name) ||
         (size_t)snprintf(home, sizeof(home), "%s/%s", base, name) >=
             sizeof(home)) {
         set_error(ERR_INVALID_PATH, "Invalid GPG home during reset: %s", name);
@@ -3320,14 +4965,483 @@ static int gpg_preflight_home_at(int base_fd, const char *base,
                          "Failed to close GPG home after preflight: %s", home);
         return -1;
     }
+    *identity = named;
     return 0;
 }
 
-static int gpg_preflight_reset_all_locked(int base_fd, const char *base) {
+enum {
+    GPG_RESET_PLAN_MAX_ENTRIES = 4096
+};
+
+typedef enum {
+    GPG_RESET_PLAN_ROLLBACK,
+    GPG_RESET_PLAN_PUBLISH,
+    GPG_RESET_PLAN_RESET_QUARANTINE,
+    GPG_RESET_PLAN_RESET_WITNESS,
+    GPG_RESET_PLAN_FORWARD_CANDIDATE,
+    GPG_RESET_PLAN_FORWARD_WITNESS,
+    GPG_RESET_PLAN_FORWARD_QUARANTINE
+} gpg_reset_plan_residue_kind_t;
+
+typedef struct {
+    char name[MAX_NAME_LEN];
+    struct stat identity;
+} gpg_reset_plan_home_t;
+
+typedef struct {
+    char name[GPG_QUARANTINE_NAME_LEN];
+    gpg_reset_plan_residue_kind_t kind;
+    gpg_link_identity_t identity;
+} gpg_reset_plan_residue_t;
+
+typedef struct {
+    gpg_reset_plan_home_t *homes;
+    size_t home_count;
+    size_t home_capacity;
+    gpg_reset_plan_residue_t *residues;
+    size_t residue_count;
+    size_t residue_capacity;
+    bool lock_present;
+    struct stat lock_identity;
+    bool current_present;
+    gpg_link_identity_t current;
+    char reset_stem[GPG_QUARANTINE_NAME_LEN];
+    bool reset_malformed;
+    size_t reset_quarantine;
+    size_t reset_witness;
+    char forward_stem[GPG_QUARANTINE_NAME_LEN];
+    size_t forward_candidate;
+    size_t forward_witness;
+    size_t forward_quarantine;
+} gpg_reset_all_plan_t;
+
+static void gpg_reset_all_plan_init(gpg_reset_all_plan_t *plan) {
+    if (!plan) return;
+    memset(plan, 0, sizeof(*plan));
+    plan->reset_quarantine = SIZE_MAX;
+    plan->reset_witness = SIZE_MAX;
+    plan->forward_candidate = SIZE_MAX;
+    plan->forward_witness = SIZE_MAX;
+    plan->forward_quarantine = SIZE_MAX;
+}
+
+static void gpg_reset_all_plan_destroy(gpg_reset_all_plan_t *plan) {
+    if (!plan) return;
+    free(plan->homes);
+    free(plan->residues);
+    gpg_reset_all_plan_init(plan);
+}
+
+static int gpg_reset_plan_grow_homes(gpg_reset_all_plan_t *plan) {
+    size_t capacity;
+    gpg_reset_plan_home_t *grown;
+
+    if (plan->home_count < plan->home_capacity) return 0;
+    capacity = plan->home_capacity ? plan->home_capacity * 2U : 8U;
+    if (capacity > GPG_RESET_PLAN_MAX_ENTRIES) {
+        capacity = GPG_RESET_PLAN_MAX_ENTRIES;
+    }
+    if (capacity <= plan->home_capacity) {
+        set_error(ERR_FILE_IO,
+                  "GPG reset namespace exceeds the bounded plan size");
+        return -1;
+    }
+    grown = realloc(plan->homes, capacity * sizeof(*grown));
+    if (!grown) {
+        set_system_error(ERR_FILE_IO, "Cannot allocate GPG reset home plan");
+        return -1;
+    }
+    plan->homes = grown;
+    plan->home_capacity = capacity;
+    return 0;
+}
+
+static int gpg_reset_plan_grow_residues(gpg_reset_all_plan_t *plan) {
+    size_t capacity;
+    gpg_reset_plan_residue_t *grown;
+
+    if (plan->residue_count < plan->residue_capacity) return 0;
+    capacity = plan->residue_capacity ? plan->residue_capacity * 2U : 8U;
+    if (capacity > GPG_RESET_PLAN_MAX_ENTRIES) {
+        capacity = GPG_RESET_PLAN_MAX_ENTRIES;
+    }
+    if (capacity <= plan->residue_capacity) {
+        set_error(ERR_FILE_IO,
+                  "GPG reset namespace exceeds the bounded plan size");
+        return -1;
+    }
+    grown = realloc(plan->residues, capacity * sizeof(*grown));
+    if (!grown) {
+        set_system_error(ERR_FILE_IO,
+                         "Cannot allocate GPG reset recovery plan");
+        return -1;
+    }
+    plan->residues = grown;
+    plan->residue_capacity = capacity;
+    return 0;
+}
+
+static int gpg_reset_plan_add_home(gpg_reset_all_plan_t *plan,
+                                   const char *name,
+                                   const struct stat *identity) {
+    gpg_reset_plan_home_t *home;
+
+    if (!plan || !name || !identity ||
+        plan->home_count + plan->residue_count >=
+            GPG_RESET_PLAN_MAX_ENTRIES ||
+        gpg_reset_plan_grow_homes(plan) != 0) {
+        if (plan && plan->home_count + plan->residue_count >=
+                        GPG_RESET_PLAN_MAX_ENTRIES) {
+            set_error(ERR_FILE_IO,
+                      "GPG reset namespace exceeds the bounded plan size");
+        }
+        return -1;
+    }
+    home = &plan->homes[plan->home_count];
+    memset(home, 0, sizeof(*home));
+    if (safe_strncpy(home->name, name, sizeof(home->name)) != 0) {
+        set_error(ERR_INVALID_PATH, "GPG reset home name is too long");
+        return -1;
+    }
+    home->identity = *identity;
+    plan->home_count++;
+    return 0;
+}
+
+static int gpg_reset_plan_add_residue(
+    int base_fd, gpg_reset_all_plan_t *plan, const char *name,
+    gpg_reset_plan_residue_kind_t kind, size_t *index) {
+    gpg_reset_plan_residue_t *residue;
+
+    if (!plan || !name || !index ||
+        plan->home_count + plan->residue_count >=
+            GPG_RESET_PLAN_MAX_ENTRIES ||
+        gpg_reset_plan_grow_residues(plan) != 0) {
+        if (plan && plan->home_count + plan->residue_count >=
+                        GPG_RESET_PLAN_MAX_ENTRIES) {
+            set_error(ERR_FILE_IO,
+                      "GPG reset namespace exceeds the bounded plan size");
+        }
+        return -1;
+    }
+    residue = &plan->residues[plan->residue_count];
+    memset(residue, 0, sizeof(*residue));
+    if (safe_strncpy(residue->name, name, sizeof(residue->name)) != 0) {
+        set_error(ERR_INVALID_PATH,
+                  "GPG reset recovery name exceeds its bounded grammar");
+        return -1;
+    }
+    if (gpg_capture_link_at(base_fd, name, &residue->identity) != 0) {
+        return -1;
+    }
+    residue->kind = kind;
+    *index = plan->residue_count;
+    plan->residue_count++;
+    return 0;
+}
+
+static int gpg_reset_plan_require_orphan_owner(
+    const char *name, const char *stem, const char *prefix) {
+    bool live = false;
+
+    if (gpg_private_name_owner_is_live(stem, prefix, true, &live) != 0) {
+        return -1;
+    }
+    if (live) {
+        set_error(ERR_FILE_IO,
+                  "Refusing to retire GPG recovery state held by a live "
+                  "gitswitch process: %s",
+                  name);
+        return -1;
+    }
+    return 0;
+}
+
+/* Historical reset crashes could leave a reserved-prefix stem outside both
+ * the legacy and v1 grammars. Such a stem is never trusted by shape alone:
+ * extract only its bounded creator PID, require that PID definitely absent,
+ * then let group validation demand a byte-for-byte hard-link witness before
+ * either alias becomes eligible for identity-bound retirement. */
+static int gpg_reset_plan_require_malformed_owner_absent(
+    const char *name, const char *stem) {
+    const char *cursor;
+    uintmax_t value = 0U;
+    pid_t pid;
+
+    if (!name || !stem ||
+        !gpg_name_has_prefix(stem, GPG_RESET_PREFIX)) {
+        return -1;
+    }
+    cursor = stem + strlen(GPG_RESET_PREFIX);
+    if (*cursor < '1' || *cursor > '9') {
+        set_error(ERR_FILE_IO,
+                  "Malformed GPG reset recovery entry blocks reset: %s",
+                  name);
+        return -1;
+    }
+    while (isdigit((unsigned char)*cursor)) {
+        unsigned int digit = (unsigned int)(*cursor - '0');
+        if (value > (UINTMAX_MAX - digit) / 10U) {
+            set_error(ERR_FILE_IO,
+                      "Malformed GPG reset owner pid is unbounded: %s", name);
+            return -1;
+        }
+        value = value * 10U + digit;
+        cursor++;
+    }
+    pid = (pid_t)value;
+    if (*cursor != '.' || cursor[1] == '\0' || pid <= 0 ||
+        (uintmax_t)pid != value || pid == getpid()) {
+        set_error(ERR_FILE_IO,
+                  "Malformed GPG reset recovery entry blocks reset: %s",
+                  name);
+        return -1;
+    }
+    errno = 0;
+    if (kill(pid, 0) == 0 || errno == EPERM) {
+        set_error(ERR_FILE_IO,
+                  "Refusing malformed GPG reset state attributed to a live "
+                  "process: %s",
+                  name);
+        return -1;
+    }
+    if (errno == ESRCH) return 0;
+    set_system_error(ERR_FILE_IO,
+                     "Cannot verify malformed GPG reset owner absence: %s",
+                     name);
+    return -1;
+}
+
+static int gpg_reset_plan_classify_residue(
+    int base_fd, gpg_reset_all_plan_t *plan, const char *name) {
+    const char *prefix;
+    char stem[GPG_QUARANTINE_NAME_LEN];
+    size_t index = SIZE_MAX;
+    size_t length;
+    size_t suffix_length;
+    gpg_reset_plan_residue_kind_t kind;
+
+    if (gpg_name_has_prefix(name, GPG_ROLLBACK_PREFIX) ||
+        gpg_name_has_prefix(name, GPG_PUBLISH_PREFIX)) {
+        gpg_private_name_format_t format;
+        bool rollback =
+            gpg_name_has_prefix(name, GPG_ROLLBACK_PREFIX);
+        prefix = rollback ? GPG_ROLLBACK_PREFIX : GPG_PUBLISH_PREFIX;
+        kind = rollback ? GPG_RESET_PLAN_ROLLBACK
+                        : GPG_RESET_PLAN_PUBLISH;
+        format = gpg_parse_private_name(name, prefix, NULL, NULL);
+        if (format == GPG_PRIVATE_NAME_INVALID) {
+            set_error(ERR_FILE_IO,
+                      "Malformed GPG orphan recovery entry blocks reset: %s",
+                      name);
+            return -1;
+        }
+        if (gpg_reset_plan_require_orphan_owner(name, name, prefix) != 0 ||
+            gpg_reset_plan_add_residue(base_fd, plan, name, kind,
+                                       &index) != 0) {
+            return -1;
+        }
+        return 0;
+    }
+
+    if (gpg_name_has_prefix(name, GPG_RESET_PREFIX)) {
+        suffix_length = strlen(GPG_RESET_WITNESS_SUFFIX);
+        length = strlen(name);
+        if (length > suffix_length &&
+            strcmp(name + length - suffix_length,
+                   GPG_RESET_WITNESS_SUFFIX) == 0) {
+            length -= suffix_length;
+            kind = GPG_RESET_PLAN_RESET_WITNESS;
+        } else {
+            kind = GPG_RESET_PLAN_RESET_QUARANTINE;
+        }
+        if (length == 0U || length >= sizeof(stem)) {
+            set_error(ERR_FILE_IO,
+                      "Malformed GPG reset recovery entry blocks reset: %s",
+                      name);
+            return -1;
+        }
+        memcpy(stem, name, length);
+        stem[length] = '\0';
+        {
+            bool group_exists = plan->reset_stem[0] != '\0';
+            gpg_private_name_format_t format =
+                gpg_parse_private_name(stem, GPG_RESET_PREFIX, NULL, NULL);
+            if (group_exists &&
+                strcmp(plan->reset_stem, stem) != 0) {
+                set_error(ERR_FILE_IO,
+                          "Ambiguous GPG reset recovery state blocks reset: %s",
+                          name);
+                return -1;
+            }
+            if ((format == GPG_PRIVATE_NAME_INVALID
+                     ? gpg_reset_plan_require_malformed_owner_absent(
+                           name, stem)
+                     : gpg_reset_plan_require_orphan_owner(
+                           name, stem, GPG_RESET_PREFIX)) != 0 ||
+                safe_strncpy(plan->reset_stem, stem,
+                             sizeof(plan->reset_stem)) != 0) {
+                return -1;
+            }
+            if (group_exists &&
+                plan->reset_malformed !=
+                    (format == GPG_PRIVATE_NAME_INVALID)) {
+                set_error(ERR_FILE_IO,
+                          "Ambiguous GPG reset recovery grammar blocks reset: %s",
+                          name);
+                return -1;
+            }
+            plan->reset_malformed =
+                format == GPG_PRIVATE_NAME_INVALID;
+            if ((kind == GPG_RESET_PLAN_RESET_QUARANTINE &&
+                 plan->reset_quarantine != SIZE_MAX) ||
+                (kind == GPG_RESET_PLAN_RESET_WITNESS &&
+                 plan->reset_witness != SIZE_MAX)) {
+                set_error(ERR_FILE_IO,
+                          "Duplicate GPG reset recovery entry blocks reset: %s",
+                          name);
+                return -1;
+            }
+            if (gpg_reset_plan_add_residue(base_fd, plan, name, kind,
+                                           &index) != 0) {
+                return -1;
+            }
+        }
+        if (kind == GPG_RESET_PLAN_RESET_QUARANTINE) {
+            plan->reset_quarantine = index;
+        } else {
+            plan->reset_witness = index;
+        }
+        return 0;
+    }
+
+    if (!gpg_name_has_prefix(name, GPG_FORWARD_PREFIX)) {
+        set_error(ERR_PERMISSION_DENIED,
+                  "Refusing unmanaged GPG reset entry: %s", name);
+        return -1;
+    }
+    length = strlen(name);
+    if (length < 3U || length >= GPG_QUARANTINE_NAME_LEN ||
+        name[length - 2U] != '.' ||
+        !strchr("pwq", name[length - 1U]) ||
+        length - 2U >= sizeof(stem)) {
+        set_error(ERR_FILE_IO,
+                  "Malformed GPG forward recovery entry blocks reset: %s",
+                  name);
+        return -1;
+    }
+    memcpy(stem, name, length - 2U);
+    stem[length - 2U] = '\0';
+    {
+        gpg_private_name_format_t format =
+            gpg_parse_private_name(stem, GPG_FORWARD_PREFIX, NULL, NULL);
+        if (format == GPG_PRIVATE_NAME_INVALID ||
+        (plan->forward_stem[0] &&
+             strcmp(plan->forward_stem, stem) != 0)) {
+            set_error(ERR_FILE_IO,
+                      "Ambiguous GPG forward recovery state blocks reset: %s",
+                      name);
+            return -1;
+        }
+        if (gpg_reset_plan_require_orphan_owner(
+                name, stem, GPG_FORWARD_PREFIX) != 0 ||
+            safe_strncpy(plan->forward_stem, stem,
+                         sizeof(plan->forward_stem)) != 0) {
+            return -1;
+        }
+        if (name[length - 1U] == 'p') {
+            kind = GPG_RESET_PLAN_FORWARD_CANDIDATE;
+            if (plan->forward_candidate != SIZE_MAX) {
+                index = plan->forward_candidate;
+            }
+        } else if (name[length - 1U] == 'w') {
+            kind = GPG_RESET_PLAN_FORWARD_WITNESS;
+            if (plan->forward_witness != SIZE_MAX) {
+                index = plan->forward_witness;
+            }
+        } else {
+            kind = GPG_RESET_PLAN_FORWARD_QUARANTINE;
+            if (plan->forward_quarantine != SIZE_MAX) {
+                index = plan->forward_quarantine;
+            }
+        }
+        if (index != SIZE_MAX) {
+            set_error(ERR_FILE_IO,
+                      "Duplicate GPG forward recovery entry blocks reset: %s",
+                      name);
+            return -1;
+        }
+        if (gpg_reset_plan_add_residue(base_fd, plan, name, kind, &index) != 0) {
+            return -1;
+        }
+    }
+    if (kind == GPG_RESET_PLAN_FORWARD_CANDIDATE) {
+        plan->forward_candidate = index;
+    } else if (kind == GPG_RESET_PLAN_FORWARD_WITNESS) {
+        plan->forward_witness = index;
+    } else {
+        plan->forward_quarantine = index;
+    }
+    return 0;
+}
+
+static int gpg_reset_plan_validate_groups(
+    const gpg_reset_all_plan_t *plan) {
+    if (plan->reset_malformed &&
+        (plan->reset_quarantine == SIZE_MAX ||
+         plan->reset_witness == SIZE_MAX)) {
+        set_error(ERR_FILE_IO,
+                  "Malformed GPG reset recovery entry lacks an exact witness");
+        return -1;
+    }
+    /* Discovery has either required an exact private-name grammar and proved
+     * the recorded owner absent/replaced, or paired a malformed historical
+     * stem with a dead PID and exact witness above. Under the held full-reset
+     * lock, an exact orphan may reach identity-bound no-replace retirement.
+     * Targeted mutation remains stricter and preserves unwitnessed retry
+     * artifacts. */
+    if (plan->reset_quarantine != SIZE_MAX &&
+        plan->reset_witness != SIZE_MAX &&
+        !gpg_same_link(
+            &plan->residues[plan->reset_quarantine].identity,
+            &plan->residues[plan->reset_witness].identity)) {
+        set_error(ERR_FILE_IO,
+                  "GPG reset quarantine differs from its witness; "
+                  "replacement preserved: %s",
+                  plan->residues[plan->reset_quarantine].name);
+        return -1;
+    }
+    if (plan->forward_candidate == SIZE_MAX &&
+        (plan->forward_witness != SIZE_MAX ||
+         plan->forward_quarantine != SIZE_MAX)) {
+        set_error(ERR_FILE_IO,
+                  "Malformed GPG forward recovery group blocks reset");
+        return -1;
+    }
+    if (plan->forward_quarantine != SIZE_MAX &&
+        plan->forward_witness == SIZE_MAX) {
+        set_error(ERR_FILE_IO,
+                  "Unwitnessed GPG forward quarantine blocks reset");
+        return -1;
+    }
+    /* Full reset does not need to infer which forward generation should be
+     * restored. P+W without Q/current is its own retry tail after Q was
+     * unlinked but the directory sync failed, while Q!=W is the valid M17
+     * displaced-writer state. Once the complete namespace plan has passed
+     * both identity scans, every exact private alias and managed home is an
+     * explicit deletion target. Targeted mutation still uses the stricter
+     * forward reconciliation state machine above. */
+    return 0;
+}
+
+static int gpg_discover_reset_all_plan_locked(
+    int base_fd, int lock_fd, const char *base,
+    gpg_reset_all_plan_t *plan) {
     int flags = O_RDONLY | O_CLOEXEC;
     int scan_fd;
     DIR *dir;
     struct dirent *entry;
+    int rc = -1;
 
 #ifdef O_DIRECTORY
     flags |= O_DIRECTORY;
@@ -3352,52 +5466,512 @@ static int gpg_preflight_reset_all_locked(int base_fd, const char *base) {
                 closedir(dir);
                 errno = saved_errno;
                 set_system_error(ERR_FILE_IO,
-                                 "Failed while preflighting GPG base: %s", base);
+                                 "Failed while discovering GPG reset plan: %s",
+                                 base);
                 return -1;
             }
             break;
         }
         if (strcmp(entry->d_name, ".") == 0 ||
-            strcmp(entry->d_name, "..") == 0 ||
-            strcmp(entry->d_name, ".lock") == 0) {
+            strcmp(entry->d_name, "..") == 0) {
+            continue;
+        }
+        if (strcmp(entry->d_name, ".lock") == 0) {
+            if (plan->lock_present ||
+                verify_private_lock_file_at(lock_fd, base_fd, ".lock") != 0 ||
+                fstatat(base_fd, ".lock", &plan->lock_identity,
+                        AT_SYMLINK_NOFOLLOW) != 0) {
+                set_error(ERR_FILE_IO,
+                          "GPG reset plan does not own one exact lock: %s",
+                          base);
+                goto out;
+            }
+            plan->lock_present = true;
             continue;
         }
         if (strcmp(entry->d_name, "current") == 0) {
-            gpg_link_identity_t current;
-            if (gpg_capture_link_at(base_fd, "current", &current) != 0) {
-                closedir(dir);
-                return -1;
+            if (plan->current_present ||
+                gpg_capture_link_at(base_fd, "current", &plan->current) != 0) {
+                set_error(ERR_FILE_IO,
+                          "Cannot capture exact stable GNUPGHOME for reset");
+                goto out;
             }
+            plan->current_present = true;
             continue;
         }
         if (gpg_name_has_prefix(entry->d_name, GPG_ROLLBACK_PREFIX) ||
             gpg_name_has_prefix(entry->d_name, GPG_PUBLISH_PREFIX) ||
-            gpg_name_has_prefix(entry->d_name, GPG_RESET_PREFIX)) {
-            char residue[GPG_QUARANTINE_NAME_LEN];
-            safe_strncpy(residue, entry->d_name, sizeof(residue));
-            closedir(dir);
-            set_error(ERR_FILE_IO,
-                      "Unresolved GPG runtime quarantine blocks reset: %s",
-                      residue);
-            return -1;
+            gpg_name_has_prefix(entry->d_name, GPG_RESET_PREFIX) ||
+            gpg_name_has_prefix(entry->d_name, GPG_FORWARD_PREFIX)) {
+            if (gpg_reset_plan_classify_residue(
+                    base_fd, plan, entry->d_name) != 0) {
+                goto out;
+            }
+            continue;
         }
         if (entry->d_name[0] == '.' || !validate_name(entry->d_name)) {
-            char residue[MAX_PATH_LEN];
-            safe_strncpy(residue, entry->d_name, sizeof(residue));
-            closedir(dir);
             set_error(ERR_PERMISSION_DENIED,
-                      "Refusing unmanaged GPG reset entry: %s", residue);
+                      "Refusing unmanaged GPG reset entry: %s",
+                      entry->d_name);
+            goto out;
+        }
+        {
+            struct stat identity;
+            if (fstatat(base_fd, entry->d_name, &identity,
+                        AT_SYMLINK_NOFOLLOW) != 0) {
+                set_system_error(ERR_FILE_IO,
+                                 "Cannot inspect GPG reset plan entry: %s/%s",
+                                 base, entry->d_name);
+                goto out;
+            }
+            if (gpg_reset_plan_add_home(plan, entry->d_name,
+                                        &identity) != 0) {
+                goto out;
+            }
+        }
+    }
+    rc = 0;
+out:
+    if (closedir(dir) != 0 && rc == 0) {
+        set_system_error(ERR_FILE_IO,
+                         "Failed to close GPG reset discovery: %s", base);
+        rc = -1;
+    }
+    return rc;
+}
+
+/* Discovery above records the complete bounded top-level namespace without
+ * modifying it. Only after that scan closes do we validate the exact lock,
+ * recovery groups, and every complete home tree. This ordering guarantees
+ * that a blocker at the end of the directory cannot be learned after an
+ * earlier recovery entry was already retired. */
+static int gpg_validate_reset_all_plan_locked(
+    int base_fd, int lock_fd, const char *base,
+    const gpg_reset_all_plan_t *plan) {
+    if (!plan->lock_present ||
+        verify_private_lock_file_at(lock_fd, base_fd, ".lock") != 0) {
+        set_error(ERR_FILE_IO, "GPG reset plan lost its exact lock: %s", base);
+        return -1;
+    }
+    if (gpg_reset_plan_validate_groups(plan) != 0) {
+        return -1;
+    }
+    for (size_t i = 0; i < plan->home_count; i++) {
+        struct stat validated;
+
+        if (gpg_preflight_home_at(base_fd, base, plan->homes[i].name,
+                                  &validated) != 0) {
             return -1;
         }
-        if (gpg_preflight_home_at(base_fd, base, entry->d_name) != 0) {
-            closedir(dir);
+        if (!gpg_same_file_version(&validated,
+                                   &plan->homes[i].identity)) {
+            set_error(ERR_FILE_IO,
+                      "GPG reset home changed during plan validation: %s",
+                      plan->homes[i].name);
             return -1;
         }
     }
-    if (closedir(dir) != 0) {
+    return 0;
+}
+
+static size_t gpg_reset_plan_find_home(
+    const gpg_reset_all_plan_t *plan, const char *name) {
+    for (size_t i = 0; i < plan->home_count; i++) {
+        if (strcmp(plan->homes[i].name, name) == 0) return i;
+    }
+    return SIZE_MAX;
+}
+
+static size_t gpg_reset_plan_find_residue(
+    const gpg_reset_all_plan_t *plan, const char *name) {
+    for (size_t i = 0; i < plan->residue_count; i++) {
+        if (strcmp(plan->residues[i].name, name) == 0) return i;
+    }
+    return SIZE_MAX;
+}
+
+static bool gpg_same_planned_link(const gpg_link_identity_t *left,
+                                  const gpg_link_identity_t *right) {
+    return gpg_same_link(left, right) &&
+           gpg_same_file_version(&left->st, &right->st);
+}
+
+static int gpg_revalidate_reset_all_plan_locked(
+    int base_fd, int lock_fd, const char *base,
+    const gpg_reset_all_plan_t *plan) {
+    int flags = O_RDONLY | O_CLOEXEC;
+    int scan_fd;
+    DIR *dir;
+    struct dirent *entry;
+    bool *homes_seen = NULL;
+    bool *residues_seen = NULL;
+    bool lock_seen = false;
+    bool current_seen = false;
+    int rc = -1;
+
+#ifdef O_DIRECTORY
+    flags |= O_DIRECTORY;
+#endif
+#ifdef O_NOFOLLOW
+    flags |= O_NOFOLLOW;
+#endif
+    if (plan->home_count) {
+        homes_seen = calloc(plan->home_count, sizeof(*homes_seen));
+    }
+    if (plan->residue_count) {
+        residues_seen = calloc(plan->residue_count, sizeof(*residues_seen));
+    }
+    if ((plan->home_count && !homes_seen) ||
+        (plan->residue_count && !residues_seen)) {
         set_system_error(ERR_FILE_IO,
-                         "Failed to close GPG reset preflight: %s", base);
+                         "Cannot allocate GPG reset revalidation state");
+        goto out;
+    }
+    if (verify_private_lock_file_at(lock_fd, base_fd, ".lock") != 0) {
+        set_error(ERR_FILE_IO,
+                  "GPG reset lock changed before plan revalidation: %s", base);
+        goto out;
+    }
+    scan_fd = openat(base_fd, ".", flags);
+    dir = scan_fd >= 0 ? fdopendir(scan_fd) : NULL;
+    if (!dir) {
+        if (scan_fd >= 0) close(scan_fd);
+        set_system_error(ERR_FILE_IO,
+                         "Cannot revalidate GPG reset plan: %s", base);
+        goto out;
+    }
+    for (;;) {
+        size_t index;
+
+        errno = 0;
+        entry = g_gpg_readdir(dir);
+        if (!entry) {
+            if (errno != 0) {
+                int saved_errno = errno;
+                closedir(dir);
+                dir = NULL;
+                errno = saved_errno;
+                set_system_error(ERR_FILE_IO,
+                                 "Failed while revalidating GPG reset plan: %s",
+                                 base);
+                goto out;
+            }
+            break;
+        }
+        if (strcmp(entry->d_name, ".") == 0 ||
+            strcmp(entry->d_name, "..") == 0) {
+            continue;
+        }
+        if (strcmp(entry->d_name, ".lock") == 0) {
+            struct stat lock_identity;
+            if (lock_seen ||
+                fstatat(base_fd, ".lock", &lock_identity,
+                        AT_SYMLINK_NOFOLLOW) != 0 ||
+                !gpg_same_file_version(&lock_identity,
+                                       &plan->lock_identity) ||
+                verify_private_lock_file_at(lock_fd, base_fd, ".lock") != 0) {
+                set_error(ERR_FILE_IO,
+                          "GPG reset lock changed during plan revalidation");
+                goto close_out;
+            }
+            lock_seen = true;
+            continue;
+        }
+        if (strcmp(entry->d_name, "current") == 0) {
+            gpg_link_identity_t current;
+            if (current_seen || !plan->current_present ||
+                gpg_capture_link_at(base_fd, "current", &current) != 0 ||
+                !gpg_same_planned_link(&current, &plan->current)) {
+                set_error(ERR_FILE_IO,
+                          "Stable GNUPGHOME changed during reset preflight");
+                goto close_out;
+            }
+            current_seen = true;
+            continue;
+        }
+        index = gpg_reset_plan_find_home(plan, entry->d_name);
+        if (index != SIZE_MAX) {
+            struct stat home;
+            if (homes_seen[index] ||
+                fstatat(base_fd, entry->d_name, &home,
+                        AT_SYMLINK_NOFOLLOW) != 0 ||
+                !gpg_same_file_version(&home,
+                                       &plan->homes[index].identity)) {
+                set_error(ERR_FILE_IO,
+                          "GPG reset home changed during plan revalidation: %s",
+                          entry->d_name);
+                goto close_out;
+            }
+            homes_seen[index] = true;
+            continue;
+        }
+        index = gpg_reset_plan_find_residue(plan, entry->d_name);
+        if (index != SIZE_MAX) {
+            gpg_link_identity_t residue;
+            if (residues_seen[index] ||
+                gpg_capture_link_at(base_fd, entry->d_name,
+                                    &residue) != 0 ||
+                !gpg_same_planned_link(
+                    &residue, &plan->residues[index].identity)) {
+                set_error(ERR_FILE_IO,
+                          "GPG recovery entry changed during reset preflight: %s",
+                          entry->d_name);
+                goto close_out;
+            }
+            residues_seen[index] = true;
+            continue;
+        }
+        set_error(ERR_FILE_IO,
+                  "GPG reset namespace changed after discovery: %s",
+                  entry->d_name);
+        goto close_out;
+    }
+    if (!lock_seen || current_seen != plan->current_present) {
+        set_error(ERR_FILE_IO,
+                  "GPG reset namespace changed after discovery");
+        goto close_out;
+    }
+    for (size_t i = 0; i < plan->home_count; i++) {
+        if (!homes_seen[i]) {
+            set_error(ERR_FILE_IO,
+                      "GPG reset home disappeared after discovery: %s",
+                      plan->homes[i].name);
+            goto close_out;
+        }
+    }
+    for (size_t i = 0; i < plan->residue_count; i++) {
+        if (!residues_seen[i]) {
+            set_error(ERR_FILE_IO,
+                      "GPG recovery entry disappeared after discovery: %s",
+                      plan->residues[i].name);
+            goto close_out;
+        }
+    }
+    if (verify_private_lock_file_at(lock_fd, base_fd, ".lock") != 0) {
+        set_error(ERR_FILE_IO,
+                  "GPG reset lock changed after plan revalidation: %s", base);
+        goto close_out;
+    }
+    rc = 0;
+close_out:
+    if (dir && closedir(dir) != 0 && rc == 0) {
+        set_system_error(ERR_FILE_IO,
+                         "Failed to close GPG reset revalidation: %s", base);
+        rc = -1;
+    }
+    if (rc == 0) {
+        for (size_t i = 0; i < plan->home_count; i++) {
+            struct stat validated;
+
+            if (gpg_preflight_home_at(base_fd, base,
+                                      plan->homes[i].name,
+                                      &validated) != 0) {
+                rc = -1;
+                break;
+            }
+            if (!gpg_same_file_version(
+                    &validated, &plan->homes[i].identity)) {
+                set_error(
+                    ERR_FILE_IO,
+                    "GPG reset home changed during final plan validation: %s",
+                    plan->homes[i].name);
+                rc = -1;
+                break;
+            }
+        }
+    }
+out:
+    free(homes_seen);
+    free(residues_seen);
+    return rc;
+}
+
+static unsigned int gpg_reset_plan_residue_priority(
+    gpg_reset_plan_residue_kind_t kind) {
+    switch (kind) {
+        case GPG_RESET_PLAN_RESET_QUARANTINE:
+        case GPG_RESET_PLAN_FORWARD_QUARANTINE:
+            return 0U;
+        case GPG_RESET_PLAN_RESET_WITNESS:
+        case GPG_RESET_PLAN_FORWARD_WITNESS:
+            return 1U;
+        case GPG_RESET_PLAN_FORWARD_CANDIDATE:
+            return 2U;
+        case GPG_RESET_PLAN_ROLLBACK:
+        case GPG_RESET_PLAN_PUBLISH:
+            return 3U;
+        default:
+            return 4U;
+    }
+}
+
+static int gpg_retire_planned_reset_residue_locked(
+    int base_fd, const gpg_reset_plan_residue_t *residue) {
+    char quarantine[GPG_QUARANTINE_NAME_LEN];
+    gpg_link_identity_t observed;
+    int renamed = 0;
+#if defined(__FreeBSD__)
+    struct stat pinned;
+    int pinned_fd = -1;
+#endif
+
+    if (gpg_capture_link_at(base_fd, residue->name, &observed) != 0 ||
+        !gpg_same_link(&observed, &residue->identity)) {
+        set_error(ERR_FILE_IO,
+                  "GPG recovery entry changed; preserving replacement: %s",
+                  residue->name);
         return -1;
+    }
+    for (unsigned int attempt = 0U; attempt < 4U; attempt++) {
+        if (gpg_make_private_name(quarantine, sizeof(quarantine),
+                                  GPG_RESET_PREFIX) != 0) {
+            return -1;
+        }
+        if (g_rename_noreplace(base_fd, residue->name, base_fd,
+                               quarantine) == 0) {
+            renamed = 1;
+            break;
+        }
+        if (errno != EEXIST) break;
+    }
+    if (!renamed) {
+        set_system_error(ERR_FILE_IO,
+                         "Cannot quarantine planned GPG recovery entry: %s",
+                         residue->name);
+        return -1;
+    }
+    if (gpg_capture_link_at(base_fd, quarantine, &observed) != 0 ||
+        !gpg_same_link(&observed, &residue->identity)) {
+        int saved_errno = errno;
+        if (g_rename_noreplace(base_fd, quarantine, base_fd,
+                               residue->name) != 0) {
+            set_error(ERR_FILE_IO,
+                      "GPG recovery entry changed during quarantine; "
+                      "replacement retained privately: %s",
+                      residue->name);
+        } else {
+            errno = saved_errno;
+            set_error(ERR_FILE_IO,
+                      "GPG recovery entry changed during quarantine; "
+                      "replacement restored: %s",
+                      residue->name);
+        }
+        return -1;
+    }
+    if (g_sync_base(base_fd) != 0) {
+        set_system_error(ERR_FILE_IO,
+                         "Cannot synchronize GPG recovery quarantine: %s",
+                         residue->name);
+        return -1;
+    }
+    if (g_reset_retire_hook &&
+        g_reset_retire_hook(base_fd, quarantine) != 0) {
+        set_error(ERR_FILE_IO,
+                  "GPG recovery retirement hook failed: %s",
+                  residue->name);
+        return -1;
+    }
+    if (gpg_capture_link_at(base_fd, quarantine, &observed) != 0 ||
+        !gpg_same_link(&observed, &residue->identity)) {
+        set_error(ERR_FILE_IO,
+                  "GPG recovery quarantine changed; preserving replacement: %s",
+                  residue->name);
+        return -1;
+    }
+#if defined(__FreeBSD__)
+    if (!g_identity_unlink) {
+        pinned_fd = openat(base_fd, quarantine,
+                           O_PATH | O_NOFOLLOW | O_CLOEXEC);
+        if (pinned_fd < 0 || fstat(pinned_fd, &pinned) != 0 ||
+            pinned.st_dev != observed.st.st_dev ||
+            pinned.st_ino != observed.st.st_ino ||
+            pinned.st_mode != observed.st.st_mode ||
+            pinned.st_uid != observed.st.st_uid ||
+            pinned.st_size != observed.st.st_size) {
+            if (pinned_fd >= 0) close(pinned_fd);
+            set_error(ERR_FILE_IO,
+                      "Cannot descriptor-pin GPG recovery quarantine: %s",
+                      residue->name);
+            return -1;
+        }
+    }
+#endif
+    if (g_reset_postvalidate_hook &&
+        g_reset_postvalidate_hook(base_fd, quarantine) != 0) {
+#if defined(__FreeBSD__)
+        if (pinned_fd >= 0) close(pinned_fd);
+#endif
+        set_error(ERR_FILE_IO,
+                  "GPG recovery post-validation hook failed: %s",
+                  residue->name);
+        return -1;
+    }
+    if (g_identity_unlink) {
+        if (g_identity_unlink(base_fd, quarantine,
+                              &observed.st) != 0) {
+            set_error(ERR_FILE_IO,
+                      "Descriptor-bound GPG recovery retirement rejected a "
+                      "changed entry: %s",
+                      residue->name);
+            return -1;
+        }
+#if defined(__FreeBSD__)
+    } else if (funlinkat(base_fd, quarantine, pinned_fd, 0) == 0) {
+        close(pinned_fd);
+        pinned_fd = -1;
+#endif
+    } else {
+#if defined(__FreeBSD__)
+        int saved_errno = errno;
+        if (pinned_fd >= 0) close(pinned_fd);
+        errno = saved_errno;
+        set_system_error(ERR_FILE_IO,
+                         "Cannot descriptor-unlink GPG recovery quarantine: %s",
+                         residue->name);
+#else
+        int restore_rc = g_rename_noreplace(
+            base_fd, quarantine, base_fd, residue->name);
+        set_error(
+            ERR_FILE_IO,
+            "Platform lacks descriptor-bound GPG recovery retirement; "
+            "artifact %s: %s",
+            restore_rc == 0 ? "restored" : "retained in quarantine",
+            residue->name);
+#endif
+        return -1;
+    }
+#if defined(__FreeBSD__)
+    if (pinned_fd >= 0) close(pinned_fd);
+#endif
+    if (fstatat(base_fd, quarantine, &(struct stat){0},
+                AT_SYMLINK_NOFOLLOW) == 0 || errno != ENOENT) {
+        set_system_error(ERR_FILE_IO,
+                         "Descriptor-bound GPG recovery entry survived retirement: %s",
+                         residue->name);
+        return -1;
+    }
+    if (g_sync_base(base_fd) != 0) {
+        set_system_error(ERR_FILE_IO,
+                         "Cannot synchronize GPG recovery retirement: %s",
+                         residue->name);
+        return -1;
+    }
+    log_warning("Retired orphaned GPG recovery residue: %s",
+                residue->name);
+    return 0;
+}
+
+static int gpg_apply_reset_recovery_plan_locked(
+    int base_fd, const gpg_reset_all_plan_t *plan) {
+    for (unsigned int priority = 0U; priority <= 3U; priority++) {
+        for (size_t i = 0; i < plan->residue_count; i++) {
+            if (gpg_reset_plan_residue_priority(plan->residues[i].kind) ==
+                    priority &&
+                gpg_retire_planned_reset_residue_locked(
+                    base_fd, &plan->residues[i]) != 0) {
+                return -1;
+            }
+        }
     }
     return 0;
 }
@@ -3478,7 +6052,8 @@ static int gpg_verify_reset_all_final_locked(int base_fd, int lock_fd,
  * retry handle for both the agent and its secret-key material, so an
  * unconfirmed stop must retain it rather than erase the only targeting state. */
 static int gpg_kill_and_remove_home(int base_fd, const char *base,
-                                    const char *name) {
+                                    const char *name,
+                                    const struct stat *expected) {
     const char *argv[] = {"gpgconf", "--kill", "all", NULL};
     char home[MAX_PATH_LEN];
     const char *env[2] = {"GNUPGHOME=.", NULL};
@@ -3507,9 +6082,13 @@ static int gpg_kill_and_remove_home(int base_fd, const char *base,
     }
     if (fstatat(base_fd, name, &entry_before, AT_SYMLINK_NOFOLLOW) != 0 ||
         !S_ISDIR(entry_before.st_mode) || entry_before.st_uid != getuid() ||
-        (entry_before.st_mode & 077) != 0) {
+        (entry_before.st_mode & 077) != 0 ||
+        (expected && !gpg_same_file_version(&entry_before, expected))) {
         set_error(ERR_PERMISSION_DENIED,
-                  "Refusing unsafe isolated GPG home: %s", home);
+                  expected
+                      ? "Planned isolated GPG home changed before cleanup: %s"
+                      : "Refusing unsafe isolated GPG home: %s",
+                  home);
         return -1;
     }
     home_fd = openat(base_fd, name, home_flags);
@@ -3864,6 +6443,7 @@ static void gpg_record_reset_failure(error_accumulator_t *failures,
 int gpg_manager_reset(const char *account) {
     char base[MAX_PATH_LEN];
     char current[MAX_PATH_LEN];
+    gpg_reset_all_plan_t plan;
     error_accumulator_t failures;
     bool absent = false;
     int base_fd = -1;
@@ -3871,6 +6451,7 @@ int gpg_manager_reset(const char *account) {
     bool failed = false;
 
     error_accumulator_init(&failures);
+    gpg_reset_all_plan_init(&plan);
 
     if (account && !validate_name(account)) {
         set_error(ERR_INVALID_ARGS, "Invalid account name for reset");
@@ -3889,22 +6470,39 @@ int gpg_manager_reset(const char *account) {
         set_system_error(ERR_FILE_IO, "Failed to lock GPG base directory: %s", base);
         return -1;
     }
-    if (gpg_reconcile_reset_retry_locked(base_fd) != 0) {
-        unlock_gpg_dir(base_fd, lock_fd);
-        return -1;
-    }
-    if (!account && gpg_retire_orphan_quarantines_locked(base_fd) != 0) {
-        unlock_gpg_dir(base_fd, lock_fd);
-        return -1;
-    }
-    if (gpg_reject_stale_quarantines_locked(base_fd, NULL) != 0) {
-        unlock_gpg_dir(base_fd, lock_fd);
-        return -1;
-    }
-    if (!account &&
-        gpg_preflight_reset_all_locked(base_fd, base) != 0) {
-        unlock_gpg_dir(base_fd, lock_fd);
-        return -1;
+    if (account) {
+        if (gpg_reconcile_reset_retry_locked(base_fd) != 0 ||
+            gpg_reject_stale_quarantines_locked(base_fd, NULL) != 0) {
+            unlock_gpg_dir(base_fd, lock_fd);
+            return -1;
+        }
+    } else {
+        if (gpg_discover_reset_all_plan_locked(
+                base_fd, lock_fd, base, &plan) != 0 ||
+            gpg_validate_reset_all_plan_locked(
+                base_fd, lock_fd, base, &plan) != 0) {
+            gpg_reset_all_plan_destroy(&plan);
+            unlock_gpg_dir(base_fd, lock_fd);
+            return -1;
+        }
+        /* Test and race seam: the complete plan has been captured and
+         * validated, but no recovery name, home, or current link has been
+         * changed. The second scan below must reject any replacement. */
+        if (plan.current_present && g_reset_current_hook &&
+            g_reset_current_hook(base_fd) != 0) {
+            set_error(ERR_FILE_IO,
+                      "GPG reset plan revalidation hook failed");
+            gpg_reset_all_plan_destroy(&plan);
+            unlock_gpg_dir(base_fd, lock_fd);
+            return -1;
+        }
+        if (gpg_revalidate_reset_all_plan_locked(
+                base_fd, lock_fd, base, &plan) != 0 ||
+            gpg_apply_reset_recovery_plan_locked(base_fd, &plan) != 0) {
+            gpg_reset_all_plan_destroy(&plan);
+            unlock_gpg_dir(base_fd, lock_fd);
+            return -1;
+        }
     }
 
     if (account) {
@@ -3917,7 +6515,8 @@ int gpg_manager_reset(const char *account) {
                           base, account);
                 unlock_gpg_dir(base_fd, lock_fd);
                 return -1;
-            } else if (gpg_kill_and_remove_home(base_fd, base, account) != 0) {
+            } else if (gpg_kill_and_remove_home(
+                           base_fd, base, account, NULL) != 0) {
                 gpg_record_reset_failure(&failures, &failed,
                                          "target GPG home cleanup");
             }
@@ -3929,82 +6528,12 @@ int gpg_manager_reset(const char *account) {
                                      "target GPG home inspection");
         }
     } else {
-        int scan_flags = O_RDONLY | O_CLOEXEC;
-#ifdef O_DIRECTORY
-        scan_flags |= O_DIRECTORY;
-#endif
-#ifdef O_NOFOLLOW
-        scan_flags |= O_NOFOLLOW;
-#endif
-        int scan_fd = openat(base_fd, ".", scan_flags);
-        DIR *d = scan_fd >= 0 ? fdopendir(scan_fd) : NULL;
-        if (!d) {
-            int saved_errno = errno;
-            if (scan_fd >= 0) close(scan_fd);
-            errno = saved_errno;
-            set_system_error(ERR_FILE_IO, "Cannot enumerate GPG base directory: %s", base);
-            gpg_record_reset_failure(&failures, &failed,
-                                     "GPG base enumeration");
-        } else {
-            struct dirent *ent;
-            for (;;) {
-                errno = 0;
-                ent = g_gpg_readdir(d);
-                if (!ent) {
-                    if (errno != 0) {
-                        set_system_error(ERR_FILE_IO,
-                                         "Failed while enumerating GPG base directory: %s",
-                                         base);
-                        gpg_record_reset_failure(
-                            &failures, &failed, "GPG base enumeration read");
-                    }
-                    break;
-                }
-                /* Only the exact lock and deferred stable link are manager
-                 * metadata. Every other hidden name is an unknown survivor,
-                 * not a broad dotfile exemption. */
-                if (strcmp(ent->d_name, ".") == 0 ||
-                    strcmp(ent->d_name, "..") == 0 ||
-                    strcmp(ent->d_name, ".lock") == 0 ||
-                    strcmp(ent->d_name, "current") == 0) {
-                    continue;
-                }
-                if (!validate_name(ent->d_name)) {
-                    set_error(ERR_PERMISSION_DENIED,
-                              "Refusing unmanaged GPG reset entry: %s",
-                              ent->d_name);
-                    gpg_record_reset_failure(
-                        &failures, &failed, "unmanaged GPG base entry");
-                    continue;
-                }
-                struct stat est;
-                if (fstatat(base_fd, ent->d_name, &est,
-                            AT_SYMLINK_NOFOLLOW) != 0) {
-                    set_system_error(ERR_FILE_IO,
-                                     "Cannot inspect GPG home during reset: %s/%s",
-                                     base, ent->d_name);
-                    gpg_record_reset_failure(
-                        &failures, &failed, "GPG home inspection");
-                    continue;
-                }
-                if (!S_ISDIR(est.st_mode) || est.st_uid != getuid() ||
-                    (est.st_mode & 077) != 0) {
-                    set_error(ERR_PERMISSION_DENIED,
-                              "Refusing unsafe GPG home during reset: %s/%s",
-                              base, ent->d_name);
-                    gpg_record_reset_failure(
-                        &failures, &failed, "unsafe GPG home");
-                    continue;
-                }
-                if (gpg_kill_and_remove_home(base_fd, base, ent->d_name) != 0) {
-                    gpg_record_reset_failure(&failures, &failed,
-                                             "GPG home cleanup");
-                }
-            }
-            if (closedir(d) != 0) {
-                set_system_error(ERR_FILE_IO, "Failed to close GPG base directory: %s", base);
+        for (size_t i = 0; i < plan.home_count; i++) {
+            if (gpg_kill_and_remove_home(
+                    base_fd, base, plan.homes[i].name,
+                    &plan.homes[i].identity) != 0) {
                 gpg_record_reset_failure(&failures, &failed,
-                                         "GPG base enumeration close");
+                                         "GPG home cleanup");
             }
         }
     }
@@ -4020,8 +6549,15 @@ int gpg_manager_reset(const char *account) {
                                  "stable GNUPGHOME path");
     } else {
         gpg_link_identity_t captured_current;
-        int current_rc = gpg_capture_link_at(base_fd, "current",
+        int current_rc;
+
+        if (!account) {
+            captured_current = plan.current;
+            current_rc = plan.current_present ? 0 : 1;
+        } else {
+            current_rc = gpg_capture_link_at(base_fd, "current",
                                              &captured_current);
+        }
         if (current_rc == 0) {
             if (!account && !failed) {
                 bool current_changed = false;
@@ -4070,6 +6606,21 @@ int gpg_manager_reset(const char *account) {
         }
     }
 reset_finalize:
+    /* Every reset — including an otherwise byte-for-byte retry after an
+     * earlier fsync failure — repairs the durability boundary of
+     * home/current namespace changes before releasing the manager lock. For
+     * a full reset this barrier must precede the authoritative emptiness
+     * scan: a same-UID writer can create new residue while a blocking sync is
+     * in progress, and no later blocking namespace operation may make that
+     * successful scan stale. */
+    if (g_sync_base(base_fd) != 0) {
+        set_system_error(
+            ERR_FILE_IO,
+            "GPG reset changed the namespace but the base directory is not durable; retry reset");
+        gpg_record_reset_failure(&failures, &failed,
+                                 "GPG base directory synchronization");
+    }
+
     if (!account && !failed) {
         if (g_reset_final_hook && g_reset_final_hook(base_fd) != 0) {
             set_error(ERR_FILE_IO, "GPG reset final-verification hook failed");
@@ -4082,16 +6633,7 @@ reset_finalize:
         }
     }
 
-    /* Every successful reset — including an otherwise byte-for-byte retry
-     * after an earlier fsync failure — repairs the durability boundary of
-     * home/current namespace changes before releasing the manager lock. */
-    if (g_sync_base(base_fd) != 0) {
-        set_system_error(
-            ERR_FILE_IO,
-            "GPG reset changed the namespace but the base directory is not durable; retry reset");
-        gpg_record_reset_failure(&failures, &failed,
-                                 "GPG base directory synchronization");
-    }
+    gpg_reset_all_plan_destroy(&plan);
     unlock_gpg_dir(base_fd, lock_fd);
     if (failed) {
         if (!error_accumulator_publish(&failures)) {
@@ -4143,31 +6685,54 @@ int gpg_manager_isolated_home_present(const char *account, bool *present) {
     return 0;
 }
 
-/* Compute, policy-check, and create the base directory for isolated
- * GNUPGHOMEs (shared with the stable `current` symlink path so the two never
- * disagree). Split out of gpg_create_isolated_home so gpg_switch_account can
- * establish the base — and take its lock — BEFORE the create+import sequence
- * that lock must cover (AR-03 L12); the create path below then re-runs it
- * idempotently (the memory-backed probe is memoized, ensure_private_dir is a
- * create-or-verify). Returns 0 with the base path in `base`. */
+/* Create/open, policy-check, and retain the exact base directory for isolated
+ * GNUPGHOMEs. The memory-backed decision is made from this descriptor, then
+ * its public name is rebound before any account home is created. Returns the
+ * retained descriptor and base path; callers lock and mutate through this
+ * same descriptor without reopening it. */
 static int gpg_prepare_base_dir(char *base, size_t size) {
-    if (gpg_get_base_dir(base, size) != 0) {
+    struct stat opened;
+    struct stat named;
+    bool memory_backed = false;
+    int base_fd;
+
+    base_fd = gpg_open_base_dir(base, size, true, NULL);
+    if (base_fd < 0) {
+        return -1;
+    }
+    if (g_memory_backed_probe(base_fd, &memory_backed) != 0) {
+        int saved_errno = errno ? errno : EIO;
+
+        close(base_fd);
+        errno = saved_errno;
+        set_system_error(
+            ERR_PERMISSION_DENIED,
+            "Cannot prove isolated GPG base is memory-backed: %s", base);
+        return -1;
+    }
+    errno = 0;
+    if (fstat(base_fd, &opened) != 0 || lstat(base, &named) != 0 ||
+        !S_ISDIR(opened.st_mode) || !S_ISDIR(named.st_mode) ||
+        opened.st_uid != getuid() || (opened.st_mode & 077) != 0 ||
+        named.st_dev != opened.st_dev || named.st_ino != opened.st_ino) {
+        int saved_errno = errno ? errno : ESTALE;
+
+        close(base_fd);
+        errno = saved_errno;
+        set_system_error(
+            ERR_PERMISSION_DENIED,
+            "GPG base pathname no longer names the probed directory: %s",
+            base);
         return -1;
     }
 
-    /* Refuse to export secret-key material onto persistent disk, wherever the
-     * base came from. XDG_RUNTIME_DIR is only USUALLY a tmpfs — rootless
-     * containers, NFS-homed logins, or a hand-exported disk path are not — and
-     * the /tmp fallback (or even a bind/quota mount at exactly the base path
-     * under a tmpfs /tmp) can be persistent too, so probe the actual computed
-     * base rather than trusting its source or a hardcoded parent (AR-02 #3,
-     * #22; probe memoized per base path — AR-03 L20). Fail closed unless the
-     * user explicitly opts in with GITSWITCH_ALLOW_TMP_GPG=1 (or, better,
-     * points XDG_RUNTIME_DIR at a tmpfs); on opt-in, remind them once per
-     * process what they accepted. */
-    if (!base_memory_backed_cached(base)) {
+    /* Refuse persistent storage unless the user knowingly opts in. The
+     * process-wide warning latch is diagnostic only; every prepare call
+     * independently re-probes its exact retained descriptor. */
+    if (!memory_backed) {
         const char *optin = getenv("GITSWITCH_ALLOW_TMP_GPG");
         if (!optin || strcmp(optin, "1") != 0) {
+            close(base_fd);
             set_error(ERR_PERMISSION_DENIED,
                       "Refusing to write GPG secret keys to non-memory-backed %s. "
                       "Set XDG_RUNTIME_DIR to a tmpfs, or GITSWITCH_ALLOW_TMP_GPG=1 "
@@ -4182,13 +6747,7 @@ static int gpg_prepare_base_dir(char *base, size_t size) {
                             "disk after deletion.", base);
         }
     }
-
-    /* Create + verify the base directory (real, user-owned, 0700; not a
-     * symlink or a dir pre-created by another user in a shared /tmp). */
-    if (ensure_private_dir(base) != 0) {
-        return -1;
-    }
-    return 0;
+    return base_fd;
 }
 
 /* Create and pin one account home relative to an already-opened, locked base.
@@ -4232,7 +6791,8 @@ static int gpg_prepare_isolated_home_at(gpg_config_t *gpg_config,
         return -1;
     }
 
-    if (setup_gpg_agent_config(home_fd, gnupg_home, &update) != 0) {
+    if (setup_gpg_agent_config(gpg_config, home_fd, gnupg_home,
+                               &update, true) != 0) {
         gpg_agent_config_update_close(&update);
         close(home_fd);
         return -1;
@@ -4280,10 +6840,10 @@ int gpg_create_isolated_home(gpg_config_t *gpg_config, const account_t *account)
                   "Invalid arguments to gpg_create_isolated_home");
         return -1;
     }
-    if (gpg_prepare_base_dir(base, sizeof(base)) != 0) {
+    if (gpg_bind_executable_if_needed(gpg_config) != 0) {
         return -1;
     }
-    base_fd = gpg_open_base_dir(base, sizeof(base), false, NULL);
+    base_fd = gpg_prepare_base_dir(base, sizeof(base));
     if (base_fd < 0) {
         return -1;
     }
@@ -4345,8 +6905,9 @@ int gpg_configure_git_signing(gpg_config_t *gpg_config, const account_t *account
     /* This is the last publication step before accounts.c seals the generic
      * managed-key transaction. Require the fresh merged image to select the
      * same executable and use it for any uncached secret-key probe. */
-    if (git_test_config(&configured_account, scope,
-                        gpg_config->executable_path) != 0) {
+    if (git_test_config_with_gpg_witness(
+            &configured_account, scope, gpg_config->executable_path,
+            &gpg_config->executable_witness) != 0) {
         return -1;
     }
 
@@ -4731,6 +7292,9 @@ static int gpg_resolve_secret_key_listing_contract(
     bool signing_usable = false;
     bool have_secret_material = false;
     bool awaiting_primary_fingerprint = false;
+    bool awaiting_subkey_fingerprint = false;
+    bool pending_subkey_secret_usable = false;
+    bool pending_subkey_signing_usable = false;
     bool have_fingerprint = false;
 
     if (!listing || !fingerprint || fingerprint_size == 0) {
@@ -4765,6 +7329,13 @@ static int gpg_resolve_secret_key_listing_contract(
                 fingerprint[0] = '\0';
                 set_error(ERR_GPG_KEY_FAILED,
                           "GPG primary key fingerprint is missing or out of order");
+                return -1;
+            }
+            if (awaiting_subkey_fingerprint &&
+                !(record_len == 3 && memcmp(record, "fpr", 3) == 0)) {
+                fingerprint[0] = '\0';
+                set_error(ERR_GPG_KEY_FAILED,
+                          "GPG subkey fingerprint is missing or out of order");
                 return -1;
             }
             if (record_len == 3 && memcmp(record, "sec", 3) == 0) {
@@ -4811,6 +7382,37 @@ static int gpg_resolve_secret_key_listing_contract(
                 have_fingerprint = true;
                 awaiting_primary_fingerprint = false;
             } else if (record_len == 3 &&
+                       memcmp(record, "fpr", 3) == 0 &&
+                       primary_count == 1 &&
+                       awaiting_subkey_fingerprint) {
+                const char *value;
+                size_t value_len;
+                size_t i;
+
+                if (!gpg_colon_field(line, line_len, 9, &value, &value_len) ||
+                    (value_len != 40 && value_len != 64)) {
+                    fingerprint[0] = '\0';
+                    set_error(
+                        ERR_GPG_KEY_FAILED,
+                        "GPG subkey has no complete canonical fingerprint");
+                    return -1;
+                }
+                for (i = 0; i < value_len; i++) {
+                    if (!isxdigit((unsigned char)value[i])) {
+                        fingerprint[0] = '\0';
+                        set_error(ERR_GPG_KEY_FAILED,
+                                  "GPG subkey fingerprint is malformed");
+                        return -1;
+                    }
+                }
+                have_secret_material =
+                    have_secret_material || pending_subkey_secret_usable;
+                signing_usable =
+                    signing_usable || pending_subkey_signing_usable;
+                pending_subkey_secret_usable = false;
+                pending_subkey_signing_usable = false;
+                awaiting_subkey_fingerprint = false;
+            } else if (record_len == 3 &&
                        memcmp(record, "ssb", 3) == 0 &&
                        primary_count == 1) {
                 bool subkey_secret = gpg_record_has_secret_material(
@@ -4819,12 +7421,11 @@ static int gpg_resolve_secret_key_listing_contract(
                     subkey_secret &&
                     gpg_record_is_currently_usable(line, line_len);
 
-                have_secret_material =
-                    have_secret_material || subkey_secret_usable;
-                if (primary_usable && subkey_secret_usable &&
-                    gpg_record_has_direct_signing(line, line_len)) {
-                    signing_usable = true;
-                }
+                pending_subkey_secret_usable = subkey_secret_usable;
+                pending_subkey_signing_usable =
+                    primary_usable && subkey_secret_usable &&
+                    gpg_record_has_direct_signing(line, line_len);
+                awaiting_subkey_fingerprint = true;
             }
         }
         if (!eol) {
@@ -4848,6 +7449,12 @@ static int gpg_resolve_secret_key_listing_contract(
     if (!have_fingerprint) {
         set_error(ERR_GPG_KEY_FAILED,
                   "GPG primary key has no canonical fingerprint");
+        return -1;
+    }
+    if (awaiting_subkey_fingerprint) {
+        fingerprint[0] = '\0';
+        set_error(ERR_GPG_KEY_FAILED,
+                  "GPG subkey has no canonical fingerprint");
         return -1;
     }
     if (!primary_usable) {
@@ -4916,12 +7523,23 @@ static bool gpg_listing_has_empty_secret_material(const char *listing) {
     return false;
 }
 
+typedef enum {
+    GPG_LISTING_STATUS_UNEXPECTED_NONE,
+    GPG_LISTING_STATUS_UNEXPECTED_ERROR,
+    GPG_LISTING_STATUS_UNEXPECTED_FAILURE
+} gpg_listing_unexpected_kind_t;
+
 typedef struct {
     bool malformed;
     bool keylist_error_seen;
     bool keylist_error_conflict;
     unsigned long long keylist_error;
     bool gpg_exit_failure_seen;
+    gpg_listing_unexpected_kind_t unexpected_kind;
+    const char *unexpected_location;
+    size_t unexpected_location_len;
+    unsigned long long unexpected_code;
+    size_t unexpected_count;
 } gpg_listing_status_t;
 
 enum { GPG_KEY_LISTING_CAP = 512 * 1024 };
@@ -4964,8 +7582,10 @@ static bool gpg_status_token_is(const char *token, size_t token_len,
 }
 
 /* Parse only the status records needed to classify key listing. Unknown
- * records are forward-compatible. ERROR and FAILURE records are structural
- * evidence, so an incomplete or non-decimal form makes the capture unusable. */
+ * non-error records are forward-compatible. ERROR and FAILURE records are
+ * structural evidence, so an incomplete or non-decimal form makes the capture
+ * unusable; a valid but unrecognized pair retains its first complete identity
+ * plus the total count so it cannot disappear behind ordinary-miss evidence. */
 static void gpg_collect_listing_status(const char *capture,
                                        gpg_listing_status_t *status) {
     const char *line;
@@ -5007,8 +7627,12 @@ static void gpg_collect_listing_status(const char *capture,
             if (is_error &&
                 gpg_status_token_is(location, location_len,
                                     "keylist.getkey")) {
+                /* GnuPG may emit the same portable code with or without
+                 * libgpg-error source bits. Only low-16 disagreement is a
+                 * contradictory key-list result. */
                 if (status->keylist_error_seen &&
-                    status->keylist_error != code) {
+                    (status->keylist_error & 0xffffULL) !=
+                        (code & 0xffffULL)) {
                     status->keylist_error_conflict = true;
                 }
                 status->keylist_error_seen = true;
@@ -5017,11 +7641,41 @@ static void gpg_collect_listing_status(const char *capture,
                        gpg_status_token_is(location, location_len,
                                            "gpg-exit")) {
                 status->gpg_exit_failure_seen = true;
+            } else if (is_error || is_failure) {
+                status->unexpected_count++;
+                if (status->unexpected_kind ==
+                    GPG_LISTING_STATUS_UNEXPECTED_NONE) {
+                    status->unexpected_kind =
+                        is_error ? GPG_LISTING_STATUS_UNEXPECTED_ERROR
+                                 : GPG_LISTING_STATUS_UNEXPECTED_FAILURE;
+                    status->unexpected_location = location;
+                    status->unexpected_location_len = location_len;
+                    status->unexpected_code = code;
+                }
             }
         }
         if (!eol) break;
         line = eol + 1;
     }
+}
+
+static void gpg_set_unexpected_listing_status_error(
+    const gpg_listing_status_t *status, const char *selector) {
+    const char *kind =
+        status->unexpected_kind == GPG_LISTING_STATUS_UNEXPECTED_ERROR
+            ? "ERROR"
+            : "FAILURE";
+    int location_len =
+        status->unexpected_location_len > (size_t)INT_MAX
+            ? INT_MAX
+            : (int)status->unexpected_location_len;
+
+    set_error(
+        ERR_GPG_KEY_FAILED,
+        "GPG secret-key helper returned unexpected structured status "
+        "%s %.*s code %llu (%zu unexpected ERROR/FAILURE records) for %s",
+        kind, location_len, status->unexpected_location,
+        status->unexpected_code, status->unexpected_count, selector);
 }
 
 /* Classify the runner result without collapsing transport/setup or keyring
@@ -5049,8 +7703,18 @@ static int gpg_classify_secret_listing_run(int run_rc,
     if (run_rc == 0) {
         if (res->spawned && res->exit_code == 0 && res->term_signal == 0) {
             gpg_collect_listing_status(capture, &status);
-            if (status.malformed || status.keylist_error_conflict ||
-                status.keylist_error_seen || status.gpg_exit_failure_seen) {
+            if (status.malformed || status.keylist_error_conflict) {
+                set_error(ERR_GPG_KEY_FAILED,
+                          "GPG secret-key helper returned inconsistent "
+                          "structured success for %s",
+                          selector);
+                return -1;
+            }
+            if (status.unexpected_count > 0U) {
+                gpg_set_unexpected_listing_status_error(&status, selector);
+                return -1;
+            }
+            if (status.keylist_error_seen || status.gpg_exit_failure_seen) {
                 set_error(ERR_GPG_KEY_FAILED,
                           "GPG secret-key helper returned inconsistent "
                           "structured success for %s",
@@ -5078,6 +7742,10 @@ static int gpg_classify_secret_listing_run(int run_rc,
                       "GPG secret-key helper returned contradictory structured "
                       "status output for %s",
                       selector);
+            return -1;
+        }
+        if (status.unexpected_count > 0U) {
+            gpg_set_unexpected_listing_status_error(&status, selector);
             return -1;
         }
         /* libgpg-error stores the portable code in the low 16 bits; the high
@@ -5238,14 +7906,18 @@ static int gpg_query_secret_listing_contract(
         if (gpg_validate_pinned_home(home) != 0) return -1;
         opts.cwd_fd = home->home_fd;
         opts.use_cwd_fd = true;
-        run_rc = run_argv(argv, &opts, &result);
+        run_rc = run_argv_with_expected_launch(
+            argv, &opts, &gpg_config->executable_witness, &result);
         if (gpg_validate_pinned_home(home) != 0) return -1;
     } else {
-        if (gpg_validate_source_home(source) != 0) return -1;
         opts.cwd_fd = source->fd;
         opts.use_cwd_fd = true;
-        run_rc = run_argv(argv, &opts, &result);
-        if (gpg_validate_source_home(source) != 0) return -1;
+        if (gpg_run_source_helper(
+            source,
+            argv, &opts, &gpg_config->executable_witness, &result,
+            &run_rc) != 0) {
+            return -1;
+        }
     }
     if (result.out_truncated) {
         set_error(ERR_GPG_KEY_FAILED,
@@ -5329,22 +8001,20 @@ static int gpg_capture_secret_listing(const gpg_config_t *gpg_config,
         }
         opts.cwd_fd = home->home_fd;
         opts.use_cwd_fd = true;
-        run_rc = run_argv(argv, &opts, &res);
+        run_rc = run_argv_with_expected_launch(
+            argv, &opts, &gpg_config->executable_witness, &res);
         if (gpg_validate_pinned_home(home) != 0) {
             secure_zero_memory(listing, GPG_KEY_LISTING_CAP);
             free(listing);
             return -1;
         }
     } else {
-        if (gpg_validate_source_home(source) != 0) {
-            secure_zero_memory(listing, GPG_KEY_LISTING_CAP);
-            free(listing);
-            return -1;
-        }
         opts.cwd_fd = source->fd;
         opts.use_cwd_fd = true;
-        run_rc = run_argv(argv, &opts, &res);
-        if (gpg_validate_source_home(source) != 0) {
+        if (gpg_run_source_helper(
+            source,
+            argv, &opts, &gpg_config->executable_witness, &res,
+            &run_rc) != 0) {
             secure_zero_memory(listing, GPG_KEY_LISTING_CAP);
             free(listing);
             return -1;
@@ -5369,6 +8039,17 @@ static int gpg_capture_secret_listing(const gpg_config_t *gpg_config,
             fingerprint_size);
         secure_zero_memory(listing, GPG_KEY_LISTING_CAP);
         free(listing);
+        if (parse_rc == 0) {
+            gpg_key_cache_store(gpg_config, home, source, fingerprint,
+                                require_signing, &res.launch_witness);
+            /* Preserve the selector-only compatibility memo for injected
+             * runners. Production callers cannot consume these notes; their
+             * reusable proof is the context-bound cache populated above. */
+            if (!run_uses_default_runner()) {
+                gpg_manager_note_key_available(fingerprint);
+                gpg_manager_note_key_available(selector);
+            }
+        }
         return parse_rc;
     }
 }
@@ -5378,6 +8059,7 @@ static int gpg_resolve_source_key(const gpg_config_t *gpg_config,
                                   char *fingerprint,
                                   size_t fingerprint_size) {
     gpg_source_home_t source;
+    int cache_rc;
     int open_rc;
     int rc;
 
@@ -5393,6 +8075,17 @@ static int gpg_resolve_source_key(const gpg_config_t *gpg_config,
                       "System GPG keyring home is absent");
         }
         return -1;
+    }
+    if (gpg_validate_source_home(&source) != 0) {
+        gpg_close_source_home(&source);
+        return -1;
+    }
+    cache_rc = gpg_key_cache_lookup(
+        gpg_config, NULL, &source, selector, require_signing,
+        fingerprint, fingerprint_size);
+    if (cache_rc != 0) {
+        gpg_close_source_home(&source);
+        return cache_rc > 0 ? 0 : -1;
     }
     rc = gpg_capture_secret_listing(gpg_config, NULL, &source, selector,
                                     require_signing, fingerprint,
@@ -5411,6 +8104,15 @@ static int gpg_resolve_pinned_key(const gpg_config_t *gpg_config,
                                   const char *selector, bool require_signing,
                                   char *fingerprint,
                                   size_t fingerprint_size) {
+    int cache_rc;
+
+    if (gpg_validate_pinned_home(home) != 0) {
+        return -1;
+    }
+    cache_rc = gpg_key_cache_lookup(
+        gpg_config, home, NULL, selector, require_signing,
+        fingerprint, fingerprint_size);
+    if (cache_rc != 0) return cache_rc > 0 ? 0 : -1;
     return gpg_capture_secret_listing(gpg_config, home, NULL, selector,
                                       require_signing, fingerprint,
                                       fingerprint_size);
@@ -5434,7 +8136,7 @@ static int copy_key_from_system_keyring(const gpg_config_t *gpg_config,
     /* AR-12 L12: run_argv has early-return paths that never touch the
      * capture buffer; initialize so a pre-spawn failure cannot format
      * uninitialized stack bytes into the user-facing diagnostic. */
-    char import_diag[1024] = "";
+    char import_diag[GPG_HELPER_DIAGNOSTIC_CAP] = "";
     const char *env[2] = {"GNUPGHOME=.", NULL};
     char *key_data;
     char imported_fingerprint[GPG_FINGERPRINT_BUFSIZE];
@@ -5465,7 +8167,6 @@ static int copy_key_from_system_keyring(const gpg_config_t *gpg_config,
     if (present_rc == 0) {
         log_debug("Secret key already present in isolated home; skipping import: %s",
                   fingerprint);
-        gpg_manager_note_key_available(fingerprint);
         return 0;
     }
     if (present_rc < 0) {
@@ -5535,14 +8236,10 @@ static int copy_key_from_system_keyring(const gpg_config_t *gpg_config,
         opts.extra_env = export_env;
         opts.cwd_fd = source.fd;
         opts.use_cwd_fd = true;
-        if (gpg_validate_source_home(&source) != 0) {
-            secure_zero_memory(key_data, KEY_DATA_CAP);
-            free(key_data);
-            gpg_close_source_home(&source);
-            return -1;
-        }
-        export_rc = run_argv(export_argv, &opts, &res);
-        if (gpg_validate_source_home(&source) != 0) {
+        if (gpg_run_source_helper(
+            &source,
+            export_argv, &opts, &gpg_config->executable_witness, &res,
+            &export_rc) != 0) {
             secure_zero_memory(key_data, KEY_DATA_CAP);
             free(key_data);
             gpg_close_source_home(&source);
@@ -5602,8 +8299,11 @@ static int copy_key_from_system_keyring(const gpg_config_t *gpg_config,
     {
         const char *import_argv[] = {gpg_config->executable_path, "--batch",
                                      "--import", NULL};
+        run_result_t import_result;
         int import_rc;
         memset(&opts, 0, sizeof(opts));
+        memset(&import_result, 0, sizeof(import_result));
+        import_result.exit_code = -1;
         opts.input = key_data;
         opts.input_len = res.out_len;
         opts.out = import_diag;
@@ -5613,20 +8313,29 @@ static int copy_key_from_system_keyring(const gpg_config_t *gpg_config,
         opts.extra_env = env;
         opts.cwd_fd = home->home_fd;
         opts.use_cwd_fd = true;
-        import_rc = run_argv(import_argv, &opts, NULL);
+        import_rc = run_argv_with_expected_launch(
+            import_argv, &opts, &gpg_config->executable_witness,
+            &import_result);
         if (gpg_validate_pinned_home(home) != 0) {
+            secure_zero_memory(import_diag, sizeof(import_diag));
             secure_zero_memory(key_data, KEY_DATA_CAP);
             free(key_data);
             return -1;
         }
-        if (import_rc != 0) {
+        if (import_rc != 0 || !import_result.spawned ||
+            import_result.exit_code != 0 ||
+            import_result.term_signal != 0 ||
+            import_result.out_truncated) {
             secure_zero_memory(key_data, KEY_DATA_CAP);
             free(key_data);
-            set_error(ERR_GPG_KEY_FAILED,
-                      "Failed to import GPG key into isolated environment: %s",
-                      import_diag);
+            gpg_set_helper_failure(
+                ERR_GPG_KEY_FAILED,
+                "Failed to import GPG key into isolated environment",
+                import_diag, &import_result);
+            secure_zero_memory(import_diag, sizeof(import_diag));
             return -1;
         }
+        secure_zero_memory(import_diag, sizeof(import_diag));
     }
 
     secure_zero_memory(key_data, KEY_DATA_CAP);
@@ -5642,14 +8351,185 @@ static int copy_key_from_system_keyring(const gpg_config_t *gpg_config,
     }
     log_info("Successfully copied GPG key to isolated environment: %s",
              fingerprint);
-    gpg_manager_note_key_available(fingerprint);
     return 0;
 }
 
 enum { GPG_AGENT_CONF_MAX = 64 * 1024 };
 
 #define GPG_AGENT_RELOAD_STATE ".gitswitch-gpg-agent-reload.state"
-enum { GPG_AGENT_RELOAD_STATE_MAX = 256 };
+enum {
+    GPG_AGENT_RELOAD_STATE_MAX = 96 * 1024,
+    GPGCONF_METADATA_MAX = 64 * 1024
+};
+
+static int gpg_run_bound_capture(
+    const char *const argv[], const run_launch_witness_t *witness,
+    char *output, size_t output_size) {
+    run_opts_t opts;
+    run_result_t result;
+    int rc;
+
+    if (!argv || !argv[0] || !witness || !witness->valid ||
+        !output || output_size < 2U) {
+        set_error(ERR_INVALID_ARGS, "Invalid bound GnuPG metadata request");
+        return -1;
+    }
+    memset(&opts, 0, sizeof(opts));
+    memset(&result, 0, sizeof(result));
+    result.exit_code = -1;
+    output[0] = '\0';
+    opts.out = output;
+    opts.out_size = output_size;
+    opts.stderr_to_devnull = true;
+    opts.unset_env = g_gpg_child_unset_env;
+    rc = run_argv_with_expected_launch(argv, &opts, witness, &result);
+    if (rc != 0 || !result.spawned || result.exit_code != 0 ||
+        result.term_signal != 0 || result.out_truncated ||
+        result.out_len >= output_size ||
+        result.out_len != strlen(output)) {
+        set_error(ERR_SYSTEM_COMMAND_FAILED,
+                  "Bound GnuPG metadata command failed");
+        return -1;
+    }
+    return 0;
+}
+
+static int gpg_percent_decode_field(const char *start, size_t length,
+                                    char *output, size_t output_size) {
+    size_t used = 0;
+
+    if (!start || !output || output_size == 0U) return -1;
+    for (size_t i = 0; i < length; i++) {
+        unsigned char value = (unsigned char)start[i];
+        if (value == '%') {
+            int high;
+            int low;
+            if (i + 2U >= length ||
+                !isxdigit((unsigned char)start[i + 1U]) ||
+                !isxdigit((unsigned char)start[i + 2U])) {
+                return -1;
+            }
+            high = isdigit((unsigned char)start[i + 1U])
+                       ? start[i + 1U] - '0'
+                       : 10 + (tolower((unsigned char)start[i + 1U]) - 'a');
+            low = isdigit((unsigned char)start[i + 2U])
+                      ? start[i + 2U] - '0'
+                      : 10 + (tolower((unsigned char)start[i + 2U]) - 'a');
+            value = (unsigned char)((high << 4) | low);
+            i += 2U;
+        }
+        if (value == '\0' || value == '\r' || value == '\n' ||
+            iscntrl(value) || used + 1U >= output_size) {
+            return -1;
+        }
+        output[used++] = (char)value;
+    }
+    output[used] = '\0';
+    return 0;
+}
+
+static int gpg_parse_component_gpg_path(const char *metadata,
+                                        char *gpg_path, size_t gpg_size) {
+    const char *cursor = metadata;
+    bool have_gpg = false;
+
+    if (!metadata || !gpg_path) return -1;
+    while (*cursor) {
+        const char *end = strchr(cursor, '\n');
+        const char *first;
+        const char *second;
+        const char *third;
+        size_t line_len;
+        char name[32];
+        char path[MAX_PATH_LEN];
+
+        if (!end) end = cursor + strlen(cursor);
+        line_len = (size_t)(end - cursor);
+        if (line_len > 0U && cursor[line_len - 1U] == '\r') line_len--;
+        if (line_len == 0U) return -1;
+        first = memchr(cursor, ':', line_len);
+        second = first ? memchr(first + 1, ':',
+                                line_len - (size_t)(first + 1 - cursor))
+                       : NULL;
+        third = second ? memchr(second + 1, ':',
+                               line_len - (size_t)(second + 1 - cursor))
+                       : NULL;
+        if (!first || !second ||
+            (size_t)(first - cursor) >= sizeof(name)) {
+            return -1;
+        }
+        memcpy(name, cursor, (size_t)(first - cursor));
+        name[first - cursor] = '\0';
+        if ((third && third != cursor + line_len - 1) ||
+            gpg_percent_decode_field(second + 1,
+                                     third
+                                         ? (size_t)(third - (second + 1))
+                                         : line_len -
+                                               (size_t)(second + 1 - cursor),
+                                     path, sizeof(path)) != 0 ||
+            path[0] != '/') {
+            return -1;
+        }
+        if (strcmp(name, "gpg") == 0) {
+            if (have_gpg || safe_strncpy(gpg_path, path, gpg_size) != 0)
+                return -1;
+            have_gpg = true;
+        }
+        cursor = *end ? end + 1 : end;
+    }
+    return have_gpg ? 0 : -1;
+}
+
+static int gpg_bind_agent_toolchain(
+    const gpg_config_t *gpg_config, gpg_agent_config_update_t *update) {
+    char metadata[GPGCONF_METADATA_MAX];
+    char component_gpg[MAX_PATH_LEN];
+    char resolved[MAX_PATH_LEN];
+    run_launch_witness_t component_gpg_witness;
+    const char *components_argv[3];
+
+    if (!gpg_config || !gpg_config->executable_witness.valid || !update) {
+        set_error(ERR_INVALID_ARGS, "Invalid GPG agent toolchain binding");
+        return -1;
+    }
+    if (find_command_path("gpgconf", update->gpgconf_path,
+                          sizeof(update->gpgconf_path)) != 0 ||
+        !run_launch_witness_capture(update->gpgconf_path,
+                                    &update->gpgconf_witness)) {
+        set_error(ERR_SYSTEM_COMMAND_FAILED,
+                  "Cannot bind trusted gpgconf for GPG agent reload");
+        return -1;
+    }
+    components_argv[0] = update->gpgconf_path;
+    components_argv[1] = "--list-components";
+    components_argv[2] = NULL;
+    if (gpg_run_bound_capture(components_argv, &update->gpgconf_witness,
+                              metadata, sizeof(metadata)) != 0) {
+        return -1;
+    }
+    if (gpg_parse_component_gpg_path(
+            metadata, component_gpg, sizeof(component_gpg)) != 0) {
+        set_error(ERR_SYSTEM_COMMAND_FAILED,
+                  "gpgconf returned invalid GnuPG component metadata");
+        return -1;
+    }
+    if (
+        find_command_path(component_gpg, resolved, sizeof(resolved)) != 0 ||
+        !run_launch_witness_capture(resolved,
+                                    &component_gpg_witness)) {
+        set_error(ERR_SYSTEM_COMMAND_FAILED,
+                  "gpgconf returned invalid GnuPG component metadata");
+        return -1;
+    }
+    if (!run_launch_witness_matches(&component_gpg_witness,
+                                    &gpg_config->executable_witness)) {
+        set_error(ERR_SYSTEM_COMMAND_FAILED,
+                  "gpgconf describes a different GPG executable generation");
+        return -1;
+    }
+    update->gpg_config = gpg_config;
+    return 0;
+}
 
 static bool conf_bytes_have_pinentry(const unsigned char *bytes, size_t len) {
     size_t offset = 0;
@@ -5716,27 +8596,58 @@ static int append_conf_bytes(unsigned char *dest, size_t capacity,
     return 0;
 }
 
+typedef enum {
+    GPG_AGENT_CONF_MATCH_STRICT = 0,
+    GPG_AGENT_CONF_MATCH_CLEAN_CTIME,
+    GPG_AGENT_CONF_MATCH_PUBLICATION_CTIME,
+    GPG_AGENT_CONF_MATCH_TERMINAL_CTIME
+} gpg_agent_conf_match_policy_t;
+
+static bool gpg_agent_conf_identity_transition(
+    const struct stat *before, const struct stat *after,
+    gpg_agent_conf_match_policy_t policy, bool *saw_ctime_transition) {
+    if (gpg_same_file_version(before, after)) return true;
+    if (policy == GPG_AGENT_CONF_MATCH_STRICT ||
+        !gpg_file_ctime_only_change(before, after)) {
+        return false;
+    }
+    if (saw_ctime_transition) *saw_ctime_transition = true;
+    return true;
+}
+
 /* Return 1 only for a byte-identical, private regular destination; 0 means a
  * safe atomic replacement is needed, and -1 means comparison raced or failed.
+ * Setup, publication, and terminal proofs may admit ctime-only observation
+ * edges where their callers bind exact bytes and all other metadata.
  * The comparator opens no write descriptor and performs no fsync or rename;
  * its caller still syncs the directory before accepting an identical retry. */
 static int gpg_agent_conf_matches(int home_fd, const unsigned char *desired,
-                                  size_t desired_len, int *matched_fd_out,
+                                  size_t desired_len,
+                                  gpg_agent_conf_match_policy_t policy,
+                                  bool *ctime_transition_out,
+                                  int *matched_fd_out,
                                   struct stat *identity_out) {
     struct stat before;
     struct stat opened;
     struct stat after;
+    struct stat named_after;
     unsigned char buf[4096];
     size_t offset = 0;
+    bool saw_ctime_transition = false;
     int fd;
     int result = 0;
 
-    if ((matched_fd_out == NULL) != (identity_out == NULL)) {
+    if ((matched_fd_out == NULL) != (identity_out == NULL) ||
+        (policy != GPG_AGENT_CONF_MATCH_STRICT &&
+         policy != GPG_AGENT_CONF_MATCH_CLEAN_CTIME &&
+         policy != GPG_AGENT_CONF_MATCH_PUBLICATION_CTIME &&
+         policy != GPG_AGENT_CONF_MATCH_TERMINAL_CTIME)) {
         set_error(ERR_INVALID_ARGS,
                   "Invalid GPG agent config comparison outputs");
         return -1;
     }
     if (matched_fd_out) *matched_fd_out = -1;
+    if (ctime_transition_out) *ctime_transition_out = false;
 
     if (fstatat(home_fd, "gpg-agent.conf", &before,
                 AT_SYMLINK_NOFOLLOW) != 0) {
@@ -5749,12 +8660,44 @@ static int gpg_agent_conf_matches(int home_fd, const unsigned char *desired,
         before.st_nlink != 1 || (before.st_mode & 0777) != 0600) {
         return 0;
     }
+#ifdef GITSWITCH_TESTING
+    if (policy == GPG_AGENT_CONF_MATCH_TERMINAL_CTIME &&
+        g_agent_conf_terminal_preopen &&
+        g_agent_conf_terminal_preopen(home_fd) != 0) {
+        int saved_errno = errno ? errno : EIO;
+
+        errno = saved_errno;
+        set_system_error(
+            ERR_FILE_IO,
+            "GPG agent configuration terminal pre-open hook failed");
+        return -1;
+    }
+    if (policy == GPG_AGENT_CONF_MATCH_PUBLICATION_CTIME &&
+        g_agent_conf_publication_hook &&
+        g_agent_conf_publication_hook(
+            home_fd,
+            GPG_AGENT_CONF_PUBLICATION_PROOF_PREOPEN) != 0) {
+        int saved_errno = errno ? errno : EIO;
+
+        errno = saved_errno;
+        set_system_error(
+            ERR_FILE_IO,
+            "GPG agent configuration publication proof hook failed");
+        return -1;
+    }
+#endif
     fd = openat(home_fd, "gpg-agent.conf",
                 O_RDONLY | O_CLOEXEC | O_NOFOLLOW | O_NONBLOCK);
-    if (fd < 0 || fstat(fd, &opened) != 0 ||
-        !gpg_same_file_version(&before, &opened) ||
+    if (fd < 0) {
+        set_error(ERR_FILE_IO,
+                  "Installed gpg-agent.conf changed while opening");
+        return -1;
+    }
+    if (fstat(fd, &opened) != 0 ||
+        !gpg_agent_conf_identity_transition(
+            &before, &opened, policy, &saw_ctime_transition) ||
         opened.st_nlink != 1 || !S_ISREG(opened.st_mode)) {
-        if (fd >= 0) close(fd);
+        (void)close(fd);
         set_error(ERR_FILE_IO,
                   "Installed gpg-agent.conf changed while opening");
         return -1;
@@ -5783,19 +8726,24 @@ static int gpg_agent_conf_matches(int home_fd, const unsigned char *desired,
         }
     }
     if (fstat(fd, &after) != 0 ||
-        fstatat(home_fd, "gpg-agent.conf", &before,
+        fstatat(home_fd, "gpg-agent.conf", &named_after,
                 AT_SYMLINK_NOFOLLOW) != 0 ||
-        !gpg_same_file_version(&opened, &after) ||
-        !gpg_same_file_version(&opened, &before) ||
-        after.st_nlink != 1 || before.st_nlink != 1) {
+        !gpg_agent_conf_identity_transition(
+            &opened, &after, policy, &saw_ctime_transition) ||
+        !gpg_agent_conf_identity_transition(
+            &after, &named_after, policy, &saw_ctime_transition) ||
+        after.st_nlink != 1 || named_after.st_nlink != 1) {
         result = -1;
     }
     if (result == 1 && matched_fd_out) {
         *matched_fd_out = fd;
-        *identity_out = opened;
+        *identity_out = named_after;
         fd = -1;
     }
     if (fd >= 0 && close(fd) != 0) result = -1;
+    if (result == 1 && ctime_transition_out) {
+        *ctime_transition_out = saw_ctime_transition;
+    }
     if (result < 0) {
         set_system_error(ERR_FILE_IO,
                          "Failed to compare installed gpg-agent.conf safely");
@@ -5866,64 +8814,165 @@ static int gpg_open_agent_reload_state(int home_fd, int *fd_out,
     return 0;
 }
 
-/* A clean record certifies one exact installed config generation. Binding the
- * inode plus size/mtime/ctime closes both the pre-M20 migration gap (no record)
- * and non-cooperating same-uid rewrites which leave desired bytes unchanged
- * but may have reloaded a different intermediate configuration. */
-static int gpg_format_agent_reload_clean(
-    const struct stat *config_identity, unsigned char *output,
-    size_t output_size, size_t *length_out) {
+/* A clean record certifies one exact installed config generation. C4 retains
+ * C3's length-prefixed bytes and bound helper witnesses, while restoring ctime
+ * as the causal token which distinguishes a transient A -> B -> reload -> A
+ * rewrite from a genuinely unchanged live-agent configuration. FreeBSD/UFS
+ * ctime-only successors are admitted only inside the bounded proof which
+ * publishes or settles this record; a later invocation reloads conservatively. */
+static int gpg_append_clean_record(unsigned char *output, size_t output_size,
+                                   size_t *used, const char *format, ...) {
+    va_list args;
     int written;
+
+    if (!output || !used || *used >= output_size || !format) return -1;
+    va_start(args, format);
+    written = vsnprintf( /* Flawfinder: ignore — bounded destination; private
+                          * callers pass fixed formats. */
+        (char *)output + *used, output_size - *used, format, args);
+    va_end(args);
+    if (written < 0 || (size_t)written >= output_size - *used) return -1;
+    *used += (size_t)written;
+    return 0;
+}
+
+static int gpg_append_clean_hex(unsigned char *output, size_t output_size,
+                                size_t *used, const char *value,
+                                size_t capacity) {
+    size_t length;
+
+    if (!value || !memchr(value, '\0', capacity)) return -1;
+    length = strlen(value);
+    if (gpg_append_clean_record(output, output_size, used, "%zu:", length) != 0)
+        return -1;
+    for (size_t i = 0; i < length; i++) {
+        if (gpg_append_clean_record(output, output_size, used, "%02x",
+                                    (unsigned char)value[i]) != 0)
+            return -1;
+    }
+    return 0;
+}
+
+static int gpg_append_clean_identity(unsigned char *output,
+                                     size_t output_size, size_t *used,
+                                     const struct stat *identity) {
     intmax_t mtime_sec;
     long mtime_nsec;
     intmax_t ctime_sec;
     long ctime_nsec;
 
-    if (!config_identity || !output || output_size == 0 || !length_out ||
-        config_identity->st_size < 0) {
-        set_error(ERR_INVALID_ARGS, "Invalid GPG agent clean-state record");
+    if (!identity || identity->st_size < 0) return -1;
+#ifdef __APPLE__
+    mtime_sec = (intmax_t)identity->st_mtimespec.tv_sec;
+    mtime_nsec = identity->st_mtimespec.tv_nsec;
+    ctime_sec = (intmax_t)identity->st_ctimespec.tv_sec;
+    ctime_nsec = identity->st_ctimespec.tv_nsec;
+#else
+    mtime_sec = (intmax_t)identity->st_mtim.tv_sec;
+    mtime_nsec = identity->st_mtim.tv_nsec;
+    ctime_sec = (intmax_t)identity->st_ctim.tv_sec;
+    ctime_nsec = identity->st_ctim.tv_nsec;
+#endif
+    return gpg_append_clean_record(
+        output, output_size, used,
+        "%ju:%ju:%ju:%ju:%ju:%ju:%ju:%jd:%ld:%jd:%ld;",
+        (uintmax_t)identity->st_dev, (uintmax_t)identity->st_ino,
+        (uintmax_t)identity->st_mode, (uintmax_t)identity->st_uid,
+        (uintmax_t)identity->st_gid, (uintmax_t)identity->st_nlink,
+        (uintmax_t)identity->st_size,
+        mtime_sec, mtime_nsec, ctime_sec, ctime_nsec);
+}
+
+static int gpg_append_clean_witness(unsigned char *output,
+                                    size_t output_size, size_t *used,
+                                    const run_launch_witness_t *witness) {
+    if (!witness || !witness->valid ||
+        gpg_append_clean_record(output, output_size, used, "%u:%u:%u;",
+                                witness->valid ? 1U : 0U,
+                                witness->is_script ? 1U : 0U,
+                                witness->has_interpreter_arg ? 1U : 0U) != 0 ||
+        gpg_append_clean_identity(output, output_size, used,
+                                  &witness->executable_identity) != 0 ||
+        gpg_append_clean_identity(output, output_size, used,
+                                  &witness->interpreter_identity) != 0 ||
+        gpg_append_clean_hex(output, output_size, used,
+                             witness->executable_path,
+                             sizeof(witness->executable_path)) != 0 ||
+        gpg_append_clean_hex(output, output_size, used,
+                             witness->interpreter_argv0,
+                             sizeof(witness->interpreter_argv0)) != 0 ||
+        gpg_append_clean_hex(output, output_size, used,
+                             witness->interpreter_arg,
+                             sizeof(witness->interpreter_arg)) != 0 ||
+        gpg_append_clean_record(output, output_size, used, ";") != 0) {
         return -1;
     }
-#ifdef __APPLE__
-    mtime_sec = (intmax_t)config_identity->st_mtimespec.tv_sec;
-    mtime_nsec = config_identity->st_mtimespec.tv_nsec;
-    ctime_sec = (intmax_t)config_identity->st_ctimespec.tv_sec;
-    ctime_nsec = config_identity->st_ctimespec.tv_nsec;
-#else
-    mtime_sec = (intmax_t)config_identity->st_mtim.tv_sec;
-    mtime_nsec = config_identity->st_mtim.tv_nsec;
-    ctime_sec = (intmax_t)config_identity->st_ctim.tv_sec;
-    ctime_nsec = config_identity->st_ctim.tv_nsec;
-#endif
-    written = snprintf(
-        (char *)output, output_size,
-        "C1:%ju:%ju:%ju:%jd:%ld:%jd:%ld\n",
-        (uintmax_t)config_identity->st_dev,
-        (uintmax_t)config_identity->st_ino,
-        (uintmax_t)config_identity->st_size,
-        mtime_sec, mtime_nsec, ctime_sec, ctime_nsec);
-    if (written < 0 || (size_t)written >= output_size) {
+    return 0;
+}
+
+static int gpg_format_agent_reload_clean(
+    const struct stat *config_identity,
+    const gpg_agent_config_update_t *update, unsigned char *output,
+    size_t output_size, size_t *length_out) {
+    size_t used = 0;
+
+    if (!config_identity || !update || !update->gpg_config ||
+        (!update->config_witness &&
+         update->config_witness_length != 0U) ||
+        !output || output_size == 0U || !length_out ||
+        gpg_append_clean_record(output, output_size, &used, "C4;") != 0 ||
+        gpg_append_clean_identity(
+            output, output_size, &used, config_identity) != 0 ||
+        gpg_append_clean_record(
+            output, output_size, &used, "%zu:",
+            update->config_witness_length) != 0 ||
+        (update->config_witness_length != 0U &&
+         append_conf_bytes(
+             output, output_size, &used, update->config_witness,
+             update->config_witness_length) != 0) ||
+        gpg_append_clean_record(output, output_size, &used, ";") != 0 ||
+        gpg_append_clean_witness(
+            output, output_size, &used,
+            &update->gpg_config->executable_witness) != 0 ||
+        gpg_append_clean_witness(output, output_size, &used,
+                                 &update->gpgconf_witness) != 0 ||
+        gpg_append_clean_record(output, output_size, &used, "\n") != 0) {
         set_error(ERR_FILE_IO, "GPG agent clean-state record is too large");
         return -1;
     }
-    *length_out = (size_t)written;
+    *length_out = used;
     return 0;
 }
 
 static int gpg_agent_reload_state_matches_config(
     int home_fd, int state_fd, const struct stat *state_identity,
-    const struct stat *config_identity, bool *matches_out) {
-    unsigned char expected[GPG_AGENT_RELOAD_STATE_MAX];
-    unsigned char actual[GPG_AGENT_RELOAD_STATE_MAX] = {0};
+    const struct stat *config_identity,
+    const gpg_agent_config_update_t *update, bool *matches_out) {
+    unsigned char *expected;
+    unsigned char *actual;
     struct stat opened;
     struct stat named;
     size_t expected_len;
     size_t offset = 0;
 
     if (home_fd < 0 || state_fd < 0 || !state_identity ||
-        !config_identity || !matches_out ||
-        gpg_format_agent_reload_clean(config_identity, expected,
-                                      sizeof(expected), &expected_len) != 0) {
+        !config_identity || !update || !matches_out) {
+        return -1;
+    }
+    expected = malloc(GPG_AGENT_RELOAD_STATE_MAX);
+    actual = calloc(1U, GPG_AGENT_RELOAD_STATE_MAX);
+    if (!expected || !actual) {
+        free(expected);
+        free(actual);
+        set_error(ERR_MEMORY_ALLOCATION,
+                  "Failed to allocate GPG agent clean-state proof");
+        return -1;
+    }
+    if (gpg_format_agent_reload_clean(
+            config_identity, update, expected,
+            GPG_AGENT_RELOAD_STATE_MAX, &expected_len) != 0) {
+        free(expected);
+        free(actual);
         return -1;
     }
     *matches_out = false;
@@ -5940,6 +8989,8 @@ static int gpg_agent_reload_state_matches_config(
                     set_error(ERR_FILE_IO,
                               "Short read of GPG agent clean state");
                 }
+                free(expected);
+                free(actual);
                 return -1;
             }
             offset += (size_t)n;
@@ -5953,8 +9004,12 @@ static int gpg_agent_reload_state_matches_config(
         !gpg_same_file_version(state_identity, &named)) {
         set_error(ERR_FILE_IO,
                   "GPG agent clean state changed while being verified");
+        free(expected);
+        free(actual);
         return -1;
     }
+    free(expected);
+    free(actual);
     return 0;
 }
 
@@ -5991,6 +9046,7 @@ static bool gpg_file_ctime_only_change(const struct stat *before,
 
     if (!before || !after) return false;
     same_without_ctime = gpg_same_reset_entry(before, after) &&
+                         before->st_gid == after->st_gid &&
                          before->st_nlink == after->st_nlink &&
                          before->st_size == after->st_size;
 #ifdef __APPLE__
@@ -6051,61 +9107,388 @@ static int gpg_config_witness_matches_fd(
     return 0;
 }
 
-/* Validate the retained config descriptor normally. If only ctime advanced
- * since this invocation published the file, re-prove every byte and refresh
- * the in-memory identity. This does not weaken cross-invocation clean-state
- * matching: a later same-inode rewrite still changes the persisted generation
- * and therefore forces another agent reload. */
+static bool gpg_is_published_agent_config_identity(
+    const struct stat *identity, const struct stat *created,
+    size_t expected_length) {
+    return identity && created && identity->st_dev == created->st_dev &&
+           identity->st_ino == created->st_ino &&
+           S_ISREG(identity->st_mode) &&
+           identity->st_uid == getuid() &&
+           identity->st_gid == created->st_gid &&
+           identity->st_nlink == 1 &&
+           (identity->st_mode & 0777) == 0600 &&
+           identity->st_size >= 0 &&
+           (uintmax_t)identity->st_size ==
+               (uintmax_t)expected_length;
+}
+
+/* A directory fsync can make FreeBSD/UFS expose adjacent ctime generations
+ * through the retained writable descriptor and its newly installed pathname.
+ * Bind both observations to the last strict pre-sync identity, prove the exact
+ * desired bytes, and admit no other metadata transition before close. */
+static int gpg_prove_published_agent_config_while_open(
+    int home_fd, int fd, const struct stat *created,
+    const struct stat *pre_sync_identity,
+    const unsigned char *desired, size_t desired_len,
+    struct stat *identity_out) {
+    struct stat opened_before;
+    struct stat named_before;
+    struct stat opened_after;
+    struct stat named_after;
+
+    if (home_fd < 0 || fd < 0 || !created || !pre_sync_identity ||
+        (!desired && desired_len != 0U) || !identity_out) {
+        set_error(
+            ERR_FILE_IO,
+            "Installed gpg-agent.conf proof is invalid after synchronization");
+        return -1;
+    }
+#ifdef GITSWITCH_TESTING
+    if (g_agent_conf_publication_hook &&
+        g_agent_conf_publication_hook(
+            home_fd,
+            GPG_AGENT_CONF_PUBLICATION_POSTSYNC_PREOBSERVE) != 0) {
+        int saved_errno = errno ? errno : EIO;
+
+        errno = saved_errno;
+        set_system_error(
+            ERR_FILE_IO,
+            "GPG agent configuration post-sync proof hook failed");
+        return -1;
+    }
+#endif
+    if (fstat(fd, &opened_before) != 0 ||
+        fstatat(home_fd, "gpg-agent.conf", &named_before,
+                AT_SYMLINK_NOFOLLOW) != 0 ||
+        !gpg_is_published_agent_config_identity(
+            &opened_before, created, desired_len) ||
+        !gpg_is_published_agent_config_identity(
+            &named_before, created, desired_len) ||
+        !gpg_agent_conf_identity_transition(
+            pre_sync_identity, &opened_before,
+            GPG_AGENT_CONF_MATCH_PUBLICATION_CTIME, NULL) ||
+        !gpg_agent_conf_identity_transition(
+            pre_sync_identity, &named_before,
+            GPG_AGENT_CONF_MATCH_PUBLICATION_CTIME, NULL) ||
+        !gpg_agent_conf_identity_transition(
+            &opened_before, &named_before,
+            GPG_AGENT_CONF_MATCH_PUBLICATION_CTIME, NULL) ||
+        gpg_config_witness_matches_fd(
+            fd, desired, desired_len) != 0 ||
+        fstat(fd, &opened_after) != 0 ||
+        fstatat(home_fd, "gpg-agent.conf", &named_after,
+                AT_SYMLINK_NOFOLLOW) != 0 ||
+        !gpg_is_published_agent_config_identity(
+            &opened_after, created, desired_len) ||
+        !gpg_is_published_agent_config_identity(
+            &named_after, created, desired_len) ||
+        !gpg_agent_conf_identity_transition(
+            &opened_before, &opened_after,
+            GPG_AGENT_CONF_MATCH_PUBLICATION_CTIME, NULL) ||
+        !gpg_agent_conf_identity_transition(
+            &named_before, &named_after,
+            GPG_AGENT_CONF_MATCH_PUBLICATION_CTIME, NULL) ||
+        !gpg_agent_conf_identity_transition(
+            &opened_after, &named_after,
+            GPG_AGENT_CONF_MATCH_PUBLICATION_CTIME, NULL)) {
+        set_error(
+            ERR_FILE_IO,
+            "Installed gpg-agent.conf changed after synchronization");
+        return -1;
+    }
+    *identity_out = named_after;
+    return 0;
+}
+
+/* After the writable publisher closes, acquire the read-only descriptor that
+ * crosses the reload boundary. Discard any proof that observed a delayed
+ * ctime-only successor and retry from that exact generation; a stable
+ * comparator spans pathname-open-read-pathname and leaves its fd retained. */
+static int gpg_acquire_published_agent_config(
+    int home_fd, const struct stat *created,
+    const struct stat *initial_identity,
+    const unsigned char *desired, size_t desired_len,
+    int *matched_fd_out, struct stat *identity_out) {
+    enum { GPG_AGENT_PUBLICATION_PROOF_ATTEMPTS = 8 };
+    struct stat expected;
+
+    if (home_fd < 0 || !created || !initial_identity ||
+        (!desired && desired_len != 0U) ||
+        !matched_fd_out || !identity_out) {
+        set_error(
+            ERR_INVALID_ARGS,
+            "Invalid published GPG agent configuration proof");
+        return -1;
+    }
+    *matched_fd_out = -1;
+    expected = *initial_identity;
+    for (int attempt = 0;
+         attempt < GPG_AGENT_PUBLICATION_PROOF_ATTEMPTS; attempt++) {
+        struct stat proven;
+        bool comparator_ctime_transition = false;
+        bool generation_advanced;
+        int proof_fd = -1;
+        int match = gpg_agent_conf_matches(
+            home_fd, desired, desired_len,
+            GPG_AGENT_CONF_MATCH_PUBLICATION_CTIME,
+            &comparator_ctime_transition, &proof_fd, &proven);
+
+        if (match != 1 || proof_fd < 0 ||
+            !gpg_is_published_agent_config_identity(
+                &proven, created, desired_len) ||
+            (!gpg_same_file_version(&expected, &proven) &&
+             !gpg_file_ctime_only_change(&expected, &proven))) {
+            if (proof_fd >= 0) (void)close(proof_fd);
+            if (match >= 0) {
+                set_error(
+                    ERR_FILE_IO,
+                    "Installed gpg-agent.conf changed after publication");
+            }
+            return -1;
+        }
+        generation_advanced =
+            comparator_ctime_transition ||
+            !gpg_same_file_version(&expected, &proven);
+        if (!generation_advanced) {
+            *matched_fd_out = proof_fd;
+            *identity_out = proven;
+            return 0;
+        }
+        expected = proven;
+        if (close(proof_fd) != 0) {
+            set_system_error(
+                ERR_FILE_IO,
+                "Failed to close superseded GPG agent publication proof");
+            return -1;
+        }
+    }
+    set_error(
+        ERR_FILE_IO,
+        "Installed gpg-agent.conf did not settle after publication");
+    return -1;
+}
+
+/* Validate the retained config descriptor normally. If only ctime advances
+ * across the retained identity, descriptor, or pathname observations, re-prove
+ * every byte and refresh to the latest named identity. FreeBSD/UFS can expose
+ * such a delayed successor between two observations of the same inode. Every
+ * successful close path immediately follows this check with a no-descriptor
+ * terminal proof. */
 static int gpg_validate_agent_config_update(
     int home_fd, gpg_agent_config_update_t *update) {
     struct stat opened_before;
     struct stat named_before;
     struct stat opened_after;
     struct stat named_after;
-    bool opened_admissible;
-    bool named_admissible;
+    bool identity_changed;
 
     if (home_fd < 0 || !update || update->config_fd < 0 ||
         (!update->config_witness && update->config_witness_length != 0U) ||
         update->config_identity.st_size < 0 ||
         (uintmax_t)update->config_identity.st_size !=
             update->config_witness_length ||
-        fstat(update->config_fd, &opened_before) != 0 ||
-        fstatat(home_fd, "gpg-agent.conf", &named_before,
-                AT_SYMLINK_NOFOLLOW) != 0) {
+        fstat(update->config_fd, &opened_before) != 0) {
         set_error(ERR_FILE_IO,
-                  "Installed gpg-agent.conf changed during GPG agent activation");
+                  "Installed gpg-agent.conf retained proof is invalid during GPG agent activation");
         return -1;
     }
-    if (!S_ISREG(opened_before.st_mode) ||
+    if (fstatat(home_fd, "gpg-agent.conf", &named_before,
+                AT_SYMLINK_NOFOLLOW) != 0 ||
+        !S_ISREG(opened_before.st_mode) ||
         opened_before.st_uid != getuid() || opened_before.st_nlink != 1 ||
         (opened_before.st_mode & 0777) != 0600 ||
-        !gpg_same_file_version(&opened_before, &named_before)) {
+        !gpg_agent_conf_identity_transition(
+            &update->config_identity, &opened_before,
+            GPG_AGENT_CONF_MATCH_TERMINAL_CTIME, NULL) ||
+        !gpg_agent_conf_identity_transition(
+            &opened_before, &named_before,
+            GPG_AGENT_CONF_MATCH_TERMINAL_CTIME, NULL)) {
         set_error(ERR_FILE_IO,
-                  "Installed gpg-agent.conf changed during GPG agent activation");
+                  "Installed gpg-agent.conf identity changed during GPG agent activation");
         return -1;
     }
-    if (gpg_same_file_version(&update->config_identity, &opened_before)) {
+    identity_changed =
+        !gpg_same_file_version(
+            &update->config_identity, &opened_before) ||
+        !gpg_same_file_version(&opened_before, &named_before);
+    if (!identity_changed) {
         return 0;
     }
-    opened_admissible = gpg_file_ctime_only_change(
-        &update->config_identity, &opened_before);
-    named_admissible = gpg_file_ctime_only_change(
-        &update->config_identity, &named_before);
-    if (!opened_admissible || !named_admissible ||
-        gpg_config_witness_matches_fd(
+    if (gpg_config_witness_matches_fd(
             update->config_fd, update->config_witness,
             update->config_witness_length) != 0 ||
         fstat(update->config_fd, &opened_after) != 0 ||
         fstatat(home_fd, "gpg-agent.conf", &named_after,
                 AT_SYMLINK_NOFOLLOW) != 0 ||
-        !gpg_same_file_version(&opened_before, &opened_after) ||
-        !gpg_same_file_version(&opened_after, &named_after)) {
+        !gpg_agent_conf_identity_transition(
+            &opened_before, &opened_after,
+            GPG_AGENT_CONF_MATCH_TERMINAL_CTIME, NULL) ||
+        !gpg_agent_conf_identity_transition(
+            &opened_after, &named_after,
+            GPG_AGENT_CONF_MATCH_TERMINAL_CTIME, NULL)) {
         set_error(ERR_FILE_IO,
-                  "Installed gpg-agent.conf changed during GPG agent activation");
+                  "Installed gpg-agent.conf bytes or identity changed during GPG agent activation");
         return -1;
     }
-    update->config_identity = opened_after;
+    update->config_identity = named_after;
+    return 0;
+}
+
+/* Finish the exact config proof with no descriptor left open. A ctime-only
+ * edge may be admitted only inside this invocation after exact byte proof.
+ * Because one edge can conceal a same-inode byte rewrite with restored mtime,
+ * advance to that observation and require one complete
+ * scan/open/close/pathname pass with no transition before accepting it. */
+static int gpg_reprove_agent_config_after_close(
+    int home_fd, gpg_agent_config_update_t *update) {
+    enum { GPG_AGENT_TERMINAL_PROOF_ATTEMPTS = 8 };
+    struct stat expected;
+
+    if (home_fd < 0 || !update || update->config_fd >= 0 ||
+        (!update->config_witness &&
+         update->config_witness_length != 0U) ||
+        update->config_identity.st_size < 0 ||
+        (uintmax_t)update->config_identity.st_size !=
+            update->config_witness_length) {
+        set_error(ERR_INVALID_ARGS,
+                  "Invalid closed GPG agent configuration proof");
+        return -1;
+    }
+    expected = update->config_identity;
+    for (int attempt = 0;
+         attempt < GPG_AGENT_TERMINAL_PROOF_ATTEMPTS; attempt++) {
+        struct stat proven;
+        struct stat after_close;
+        bool comparator_ctime_transition = false;
+        bool generation_advanced;
+        int proof_fd = -1;
+        int match = gpg_agent_conf_matches(
+            home_fd, update->config_witness,
+            update->config_witness_length,
+            GPG_AGENT_CONF_MATCH_TERMINAL_CTIME,
+            &comparator_ctime_transition, &proof_fd, &proven);
+
+        if (match != 1 || proof_fd < 0 ||
+            !S_ISREG(proven.st_mode) ||
+            proven.st_uid != getuid() ||
+            proven.st_nlink != 1 ||
+            (proven.st_mode & 0777) != 0600 ||
+            proven.st_size < 0 ||
+            (uintmax_t)proven.st_size !=
+                update->config_witness_length ||
+            (!gpg_same_file_version(&expected, &proven) &&
+             !gpg_file_ctime_only_change(&expected, &proven))) {
+            if (proof_fd >= 0) (void)close(proof_fd);
+            set_error(
+                ERR_FILE_IO,
+                "Installed gpg-agent.conf changed while its activation proof was closing");
+            return -1;
+        }
+        generation_advanced =
+            comparator_ctime_transition ||
+            !gpg_same_file_version(&expected, &proven);
+        if (close(proof_fd) != 0) {
+            set_system_error(
+                ERR_FILE_IO,
+                "Failed to close exact GPG agent configuration proof");
+            return -1;
+        }
+#ifdef GITSWITCH_TESTING
+        if (g_agent_conf_postclose &&
+            g_agent_conf_postclose(home_fd) != 0) {
+            set_system_error(
+                ERR_FILE_IO,
+                "GPG agent configuration post-close proof hook failed");
+            return -1;
+        }
+#endif
+        if (fstatat(home_fd, "gpg-agent.conf", &after_close,
+                    AT_SYMLINK_NOFOLLOW) != 0 ||
+            !S_ISREG(after_close.st_mode) ||
+            after_close.st_uid != getuid() ||
+            after_close.st_nlink != 1 ||
+            (after_close.st_mode & 0777) != 0600 ||
+            after_close.st_size < 0 ||
+            (uintmax_t)after_close.st_size !=
+                update->config_witness_length ||
+            (!gpg_same_file_version(&proven, &after_close) &&
+             !gpg_file_ctime_only_change(
+                 &proven, &after_close))) {
+            set_error(
+                ERR_FILE_IO,
+                "Installed gpg-agent.conf changed while its activation proof was closing");
+            return -1;
+        }
+        generation_advanced =
+            generation_advanced ||
+            !gpg_same_file_version(&proven, &after_close);
+        if (!generation_advanced) {
+            update->config_identity = after_close;
+            return 0;
+        }
+        expected = after_close;
+    }
+    set_error(
+        ERR_FILE_IO,
+        "Installed gpg-agent.conf did not settle after its activation proof closed");
+    return -1;
+}
+
+static int gpg_close_agent_config(
+    int home_fd, gpg_agent_config_update_t *update) {
+    if (gpg_validate_agent_config_update(home_fd, update) != 0) {
+        return -1;
+    }
+    if (close(update->config_fd) != 0) {
+        update->config_fd = -1;
+        set_system_error(
+            ERR_FILE_IO,
+            "Failed to close applied GPG agent configuration proof");
+        return -1;
+    }
+    update->config_fd = -1;
+    return 0;
+}
+
+static int gpg_close_and_reprove_agent_config(
+    int home_fd, gpg_agent_config_update_t *update) {
+    if (gpg_close_agent_config(home_fd, update) != 0) {
+        return -1;
+    }
+    return gpg_reprove_agent_config_after_close(home_fd, update);
+}
+
+/* Persist the completed-state namespace once, then byte-prove the config and
+ * bind its full generation. A ctime-only successor discovered here is returned
+ * to the bounded C4 rebinding loop; it is never erased from durable state. */
+static int gpg_settle_agent_config_after_clean_close(
+    int home_fd, gpg_agent_config_update_t *update) {
+    struct stat before_sync;
+
+    if (home_fd < 0 || !update || update->config_fd >= 0) {
+        set_error(ERR_INVALID_ARGS,
+                  "Invalid completed GPG agent configuration settlement");
+        return -1;
+    }
+    before_sync = update->config_identity;
+    if (g_agent_conf_sync(home_fd, true) != 0) {
+        set_system_error(
+            ERR_FILE_IO,
+            "Failed to synchronize completed GPG agent reload state");
+        return -1;
+    }
+    if (gpg_reprove_agent_config_after_close(home_fd, update) != 0) {
+        return -1;
+    }
+    if (!gpg_same_file_version(
+            &before_sync, &update->config_identity) &&
+        !gpg_file_ctime_only_change(
+            &before_sync, &update->config_identity)) {
+        set_error(
+            ERR_FILE_IO,
+            "Installed gpg-agent.conf changed while settling completed activation");
+        return -1;
+    }
     return 0;
 }
 
@@ -6204,6 +9587,43 @@ static int gpg_set_agent_reload_pending(int home_fd,
     return 0;
 }
 
+static int gpg_reopen_agent_config_for_reload(
+    int home_fd, gpg_agent_config_update_t *update) {
+    struct stat reopened;
+    int reopened_fd = -1;
+    int match;
+
+    if (home_fd < 0 || !update || update->config_fd >= 0 ||
+        update->marker_fd < 0 ||
+        (!update->config_witness &&
+         update->config_witness_length != 0U)) {
+        set_error(
+            ERR_INVALID_ARGS,
+            "Invalid GPG agent configuration reload reacquisition");
+        return -1;
+    }
+    match = gpg_agent_conf_matches(
+        home_fd, update->config_witness,
+        update->config_witness_length,
+        GPG_AGENT_CONF_MATCH_STRICT, NULL,
+        &reopened_fd, &reopened);
+    if (match != 1 || reopened_fd < 0 ||
+        !gpg_same_file_version(
+            &update->config_identity, &reopened)) {
+        if (reopened_fd >= 0) (void)close(reopened_fd);
+        if (match >= 0) {
+            set_error(
+                ERR_FILE_IO,
+                "Installed gpg-agent.conf changed before corrective reload");
+        }
+        return -1;
+    }
+    update->config_fd = reopened_fd;
+    update->config_identity = reopened;
+    update->reload_required = true;
+    return gpg_set_agent_reload_pending(home_fd, update);
+}
+
 static int gpg_set_agent_reload_clean(int home_fd,
                                       gpg_agent_config_update_t *update) {
     unsigned char clean[GPG_AGENT_RELOAD_STATE_MAX];
@@ -6214,11 +9634,14 @@ static int gpg_set_agent_reload_clean(int home_fd,
     bool matches = false;
 
     if (!update || update->marker_fd < 0 ||
-        gpg_format_agent_reload_clean(&update->config_identity, clean,
+        update->marker_identity.st_size < 0 ||
+        update->marker_identity.st_size > GPG_AGENT_RELOAD_STATE_MAX ||
+        gpg_format_agent_reload_clean(&update->config_identity, update, clean,
                                       sizeof(clean), &clean_len) != 0 ||
         gpg_validate_agent_update_entry(
             home_fd, GPG_AGENT_RELOAD_STATE, update->marker_fd,
-            &update->marker_identity, 0, "GPG agent reload state") != 0) {
+            &update->marker_identity, update->marker_identity.st_size,
+            "GPG agent reload state") != 0) {
         return -1;
     }
     while (offset < clean_len) {
@@ -6264,7 +9687,7 @@ static int gpg_set_agent_reload_clean(int home_fd,
     update->marker_identity = opened;
     if (gpg_agent_reload_state_matches_config(
             home_fd, update->marker_fd, &update->marker_identity,
-            &update->config_identity, &matches) != 0) {
+            &update->config_identity, update, &matches) != 0) {
         return -1;
     }
     if (!matches) {
@@ -6275,17 +9698,121 @@ static int gpg_set_agent_reload_clean(int home_fd,
     return 0;
 }
 
+/* Close the sibling clean-state descriptor before the durable directory
+ * barrier and final exact config reproof. If this invocation observes an
+ * eligible ctime-only successor, reopen and prove the exact prior C4 marker,
+ * then rewrite it for the newly proved config generation. This exception is
+ * bounded to the current invocation; C4 keeps ctime durable across entries. */
+static int gpg_set_agent_reload_clean_stable(
+    int home_fd, gpg_agent_config_update_t *update,
+    bool state_already_clean) {
+    enum { GPG_AGENT_CLEAN_SETTLE_ATTEMPTS = 8 };
+
+    if (home_fd < 0 || !update || update->config_fd >= 0 ||
+        update->marker_fd < 0) {
+        set_error(ERR_INVALID_ARGS,
+                  "Invalid stable GPG agent clean-state request");
+        return -1;
+    }
+    for (int attempt = 0;
+         attempt < GPG_AGENT_CLEAN_SETTLE_ATTEMPTS; attempt++) {
+        struct stat recorded_config;
+        struct stat recorded_marker;
+
+        if (state_already_clean) {
+            bool matches = false;
+
+            if (gpg_validate_agent_update_entry(
+                    home_fd, GPG_AGENT_RELOAD_STATE, update->marker_fd,
+                    &update->marker_identity,
+                    update->marker_identity.st_size,
+                    "GPG agent reload state") != 0 ||
+                gpg_agent_reload_state_matches_config(
+                    home_fd, update->marker_fd,
+                    &update->marker_identity,
+                    &update->config_identity, update, &matches) != 0 ||
+                !matches) {
+                set_error(
+                    ERR_FILE_IO,
+                    "GPG agent reload state changed before settling completed activation");
+                return -1;
+            }
+        } else if (gpg_set_agent_reload_clean(home_fd, update) != 0) {
+            return -1;
+        }
+        recorded_config = update->config_identity;
+        recorded_marker = update->marker_identity;
+        if (close(update->marker_fd) != 0) {
+            update->marker_fd = -1;
+            set_system_error(
+                ERR_FILE_IO,
+                "Failed to close completed GPG agent reload state");
+            return -1;
+        }
+        update->marker_fd = -1;
+        if (gpg_settle_agent_config_after_clean_close(
+                home_fd, update) != 0) {
+            return -1;
+        }
+        if (gpg_same_file_version(
+                &recorded_config, &update->config_identity)) {
+            return 0;
+        }
+        if (!gpg_file_ctime_only_change(
+                &recorded_config, &update->config_identity)) {
+            set_error(
+                ERR_FILE_IO,
+                "Installed gpg-agent.conf changed while recording completed activation");
+            return -1;
+        }
+        {
+            struct stat reopened;
+            bool present = false;
+            bool pending = false;
+            bool matches = false;
+
+            if (gpg_open_agent_reload_state(
+                    home_fd, &update->marker_fd, &reopened,
+                    &present, &pending) != 0 ||
+                !present || pending ||
+                (!gpg_same_file_version(&recorded_marker, &reopened) &&
+                 !gpg_file_ctime_only_change(
+                     &recorded_marker, &reopened)) ||
+                gpg_agent_reload_state_matches_config(
+                    home_fd, update->marker_fd, &reopened,
+                    &recorded_config, update, &matches) != 0 ||
+                !matches) {
+                if (update->marker_fd >= 0) {
+                    (void)close(update->marker_fd);
+                    update->marker_fd = -1;
+                }
+                set_error(
+                    ERR_FILE_IO,
+                    "GPG agent reload state changed while settling completed activation");
+                return -1;
+            }
+            update->marker_identity = reopened;
+            state_already_clean = false;
+        }
+    }
+    set_error(
+        ERR_FILE_IO,
+        "Installed gpg-agent.conf did not settle while recording completed activation");
+    return -1;
+}
+
 static int gpg_reload_agent_config(const gpg_pinned_home_t *home,
                                    gpg_agent_config_update_t *update) {
     const char *env[] = {"GNUPGHOME=.", NULL};
     const char *argv[4];
+    char reload_diag[GPG_HELPER_DIAGNOSTIC_CAP] = "";
     run_opts_t opts;
     run_result_t result;
     int run_rc;
 
     if (!home || !update || !update->reload_required ||
         update->config_fd < 0 || update->marker_fd < 0 ||
-        update->gpgconf_path[0] != '/') {
+        !update->gpg_config || update->gpgconf_path[0] != '/') {
         set_error(ERR_INVALID_ARGS, "Invalid GPG agent reload request");
         return -1;
     }
@@ -6297,6 +9824,15 @@ static int gpg_reload_agent_config(const gpg_pinned_home_t *home,
         return -1;
     }
 
+    if (!run_launch_witness_revalidate(
+            update->gpg_config->executable_path,
+            &update->gpg_config->executable_witness) ||
+        !run_launch_witness_revalidate(update->gpgconf_path,
+                                       &update->gpgconf_witness)) {
+        set_error(ERR_SYSTEM_COMMAND_FAILED,
+                  "GnuPG reload toolchain changed before activation");
+        return -1;
+    }
     argv[0] = update->gpgconf_path;
     argv[1] = "--reload";
     argv[2] = "gpg-agent";
@@ -6304,25 +9840,39 @@ static int gpg_reload_agent_config(const gpg_pinned_home_t *home,
     memset(&opts, 0, sizeof(opts));
     memset(&result, 0, sizeof(result));
     result.exit_code = -1;
+    opts.out = reload_diag;
+    opts.out_size = sizeof(reload_diag);
+    opts.merge_stderr = true;
     opts.unset_env = g_gpg_child_unset_env;
     opts.extra_env = env;
-    opts.stderr_to_devnull = true;
     opts.cwd_fd = home->home_fd;
     opts.use_cwd_fd = true;
-    run_rc = run_argv(argv, &opts, &result);
+    run_rc = run_argv_with_expected_launch(
+        argv, &opts, &update->gpgconf_witness, &result);
     if (run_rc != 0 || !result.spawned || result.exit_code != 0 ||
-        result.term_signal != 0) {
-        set_error(ERR_SYSTEM_COMMAND_FAILED,
-                  "Failed to reload GPG agent configuration; retry required");
+        result.term_signal != 0 || result.out_truncated) {
+        gpg_set_helper_failure(
+            ERR_SYSTEM_COMMAND_FAILED,
+            "Failed to reload GPG agent configuration; retry required",
+            reload_diag, &result);
+        secure_zero_memory(reload_diag, sizeof(reload_diag));
         return -1;
     }
+    secure_zero_memory(reload_diag, sizeof(reload_diag));
     if (gpg_validate_pinned_home(home) != 0 ||
+        !run_launch_witness_revalidate(
+            update->gpg_config->executable_path,
+            &update->gpg_config->executable_witness) ||
+        !run_launch_witness_revalidate(update->gpgconf_path,
+                                       &update->gpgconf_witness) ||
         gpg_validate_agent_config_update(home->home_fd, update) != 0 ||
         gpg_validate_agent_update_entry(
             home->home_fd, GPG_AGENT_RELOAD_STATE, update->marker_fd,
             &update->marker_identity, 0, "GPG agent reload state") != 0 ||
-        gpg_set_agent_reload_clean(home->home_fd, update) != 0 ||
-        gpg_validate_agent_config_update(home->home_fd, update) != 0 ||
+        gpg_close_and_reprove_agent_config(
+            home->home_fd, update) != 0 ||
+        gpg_set_agent_reload_clean_stable(
+            home->home_fd, update, false) != 0 ||
         gpg_validate_pinned_home(home) != 0) {
         return -1;
     }
@@ -6686,6 +10236,9 @@ struct gpg_source_proof {
     gpg_source_proof_entry_t *entries;
     size_t count;
     size_t capacity;
+    size_t retained_limit;
+    int helper_reserve[GPG_SOURCE_PROOF_HELPER_FD_RESERVE];
+    size_t helper_reserve_count;
     bool base_absent;
     char base_path[MAX_PATH_LEN];
     struct stat base_identity;
@@ -6696,6 +10249,9 @@ static void gpg_source_proof_destroy(gpg_source_proof_t *proof) {
     size_t index;
 
     if (!proof) return;
+    for (index = 0; index < proof->helper_reserve_count; index++) {
+        close(proof->helper_reserve[index]);
+    }
     for (index = 0; index < proof->count; index++) {
         if (proof->entries[index].fd >= 0) {
             close(proof->entries[index].fd);
@@ -6703,6 +10259,197 @@ static void gpg_source_proof_destroy(gpg_source_proof_t *proof) {
     }
     free(proof->entries);
     free(proof);
+}
+
+static int gpg_source_proof_dup_cloexec(int fd) {
+#ifdef F_DUPFD_CLOEXEC
+    return fcntl(fd, F_DUPFD_CLOEXEC, STDERR_FILENO + 1);
+#else
+    int duplicate = fcntl(fd, F_DUPFD, STDERR_FILENO + 1);
+
+    if (duplicate >= 0 &&
+        fcntl(duplicate, F_SETFD, FD_CLOEXEC) != 0) {
+        int saved_errno = errno;
+        close(duplicate);
+        errno = saved_errno;
+        return -1;
+    }
+    return duplicate;
+#endif
+}
+
+/* Reserve real descriptor-table slots while a proof is retained. Arithmetic
+ * alone cannot account for unrelated descriptors already open in the process;
+ * duplicating the pinned source makes the launch headroom both path-free and
+ * observable. The reserve is dropped only around a source helper launch and
+ * immediately rebuilt before the post-launch proof validation. */
+static int gpg_source_proof_acquire_helper_reserve(
+    gpg_source_proof_t *proof, int trusted_fd) {
+    while (proof &&
+           proof->helper_reserve_count <
+               GPG_SOURCE_PROOF_HELPER_FD_RESERVE) {
+        int duplicate = gpg_source_proof_dup_cloexec(trusted_fd);
+
+        if (duplicate < 0) {
+            set_system_error(
+                ERR_PERMISSION_DENIED,
+                "Insufficient descriptor headroom for a GPG source helper");
+            return -1;
+        }
+        proof->helper_reserve[proof->helper_reserve_count++] = duplicate;
+    }
+    return proof ? 0 : -1;
+}
+
+static void gpg_source_proof_release_helper_reserve(
+    gpg_source_proof_t *proof) {
+    while (proof && proof->helper_reserve_count > 0) {
+        proof->helper_reserve_count--;
+        close(proof->helper_reserve[proof->helper_reserve_count]);
+        proof->helper_reserve[proof->helper_reserve_count] = -1;
+    }
+}
+
+static int gpg_source_proof_count_open_descriptors(
+    rlim_t soft_limit, size_t *count_out, size_t *capacity_out) {
+    enum { GPG_SOURCE_PROOF_FD_SCAN_MAX = 65536 };
+    const char *const fd_paths[] = {"/proc/self/fd", "/dev/fd", NULL};
+    DIR *descriptor_dir = NULL;
+    size_t path_index;
+    size_t count = 0;
+
+    if (!count_out || !capacity_out) {
+        errno = EINVAL;
+        return -1;
+    }
+    for (path_index = 0; fd_paths[path_index]; path_index++) {
+        descriptor_dir = opendir(fd_paths[path_index]);
+        if (descriptor_dir) break;
+    }
+    if (descriptor_dir) {
+        struct dirent *entry;
+        int scan_errno = 0;
+        int close_errno = 0;
+        int scan_fd = dirfd(descriptor_dir);
+
+        for (;;) {
+            char *end = NULL;
+            long value;
+
+            errno = 0;
+            entry = readdir(descriptor_dir);
+            if (!entry) {
+                scan_errno = errno;
+                break;
+            }
+            errno = 0;
+            value = strtol(entry->d_name, &end, 10);
+            if (errno == 0 && end && *end == '\0' && value >= 0 &&
+                value <= INT_MAX && value != scan_fd) {
+                count++;
+            }
+        }
+        if (closedir(descriptor_dir) != 0) close_errno = errno;
+        if (scan_errno != 0 || close_errno != 0) {
+            errno = scan_errno != 0 ? scan_errno : close_errno;
+            return -1;
+        }
+        *count_out = count;
+        *capacity_out = soft_limit == RLIM_INFINITY
+                            ? SIZE_MAX
+                            : (size_t)soft_limit;
+        return 0;
+    }
+
+    /* procfs and fdescfs are optional. Fall back to a bounded POSIX fcntl
+     * probe so source proof remains available without either filesystem.
+     * Only the scanned descriptor-number window is reported as capacity:
+     * ordinary opens consume its lowest free slots, while the real reserved
+     * descriptors remain the fail-closed guard for sparse higher-numbered
+     * descriptors that this bounded fallback cannot observe. */
+    {
+        size_t scan_limit = GPG_SOURCE_PROOF_FD_SCAN_MAX;
+        size_t fd;
+
+        if (soft_limit != RLIM_INFINITY &&
+            soft_limit < (rlim_t)scan_limit) {
+            scan_limit = (size_t)soft_limit;
+        } else if (soft_limit == RLIM_INFINITY) {
+            long open_max = sysconf(_SC_OPEN_MAX);
+
+            if (open_max > 0 &&
+                (unsigned long)open_max < scan_limit) {
+                scan_limit = (size_t)open_max;
+            }
+        }
+        for (fd = 0; fd < scan_limit; fd++) {
+            int rc;
+
+            do {
+                rc = fcntl((int)fd, F_GETFD);
+            } while (rc < 0 && errno == EINTR);
+            if (rc >= 0) {
+                count++;
+            } else if (errno != EBADF) {
+                return -1;
+            }
+        }
+        *capacity_out = scan_limit;
+    }
+    *count_out = count;
+    return 0;
+}
+
+static int gpg_source_proof_set_descriptor_budget(
+    gpg_source_proof_t *proof, int trusted_fd) {
+    const size_t maximum = GPG_SOURCE_PROOF_MAX_DIRECTORIES +
+                           GPG_SOURCE_PROOF_MAX_NULLFS_HOPS + 1U;
+    size_t open_descriptors = 0;
+    size_t descriptor_capacity = 0;
+    struct rlimit limit;
+
+    if (!proof || trusted_fd < 0) {
+        errno = EINVAL;
+        set_error(ERR_INVALID_ARGS,
+                  "Invalid GPG source-proof descriptor budget");
+        return -1;
+    }
+    if (getrlimit(RLIMIT_NOFILE, &limit) != 0) {
+        set_system_error(ERR_PERMISSION_DENIED,
+                         "Cannot determine the GPG source-proof descriptor limit");
+        return -1;
+    }
+    if (gpg_source_proof_count_open_descriptors(
+            limit.rlim_cur, &open_descriptors,
+            &descriptor_capacity) != 0) {
+        set_system_error(
+            ERR_PERMISSION_DENIED,
+            "Cannot enumerate open descriptors for the GPG source proof");
+        return -1;
+    }
+    if (descriptor_capacity == SIZE_MAX) {
+        proof->retained_limit = maximum;
+    } else if (open_descriptors <= descriptor_capacity &&
+               descriptor_capacity - open_descriptors >
+                   GPG_SOURCE_PROOF_HELPER_FD_RESERVE +
+                       GPG_SOURCE_PROOF_VALIDATION_FD_HEADROOM) {
+        size_t available =
+            descriptor_capacity - open_descriptors -
+            GPG_SOURCE_PROOF_HELPER_FD_RESERVE -
+            GPG_SOURCE_PROOF_VALIDATION_FD_HEADROOM;
+
+        /* The tree walk charges its live DFS scan depth separately. Shallow
+         * wide trees therefore retain all genuinely available descriptors,
+         * while deep trees still stop before traversal can consume the
+         * helper reserve or fall through to EMFILE. */
+        proof->retained_limit = available;
+        if (proof->retained_limit > maximum) {
+            proof->retained_limit = maximum;
+        }
+    } else {
+        proof->retained_limit = 0;
+    }
+    return gpg_source_proof_acquire_helper_reserve(proof, trusted_fd);
 }
 
 /* Transfer one descriptor into the retained proof. Managed-tree entries keep
@@ -6727,10 +10474,12 @@ static int gpg_source_proof_add_owned(
         set_error(ERR_INVALID_ARGS, "Invalid retained GPG source proof");
         return -1;
     }
-    if (proof->count >= maximum) {
+    if (proof->count >= maximum ||
+        proof->count >= proof->retained_limit) {
         errno = E2BIG;
         set_error(ERR_PERMISSION_DENIED,
-                  "Managed GPG ancestry exceeds the retained proof bound");
+                  "Managed GPG ancestry exceeds the descriptor-budgeted "
+                  "retained proof bound");
         return -1;
     }
     if (proof->count == proof->capacity) {
@@ -7126,6 +10875,15 @@ static int gpg_source_matches_managed_tree_at(
                   "Managed GPG ancestry exceeds the retained directory bound");
         return -1;
     }
+    if (proof->count >= proof->retained_limit ||
+        (size_t)depth + 1U > proof->retained_limit - proof->count) {
+        close(directory_fd);
+        errno = E2BIG;
+        set_error(ERR_PERMISSION_DENIED,
+                  "Managed GPG ancestry exceeds the descriptor-budgeted "
+                  "retained proof bound");
+        return -1;
+    }
     errno = 0;
     if (fstat(directory_fd, &directory_before) != 0 ||
         !S_ISDIR(directory_before.st_mode) ||
@@ -7308,6 +11066,10 @@ static int gpg_source_matches_managed_home(
                   "Cannot allocate the managed GPG ancestry proof");
         return -1;
     }
+    if (gpg_source_proof_set_descriptor_budget(proof, source->fd) != 0) {
+        gpg_source_proof_destroy(proof);
+        return -1;
+    }
 
     base_fd = gpg_open_base_dir(base, sizeof(base), false, &absent);
     if (base_fd < 0) {
@@ -7430,6 +11192,60 @@ static int gpg_validate_source_home(const gpg_source_home_t *source) {
     return gpg_source_proof_revalidate(source->proof);
 }
 
+static int gpg_run_source_helper(
+    const gpg_source_home_t *source, const char *const argv[],
+    const run_opts_t *opts, const run_launch_witness_t *witness,
+    run_result_t *result, int *helper_rc) {
+
+    if (!helper_rc) {
+        errno = EINVAL;
+        set_error(ERR_INVALID_ARGS, "Invalid GPG source-helper outcome");
+        return -1;
+    }
+    *helper_rc = -1;
+    if (gpg_validate_source_home(source) != 0) return -1;
+    gpg_source_proof_release_helper_reserve(source->proof);
+    *helper_rc =
+        run_argv_with_expected_launch(argv, opts, witness, result);
+    if (gpg_source_proof_acquire_helper_reserve(
+            source->proof, source->fd) != 0) {
+        return -1;
+    }
+    return gpg_validate_source_home(source);
+}
+
+/* Cache acceptance is stricter than a real descriptor-pinned listing: no
+ * helper runs on a hit, so the public source pathname must still reopen to the
+ * exact retained directory and mount immediately before reuse. Real listings
+ * intentionally keep operating on their already-pinned source if that public
+ * name is concurrently replaced, then report the result from the object they
+ * actually inspected. */
+static int gpg_validate_source_home_binding(
+    const gpg_source_home_t *source) {
+    struct stat named;
+    gpg_mount_identity_t named_mount;
+    int named_fd;
+
+    if (gpg_validate_source_home(source) != 0) return -1;
+    named_fd = open(source->path,
+                    O_RDONLY | O_DIRECTORY | O_CLOEXEC | O_NOFOLLOW);
+    if (named_fd < 0 || fstat(named_fd, &named) != 0 ||
+        gpg_mount_identity_fd(named_fd, &named_mount) != 0 ||
+        !S_ISDIR(named.st_mode) || named.st_uid != getuid() ||
+        (named.st_mode & 022) != 0 ||
+        named.st_dev != source->identity.st_dev ||
+        named.st_ino != source->identity.st_ino ||
+        !gpg_same_mount(&named_mount, &source->mount)) {
+        if (named_fd >= 0) close(named_fd);
+        set_error(ERR_PERMISSION_DENIED,
+                  "GPG source pathname no longer names the pinned home: %s",
+                  source->path);
+        return -1;
+    }
+    close(named_fd);
+    return 0;
+}
+
 /* Return 0 with a retained descriptor, 1 only for confirmed ENOENT, and -1
  * for every resolution/access/provenance error. */
 static int gpg_open_user_source_home(gpg_source_home_t *source) {
@@ -7490,8 +11306,10 @@ static void gpg_close_source_home(gpg_source_home_t *source) {
  * defaults, and a *detected* pinentry is appended only if none is already set
  * (the compiled-in default can be wrong, e.g. on FreeBSD). Re-run each switch,
  * so edits to the user's real config propagate. */
-static int setup_gpg_agent_config(int home_fd, const char *gnupg_home,
-                                  gpg_agent_config_update_t *update) {
+static int setup_gpg_agent_config(const gpg_config_t *gpg_config,
+                                  int home_fd, const char *gnupg_home,
+                                  gpg_agent_config_update_t *update,
+                                  bool bind_toolchain) {
     static const char default_conf[] =
         "# GPG Agent configuration for gitswitch isolated environment\n"
         "default-cache-ttl 3600\n"
@@ -7525,11 +11343,17 @@ static int setup_gpg_agent_config(int home_fd, const char *gnupg_home,
     struct stat matched_identity;
     gpg_source_home_t source = { .fd = -1 };
 
-    if (home_fd < 0 || !gnupg_home || !update) {
+    if ((bind_toolchain &&
+         (!gpg_config || !gpg_config->executable_witness.valid)) ||
+        home_fd < 0 || !gnupg_home || !update) {
         set_error(ERR_INVALID_ARGS, "Invalid GPG agent config destination");
         return -1;
     }
     gpg_agent_config_update_init(update);
+    if (bind_toolchain &&
+        gpg_bind_agent_toolchain(gpg_config, update) != 0) {
+        return -1;
+    }
     if (safe_snprintf(gpg_agent_conf_path, sizeof(gpg_agent_conf_path),
                       "%s/gpg-agent.conf", gnupg_home) != 0) {
         set_error(ERR_INVALID_PATH, "GPG agent config path too long");
@@ -7677,13 +11501,27 @@ static int setup_gpg_agent_config(int home_fd, const char *gnupg_home,
                 }
                 break;
             }
+            if (errno != ENOENT) {
+                set_system_error(
+                    ERR_SYSTEM_COMMAND_FAILED,
+                    "Failed to resolve trusted pinentry executable");
+                goto fail;
+            }
         }
     }
 
-    match = gpg_agent_conf_matches(home_fd, desired, desired_len,
-                                   &matched_fd, &matched_identity);
+    match = gpg_agent_conf_matches(
+        home_fd, desired, desired_len,
+        GPG_AGENT_CONF_MATCH_CLEAN_CTIME,
+        NULL, &matched_fd, &matched_identity);
     if (match < 0) goto fail;
     if (match > 0) {
+        update->config_fd = matched_fd;
+        update->config_identity = matched_identity;
+        matched_fd = -1;
+        update->config_witness = desired;
+        update->config_witness_length = desired_len;
+        desired = NULL;
         /* Matching bytes do not prove that a prior rename is directory-durable.
          * Re-sync the pinned home so a retry after post-rename fsync failure
          * repairs that uncertain namespace commit before reporting success. */
@@ -7698,55 +11536,58 @@ static int setup_gpg_agent_config(int home_fd, const char *gnupg_home,
                 &state_present, &state_pending) != 0) {
             goto fail;
         }
-        if (state_present && !state_pending &&
+        if (bind_toolchain && state_present && !state_pending &&
             gpg_agent_reload_state_matches_config(
                 home_fd, update->marker_fd, &update->marker_identity,
-                &matched_identity, &state_matches) != 0) {
-            goto fail;
-        }
-        if (state_matches &&
-            gpg_validate_agent_update_entry(
-                home_fd, "gpg-agent.conf", matched_fd,
-                &matched_identity, matched_identity.st_size,
-                "Installed gpg-agent.conf") != 0) {
+                &update->config_identity, update, &state_matches) != 0) {
             goto fail;
         }
         if (state_matches) {
-            update->config_fd = matched_fd;
-            update->config_identity = matched_identity;
-            matched_fd = -1;
+            if (gpg_close_agent_config(home_fd, update) != 0) {
+                goto fail;
+            }
+            if (!gpg_same_file_version(
+                    &matched_identity, &update->config_identity)) {
+                if (!gpg_file_ctime_only_change(
+                        &matched_identity,
+                        &update->config_identity)) {
+                    set_error(
+                        ERR_FILE_IO,
+                        "Installed gpg-agent.conf changed after its clean state was verified");
+                    goto fail;
+                }
+                /* The prior C4 attests the generation observed by the live
+                 * agent. A later ctime generation may be benign delayed UFS
+                 * disclosure, but is indistinguishable from a transient
+                 * A -> B -> reload -> A rewrite. Preserve exact bytes and
+                 * conservatively reacquire a pending corrective reload. */
+                if (gpg_reopen_agent_config_for_reload(
+                        home_fd, update) != 0) {
+                    goto fail;
+                }
+                log_debug(
+                    "Reused changed-generation GPG agent configuration pending corrective reload: %s",
+                    gpg_agent_conf_path);
+                return 0;
+            }
+            if (gpg_set_agent_reload_clean_stable(
+                    home_fd, update, true) != 0) {
+                goto fail;
+            }
             if (gpg_agent_config_update_close(update) != 0) {
-                free(desired);
                 set_system_error(
                     ERR_FILE_IO,
                     "Failed to close unchanged GPG agent configuration");
                 return -1;
             }
-            free(desired);
             log_debug("Reused unchanged GPG agent configuration: %s",
                       gpg_agent_conf_path);
             return 0;
         }
-        if (find_command_path("gpgconf", update->gpgconf_path,
-                              sizeof(update->gpgconf_path)) != 0) {
-            int resolve_errno = errno;
-            errno = resolve_errno;
-            set_system_error(
-                ERR_SYSTEM_COMMAND_FAILED,
-                "Cannot resolve trusted gpgconf for GPG agent reload");
-            errno = resolve_errno;
-            goto fail;
-        }
-        update->config_fd = matched_fd;
-        update->config_identity = matched_identity;
-        matched_fd = -1;
         update->reload_required = true;
         if (gpg_set_agent_reload_pending(home_fd, update) != 0) {
             goto fail;
         }
-        update->config_witness = desired;
-        update->config_witness_length = desired_len;
-        desired = NULL;
         log_debug("Reused pending GPG agent configuration: %s",
                   gpg_agent_conf_path);
         return 0;
@@ -7823,16 +11664,6 @@ static int setup_gpg_agent_config(int home_fd, const char *gnupg_home,
                   "Temporary gpg-agent.conf changed before atomic commit");
         goto fail;
     }
-    if (find_command_path("gpgconf", update->gpgconf_path,
-                          sizeof(update->gpgconf_path)) != 0) {
-        int resolve_errno = errno;
-        errno = resolve_errno;
-        set_system_error(
-            ERR_SYSTEM_COMMAND_FAILED,
-            "Cannot resolve trusted gpgconf for GPG agent reload");
-        errno = resolve_errno;
-        goto fail;
-    }
     if (gpg_open_agent_reload_state(
             home_fd, &update->marker_fd, &update->marker_identity,
             &state_present, &state_pending) != 0 ||
@@ -7862,12 +11693,9 @@ static int setup_gpg_agent_config(int home_fd, const char *gnupg_home,
                          "Failed to synchronize installed gpg-agent.conf");
         goto fail;
     }
-    if (fstat(fd, &fd_now) != 0 ||
-        fstatat(home_fd, "gpg-agent.conf", &entry,
-                AT_SYMLINK_NOFOLLOW) != 0 ||
-        !gpg_same_file_version(&fd_now, &entry)) {
-        set_error(ERR_FILE_IO,
-                  "Installed gpg-agent.conf changed after synchronization");
+    if (gpg_prove_published_agent_config_while_open(
+            home_fd, fd, &created, &fd_now, desired, desired_len,
+            &entry) != 0) {
         goto fail;
     }
     /* FreeBSD/UFS can materialize the final ctime only when the writable
@@ -7882,14 +11710,9 @@ static int setup_gpg_agent_config(int home_fd, const char *gnupg_home,
         goto fail;
     }
     fd = -1;
-    match = gpg_agent_conf_matches(home_fd, desired, desired_len,
-                                   &matched_fd, &matched_identity);
-    if (match != 1 || matched_identity.st_dev != created.st_dev ||
-        matched_identity.st_ino != created.st_ino) {
-        if (match >= 0) {
-            set_error(ERR_FILE_IO,
-                      "Installed gpg-agent.conf changed after publication");
-        }
+    if (gpg_acquire_published_agent_config(
+            home_fd, &created, &entry, desired, desired_len,
+            &matched_fd, &matched_identity) != 0) {
         goto fail;
     }
     update->config_fd = matched_fd;
@@ -7928,7 +11751,7 @@ int gpg_manager_setup_agent_config_for_test(int home_fd,
     int rc;
 
     gpg_agent_config_update_init(&update);
-    rc = setup_gpg_agent_config(home_fd, gnupg_home, &update);
+    rc = setup_gpg_agent_config(NULL, home_fd, gnupg_home, &update, false);
     close_rc = gpg_agent_config_update_close(&update);
     if (rc == 0 && close_rc != 0) {
         set_system_error(ERR_FILE_IO,

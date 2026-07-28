@@ -158,9 +158,9 @@ static void raise_second_rollback_signal_before_pid_publication(void) {
     sigset_t current;
     sigset_t expected = g_expected_parent_mask;
 
-    /* The ownership window keeps SIGCHLD blocked, and the spawn window adds
-     * every guard-INSTALLED signal: SIGINT, SIGTERM, and (AR-10 L16)
-     * SIGQUIT. SIGHUP is SIG_IGN here, so the guard deliberately skipped it. */
+    /* The ownership window keeps SIGCHLD blocked. After fork the parent
+     * immediately restores the exact guard-installed set while the child
+     * retains the complete relay set inherited at fork. */
     sigaddset(&expected, SIGCHLD);
     sigaddset(&expected, SIGINT);
     sigaddset(&expected, SIGTERM);
@@ -455,6 +455,49 @@ TEST(run_passes_extra_env) {
     CHECK_STR_EQ(out, "hello_env\n");
 }
 
+static void exercise_malformed_extra_env(const char *entry) {
+    char marker[] = "/tmp/gitswitch-runner-env.XXXXXX";
+    char command[MAX_PATH_LEN + 32];
+    const char *argv[] = {"sh", "-c", command, NULL};
+    const char *extra_env[] = {entry, NULL};
+    const error_context_t *error;
+    run_opts_t opts;
+    run_result_t result;
+    int marker_fd;
+    int returned_errno;
+
+    marker_fd = mkstemp(marker);
+    CHECK(marker_fd >= 0);
+    if (marker_fd < 0) return;
+    CHECK_EQ_INT(close(marker_fd), 0);
+    CHECK_EQ_INT(unlink(marker), 0);
+    CHECK((size_t)snprintf(command, sizeof(command), ": > '%s'", marker) <
+          sizeof(command));
+
+    memset(&opts, 0, sizeof(opts));
+    memset(&result, 0, sizeof(result));
+    opts.extra_env = extra_env;
+    clear_error();
+    errno = 0;
+    CHECK_EQ_INT(run_argv(argv, &opts, &result), -1);
+    returned_errno = errno;
+    error = get_last_error();
+
+    CHECK(result.spawned);
+    CHECK_EQ_INT(result.exit_code, 126);
+    CHECK_EQ_INT(result.term_signal, 0);
+    CHECK_EQ_INT(returned_errno, EINVAL);
+    CHECK_EQ_INT(error->code, ERR_SYSTEM_CALL);
+    CHECK_EQ_INT(error->system_errno, EINVAL);
+    CHECK(strstr(error->message, "child environment setup failed") != NULL);
+    CHECK(access(marker, F_OK) != 0 && errno == ENOENT);
+}
+
+TEST(run_rejects_malformed_extra_env_before_exec) {
+    exercise_malformed_extra_env("GITSWITCH_TEST_MALFORMED");
+    exercise_malformed_extra_env("=value");
+}
+
 TEST(run_unsets_environment_before_applying_additions) {
     const char *name = "GITSWITCH_TEST_UNSET_VAR";
     const char *argv[] = {"printenv", "GITSWITCH_TEST_UNSET_VAR", NULL};
@@ -643,6 +686,7 @@ TEST_MAIN_BEGIN()
     RUN_TEST(run_feeds_binary_stdin_at_exact_length);
     RUN_TEST(run_null_input_retains_devnull_eof);
     RUN_TEST(run_passes_extra_env);
+    RUN_TEST(run_rejects_malformed_extra_env_before_exec);
     RUN_TEST(run_unsets_environment_before_applying_additions);
     RUN_TEST(run_uses_pinned_child_working_directory);
     RUN_TEST(run_preserves_pinned_cwd_when_it_collides_with_closed_stdio);

@@ -60,6 +60,133 @@ static int write_exact_file(const char *path, const char *contents) {
     return result;
 }
 
+typedef enum {
+    READ_MUTATION_NONE = 0,
+    READ_MUTATION_APPEND,
+    READ_MUTATION_TRUNCATE,
+    READ_MUTATION_DESCRIPTOR_METADATA,
+    READ_MUTATION_REPLACE_PATH,
+    READ_MUTATION_REWRITE_SAME_INODE
+} read_mutation_t;
+
+static read_mutation_t g_read_mutation;
+static char g_read_mutation_path[256];
+static char g_read_mutation_moved_path[256];
+static bool g_read_mutation_succeeded;
+static bool g_read_rewrite_shape_unchanged;
+static bool g_read_rewrite_timestamps_changed;
+
+static bool stat_timestamps_differ(const struct stat *left,
+                                   const struct stat *right) {
+#if defined(__APPLE__) || defined(__FreeBSD__)
+    return left->st_mtimespec.tv_sec != right->st_mtimespec.tv_sec ||
+           left->st_mtimespec.tv_nsec != right->st_mtimespec.tv_nsec ||
+           left->st_ctimespec.tv_sec != right->st_ctimespec.tv_sec ||
+           left->st_ctimespec.tv_nsec != right->st_ctimespec.tv_nsec;
+#else
+    return left->st_mtim.tv_sec != right->st_mtim.tv_sec ||
+           left->st_mtim.tv_nsec != right->st_mtim.tv_nsec ||
+           left->st_ctim.tv_sec != right->st_ctim.tv_sec ||
+           left->st_ctim.tv_nsec != right->st_ctim.tv_nsec;
+#endif
+}
+
+static int rewrite_same_size_and_force_mtime(const char *path) {
+    static const char replacement[] =
+        "[settings]\ndefault_scope = \"other\"\n";
+    struct stat before;
+    struct stat after;
+    struct timespec times[2];
+    size_t total = 0;
+    int fd;
+    int result = -1;
+
+    fd = open(path, O_WRONLY | O_CLOEXEC);
+    if (fd < 0 || fstat(fd, &before) != 0 ||
+        before.st_size != (off_t)(sizeof(replacement) - 1)) {
+        if (fd >= 0) (void)close(fd);
+        return -1;
+    }
+    while (total < sizeof(replacement) - 1) {
+        ssize_t written =
+            pwrite(fd, replacement + total,
+                   sizeof(replacement) - 1 - total, (off_t)total);
+        if (written > 0) {
+            total += (size_t)written;
+        } else if (written < 0 && errno == EINTR) {
+            continue;
+        } else {
+            goto cleanup;
+        }
+    }
+#if defined(__APPLE__) || defined(__FreeBSD__)
+    times[0] = before.st_atimespec;
+    times[1] = before.st_mtimespec;
+#else
+    times[0] = before.st_atim;
+    times[1] = before.st_mtim;
+#endif
+    times[1].tv_sec -= 1;
+    if (futimens(fd, times) != 0 || fstat(fd, &after) != 0) goto cleanup;
+
+    g_read_rewrite_shape_unchanged =
+        before.st_dev == after.st_dev && before.st_ino == after.st_ino &&
+        before.st_mode == after.st_mode && before.st_uid == after.st_uid &&
+        before.st_gid == after.st_gid && before.st_nlink == after.st_nlink &&
+        before.st_size == after.st_size;
+    g_read_rewrite_timestamps_changed =
+        stat_timestamps_differ(&before, &after);
+    result = 0;
+
+cleanup:
+    if (close(fd) != 0) result = -1;
+    return result;
+}
+
+static bool mutate_toml_read(toml_metadata_test_stage_t stage) {
+    int fd;
+    static const char appended[] = "trailing = \"bytes\"\n";
+
+    g_read_mutation_succeeded = false;
+    if (g_read_mutation == READ_MUTATION_APPEND) {
+        if (stage != TOML_METADATA_TEST_FILE_BEFORE_READ) return false;
+        fd = open(g_read_mutation_path, O_WRONLY | O_APPEND | O_CLOEXEC);
+        if (fd < 0) return false;
+        ssize_t written = write(fd, appended, sizeof(appended) - 1);
+        int saved_errno = errno;
+        if (close(fd) != 0 && written == (ssize_t)(sizeof(appended) - 1)) {
+            written = -1;
+            saved_errno = errno;
+        }
+        errno = saved_errno;
+        g_read_mutation_succeeded =
+            written == (ssize_t)(sizeof(appended) - 1);
+    } else if (g_read_mutation == READ_MUTATION_TRUNCATE) {
+        if (stage != TOML_METADATA_TEST_FILE_BEFORE_READ) return false;
+        g_read_mutation_succeeded = truncate(g_read_mutation_path, 1) == 0;
+    } else if (g_read_mutation == READ_MUTATION_DESCRIPTOR_METADATA) {
+        if (stage != TOML_METADATA_TEST_FILE_AFTER_READ) return false;
+        g_read_mutation_succeeded =
+            chmod(g_read_mutation_path, S_IRUSR) == 0;
+    } else if (g_read_mutation == READ_MUTATION_REPLACE_PATH) {
+        if (stage != TOML_METADATA_TEST_FILE_AFTER_READ) return false;
+        g_read_mutation_succeeded =
+            rename(g_read_mutation_path, g_read_mutation_moved_path) == 0 &&
+            write_exact_file(g_read_mutation_path,
+                             "[settings]\ndefault_scope = \"global\"\n") == 0;
+    } else if (g_read_mutation == READ_MUTATION_REWRITE_SAME_INODE) {
+        if (stage != TOML_METADATA_TEST_FILE_AFTER_READ) return false;
+        g_read_mutation_succeeded =
+            rewrite_same_size_and_force_mtime(g_read_mutation_path) == 0;
+    }
+    return false;
+}
+
+static bool document_is_zeroed(const toml_document_t *doc) {
+    static const toml_document_t zero;
+    return doc && memcmp(doc, &zero, sizeof(*doc)) == 0;
+}
+
 static int read_exact_file(const char *path, char *buffer, size_t size) {
     FILE *file = fopen(path, "rb");
     if (!file || size == 0) {
@@ -860,6 +987,148 @@ TEST(descriptor_metadata_mismatch_uses_stable_estale_diagnostic) {
     ts_rm_rf(dir);
 }
 
+TEST(file_reader_rejects_bytes_appended_after_initial_size_snapshot) {
+    static toml_document_t doc;
+    char dir[128];
+    char path[192];
+    toml_metadata_test_hook_fn previous;
+
+    CHECK_EQ_INT(make_fixture(dir, sizeof(dir), path, sizeof(path)), 0);
+    CHECK_EQ_INT(write_exact_file(path,
+                                 "[settings]\ndefault_scope = \"local\"\n"),
+                 0);
+    CHECK((size_t)snprintf(g_read_mutation_path,
+                           sizeof(g_read_mutation_path), "%s", path) <
+          sizeof(g_read_mutation_path));
+    memset(&doc, 0xa5, sizeof(doc));
+    g_read_mutation = READ_MUTATION_APPEND;
+    g_read_mutation_succeeded = false;
+    previous = toml_set_metadata_test_hook_fn(mutate_toml_read);
+    clear_error();
+    CHECK_EQ_INT(toml_parse_file(path, &doc), -1);
+    toml_set_metadata_test_hook_fn(previous);
+
+    CHECK(g_read_mutation_succeeded);
+    CHECK_EQ_INT(get_last_error()->system_errno, ESTALE);
+    CHECK(document_is_zeroed(&doc));
+    ts_rm_rf(dir);
+}
+
+TEST(file_reader_reports_estale_when_file_shrinks_before_read) {
+    static toml_document_t doc;
+    char dir[128];
+    char path[192];
+    toml_metadata_test_hook_fn previous;
+
+    CHECK_EQ_INT(make_fixture(dir, sizeof(dir), path, sizeof(path)), 0);
+    CHECK_EQ_INT(write_exact_file(path,
+                                 "[settings]\ndefault_scope = \"local\"\n"),
+                 0);
+    CHECK((size_t)snprintf(g_read_mutation_path,
+                           sizeof(g_read_mutation_path), "%s", path) <
+          sizeof(g_read_mutation_path));
+    memset(&doc, 0xa5, sizeof(doc));
+    g_read_mutation = READ_MUTATION_TRUNCATE;
+    g_read_mutation_succeeded = false;
+    previous = toml_set_metadata_test_hook_fn(mutate_toml_read);
+    clear_error();
+    CHECK_EQ_INT(toml_parse_file(path, &doc), -1);
+    toml_set_metadata_test_hook_fn(previous);
+
+    CHECK(g_read_mutation_succeeded);
+    CHECK_EQ_INT(get_last_error()->system_errno, ESTALE);
+    CHECK(document_is_zeroed(&doc));
+    ts_rm_rf(dir);
+}
+
+TEST(file_reader_rejects_post_read_descriptor_metadata_mutation) {
+    static toml_document_t doc;
+    char dir[128];
+    char path[192];
+    toml_metadata_test_hook_fn previous;
+
+    CHECK_EQ_INT(make_fixture(dir, sizeof(dir), path, sizeof(path)), 0);
+    CHECK_EQ_INT(write_exact_file(path,
+                                 "[settings]\ndefault_scope = \"local\"\n"),
+                 0);
+    CHECK((size_t)snprintf(g_read_mutation_path,
+                           sizeof(g_read_mutation_path), "%s", path) <
+          sizeof(g_read_mutation_path));
+    memset(&doc, 0xa5, sizeof(doc));
+    g_read_mutation = READ_MUTATION_DESCRIPTOR_METADATA;
+    g_read_mutation_succeeded = false;
+    previous = toml_set_metadata_test_hook_fn(mutate_toml_read);
+    clear_error();
+    CHECK_EQ_INT(toml_parse_file(path, &doc), -1);
+    toml_set_metadata_test_hook_fn(previous);
+
+    CHECK(g_read_mutation_succeeded);
+    CHECK_EQ_INT(get_last_error()->system_errno, ESTALE);
+    CHECK(document_is_zeroed(&doc));
+    ts_rm_rf(dir);
+}
+
+TEST(file_reader_rejects_post_read_pathname_replacement) {
+    static toml_document_t doc;
+    char dir[128];
+    char path[192];
+    toml_metadata_test_hook_fn previous;
+
+    CHECK_EQ_INT(make_fixture(dir, sizeof(dir), path, sizeof(path)), 0);
+    CHECK_EQ_INT(write_exact_file(path,
+                                 "[settings]\ndefault_scope = \"local\"\n"),
+                 0);
+    CHECK((size_t)snprintf(g_read_mutation_path,
+                           sizeof(g_read_mutation_path), "%s", path) <
+          sizeof(g_read_mutation_path));
+    CHECK((size_t)snprintf(g_read_mutation_moved_path,
+                           sizeof(g_read_mutation_moved_path), "%s.read-old",
+                           path) < sizeof(g_read_mutation_moved_path));
+    memset(&doc, 0xa5, sizeof(doc));
+    g_read_mutation = READ_MUTATION_REPLACE_PATH;
+    g_read_mutation_succeeded = false;
+    previous = toml_set_metadata_test_hook_fn(mutate_toml_read);
+    clear_error();
+    CHECK_EQ_INT(toml_parse_file(path, &doc), -1);
+    toml_set_metadata_test_hook_fn(previous);
+
+    CHECK(g_read_mutation_succeeded);
+    CHECK_EQ_INT(get_last_error()->system_errno, ESTALE);
+    CHECK(document_is_zeroed(&doc));
+    ts_rm_rf(dir);
+}
+
+TEST(file_reader_rejects_same_inode_same_size_post_read_rewrite) {
+    static toml_document_t doc;
+    char dir[128];
+    char path[192];
+    toml_metadata_test_hook_fn previous;
+
+    CHECK_EQ_INT(make_fixture(dir, sizeof(dir), path, sizeof(path)), 0);
+    CHECK_EQ_INT(write_exact_file(path,
+                                 "[settings]\ndefault_scope = \"local\"\n"),
+                 0);
+    CHECK((size_t)snprintf(g_read_mutation_path,
+                           sizeof(g_read_mutation_path), "%s", path) <
+          sizeof(g_read_mutation_path));
+    memset(&doc, 0xa5, sizeof(doc));
+    g_read_mutation = READ_MUTATION_REWRITE_SAME_INODE;
+    g_read_mutation_succeeded = false;
+    g_read_rewrite_shape_unchanged = false;
+    g_read_rewrite_timestamps_changed = false;
+    previous = toml_set_metadata_test_hook_fn(mutate_toml_read);
+    clear_error();
+    CHECK_EQ_INT(toml_parse_file(path, &doc), -1);
+    toml_set_metadata_test_hook_fn(previous);
+
+    CHECK(g_read_mutation_succeeded);
+    CHECK(g_read_rewrite_shape_unchanged);
+    CHECK(g_read_rewrite_timestamps_changed);
+    CHECK_EQ_INT(get_last_error()->system_errno, ESTALE);
+    CHECK(document_is_zeroed(&doc));
+    ts_rm_rf(dir);
+}
+
 TEST_MAIN_BEGIN()
     RUN_TEST(setters_reject_invalid_sections_without_mutating_document);
     RUN_TEST(dotted_section_names_round_trip_across_parser_and_setters);
@@ -873,4 +1142,9 @@ TEST_MAIN_BEGIN()
     RUN_TEST(parent_namespace_replacement_fails_and_cleans_pinned_temp);
     RUN_TEST(temp_namespace_replacement_is_never_published_or_unlinked);
     RUN_TEST(descriptor_metadata_mismatch_uses_stable_estale_diagnostic);
+    RUN_TEST(file_reader_rejects_bytes_appended_after_initial_size_snapshot);
+    RUN_TEST(file_reader_reports_estale_when_file_shrinks_before_read);
+    RUN_TEST(file_reader_rejects_post_read_descriptor_metadata_mutation);
+    RUN_TEST(file_reader_rejects_post_read_pathname_replacement);
+    RUN_TEST(file_reader_rejects_same_inode_same_size_post_read_rewrite);
 TEST_MAIN_END()

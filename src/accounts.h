@@ -38,16 +38,21 @@ typedef struct {
 } account_validation_t;
 
 /* Prepared-switch commit result. NOT_COMMITTED authorizes the caller to use
- * accounts_switch_abort(). Every other non-success state means Git/runtime,
- * active metadata, and the installed SSH alias were intentionally retained as
- * one committed transaction; the caller reports failure but must not restore
- * persistence before-images around it. */
+ * accounts_switch_abort(). Every other non-success state has crossed the
+ * forward-only boundary: the caller must retain the persisted active image
+ * and must not restore before-images. FORWARD_RECOVERY_REQUIRED deliberately
+ * permits Git/alias state to be incomplete because the exact durable switch
+ * fence remains callable by explicit resume. */
 typedef enum {
     ACCOUNTS_SWITCH_COMMIT_NOT_COMMITTED,
     ACCOUNTS_SWITCH_COMMIT_COMPLETE,
     ACCOUNTS_SWITCH_COMMIT_ALIAS_UNVERIFIED,
     ACCOUNTS_SWITCH_COMMIT_ALIAS_DURABILITY_UNCERTAIN,
-    ACCOUNTS_SWITCH_COMMIT_ALIAS_CLEANUP_FAILED
+    ACCOUNTS_SWITCH_COMMIT_ALIAS_CLEANUP_FAILED,
+    ACCOUNTS_SWITCH_COMMIT_RECOVERY_FENCE_RETAINED,
+    ACCOUNTS_SWITCH_COMMIT_FORWARD_RECOVERY_REQUIRED,
+    ACCOUNTS_SWITCH_COMMIT_RECOVERY_FENCE_CLEANUP_FAILED,
+    ACCOUNTS_SWITCH_COMMIT_FINALIZATION_CLEANUP_FAILED
 } accounts_switch_commit_state_t;
 
 /* Transactional prepare outcome. A nonzero return with CLEAN_FAILURE owns no
@@ -124,13 +129,13 @@ int accounts_switch(gitswitch_ctx_t *ctx, const char *identifier);
  * rollback state and runtime lock. Commit releases that state only after the
  * caller durably saves active-account metadata; abort restores the prior Git,
  * runtime, and in-memory active state. Resume and direct library callers keep
- * using accounts_switch().
+ * using accounts_switch(). The structured result is mandatory: callers must
+ * settle PREPARED versus ABORT_REQUIRED before releasing their context, and
+ * must distinguish a completed commit from a still-abortable failure.
  */
-int accounts_switch_prepare(gitswitch_ctx_t *ctx, const char *identifier);
 int accounts_switch_prepare_result(gitswitch_ctx_t *ctx,
                                    const char *identifier,
                                    accounts_switch_prepare_state_t *state);
-int accounts_switch_commit(gitswitch_ctx_t *ctx);
 int accounts_switch_commit_result(gitswitch_ctx_t *ctx,
                                   accounts_switch_commit_state_t *state);
 /* Borrow the exact sealed Git publication owned by a prepared switch. The
@@ -140,16 +145,21 @@ int accounts_switch_commit_result(gitswitch_ctx_t *ctx,
 int accounts_switch_publication(
     const gitswitch_ctx_t *ctx, const publication_record_t **publication);
 /* continue_persistence_rollback keeps the signal rollback window active so
- * the caller can restore config/hint state without an interruptible gap. */
+ * the caller can restore config/hint state without an interruptible gap. A
+ * reverse abort clears only a recovery fence freshly created by this switch;
+ * a fence adopted from an older unresolved switch remains durable. */
 int accounts_switch_abort(gitswitch_ctx_t *ctx,
                           bool continue_persistence_rollback);
 
 /**
- * Add new account interactively
- * - Prompts for account details
- * - Validates input
+ * Prepare an interactive account addition in the in-memory context.
+ * - Prompts for and validates account details
  * - Tests SSH/GPG configuration if provided
- * - Saves to configuration
+ * - Requires the caller to persist the configuration separately
+ * - After persistence, the caller must commit; on failure it must abort
+ *
+ * accounts_add_interactive() is a prepare+commit convenience for direct
+ * library callers. It does not save the configuration.
  */
 int accounts_add_interactive(gitswitch_ctx_t *ctx);
 int accounts_add_interactive_prepare(gitswitch_ctx_t *ctx);
@@ -179,14 +189,24 @@ int accounts_edit_abort(gitswitch_ctx_t *ctx);
  * accounts_remove_finalize(): DURABLE after proven directory sync, UNCERTAIN
  * after installation without proven durability, or PREINSTALL_FAILED only
  * when the account document was not installed. The commit/abort wrappers are
- * retained for direct one-call compatibility. Finalization retires only an
- * exclusively owned SSH alias after installation; a pre-install failure
- * deliberately leaves it paired with the retained durable account. */
+ * retained for direct one-call compatibility. Finalization retires only the
+ * captured, exclusively owned SSH alias after installation and settles the
+ * marker independently from any post-install cleanup diagnostic. A
+ * pre-install failure deliberately leaves the alias paired with the retained
+ * durable account. */
 int accounts_remove(gitswitch_ctx_t *ctx, const char *identifier);
 int accounts_remove_commit(gitswitch_ctx_t *ctx);
 int accounts_remove_abort(gitswitch_ctx_t *ctx);
 int accounts_remove_finalize(
     gitswitch_ctx_t *ctx, accounts_retirement_save_outcome_t outcome);
+/* Recover an installed-but-durability-uncertain remove whose immutable owner
+ * survives only in the durable retirement marker and RETIRING publication
+ * tombstones. Only an exact canonical numeric ID may select this path.
+ * Returns 1 after exact settlement, 0 when no matching absent-owner recovery
+ * exists (the caller should continue ordinary remove resolution), and -1 on a
+ * matching but unsafe/incomplete recovery while leaving the fence blocking. */
+int accounts_remove_recover_incomplete(gitswitch_ctx_t *ctx,
+                                       const char *identifier);
 
 /* Reset owns runtime teardown in main, but its Git retirement must survive
  * until main classifies the active-state save. `target == NULL` batches all

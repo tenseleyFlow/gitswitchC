@@ -8,6 +8,9 @@
 #include "gitswitch.h"
 #include "scratch_registry_test.h"
 #include "ssh_manager.h"
+#define GITSWITCH_INTERNAL_API
+#include "ssh_manager_internal.h"
+#undef GITSWITCH_INTERNAL_API
 #include "utils.h"
 
 #include <dirent.h>
@@ -53,6 +56,13 @@ static int g_unchanged_recheck_hook_calls;
 static bool g_unchanged_recheck_chmod_succeeded;
 static int g_unchanged_final_recheck_hook_calls;
 static bool g_unchanged_final_recheck_swap_succeeded;
+static int g_remove_final_sync_swap_calls;
+static bool g_remove_final_sync_swap_succeeded;
+static int g_temp_initial_fstat_fault_calls;
+static int g_temp_cleanup_unlink_fault_calls;
+static int g_observed_temp_dir_fd = -1;
+static char g_observed_temp_name[64];
+static bool g_temp_replacement_written;
 
 static int setup_home_without_ssh(char home[96],
                                   char config[MAX_PATH_LEN]) {
@@ -125,6 +135,19 @@ static int write_bytes(const char *path, const void *bytes, size_t length) {
     return close(fd);
 }
 
+static int write_fd_bytes(int fd, const void *bytes, size_t length) {
+    size_t written = 0;
+
+    while (written < length) {
+        ssize_t n = write(fd, (const char *)bytes + written,
+                          length - written);
+        if (n > 0) written += (size_t)n;
+        else if (n < 0 && errno == EINTR) continue;
+        else return -1;
+    }
+    return 0;
+}
+
 static char *read_bytes(const char *path, size_t *length) {
     struct stat st;
     char *buf;
@@ -193,6 +216,32 @@ static void check_unchanged(const char *path, const void *expected,
     free(actual);
 }
 
+static void check_alias_conflict_rejected_before_publication(
+    const char *config, const char *original, size_t original_len,
+    const account_t *account) {
+    struct stat before;
+    ssh_config_publication_state_t publication =
+        SSH_CONFIG_PUBLICATION_COMMITTED;
+
+    CHECK_EQ_INT(stat(config, &before), 0);
+    CHECK_EQ_INT(ssh_preflight_host_alias_config(account), -1);
+    check_unchanged(config, original, original_len, &before);
+
+    CHECK_EQ_INT(ssh_configure_host_alias_result(account, &publication), -1);
+    CHECK_EQ_INT(publication, SSH_CONFIG_PUBLICATION_PREINSTALL_FAILED);
+    check_unchanged(config, original, original_len, &before);
+}
+
+static void check_alias_config_permitted_without_mutation(
+    const char *config, const char *original, size_t original_len,
+    const account_t *account) {
+    struct stat before;
+
+    CHECK_EQ_INT(stat(config, &before), 0);
+    CHECK_EQ_INT(ssh_preflight_host_alias_config(account), 0);
+    check_unchanged(config, original, original_len, &before);
+}
+
 static size_t count_text(const char *haystack, const char *needle) {
     size_t count = 0;
     size_t needle_len = strlen(needle);
@@ -214,6 +263,26 @@ static size_t count_temps_in(const char *dir_path) {
     }
     closedir(dir);
     return count;
+}
+
+static int find_single_temp_path(const char *dir_path,
+                                 char path[MAX_PATH_LEN]) {
+    DIR *dir = opendir(dir_path);
+    struct dirent *entry;
+    size_t matches = 0;
+
+    if (!dir) return -1;
+    while ((entry = readdir(dir)) != NULL) {
+        if (strncmp(entry->d_name, "config.gitswitch.", 17) != 0) continue;
+        matches++;
+        if ((size_t)snprintf(path, MAX_PATH_LEN, "%s/%s", dir_path,
+                             entry->d_name) >= MAX_PATH_LEN) {
+            closedir(dir);
+            return -1;
+        }
+    }
+    if (closedir(dir) != 0) return -1;
+    return matches == 1U ? 0 : -1;
 }
 
 typedef struct {
@@ -366,6 +435,67 @@ static bool make_config_writable_before_unchanged_recheck(
     return false;
 }
 
+static bool fail_initial_temp_fstat(ssh_metadata_test_stage_t stage) {
+    if (stage != SSH_METADATA_TEST_CONFIG_TEMP_INITIAL_FSTAT) return false;
+    g_temp_initial_fstat_fault_calls++;
+    errno = EIO;
+    return true;
+}
+
+static bool fail_temp_cleanup_unlink(ssh_metadata_test_stage_t stage) {
+    if (stage != SSH_METADATA_TEST_CONFIG_TEMP_CLEANUP_PREPROOF) return false;
+    g_temp_cleanup_unlink_fault_calls++;
+    errno = EIO;
+    return true;
+}
+
+static int remember_temp_name(const char *temp_name) {
+    int length = snprintf(g_observed_temp_name,
+                          sizeof(g_observed_temp_name), "%s", temp_name);
+
+    if (length < 0 || (size_t)length >= sizeof(g_observed_temp_name)) {
+        errno = ENAMETOOLONG;
+        return -1;
+    }
+    return 0;
+}
+
+static int record_config_temp_and_fail(int dir_fd, const char *temp_name) {
+    if (remember_temp_name(temp_name) != 0) return -1;
+    g_observed_temp_dir_fd = dir_fd;
+    errno = EIO;
+    return -1;
+}
+
+static bool replace_config_temp_before_cleanup_proof(
+    ssh_metadata_test_stage_t stage) {
+    static const char replacement[] =
+        "Host replacement-temp\n  User untouched\n";
+    int fd;
+
+    if (stage != SSH_METADATA_TEST_CONFIG_TEMP_CLEANUP_PREPROOF) return false;
+    g_temp_replacement_written = false;
+    if (g_observed_temp_dir_fd < 0 || g_observed_temp_name[0] == '\0' ||
+        unlinkat(g_observed_temp_dir_fd, g_observed_temp_name, 0) != 0) {
+        return false;
+    }
+    fd = openat(g_observed_temp_dir_fd, g_observed_temp_name,
+                O_WRONLY | O_CREAT | O_EXCL | O_CLOEXEC | O_NOFOLLOW,
+                0600);
+    if (fd < 0) return false;
+    if (write_fd_bytes(fd, replacement, sizeof(replacement) - 1U) != 0) {
+        int saved_errno = errno;
+        (void)close(fd);
+        errno = saved_errno;
+        return false;
+    }
+    if (close(fd) != 0) {
+        return false;
+    }
+    g_temp_replacement_written = true;
+    return false;
+}
+
 static int fail_postrename_verification(int dir_fd) {
     (void)dir_fd;
     errno = EIO;
@@ -401,6 +531,32 @@ static int swap_public_ssh_directory(int dir_fd, const char *temp_name) {
         return -1;
     }
     return 0;
+}
+
+static int swap_ssh_directory_during_remove_final_sync(int dir_fd) {
+    static const char replacement[] =
+        BEGIN_MARK "\n"
+        "Host " TEST_ALIAS "\n"
+        "  HostName replacement.example\n"
+        "  IdentityFile \"/replacement/key\"\n"
+        "  IdentitiesOnly yes\n"
+        END_MARK "\n";
+    char replacement_config[MAX_PATH_LEN];
+
+    g_remove_final_sync_swap_calls++;
+    if (g_remove_final_sync_swap_calls == 1) {
+        g_remove_final_sync_swap_succeeded =
+            rename(g_public_ssh_dir, g_moved_ssh_dir) == 0 &&
+            mkdir(g_public_ssh_dir, 0700) == 0 &&
+            (size_t)snprintf(replacement_config,
+                             sizeof(replacement_config), "%s/config",
+                             g_public_ssh_dir) <
+                sizeof(replacement_config) &&
+            write_bytes(replacement_config, replacement,
+                        sizeof(replacement) - 1U) == 0;
+        if (!g_remove_final_sync_swap_succeeded) return -1;
+    }
+    return fsync(dir_fd);
 }
 
 static bool swap_ssh_directory_before_unchanged_final_recheck(
@@ -540,6 +696,39 @@ static int replace_config_byte_preserving_mtime(int dir_fd,
     return close(fd);
 }
 
+static int advance_directory_ctime(const char *path) {
+    struct stat before;
+    struct stat after;
+    int fd;
+
+    fd = open(path, O_RDONLY | O_CLOEXEC | O_DIRECTORY);
+    if (fd < 0 || fstat(fd, &before) != 0) {
+        if (fd >= 0) close(fd);
+        return -1;
+    }
+    for (int attempt = 0; attempt < 10; attempt++) {
+        if (fchmod(fd, before.st_mode & 0777) != 0 ||
+            fstat(fd, &after) != 0) {
+            close(fd);
+            return -1;
+        }
+        if (!same_ctime(&before, &after)) return close(fd);
+        (void)poll(NULL, 0, 1);
+    }
+    close(fd);
+    errno = EIO;
+    return -1;
+}
+
+static bool obligation_is_zero(
+    const config_retirement_ssh_alias_obligation_t *obligation) {
+    config_retirement_ssh_alias_obligation_t zero;
+
+    memset(&zero, 0, sizeof(zero));
+    return obligation &&
+           memcmp(obligation, &zero, sizeof(zero)) == 0;
+}
+
 TEST(identityfile_quoting_and_hostname_are_serialized_safely) {
     char home[96], config[MAX_PATH_LEN], key[MAX_PATH_LEN];
     account_t account;
@@ -547,7 +736,7 @@ TEST(identityfile_quoting_and_hostname_are_serialized_safely) {
     char *content;
 
     CHECK_EQ_INT(setup_home(home, config), 0);
-    snprintf(key, sizeof(key), "%s/key dir/id\\backslash", home);
+    snprintf(key, sizeof(key), "%s/key dir/id'apostrophe%%literal", home);
     make_account(&account, key);
     CHECK_EQ_INT(ssh_configure_host_alias(&account), 0);
     content = read_bytes(config, &config_len);
@@ -555,7 +744,8 @@ TEST(identityfile_quoting_and_hostname_are_serialized_safely) {
     if (content) {
         CHECK(strstr(content, "HostName " TEST_HOSTNAME "\n") != NULL);
         CHECK(strstr(content, "IdentityFile \"") != NULL);
-        CHECK(strstr(content, "key dir/id\\backslash\"") != NULL);
+        CHECK(strstr(content,
+                     "key dir/id'apostrophe%%literal\"") != NULL);
         free(content);
     }
 }
@@ -665,7 +855,7 @@ TEST(identityfile_quoting_and_hostname_match_openssh_oracle) {
         TS_SKIP("openssh", "ssh unavailable in trusted PATH");
     }
     CHECK_EQ_INT(setup_home(home, config), 0);
-    snprintf(key, sizeof(key), "%s/key dir/id\\backslash", home);
+    snprintf(key, sizeof(key), "%s/key dir/id'apostrophe", home);
     make_account(&account, key);
     CHECK_EQ_INT(safe_strncpy(account.ssh_hostname, ipv6_hostname,
                               sizeof(account.ssh_hostname)), 0);
@@ -836,6 +1026,437 @@ TEST(exact_marker_parser_preserves_incidental_substrings) {
     CHECK_EQ_INT(stat(config, &before), 0);
     CHECK_EQ_INT(ssh_remove_host_alias(TEST_ALIAS), 0);
     check_unchanged(config, original, sizeof(original) - 1U, &before);
+}
+
+TEST(earlier_unmanaged_catchall_is_rejected_before_alias_publication) {
+    static const char original[] =
+        "Host *\n"
+        "  HostName catchall.example.test\n"
+        "  IdentityFile \"/preserved/catchall-key\"\n"
+        "Host preserved\n"
+        "  User alice\n";
+    char home[96], config[MAX_PATH_LEN], key[MAX_PATH_LEN];
+    account_t account;
+
+    CHECK_EQ_INT(setup_home(home, config), 0);
+    CHECK_EQ_INT(write_bytes(config, original, sizeof(original) - 1U), 0);
+    snprintf(key, sizeof(key), "%s/id", home);
+    make_account(&account, key);
+
+    check_alias_conflict_rejected_before_publication(
+        config, original, sizeof(original) - 1U, &account);
+}
+
+TEST(earlier_unmanaged_wildcard_match_is_rejected_before_alias_publication) {
+    static const char original[] =
+        "Host github-*\n"
+        "  HostName wildcard.example.test\n"
+        "  IdentityFile \"/preserved/wildcard-key\"\n"
+        "Host preserved\n"
+        "  User alice\n";
+    char home[96], config[MAX_PATH_LEN], key[MAX_PATH_LEN];
+    account_t account;
+
+    CHECK_EQ_INT(setup_home(home, config), 0);
+    CHECK_EQ_INT(write_bytes(config, original, sizeof(original) - 1U), 0);
+    snprintf(key, sizeof(key), "%s/id", home);
+    make_account(&account, key);
+
+    check_alias_conflict_rejected_before_publication(
+        config, original, sizeof(original) - 1U, &account);
+}
+
+TEST(earlier_unmanaged_second_whitespace_pattern_is_rejected_before_publication) {
+    static const char original[] =
+        "Host preserved github-*\n"
+        "  HostName wildcard.example.test\n"
+        "  IdentityFile \"/preserved/wildcard-key\"\n";
+    char home[96], config[MAX_PATH_LEN], key[MAX_PATH_LEN];
+    account_t account;
+
+    CHECK_EQ_INT(setup_home(home, config), 0);
+    CHECK_EQ_INT(write_bytes(config, original, sizeof(original) - 1U), 0);
+    snprintf(key, sizeof(key), "%s/id", home);
+    make_account(&account, key);
+
+    check_alias_conflict_rejected_before_publication(
+        config, original, sizeof(original) - 1U, &account);
+}
+
+TEST(earlier_managed_wildcard_overlap_is_rejected_before_alias_publication) {
+    static const char original[] =
+        "# >>> gitswitch github-* >>>\n"
+        "Host github-*\n"
+        "  HostName wildcard.example.test\n"
+        "  IdentityFile \"/preserved/managed-wildcard-key\"\n"
+        "  IdentitiesOnly yes\n"
+        "# <<< gitswitch github-* <<<\n"
+        "Host preserved\n"
+        "  User alice\n";
+    char home[96], config[MAX_PATH_LEN], key[MAX_PATH_LEN];
+    account_t account;
+
+    CHECK_EQ_INT(setup_home(home, config), 0);
+    CHECK_EQ_INT(write_bytes(config, original, sizeof(original) - 1U), 0);
+    snprintf(key, sizeof(key), "%s/id", home);
+    make_account(&account, key);
+
+    check_alias_conflict_rejected_before_publication(
+        config, original, sizeof(original) - 1U, &account);
+}
+
+TEST(later_managed_wildcard_identity_accumulation_is_rejected_before_publication) {
+    static const char original[] =
+        BEGIN_MARK "\n"
+        "Host " TEST_ALIAS "\n"
+        "  HostName github.com\n"
+        "  IdentityFile \"/preserved/intended-key\"\n"
+        "  IdentitiesOnly yes\n"
+        END_MARK "\n"
+        "# >>> gitswitch github-* >>>\n"
+        "Host github-*\n"
+        "  HostName wildcard.example.test\n"
+        "  IdentityFile \"/preserved/foreign-key\"\n"
+        "  IdentitiesOnly yes\n"
+        "# <<< gitswitch github-* <<<\n";
+    char home[96], config[MAX_PATH_LEN], key[MAX_PATH_LEN];
+    account_t account;
+
+    CHECK_EQ_INT(setup_home(home, config), 0);
+    CHECK_EQ_INT(write_bytes(config, original, sizeof(original) - 1U), 0);
+    snprintf(key, sizeof(key), "%s/id", home);
+    make_account(&account, key);
+
+    check_alias_conflict_rejected_before_publication(
+        config, original, sizeof(original) - 1U, &account);
+}
+
+TEST(negated_unmanaged_wildcard_exception_does_not_conflict) {
+    static const char original[] =
+        "Host * !" TEST_ALIAS "\n"
+        "  HostName excluded.example.test\n"
+        "  IdentityFile \"/preserved/excluded-key\"\n";
+    char home[96], config[MAX_PATH_LEN], key[MAX_PATH_LEN];
+    account_t account;
+
+    CHECK_EQ_INT(setup_home(home, config), 0);
+    CHECK_EQ_INT(write_bytes(config, original, sizeof(original) - 1U), 0);
+    snprintf(key, sizeof(key), "%s/id", home);
+    make_account(&account, key);
+
+    check_alias_config_permitted_without_mutation(
+        config, original, sizeof(original) - 1U, &account);
+}
+
+TEST(escaped_leading_bang_is_literal_and_wildcard_still_conflicts) {
+    static const char original[] =
+        "Host \\!" TEST_ALIAS " *\n"
+        "  HostName escaped-bang.example.test\n"
+        "  IdentityFile \"/preserved/escaped-bang-key\"\n";
+    char home[96], config[MAX_PATH_LEN], key[MAX_PATH_LEN];
+    account_t account;
+
+    CHECK_EQ_INT(setup_home(home, config), 0);
+    CHECK_EQ_INT(write_bytes(config, original, sizeof(original) - 1U), 0);
+    snprintf(key, sizeof(key), "%s/id", home);
+    make_account(&account, key);
+
+    check_alias_conflict_rejected_before_publication(
+        config, original, sizeof(original) - 1U, &account);
+}
+
+TEST(comma_separated_text_is_one_nonmatching_pattern) {
+    static const char original[] =
+        "Host preserved," TEST_ALIAS "\n"
+        "  HostName comma-literal.example.test\n"
+        "  IdentityFile \"/preserved/comma-key\"\n";
+    char home[96], config[MAX_PATH_LEN], key[MAX_PATH_LEN];
+    account_t account;
+
+    CHECK_EQ_INT(setup_home(home, config), 0);
+    CHECK_EQ_INT(write_bytes(config, original, sizeof(original) - 1U), 0);
+    snprintf(key, sizeof(key), "%s/id", home);
+    make_account(&account, key);
+
+    check_alias_config_permitted_without_mutation(
+        config, original, sizeof(original) - 1U, &account);
+}
+
+TEST(similar_exact_alias_does_not_conflict) {
+    static const char original[] =
+        "Host " TEST_ALIAS "-old\n"
+        "  HostName old.example.test\n"
+        "  IdentityFile \"/preserved/old-key\"\n";
+    char home[96], config[MAX_PATH_LEN], key[MAX_PATH_LEN];
+    account_t account;
+
+    CHECK_EQ_INT(setup_home(home, config), 0);
+    CHECK_EQ_INT(write_bytes(config, original, sizeof(original) - 1U), 0);
+    snprintf(key, sizeof(key), "%s/id", home);
+    make_account(&account, key);
+
+    check_alias_config_permitted_without_mutation(
+        config, original, sizeof(original) - 1U, &account);
+}
+
+TEST(wildcard_target_pattern_conflicting_with_exact_host_is_rejected) {
+    static const char original[] =
+        "Host github-work\n"
+        "  HostName exact.example.test\n"
+        "  IdentityFile \"/preserved/exact-key\"\n";
+    char home[96], config[MAX_PATH_LEN], key[MAX_PATH_LEN];
+    account_t account;
+
+    CHECK_EQ_INT(setup_home(home, config), 0);
+    CHECK_EQ_INT(write_bytes(config, original, sizeof(original) - 1U), 0);
+    snprintf(key, sizeof(key), "%s/id", home);
+    make_account(&account, key);
+    snprintf(account.ssh_host_alias, sizeof(account.ssh_host_alias),
+             "github-*");
+
+    check_alias_conflict_rejected_before_publication(
+        config, original, sizeof(original) - 1U, &account);
+}
+
+TEST(question_target_pattern_conflicting_with_exact_host_is_rejected) {
+    static const char original[] =
+        "Host github-work\n"
+        "  HostName exact.example.test\n"
+        "  IdentityFile \"/preserved/exact-key\"\n";
+    char home[96], config[MAX_PATH_LEN], key[MAX_PATH_LEN];
+    account_t account;
+
+    CHECK_EQ_INT(setup_home(home, config), 0);
+    CHECK_EQ_INT(write_bytes(config, original, sizeof(original) - 1U), 0);
+    snprintf(key, sizeof(key), "%s/id", home);
+    make_account(&account, key);
+    snprintf(account.ssh_host_alias, sizeof(account.ssh_host_alias),
+             "git?ub-work");
+
+    check_alias_conflict_rejected_before_publication(
+        config, original, sizeof(original) - 1U, &account);
+}
+
+TEST(case_insensitive_indented_host_equals_directive_is_rejected) {
+    static const char original[] =
+        "  hOsT=github-*\n"
+        "  HostName syntax.example.test\n"
+        "  IdentityFile \"/preserved/syntax-key\"\n";
+    char home[96], config[MAX_PATH_LEN], key[MAX_PATH_LEN];
+    account_t account;
+
+    CHECK_EQ_INT(setup_home(home, config), 0);
+    CHECK_EQ_INT(write_bytes(config, original, sizeof(original) - 1U), 0);
+    snprintf(key, sizeof(key), "%s/id", home);
+    make_account(&account, key);
+
+    check_alias_conflict_rejected_before_publication(
+        config, original, sizeof(original) - 1U, &account);
+}
+
+TEST(bare_carriage_return_host_whitespace_is_rejected) {
+    static const char original[] =
+        " \rHost\rgithub-*\n"
+        "  HostName carriage-return.example.test\n"
+        "  IdentityFile \"/preserved/carriage-return-key\"\n";
+    char home[96], config[MAX_PATH_LEN], key[MAX_PATH_LEN];
+    account_t account;
+
+    CHECK_EQ_INT(setup_home(home, config), 0);
+    CHECK_EQ_INT(write_bytes(config, original, sizeof(original) - 1U), 0);
+    snprintf(key, sizeof(key), "%s/id", home);
+    make_account(&account, key);
+
+    check_alias_conflict_rejected_before_publication(
+        config, original, sizeof(original) - 1U, &account);
+}
+
+TEST(host_patterns_remain_case_sensitive) {
+    static const char original[] =
+        "Host GITHUB-*\n"
+        "  HostName case.example.test\n"
+        "  IdentityFile \"/preserved/case-key\"\n";
+    char home[96], config[MAX_PATH_LEN], key[MAX_PATH_LEN];
+    account_t account;
+
+    CHECK_EQ_INT(setup_home(home, config), 0);
+    CHECK_EQ_INT(write_bytes(config, original, sizeof(original) - 1U), 0);
+    snprintf(key, sizeof(key), "%s/id", home);
+    make_account(&account, key);
+
+    check_alias_config_permitted_without_mutation(
+        config, original, sizeof(original) - 1U, &account);
+}
+
+TEST(matching_host_with_proxy_command_is_permitted) {
+    static const char original[] =
+        "Host github-*\n"
+        "  ProxyCommand false\n";
+    char home[96], config[MAX_PATH_LEN], key[MAX_PATH_LEN];
+    account_t account;
+
+    CHECK_EQ_INT(setup_home(home, config), 0);
+    CHECK_EQ_INT(write_bytes(config, original, sizeof(original) - 1U), 0);
+    snprintf(key, sizeof(key), "%s/id", home);
+    make_account(&account, key);
+
+    check_alias_config_permitted_without_mutation(
+        config, original, sizeof(original) - 1U, &account);
+}
+
+TEST(matching_host_with_harmless_options_is_permitted) {
+    static const char original[] =
+        "Host *\n"
+        "  ServerAliveInterval 30\n"
+        "  Compression yes\n";
+    char home[96], config[MAX_PATH_LEN], key[MAX_PATH_LEN];
+    account_t account;
+
+    CHECK_EQ_INT(setup_home(home, config), 0);
+    CHECK_EQ_INT(write_bytes(config, original, sizeof(original) - 1U), 0);
+    snprintf(key, sizeof(key), "%s/id", home);
+    make_account(&account, key);
+
+    check_alias_config_permitted_without_mutation(
+        config, original, sizeof(original) - 1U, &account);
+}
+
+TEST(matching_host_with_certificate_file_is_rejected) {
+    static const char original[] =
+        "Host github-*\n"
+        "  CertificateFile \"/preserved/foreign-cert.pub\"\n";
+    char home[96], config[MAX_PATH_LEN], key[MAX_PATH_LEN];
+    account_t account;
+
+    CHECK_EQ_INT(setup_home(home, config), 0);
+    CHECK_EQ_INT(write_bytes(config, original, sizeof(original) - 1U), 0);
+    snprintf(key, sizeof(key), "%s/id", home);
+    make_account(&account, key);
+
+    check_alias_conflict_rejected_before_publication(
+        config, original, sizeof(original) - 1U, &account);
+}
+
+TEST(matching_host_with_hostname_only_is_rejected) {
+    static const char original[] =
+        "Host github-*\n"
+        "  HostName foreign.example.test\n";
+    char home[96], config[MAX_PATH_LEN], key[MAX_PATH_LEN];
+    account_t account;
+
+    CHECK_EQ_INT(setup_home(home, config), 0);
+    CHECK_EQ_INT(write_bytes(config, original, sizeof(original) - 1U), 0);
+    snprintf(key, sizeof(key), "%s/id", home);
+    make_account(&account, key);
+
+    check_alias_conflict_rejected_before_publication(
+        config, original, sizeof(original) - 1U, &account);
+}
+
+TEST(matching_host_with_identity_file_only_is_rejected) {
+    static const char original[] =
+        "Host github-*\n"
+        "  IdentityFile \"/preserved/foreign-key\"\n";
+    char home[96], config[MAX_PATH_LEN], key[MAX_PATH_LEN];
+    account_t account;
+
+    CHECK_EQ_INT(setup_home(home, config), 0);
+    CHECK_EQ_INT(write_bytes(config, original, sizeof(original) - 1U), 0);
+    snprintf(key, sizeof(key), "%s/id", home);
+    make_account(&account, key);
+
+    check_alias_conflict_rejected_before_publication(
+        config, original, sizeof(original) - 1U, &account);
+}
+
+TEST(matching_host_with_identities_only_is_rejected) {
+    static const char original[] =
+        "Host github-*\n"
+        "  IdentitiesOnly no\n";
+    char home[96], config[MAX_PATH_LEN], key[MAX_PATH_LEN];
+    account_t account;
+
+    CHECK_EQ_INT(setup_home(home, config), 0);
+    CHECK_EQ_INT(write_bytes(config, original, sizeof(original) - 1U), 0);
+    snprintf(key, sizeof(key), "%s/id", home);
+    make_account(&account, key);
+
+    check_alias_conflict_rejected_before_publication(
+        config, original, sizeof(original) - 1U, &account);
+}
+
+TEST(overlong_host_pattern_fails_closed_before_publication) {
+    char original[MAX_NAME_LEN * 8U + 64U];
+    char pattern[MAX_NAME_LEN * 8U + 1U];
+    char home[96], config[MAX_PATH_LEN], key[MAX_PATH_LEN];
+    account_t account;
+    int needed;
+
+    memset(pattern, 'a', sizeof(pattern) - 1U);
+    pattern[sizeof(pattern) - 1U] = '\0';
+    needed = snprintf(original, sizeof(original),
+                      "Host %s\n  ProxyCommand false\n", pattern);
+    CHECK(needed > 0 && (size_t)needed < sizeof(original));
+    CHECK_EQ_INT(setup_home(home, config), 0);
+    CHECK_EQ_INT(write_bytes(config, original,
+                             needed > 0 ? (size_t)needed : 0U), 0);
+    snprintf(key, sizeof(key), "%s/id", home);
+    make_account(&account, key);
+
+    check_alias_conflict_rejected_before_publication(
+        config, original, needed > 0 ? (size_t)needed : 0U, &account);
+}
+
+TEST(include_directive_fails_closed_before_alias_publication) {
+    static const char original[] =
+        "Include /preserved/external-ssh-config\n"
+        "Host preserved\n"
+        "  User alice\n";
+    char home[96], config[MAX_PATH_LEN], key[MAX_PATH_LEN];
+    account_t account;
+
+    CHECK_EQ_INT(setup_home(home, config), 0);
+    CHECK_EQ_INT(write_bytes(config, original, sizeof(original) - 1U), 0);
+    snprintf(key, sizeof(key), "%s/id", home);
+    make_account(&account, key);
+
+    check_alias_conflict_rejected_before_publication(
+        config, original, sizeof(original) - 1U, &account);
+}
+
+TEST(match_directive_fails_closed_before_alias_publication) {
+    static const char original[] =
+        "Match host " TEST_ALIAS "\n"
+        "  HostName match.example.test\n"
+        "  IdentityFile \"/preserved/match-key\"\n";
+    char home[96], config[MAX_PATH_LEN], key[MAX_PATH_LEN];
+    account_t account;
+
+    CHECK_EQ_INT(setup_home(home, config), 0);
+    CHECK_EQ_INT(write_bytes(config, original, sizeof(original) - 1U), 0);
+    snprintf(key, sizeof(key), "%s/id", home);
+    make_account(&account, key);
+
+    check_alias_conflict_rejected_before_publication(
+        config, original, sizeof(original) - 1U, &account);
+}
+
+TEST(global_routing_options_fail_closed_before_alias_publication) {
+    static const char original[] =
+        "HostName global.example.test\n"
+        "IdentityFile \"/preserved/global-key\"\n"
+        "Host preserved\n"
+        "  User alice\n";
+    char home[96], config[MAX_PATH_LEN], key[MAX_PATH_LEN];
+    account_t account;
+
+    CHECK_EQ_INT(setup_home(home, config), 0);
+    CHECK_EQ_INT(write_bytes(config, original, sizeof(original) - 1U), 0);
+    snprintf(key, sizeof(key), "%s/id", home);
+    make_account(&account, key);
+
+    check_alias_conflict_rejected_before_publication(
+        config, original, sizeof(original) - 1U, &account);
 }
 
 TEST(malformed_nested_and_mismatched_blocks_fail_closed) {
@@ -1021,6 +1642,723 @@ TEST(crlf_remove_preserves_all_unmanaged_bytes) {
         CHECK_EQ_INT(count_text(content, END_MARK), 0);
         free(content);
     }
+}
+
+TEST(remove_preinstall_failure_preserves_original_generation) {
+    static const char original[] =
+        "Host before\n  User alice\n"
+        BEGIN_MARK "\n"
+        "Host " TEST_ALIAS "\n"
+        "  HostName github.com\n"
+        "  IdentityFile \"/stale/key\"\n"
+        "  IdentitiesOnly yes\n"
+        END_MARK "\n"
+        "Host after\n  User bob\n";
+    char home[96], config[MAX_PATH_LEN], ssh_dir[MAX_PATH_LEN];
+    struct stat before;
+    ssh_config_commit_hook_fn previous;
+    ssh_config_publication_state_t publication =
+        SSH_CONFIG_PUBLICATION_COMMITTED;
+
+    CHECK_EQ_INT(setup_home(home, config), 0);
+    CHECK((size_t)snprintf(ssh_dir, sizeof(ssh_dir), "%s/.ssh", home) <
+          sizeof(ssh_dir));
+    CHECK_EQ_INT(write_bytes(config, original, sizeof(original) - 1U), 0);
+    CHECK_EQ_INT(stat(config, &before), 0);
+
+    g_identical_commit_hook_calls = 0;
+    previous = ssh_manager_set_config_commit_hook_fn(
+        fail_identical_config_commit);
+    clear_error();
+    CHECK_EQ_INT(ssh_remove_host_alias_result(TEST_ALIAS, &publication), -1);
+    ssh_manager_set_config_commit_hook_fn(previous);
+
+    CHECK_EQ_INT(publication, SSH_CONFIG_PUBLICATION_PREINSTALL_FAILED);
+    CHECK_EQ_INT(g_identical_commit_hook_calls, 1);
+    CHECK(strstr(get_last_error()->message, "interruption") != NULL);
+    check_unchanged(config, original, sizeof(original) - 1U, &before);
+    CHECK_EQ_INT(count_temps_in(ssh_dir), 0);
+}
+
+TEST(remove_changed_config_reports_committed) {
+    static const char original[] =
+        "Host before\n  User alice\n"
+        BEGIN_MARK "\n"
+        "Host " TEST_ALIAS "\n"
+        "  HostName github.com\n"
+        "  IdentityFile \"/stale/key\"\n"
+        "  IdentitiesOnly yes\n"
+        END_MARK "\n"
+        "Host after\n  User bob\n";
+    static const char expected[] =
+        "Host before\n  User alice\n"
+        "Host after\n  User bob\n";
+    char home[96], config[MAX_PATH_LEN], ssh_dir[MAX_PATH_LEN];
+    ssh_config_publication_state_t publication =
+        SSH_CONFIG_PUBLICATION_PREINSTALL_FAILED;
+
+    CHECK_EQ_INT(setup_home(home, config), 0);
+    CHECK((size_t)snprintf(ssh_dir, sizeof(ssh_dir), "%s/.ssh", home) <
+          sizeof(ssh_dir));
+    CHECK_EQ_INT(write_bytes(config, original, sizeof(original) - 1U), 0);
+
+    CHECK_EQ_INT(ssh_remove_host_alias_result(TEST_ALIAS, &publication), 0);
+
+    CHECK_EQ_INT(publication, SSH_CONFIG_PUBLICATION_COMMITTED);
+    check_exact_file_bytes(config, expected, sizeof(expected) - 1U);
+    CHECK_EQ_INT(count_temps_in(ssh_dir), 0);
+}
+
+TEST(remove_postrename_failure_reports_installed_unverified) {
+    static const char original[] =
+        "Host before\n  User alice\n"
+        BEGIN_MARK "\n"
+        "Host " TEST_ALIAS "\n"
+        "  HostName github.com\n"
+        "  IdentityFile \"/stale/key\"\n"
+        "  IdentitiesOnly yes\n"
+        END_MARK "\n"
+        "Host after\n  User bob\n";
+    static const char expected[] =
+        "Host before\n  User alice\n"
+        "Host after\n  User bob\n";
+    char home[96], config[MAX_PATH_LEN], ssh_dir[MAX_PATH_LEN];
+    ssh_config_postrename_hook_fn previous;
+    ssh_config_publication_state_t publication =
+        SSH_CONFIG_PUBLICATION_COMMITTED;
+
+    CHECK_EQ_INT(setup_home(home, config), 0);
+    CHECK((size_t)snprintf(ssh_dir, sizeof(ssh_dir), "%s/.ssh", home) <
+          sizeof(ssh_dir));
+    CHECK_EQ_INT(write_bytes(config, original, sizeof(original) - 1U), 0);
+
+    previous = ssh_manager_set_config_postrename_hook_fn(
+        fail_postrename_verification);
+    clear_error();
+    CHECK_EQ_INT(ssh_remove_host_alias_result(TEST_ALIAS, &publication), -1);
+    ssh_manager_set_config_postrename_hook_fn(previous);
+
+    CHECK_EQ_INT(publication,
+                 SSH_CONFIG_PUBLICATION_INSTALLED_UNVERIFIED);
+    CHECK(strstr(get_last_error()->message, "installed") != NULL);
+    CHECK(strstr(get_last_error()->message, "uncertain") != NULL);
+    check_exact_file_bytes(config, expected, sizeof(expected) - 1U);
+    CHECK_EQ_INT(count_temps_in(ssh_dir), 0);
+}
+
+TEST(remove_dirsync_failure_reports_durability_uncertain) {
+    static const char original[] =
+        "Host before\n  User alice\n"
+        BEGIN_MARK "\n"
+        "Host " TEST_ALIAS "\n"
+        "  HostName github.com\n"
+        "  IdentityFile \"/stale/key\"\n"
+        "  IdentitiesOnly yes\n"
+        END_MARK "\n"
+        "Host after\n  User bob\n";
+    static const char expected[] =
+        "Host before\n  User alice\n"
+        "Host after\n  User bob\n";
+    char home[96], config[MAX_PATH_LEN], ssh_dir[MAX_PATH_LEN];
+    ssh_dirsync_fn previous;
+    ssh_config_publication_state_t publication =
+        SSH_CONFIG_PUBLICATION_COMMITTED;
+
+    CHECK_EQ_INT(setup_home(home, config), 0);
+    CHECK((size_t)snprintf(ssh_dir, sizeof(ssh_dir), "%s/.ssh", home) <
+          sizeof(ssh_dir));
+    CHECK_EQ_INT(write_bytes(config, original, sizeof(original) - 1U), 0);
+
+    g_dirsync_calls = 0;
+    previous = ssh_manager_set_dirsync_fn(fail_dirsync);
+    clear_error();
+    CHECK_EQ_INT(ssh_remove_host_alias_result(TEST_ALIAS, &publication), -1);
+    ssh_manager_set_dirsync_fn(previous);
+
+    CHECK_EQ_INT(publication,
+                 SSH_CONFIG_PUBLICATION_DURABILITY_UNCERTAIN);
+    CHECK_EQ_INT(g_dirsync_calls, 1);
+    CHECK(strstr(get_last_error()->message, "durability") != NULL);
+    CHECK(strstr(get_last_error()->message, "uncertain") != NULL);
+    check_exact_file_bytes(config, expected, sizeof(expected) - 1U);
+    CHECK_EQ_INT(count_temps_in(ssh_dir), 0);
+}
+
+TEST(remove_installed_unverified_retry_settles_without_rewrite) {
+    static const char original[] =
+        "Host before\n  User alice\n"
+        BEGIN_MARK "\n"
+        "Host " TEST_ALIAS "\n"
+        "  HostName github.com\n"
+        "  IdentityFile \"/stale/key\"\n"
+        "  IdentitiesOnly yes\n"
+        END_MARK "\n"
+        "Host after\n  User bob\n";
+    static const char expected[] =
+        "Host before\n  User alice\n"
+        "Host after\n  User bob\n";
+    char home[96], config[MAX_PATH_LEN], ssh_dir[MAX_PATH_LEN];
+    struct stat installed;
+    struct stat ssh_identity;
+    ssh_config_postrename_hook_fn previous_postrename;
+    ssh_dirsync_fn previous_sync;
+    ssh_config_publication_state_t publication =
+        SSH_CONFIG_PUBLICATION_COMMITTED;
+
+    CHECK_EQ_INT(setup_home(home, config), 0);
+    CHECK((size_t)snprintf(ssh_dir, sizeof(ssh_dir), "%s/.ssh", home) <
+          sizeof(ssh_dir));
+    CHECK_EQ_INT(write_bytes(config, original, sizeof(original) - 1U), 0);
+
+    previous_postrename = ssh_manager_set_config_postrename_hook_fn(
+        fail_postrename_verification);
+    CHECK_EQ_INT(ssh_remove_host_alias_result(TEST_ALIAS, &publication), -1);
+    ssh_manager_set_config_postrename_hook_fn(previous_postrename);
+    CHECK_EQ_INT(publication,
+                 SSH_CONFIG_PUBLICATION_INSTALLED_UNVERIFIED);
+    CHECK_EQ_INT(stat(config, &installed), 0);
+    CHECK_EQ_INT(stat(ssh_dir, &ssh_identity), 0);
+
+    reset_dirsync_observations(&ssh_identity, false);
+    previous_sync = ssh_manager_set_dirsync_fn(observe_dirsync);
+    CHECK_EQ_INT(ssh_remove_host_alias_result(TEST_ALIAS, &publication), 0);
+    ssh_manager_set_dirsync_fn(previous_sync);
+
+    CHECK_EQ_INT(publication, SSH_CONFIG_PUBLICATION_UNCHANGED);
+    CHECK_EQ_INT((int)g_dirsync_observation_count, 1);
+    CHECK(ts_same_identity(&g_dirsync_observations[0], &ssh_identity));
+    check_unchanged(config, expected, sizeof(expected) - 1U, &installed);
+    CHECK_EQ_INT(count_temps_in(ssh_dir), 0);
+}
+
+TEST(remove_durability_uncertain_retry_settles_without_rewrite) {
+    static const char original[] =
+        "Host before\n  User alice\n"
+        BEGIN_MARK "\n"
+        "Host " TEST_ALIAS "\n"
+        "  HostName github.com\n"
+        "  IdentityFile \"/stale/key\"\n"
+        "  IdentitiesOnly yes\n"
+        END_MARK "\n"
+        "Host after\n  User bob\n";
+    static const char expected[] =
+        "Host before\n  User alice\n"
+        "Host after\n  User bob\n";
+    char home[96], config[MAX_PATH_LEN], ssh_dir[MAX_PATH_LEN];
+    struct stat installed;
+    struct stat ssh_identity;
+    ssh_dirsync_fn previous;
+    ssh_config_publication_state_t publication =
+        SSH_CONFIG_PUBLICATION_COMMITTED;
+
+    CHECK_EQ_INT(setup_home(home, config), 0);
+    CHECK((size_t)snprintf(ssh_dir, sizeof(ssh_dir), "%s/.ssh", home) <
+          sizeof(ssh_dir));
+    CHECK_EQ_INT(write_bytes(config, original, sizeof(original) - 1U), 0);
+
+    g_dirsync_calls = 0;
+    previous = ssh_manager_set_dirsync_fn(fail_dirsync);
+    CHECK_EQ_INT(ssh_remove_host_alias_result(TEST_ALIAS, &publication), -1);
+    ssh_manager_set_dirsync_fn(previous);
+    CHECK_EQ_INT(publication,
+                 SSH_CONFIG_PUBLICATION_DURABILITY_UNCERTAIN);
+    CHECK_EQ_INT(stat(config, &installed), 0);
+    CHECK_EQ_INT(stat(ssh_dir, &ssh_identity), 0);
+
+    reset_dirsync_observations(&ssh_identity, false);
+    previous = ssh_manager_set_dirsync_fn(observe_dirsync);
+    CHECK_EQ_INT(ssh_remove_host_alias_result(TEST_ALIAS, &publication), 0);
+    ssh_manager_set_dirsync_fn(previous);
+
+    CHECK_EQ_INT(publication, SSH_CONFIG_PUBLICATION_UNCHANGED);
+    CHECK_EQ_INT((int)g_dirsync_observation_count, 1);
+    CHECK(ts_same_identity(&g_dirsync_observations[0], &ssh_identity));
+    check_unchanged(config, expected, sizeof(expected) - 1U, &installed);
+    CHECK_EQ_INT(count_temps_in(ssh_dir), 0);
+}
+
+TEST(remove_missing_ssh_directory_syncs_pinned_home_before_success) {
+    char home[96], config[MAX_PATH_LEN], ssh_dir[MAX_PATH_LEN];
+    struct stat home_before;
+    struct stat home_after;
+    ssh_dirsync_fn previous;
+    ssh_config_publication_state_t publication =
+        SSH_CONFIG_PUBLICATION_COMMITTED;
+    int before_fds;
+
+    CHECK_EQ_INT(setup_home_without_ssh(home, config), 0);
+    CHECK((size_t)snprintf(ssh_dir, sizeof(ssh_dir), "%s/.ssh", home) <
+          sizeof(ssh_dir));
+    CHECK_EQ_INT(stat(home, &home_before), 0);
+    before_fds = test_open_fd_count();
+
+    reset_dirsync_observations(&home_before, false);
+    previous = ssh_manager_set_dirsync_fn(observe_dirsync);
+    CHECK_EQ_INT(ssh_remove_host_alias_result(TEST_ALIAS, &publication), 0);
+    ssh_manager_set_dirsync_fn(previous);
+
+    CHECK_EQ_INT(publication, SSH_CONFIG_PUBLICATION_UNCHANGED);
+    CHECK_EQ_INT((int)g_dirsync_observation_count, 1);
+    CHECK(ts_same_identity(&g_dirsync_observations[0], &home_before));
+    CHECK_EQ_INT(stat(home, &home_after), 0);
+    CHECK(ts_same_identity(&home_before, &home_after));
+    CHECK(same_mtime(&home_before, &home_after));
+    CHECK(same_ctime(&home_before, &home_after));
+    errno = 0;
+    CHECK(lstat(ssh_dir, &home_after) != 0 && errno == ENOENT);
+    errno = 0;
+    CHECK(lstat(config, &home_after) != 0 && errno == ENOENT);
+    CHECK_EQ_INT(test_open_fd_count(), before_fds);
+}
+
+TEST(remove_missing_ssh_directory_home_sync_failure_is_uncertain) {
+    char home[96], config[MAX_PATH_LEN], ssh_dir[MAX_PATH_LEN];
+    struct stat home_before;
+    struct stat home_after;
+    ssh_dirsync_fn previous;
+    ssh_config_publication_state_t publication =
+        SSH_CONFIG_PUBLICATION_COMMITTED;
+    int before_fds;
+
+    CHECK_EQ_INT(setup_home_without_ssh(home, config), 0);
+    CHECK((size_t)snprintf(ssh_dir, sizeof(ssh_dir), "%s/.ssh", home) <
+          sizeof(ssh_dir));
+    CHECK_EQ_INT(stat(home, &home_before), 0);
+    before_fds = test_open_fd_count();
+
+    reset_dirsync_observations(&home_before, true);
+    previous = ssh_manager_set_dirsync_fn(observe_dirsync);
+    clear_error();
+    CHECK_EQ_INT(ssh_remove_host_alias_result(TEST_ALIAS, &publication), -1);
+    ssh_manager_set_dirsync_fn(previous);
+
+    CHECK_EQ_INT(publication,
+                 SSH_CONFIG_PUBLICATION_DURABILITY_UNCERTAIN);
+    CHECK_EQ_INT((int)g_dirsync_observation_count, 1);
+    CHECK(ts_same_identity(&g_dirsync_observations[0], &home_before));
+    CHECK_EQ_INT(get_last_error()->code, ERR_FILE_IO);
+    CHECK_EQ_INT(get_last_error()->system_errno, EIO);
+    CHECK(strstr(get_last_error()->message, "pinned HOME") != NULL);
+    CHECK(strstr(get_last_error()->message, "uncertain") != NULL);
+    CHECK_EQ_INT(stat(home, &home_after), 0);
+    CHECK(ts_same_identity(&home_before, &home_after));
+    CHECK(same_mtime(&home_before, &home_after));
+    CHECK(same_ctime(&home_before, &home_after));
+    errno = 0;
+    CHECK(lstat(ssh_dir, &home_after) != 0 && errno == ENOENT);
+    errno = 0;
+    CHECK(lstat(config, &home_after) != 0 && errno == ENOENT);
+    CHECK_EQ_INT(test_open_fd_count(), before_fds);
+}
+
+TEST(remove_absent_config_rejects_directory_swap_during_final_sync) {
+    static const char replacement[] =
+        BEGIN_MARK "\n"
+        "Host " TEST_ALIAS "\n"
+        "  HostName replacement.example\n"
+        "  IdentityFile \"/replacement/key\"\n"
+        "  IdentitiesOnly yes\n"
+        END_MARK "\n";
+    char home[96], config[MAX_PATH_LEN], moved_config[MAX_PATH_LEN];
+    ssh_dirsync_fn previous;
+    ssh_config_publication_state_t publication =
+        SSH_CONFIG_PUBLICATION_COMMITTED;
+
+    CHECK_EQ_INT(setup_home(home, config), 0);
+    CHECK((size_t)snprintf(g_public_ssh_dir, sizeof(g_public_ssh_dir),
+                           "%s/.ssh", home) < sizeof(g_public_ssh_dir));
+    CHECK((size_t)snprintf(g_moved_ssh_dir, sizeof(g_moved_ssh_dir),
+                           "%s/.ssh.pinned", home) <
+          sizeof(g_moved_ssh_dir));
+    CHECK((size_t)snprintf(moved_config, sizeof(moved_config), "%s/config",
+                           g_moved_ssh_dir) < sizeof(moved_config));
+
+    g_remove_final_sync_swap_calls = 0;
+    g_remove_final_sync_swap_succeeded = false;
+    previous = ssh_manager_set_dirsync_fn(
+        swap_ssh_directory_during_remove_final_sync);
+    clear_error();
+    CHECK_EQ_INT(ssh_remove_host_alias_result(TEST_ALIAS, &publication), -1);
+    ssh_manager_set_dirsync_fn(previous);
+
+    CHECK_EQ_INT(g_remove_final_sync_swap_calls, 1);
+    CHECK(g_remove_final_sync_swap_succeeded);
+    CHECK(publication != SSH_CONFIG_PUBLICATION_UNCHANGED);
+    CHECK(publication != SSH_CONFIG_PUBLICATION_COMMITTED);
+    check_exact_file_bytes(config, replacement, sizeof(replacement) - 1U);
+    errno = 0;
+    CHECK(access(moved_config, F_OK) != 0 && errno == ENOENT);
+}
+
+TEST(remove_absent_alias_rejects_directory_swap_during_final_sync) {
+    static const char original[] = "Host preserved\n  User alice\n";
+    static const char replacement[] =
+        BEGIN_MARK "\n"
+        "Host " TEST_ALIAS "\n"
+        "  HostName replacement.example\n"
+        "  IdentityFile \"/replacement/key\"\n"
+        "  IdentitiesOnly yes\n"
+        END_MARK "\n";
+    char home[96], config[MAX_PATH_LEN], moved_config[MAX_PATH_LEN];
+    ssh_dirsync_fn previous;
+    ssh_config_publication_state_t publication =
+        SSH_CONFIG_PUBLICATION_COMMITTED;
+
+    CHECK_EQ_INT(setup_home(home, config), 0);
+    CHECK_EQ_INT(write_bytes(config, original, sizeof(original) - 1U), 0);
+    CHECK((size_t)snprintf(g_public_ssh_dir, sizeof(g_public_ssh_dir),
+                           "%s/.ssh", home) < sizeof(g_public_ssh_dir));
+    CHECK((size_t)snprintf(g_moved_ssh_dir, sizeof(g_moved_ssh_dir),
+                           "%s/.ssh.pinned", home) <
+          sizeof(g_moved_ssh_dir));
+    CHECK((size_t)snprintf(moved_config, sizeof(moved_config), "%s/config",
+                           g_moved_ssh_dir) < sizeof(moved_config));
+
+    g_remove_final_sync_swap_calls = 0;
+    g_remove_final_sync_swap_succeeded = false;
+    previous = ssh_manager_set_dirsync_fn(
+        swap_ssh_directory_during_remove_final_sync);
+    clear_error();
+    CHECK_EQ_INT(ssh_remove_host_alias_result(TEST_ALIAS, &publication), -1);
+    ssh_manager_set_dirsync_fn(previous);
+
+    CHECK_EQ_INT(g_remove_final_sync_swap_calls, 1);
+    CHECK(g_remove_final_sync_swap_succeeded);
+    CHECK(publication != SSH_CONFIG_PUBLICATION_UNCHANGED);
+    CHECK(publication != SSH_CONFIG_PUBLICATION_COMMITTED);
+    check_exact_file_bytes(config, replacement, sizeof(replacement) - 1U);
+    check_exact_file_bytes(moved_config, original, sizeof(original) - 1U);
+}
+
+TEST(remove_changed_config_rejects_directory_swap_during_final_sync) {
+    static const char original[] =
+        "Host preserved\n  User alice\n"
+        BEGIN_MARK "\n"
+        "Host " TEST_ALIAS "\n"
+        "  HostName github.com\n"
+        "  IdentityFile \"/stale/key\"\n"
+        "  IdentitiesOnly yes\n"
+        END_MARK "\n";
+    static const char filtered[] = "Host preserved\n  User alice\n";
+    static const char replacement[] =
+        BEGIN_MARK "\n"
+        "Host " TEST_ALIAS "\n"
+        "  HostName replacement.example\n"
+        "  IdentityFile \"/replacement/key\"\n"
+        "  IdentitiesOnly yes\n"
+        END_MARK "\n";
+    char home[96], config[MAX_PATH_LEN], moved_config[MAX_PATH_LEN];
+    ssh_dirsync_fn previous;
+    ssh_config_publication_state_t publication =
+        SSH_CONFIG_PUBLICATION_COMMITTED;
+
+    CHECK_EQ_INT(setup_home(home, config), 0);
+    CHECK_EQ_INT(write_bytes(config, original, sizeof(original) - 1U), 0);
+    CHECK((size_t)snprintf(g_public_ssh_dir, sizeof(g_public_ssh_dir),
+                           "%s/.ssh", home) < sizeof(g_public_ssh_dir));
+    CHECK((size_t)snprintf(g_moved_ssh_dir, sizeof(g_moved_ssh_dir),
+                           "%s/.ssh.pinned", home) <
+          sizeof(g_moved_ssh_dir));
+    CHECK((size_t)snprintf(moved_config, sizeof(moved_config), "%s/config",
+                           g_moved_ssh_dir) < sizeof(moved_config));
+
+    g_remove_final_sync_swap_calls = 0;
+    g_remove_final_sync_swap_succeeded = false;
+    previous = ssh_manager_set_dirsync_fn(
+        swap_ssh_directory_during_remove_final_sync);
+    clear_error();
+    CHECK_EQ_INT(ssh_remove_host_alias_result(TEST_ALIAS, &publication), -1);
+    ssh_manager_set_dirsync_fn(previous);
+
+    CHECK_EQ_INT(g_remove_final_sync_swap_calls, 1);
+    CHECK(g_remove_final_sync_swap_succeeded);
+    CHECK(publication != SSH_CONFIG_PUBLICATION_UNCHANGED);
+    CHECK(publication != SSH_CONFIG_PUBLICATION_COMMITTED);
+    check_exact_file_bytes(config, replacement, sizeof(replacement) - 1U);
+    check_exact_file_bytes(moved_config, filtered, sizeof(filtered) - 1U);
+}
+
+TEST(structured_remove_rejects_null_alias_as_preinstall_failure) {
+    ssh_config_publication_state_t publication =
+        SSH_CONFIG_PUBLICATION_COMMITTED;
+
+    clear_error();
+    CHECK_EQ_INT(ssh_remove_host_alias_result(NULL, &publication), -1);
+    CHECK_EQ_INT(publication, SSH_CONFIG_PUBLICATION_PREINSTALL_FAILED);
+    CHECK_EQ_INT(get_last_error()->code, ERR_INVALID_ARGS);
+}
+
+TEST(structured_remove_rejects_empty_alias_as_preinstall_failure) {
+    ssh_config_publication_state_t publication =
+        SSH_CONFIG_PUBLICATION_COMMITTED;
+
+    clear_error();
+    CHECK_EQ_INT(ssh_remove_host_alias_result("", &publication), -1);
+    CHECK_EQ_INT(publication, SSH_CONFIG_PUBLICATION_PREINSTALL_FAILED);
+    CHECK_EQ_INT(get_last_error()->code, ERR_INVALID_ARGS);
+}
+
+TEST(legacy_remove_preserves_empty_alias_noop_compatibility) {
+    CHECK_EQ_INT(ssh_remove_host_alias(NULL), 0);
+    CHECK_EQ_INT(ssh_remove_host_alias(""), 0);
+}
+
+TEST(alias_obligation_capture_binds_canonical_home_and_stable_directories) {
+    static const char original[] =
+        "Host preserved\n  User alice\n"
+        BEGIN_MARK "\n"
+        "Host " TEST_ALIAS "\n"
+        "  HostName github.com\n"
+        "  IdentityFile \"/stale/key\"\n"
+        "  IdentitiesOnly yes\n"
+        END_MARK "\n";
+    char root[96], real_home[MAX_PATH_LEN], public_home[MAX_PATH_LEN];
+    char config[MAX_PATH_LEN], ssh_dir[MAX_PATH_LEN];
+    char canonical_home[MAX_PATH_LEN];
+    struct stat home_stat;
+    struct stat ssh_stat;
+    publication_identity_t expected_home;
+    publication_identity_t expected_ssh;
+    config_retirement_ssh_alias_obligation_t obligation;
+
+    CHECK_EQ_INT(setup_symlinked_home(
+                     root, real_home, public_home, config), 0);
+    CHECK((size_t)snprintf(ssh_dir, sizeof(ssh_dir), "%s/.ssh",
+                           real_home) < sizeof(ssh_dir));
+    CHECK_EQ_INT(mkdir(ssh_dir, 0700), 0);
+    CHECK_EQ_INT(write_bytes(config, original, sizeof(original) - 1U), 0);
+    CHECK(realpath(public_home, canonical_home) != NULL);
+    CHECK_EQ_INT(stat(real_home, &home_stat), 0);
+    CHECK_EQ_INT(stat(ssh_dir, &ssh_stat), 0);
+    publication_identity_from_stat(&expected_home, &home_stat);
+    publication_identity_from_stat(&expected_ssh, &ssh_stat);
+
+    memset(&obligation, 0xA5, sizeof(obligation));
+    CHECK_EQ_INT(ssh_capture_host_alias_obligation(
+                     TEST_ALIAS, &obligation), 0);
+
+    CHECK(obligation.known);
+    CHECK(obligation.present);
+    CHECK(strcmp(obligation.ssh_host_alias, TEST_ALIAS) == 0);
+    CHECK(strcmp(obligation.home_path, canonical_home) == 0);
+    CHECK(publication_identity_equal(
+        &obligation.home_identity, &expected_home));
+    CHECK(publication_identity_equal(
+        &obligation.ssh_directory_identity, &expected_ssh));
+
+    CHECK_EQ_INT(advance_directory_ctime(ssh_dir), 0);
+    CHECK_EQ_INT(ssh_revalidate_host_alias_obligation(&obligation), 0);
+    check_exact_file_bytes(config, original, sizeof(original) - 1U);
+}
+
+TEST(absent_alias_obligation_rejects_later_ssh_directory_without_mutation) {
+    static const char original[] =
+        "Host preserved\n  User alice\n"
+        BEGIN_MARK "\n"
+        "Host " TEST_ALIAS "\n"
+        "  HostName github.com\n"
+        "  IdentityFile \"/stale/key\"\n"
+        "  IdentitiesOnly yes\n"
+        END_MARK "\n";
+    char home[96], config[MAX_PATH_LEN], ssh_dir[MAX_PATH_LEN];
+    struct stat before;
+    publication_identity_t zero_identity;
+    config_retirement_ssh_alias_obligation_t obligation;
+    ssh_config_publication_state_t publication =
+        SSH_CONFIG_PUBLICATION_COMMITTED;
+
+    CHECK_EQ_INT(setup_home_without_ssh(home, config), 0);
+    CHECK((size_t)snprintf(ssh_dir, sizeof(ssh_dir), "%s/.ssh", home) <
+          sizeof(ssh_dir));
+    CHECK_EQ_INT(ssh_capture_host_alias_obligation(
+                     TEST_ALIAS, &obligation), 0);
+    memset(&zero_identity, 0, sizeof(zero_identity));
+    CHECK(!obligation.ssh_directory_identity.present);
+    CHECK(memcmp(&obligation.ssh_directory_identity, &zero_identity,
+                 sizeof(zero_identity)) == 0);
+
+    CHECK_EQ_INT(mkdir(ssh_dir, 0700), 0);
+    CHECK_EQ_INT(write_bytes(config, original, sizeof(original) - 1U), 0);
+    CHECK_EQ_INT(stat(config, &before), 0);
+    clear_error();
+    CHECK_EQ_INT(ssh_remove_host_alias_obligation_result(
+                     &obligation, &publication), -1);
+
+    CHECK_EQ_INT(publication, SSH_CONFIG_PUBLICATION_PREINSTALL_FAILED);
+    CHECK(strstr(get_last_error()->message, "appeared") != NULL);
+    check_unchanged(config, original, sizeof(original) - 1U, &before);
+}
+
+TEST(alias_obligation_rejects_replaced_ssh_directory_without_mutation) {
+    static const char original[] =
+        "Host preserved\n  User alice\n"
+        BEGIN_MARK "\n"
+        "Host " TEST_ALIAS "\n"
+        "  HostName github.com\n"
+        "  IdentityFile \"/stale/key\"\n"
+        "  IdentitiesOnly yes\n"
+        END_MARK "\n";
+    char home[96], config[MAX_PATH_LEN], ssh_dir[MAX_PATH_LEN];
+    char moved_ssh[MAX_PATH_LEN], moved_config[MAX_PATH_LEN];
+    struct stat before;
+    config_retirement_ssh_alias_obligation_t obligation;
+    ssh_config_publication_state_t publication =
+        SSH_CONFIG_PUBLICATION_COMMITTED;
+
+    CHECK_EQ_INT(setup_home(home, config), 0);
+    CHECK((size_t)snprintf(ssh_dir, sizeof(ssh_dir), "%s/.ssh", home) <
+          sizeof(ssh_dir));
+    CHECK((size_t)snprintf(moved_ssh, sizeof(moved_ssh), "%s/.ssh.old",
+                           home) < sizeof(moved_ssh));
+    CHECK((size_t)snprintf(moved_config, sizeof(moved_config), "%s/config",
+                           moved_ssh) < sizeof(moved_config));
+    CHECK_EQ_INT(write_bytes(config, original, sizeof(original) - 1U), 0);
+    CHECK_EQ_INT(ssh_capture_host_alias_obligation(
+                     TEST_ALIAS, &obligation), 0);
+
+    CHECK_EQ_INT(rename(ssh_dir, moved_ssh), 0);
+    CHECK_EQ_INT(mkdir(ssh_dir, 0700), 0);
+    CHECK_EQ_INT(write_bytes(config, original, sizeof(original) - 1U), 0);
+    CHECK_EQ_INT(stat(config, &before), 0);
+    clear_error();
+    CHECK_EQ_INT(ssh_remove_host_alias_obligation_result(
+                     &obligation, &publication), -1);
+
+    CHECK_EQ_INT(publication, SSH_CONFIG_PUBLICATION_PREINSTALL_FAILED);
+    CHECK(strstr(get_last_error()->message, "generation") != NULL);
+    check_unchanged(config, original, sizeof(original) - 1U, &before);
+    check_exact_file_bytes(moved_config, original, sizeof(original) - 1U);
+}
+
+TEST(alias_obligation_rejects_retargeted_home_without_mutation) {
+    static const char original[] =
+        "Host preserved\n  User alice\n"
+        BEGIN_MARK "\n"
+        "Host " TEST_ALIAS "\n"
+        "  HostName github.com\n"
+        "  IdentityFile \"/stale/key\"\n"
+        "  IdentitiesOnly yes\n"
+        END_MARK "\n";
+    char root[96], real_home[MAX_PATH_LEN], public_home[MAX_PATH_LEN];
+    char config[MAX_PATH_LEN], original_ssh[MAX_PATH_LEN];
+    char original_config[MAX_PATH_LEN];
+    char replacement_home[MAX_PATH_LEN], replacement_ssh[MAX_PATH_LEN];
+    char replacement_config[MAX_PATH_LEN];
+    struct stat before;
+    config_retirement_ssh_alias_obligation_t obligation;
+    ssh_config_publication_state_t publication =
+        SSH_CONFIG_PUBLICATION_COMMITTED;
+
+    CHECK_EQ_INT(setup_symlinked_home(
+                     root, real_home, public_home, config), 0);
+    CHECK((size_t)snprintf(original_ssh, sizeof(original_ssh), "%s/.ssh",
+                           real_home) < sizeof(original_ssh));
+    CHECK((size_t)snprintf(original_config, sizeof(original_config),
+                           "%s/config", original_ssh) <
+          sizeof(original_config));
+    CHECK((size_t)snprintf(replacement_home, sizeof(replacement_home),
+                           "%s/replacement", root) <
+          sizeof(replacement_home));
+    CHECK((size_t)snprintf(replacement_ssh, sizeof(replacement_ssh),
+                           "%s/.ssh", replacement_home) <
+          sizeof(replacement_ssh));
+    CHECK((size_t)snprintf(replacement_config, sizeof(replacement_config),
+                           "%s/config", replacement_ssh) <
+          sizeof(replacement_config));
+    CHECK_EQ_INT(mkdir(original_ssh, 0700), 0);
+    CHECK_EQ_INT(write_bytes(original_config, original,
+                             sizeof(original) - 1U), 0);
+    CHECK_EQ_INT(ssh_capture_host_alias_obligation(
+                     TEST_ALIAS, &obligation), 0);
+
+    CHECK_EQ_INT(mkdir(replacement_home, 0700), 0);
+    CHECK_EQ_INT(mkdir(replacement_ssh, 0700), 0);
+    CHECK_EQ_INT(write_bytes(replacement_config, original,
+                             sizeof(original) - 1U), 0);
+    CHECK_EQ_INT(unlink(public_home), 0);
+    CHECK_EQ_INT(symlink(replacement_home, public_home), 0);
+    CHECK_EQ_INT(stat(replacement_config, &before), 0);
+    clear_error();
+    CHECK_EQ_INT(ssh_remove_host_alias_obligation_result(
+                     &obligation, &publication), -1);
+
+    CHECK_EQ_INT(publication, SSH_CONFIG_PUBLICATION_PREINSTALL_FAILED);
+    CHECK(strstr(get_last_error()->message, "HOME namespace") != NULL);
+    check_unchanged(replacement_config, original,
+                    sizeof(original) - 1U, &before);
+    check_exact_file_bytes(original_config, original,
+                           sizeof(original) - 1U);
+}
+
+TEST(alias_obligation_success_revalidates_until_directory_replacement) {
+    static const char original[] =
+        "Host before\n  User alice\n"
+        BEGIN_MARK "\n"
+        "Host " TEST_ALIAS "\n"
+        "  HostName github.com\n"
+        "  IdentityFile \"/stale/key\"\n"
+        "  IdentitiesOnly yes\n"
+        END_MARK "\n"
+        "Host after\n  User bob\n";
+    static const char expected[] =
+        "Host before\n  User alice\n"
+        "Host after\n  User bob\n";
+    char home[96], config[MAX_PATH_LEN], ssh_dir[MAX_PATH_LEN];
+    char moved_ssh[MAX_PATH_LEN];
+    config_retirement_ssh_alias_obligation_t obligation;
+    ssh_config_publication_state_t publication =
+        SSH_CONFIG_PUBLICATION_PREINSTALL_FAILED;
+
+    CHECK_EQ_INT(setup_home(home, config), 0);
+    CHECK((size_t)snprintf(ssh_dir, sizeof(ssh_dir), "%s/.ssh", home) <
+          sizeof(ssh_dir));
+    CHECK((size_t)snprintf(moved_ssh, sizeof(moved_ssh), "%s/.ssh.done",
+                           home) < sizeof(moved_ssh));
+    CHECK_EQ_INT(write_bytes(config, original, sizeof(original) - 1U), 0);
+    CHECK_EQ_INT(ssh_capture_host_alias_obligation(
+                     TEST_ALIAS, &obligation), 0);
+
+    CHECK_EQ_INT(ssh_remove_host_alias_obligation_result(
+                     &obligation, &publication), 0);
+    CHECK_EQ_INT(publication, SSH_CONFIG_PUBLICATION_COMMITTED);
+    check_exact_file_bytes(config, expected, sizeof(expected) - 1U);
+    CHECK_EQ_INT(ssh_revalidate_host_alias_obligation(&obligation), 0);
+
+    CHECK_EQ_INT(rename(ssh_dir, moved_ssh), 0);
+    CHECK_EQ_INT(mkdir(ssh_dir, 0700), 0);
+    clear_error();
+    CHECK_EQ_INT(ssh_revalidate_host_alias_obligation(&obligation), -1);
+    CHECK(strstr(get_last_error()->message, "no longer matches") != NULL);
+    {
+        char moved_config[MAX_PATH_LEN];
+
+        CHECK((size_t)snprintf(moved_config, sizeof(moved_config),
+                               "%s/config", moved_ssh) <
+              sizeof(moved_config));
+        check_exact_file_bytes(moved_config, expected,
+                               sizeof(expected) - 1U);
+    }
+}
+
+TEST(alias_obligation_capture_failure_clears_output) {
+    char home[96], config[MAX_PATH_LEN], ssh_dir[MAX_PATH_LEN];
+    config_retirement_ssh_alias_obligation_t obligation;
+
+    CHECK_EQ_INT(setup_home_without_ssh(home, config), 0);
+    memset(&obligation, 0xA5, sizeof(obligation));
+    CHECK_EQ_INT(ssh_capture_host_alias_obligation(
+                     "bad alias", &obligation), -1);
+    CHECK(obligation_is_zero(&obligation));
+
+    CHECK((size_t)snprintf(ssh_dir, sizeof(ssh_dir), "%s/.ssh", home) <
+          sizeof(ssh_dir));
+    CHECK_EQ_INT(mkdir(ssh_dir, 0700), 0);
+    CHECK_EQ_INT(chmod(ssh_dir, 0777), 0);
+    memset(&obligation, 0xA5, sizeof(obligation));
+    CHECK_EQ_INT(ssh_capture_host_alias_obligation(
+                     TEST_ALIAS, &obligation), -1);
+    CHECK_EQ_INT(get_last_error()->code, ERR_PERMISSION_DENIED);
+    CHECK(obligation_is_zero(&obligation));
 }
 
 TEST(byte_identical_config_skips_all_write_and_sync_work) {
@@ -1933,6 +3271,216 @@ TEST(config_registration_failure_is_atomic_and_retryable) {
     CHECK_EQ_INT(count_temps_in(ssh_dir), 0);
 }
 
+TEST(initial_temp_fstat_failure_retains_untracked_generation) {
+    char home[96], config[MAX_PATH_LEN], key[MAX_PATH_LEN];
+    char ssh_dir[MAX_PATH_LEN], temp_path[MAX_PATH_LEN];
+    account_t account;
+    error_context_t failure;
+    ssh_metadata_test_hook_fn previous;
+    ssh_config_publication_state_t publication =
+        SSH_CONFIG_PUBLICATION_COMMITTED;
+    int before;
+    int failure_errno;
+
+    CHECK_EQ_INT(setup_home(home, config), 0);
+    CHECK((size_t)snprintf(ssh_dir, sizeof(ssh_dir), "%s/.ssh", home) <
+          sizeof(ssh_dir));
+    CHECK((size_t)snprintf(key, sizeof(key), "%s/id", home) < sizeof(key));
+    make_account(&account, key);
+    before = test_open_fd_count();
+    g_temp_initial_fstat_fault_calls = 0;
+    previous = ssh_manager_set_metadata_test_hook_fn(
+        fail_initial_temp_fstat);
+    clear_error();
+    errno = 0;
+    CHECK_EQ_INT(ssh_configure_host_alias_result(&account, &publication), -1);
+    failure_errno = errno;
+    failure = *get_last_error();
+    ssh_manager_set_metadata_test_hook_fn(previous);
+
+    CHECK_EQ_INT(publication, SSH_CONFIG_PUBLICATION_PREINSTALL_FAILED);
+    CHECK_EQ_INT(g_temp_initial_fstat_fault_calls, 1);
+    CHECK_EQ_INT(failure_errno, EIO);
+    CHECK(strstr(failure.message, "capture") != NULL);
+    CHECK(strstr(failure.details, "identity is unknown") != NULL);
+    CHECK(strstr(failure.details, "untracked") != NULL);
+    CHECK_EQ_INT(count_temps_in(ssh_dir), 1);
+    CHECK_EQ_INT(find_single_temp_path(ssh_dir, temp_path), 0);
+    signals_scratch_cleanup();
+    CHECK_EQ_INT(access(temp_path, F_OK), 0);
+    CHECK_EQ_INT(unlink(temp_path), 0);
+    CHECK_EQ_INT(count_temps_in(ssh_dir), 0);
+    errno = 0;
+    CHECK(access(config, F_OK) != 0 && errno == ENOENT);
+    CHECK_EQ_INT(test_open_fd_count(), before);
+}
+
+TEST(replacement_temp_generation_survives_failed_commit) {
+    static const char replacement[] =
+        "Host replacement-temp\n  User untouched\n";
+    char home[96], config[MAX_PATH_LEN], key[MAX_PATH_LEN];
+    char ssh_dir[MAX_PATH_LEN], temp_path[MAX_PATH_LEN];
+    account_t account;
+    ssh_config_commit_hook_fn previous_commit;
+    ssh_metadata_test_hook_fn previous_metadata;
+    ssh_config_publication_state_t publication =
+        SSH_CONFIG_PUBLICATION_COMMITTED;
+    struct stat replacement_identity;
+    size_t length = 0;
+    char *content;
+    int before;
+
+    CHECK_EQ_INT(setup_home(home, config), 0);
+    CHECK((size_t)snprintf(ssh_dir, sizeof(ssh_dir), "%s/.ssh", home) <
+          sizeof(ssh_dir));
+    CHECK((size_t)snprintf(key, sizeof(key), "%s/id", home) < sizeof(key));
+    make_account(&account, key);
+    before = test_open_fd_count();
+    g_observed_temp_dir_fd = -1;
+    g_observed_temp_name[0] = '\0';
+    g_temp_replacement_written = false;
+    previous_commit = ssh_manager_set_config_commit_hook_fn(
+        record_config_temp_and_fail);
+    previous_metadata = ssh_manager_set_metadata_test_hook_fn(
+        replace_config_temp_before_cleanup_proof);
+    clear_error();
+    CHECK_EQ_INT(ssh_configure_host_alias_result(&account, &publication), -1);
+    ssh_manager_set_metadata_test_hook_fn(previous_metadata);
+    ssh_manager_set_config_commit_hook_fn(previous_commit);
+    g_observed_temp_dir_fd = -1;
+
+    CHECK_EQ_INT(publication, SSH_CONFIG_PUBLICATION_PREINSTALL_FAILED);
+    CHECK(g_temp_replacement_written);
+    CHECK(g_observed_temp_name[0] != '\0');
+    CHECK(strstr(get_last_error()->message, "interruption") != NULL);
+    CHECK((size_t)snprintf(temp_path, sizeof(temp_path), "%s/%s", ssh_dir,
+                           g_observed_temp_name) < sizeof(temp_path));
+    CHECK_EQ_INT(count_temps_in(ssh_dir), 1);
+    content = read_bytes(temp_path, &length);
+    CHECK(content != NULL);
+    if (content) {
+        CHECK_EQ_INT(length, sizeof(replacement) - 1U);
+        CHECK(length != sizeof(replacement) - 1U ||
+              memcmp(content, replacement, sizeof(replacement) - 1U) == 0);
+        free(content);
+    }
+    CHECK_EQ_INT(stat(temp_path, &replacement_identity), 0);
+    CHECK_EQ_INT(
+        signals_scratch_register_identity(temp_path, &replacement_identity),
+        0);
+    signals_scratch_unregister(temp_path);
+    signals_scratch_cleanup();
+    CHECK_EQ_INT(access(temp_path, F_OK), 0);
+    CHECK_EQ_INT(unlink(temp_path), 0);
+    CHECK_EQ_INT(count_temps_in(ssh_dir), 0);
+    errno = 0;
+    CHECK(access(config, F_OK) != 0 && errno == ENOENT);
+    CHECK_EQ_INT(test_open_fd_count(), before);
+}
+
+TEST(temp_cleanup_unlink_failure_is_reported_and_retried) {
+    char home[96], config[MAX_PATH_LEN], key[MAX_PATH_LEN];
+    char ssh_dir[MAX_PATH_LEN], temp_path[MAX_PATH_LEN];
+    account_t account;
+    error_context_t failure;
+    ssh_config_commit_hook_fn previous_commit;
+    ssh_metadata_test_hook_fn previous_metadata;
+    ssh_config_publication_state_t publication =
+        SSH_CONFIG_PUBLICATION_COMMITTED;
+    int before;
+    int failure_errno;
+
+    CHECK_EQ_INT(setup_home(home, config), 0);
+    CHECK((size_t)snprintf(ssh_dir, sizeof(ssh_dir), "%s/.ssh", home) <
+          sizeof(ssh_dir));
+    CHECK((size_t)snprintf(key, sizeof(key), "%s/id", home) < sizeof(key));
+    make_account(&account, key);
+    before = test_open_fd_count();
+    g_observed_temp_dir_fd = -1;
+    g_observed_temp_name[0] = '\0';
+    g_temp_cleanup_unlink_fault_calls = 0;
+    previous_commit = ssh_manager_set_config_commit_hook_fn(
+        record_config_temp_and_fail);
+    previous_metadata = ssh_manager_set_metadata_test_hook_fn(
+        fail_temp_cleanup_unlink);
+    clear_error();
+    errno = 0;
+    CHECK_EQ_INT(ssh_configure_host_alias_result(&account, &publication), -1);
+    failure_errno = errno;
+    failure = *get_last_error();
+    ssh_manager_set_metadata_test_hook_fn(previous_metadata);
+    ssh_manager_set_config_commit_hook_fn(previous_commit);
+    g_observed_temp_dir_fd = -1;
+
+    CHECK_EQ_INT(publication, SSH_CONFIG_PUBLICATION_PREINSTALL_FAILED);
+    CHECK_EQ_INT(g_temp_cleanup_unlink_fault_calls, 1);
+    CHECK_EQ_INT(failure_errno, EIO);
+    CHECK(strstr(failure.message, "interruption") != NULL);
+    CHECK(strstr(failure.details, "cleanup remains registered for retry") !=
+          NULL);
+    CHECK((size_t)snprintf(temp_path, sizeof(temp_path), "%s/%s", ssh_dir,
+                           g_observed_temp_name) < sizeof(temp_path));
+    CHECK_EQ_INT(access(temp_path, F_OK), 0);
+    CHECK_EQ_INT(count_temps_in(ssh_dir), 1);
+    /* Generic failure cleanup cannot unlink an identity-bound name outside
+     * the config writer boundary. */
+    signals_scratch_cleanup();
+    CHECK_EQ_INT(access(temp_path, F_OK), 0);
+    CHECK_EQ_INT(count_temps_in(ssh_dir), 1);
+
+    /* The next serialized writer settles the retained exact generation
+     * before admitting its own temp. */
+    publication = SSH_CONFIG_PUBLICATION_PREINSTALL_FAILED;
+    CHECK_EQ_INT(ssh_configure_host_alias_result(&account, &publication), 0);
+    CHECK_EQ_INT(publication, SSH_CONFIG_PUBLICATION_COMMITTED);
+    errno = 0;
+    CHECK(access(temp_path, F_OK) != 0 && errno == ENOENT);
+    CHECK_EQ_INT(count_temps_in(ssh_dir), 0);
+    CHECK_EQ_INT(test_open_fd_count(), before);
+}
+
+TEST(successful_temp_cleanup_unregisters_completed_obligation) {
+    static const char sentinel[] = "replacement sentinel\n";
+    char home[96], config[MAX_PATH_LEN], key[MAX_PATH_LEN];
+    char ssh_dir[MAX_PATH_LEN], temp_path[MAX_PATH_LEN];
+    account_t account;
+    ssh_config_commit_hook_fn previous;
+    ssh_config_publication_state_t publication =
+        SSH_CONFIG_PUBLICATION_COMMITTED;
+    struct stat sentinel_identity;
+    int before;
+
+    CHECK_EQ_INT(setup_home(home, config), 0);
+    CHECK((size_t)snprintf(ssh_dir, sizeof(ssh_dir), "%s/.ssh", home) <
+          sizeof(ssh_dir));
+    CHECK((size_t)snprintf(key, sizeof(key), "%s/id", home) < sizeof(key));
+    make_account(&account, key);
+    before = test_open_fd_count();
+    g_observed_temp_name[0] = '\0';
+    previous = ssh_manager_set_config_commit_hook_fn(
+        record_config_temp_and_fail);
+    clear_error();
+    CHECK_EQ_INT(ssh_configure_host_alias_result(&account, &publication), -1);
+    ssh_manager_set_config_commit_hook_fn(previous);
+
+    CHECK_EQ_INT(publication, SSH_CONFIG_PUBLICATION_PREINSTALL_FAILED);
+    CHECK(strstr(get_last_error()->message, "interruption") != NULL);
+    CHECK((size_t)snprintf(temp_path, sizeof(temp_path), "%s/%s", ssh_dir,
+                           g_observed_temp_name) < sizeof(temp_path));
+    errno = 0;
+    CHECK(access(temp_path, F_OK) != 0 && errno == ENOENT);
+    CHECK_EQ_INT(count_temps_in(ssh_dir), 0);
+    CHECK_EQ_INT(write_bytes(temp_path, sentinel, sizeof(sentinel) - 1U), 0);
+    CHECK_EQ_INT(stat(temp_path, &sentinel_identity), 0);
+    CHECK_EQ_INT(
+        signals_scratch_register_identity(temp_path, &sentinel_identity), 0);
+    signals_scratch_unregister(temp_path);
+    signals_scratch_cleanup();
+    CHECK_EQ_INT(access(temp_path, F_OK), 0);
+    CHECK_EQ_INT(unlink(temp_path), 0);
+    CHECK_EQ_INT(test_open_fd_count(), before);
+}
+
 TEST(postrename_dirsync_failure_is_durability_uncertain_without_temp) {
     static const char original[] = "Host existing\n  User preserved\n";
     char home[96], config[MAX_PATH_LEN], key[MAX_PATH_LEN], ssh_dir[MAX_PATH_LEN];
@@ -2391,10 +3939,54 @@ TEST_MAIN_BEGIN()
     RUN_TEST(openssh_percent_and_environment_expansions_are_safe);
     RUN_TEST(embedded_nul_at_every_region_fails_without_mutation);
     RUN_TEST(exact_marker_parser_preserves_incidental_substrings);
+    RUN_TEST(earlier_unmanaged_catchall_is_rejected_before_alias_publication);
+    RUN_TEST(earlier_unmanaged_wildcard_match_is_rejected_before_alias_publication);
+    RUN_TEST(earlier_unmanaged_second_whitespace_pattern_is_rejected_before_publication);
+    RUN_TEST(earlier_managed_wildcard_overlap_is_rejected_before_alias_publication);
+    RUN_TEST(later_managed_wildcard_identity_accumulation_is_rejected_before_publication);
+    RUN_TEST(negated_unmanaged_wildcard_exception_does_not_conflict);
+    RUN_TEST(escaped_leading_bang_is_literal_and_wildcard_still_conflicts);
+    RUN_TEST(comma_separated_text_is_one_nonmatching_pattern);
+    RUN_TEST(similar_exact_alias_does_not_conflict);
+    RUN_TEST(wildcard_target_pattern_conflicting_with_exact_host_is_rejected);
+    RUN_TEST(question_target_pattern_conflicting_with_exact_host_is_rejected);
+    RUN_TEST(case_insensitive_indented_host_equals_directive_is_rejected);
+    RUN_TEST(bare_carriage_return_host_whitespace_is_rejected);
+    RUN_TEST(host_patterns_remain_case_sensitive);
+    RUN_TEST(matching_host_with_proxy_command_is_permitted);
+    RUN_TEST(matching_host_with_harmless_options_is_permitted);
+    RUN_TEST(matching_host_with_certificate_file_is_rejected);
+    RUN_TEST(matching_host_with_hostname_only_is_rejected);
+    RUN_TEST(matching_host_with_identity_file_only_is_rejected);
+    RUN_TEST(matching_host_with_identities_only_is_rejected);
+    RUN_TEST(overlong_host_pattern_fails_closed_before_publication);
+    RUN_TEST(include_directive_fails_closed_before_alias_publication);
+    RUN_TEST(match_directive_fails_closed_before_alias_publication);
+    RUN_TEST(global_routing_options_fail_closed_before_alias_publication);
     RUN_TEST(malformed_nested_and_mismatched_blocks_fail_closed);
     RUN_TEST(valid_duplicates_collapse_to_one_then_remove_to_zero);
     RUN_TEST(crlf_duplicates_collapse_and_preserve_unrelated_bytes);
     RUN_TEST(crlf_remove_preserves_all_unmanaged_bytes);
+    RUN_TEST(remove_preinstall_failure_preserves_original_generation);
+    RUN_TEST(remove_changed_config_reports_committed);
+    RUN_TEST(remove_postrename_failure_reports_installed_unverified);
+    RUN_TEST(remove_dirsync_failure_reports_durability_uncertain);
+    RUN_TEST(remove_installed_unverified_retry_settles_without_rewrite);
+    RUN_TEST(remove_durability_uncertain_retry_settles_without_rewrite);
+    RUN_TEST(remove_missing_ssh_directory_syncs_pinned_home_before_success);
+    RUN_TEST(remove_missing_ssh_directory_home_sync_failure_is_uncertain);
+    RUN_TEST(remove_absent_config_rejects_directory_swap_during_final_sync);
+    RUN_TEST(remove_absent_alias_rejects_directory_swap_during_final_sync);
+    RUN_TEST(remove_changed_config_rejects_directory_swap_during_final_sync);
+    RUN_TEST(structured_remove_rejects_null_alias_as_preinstall_failure);
+    RUN_TEST(structured_remove_rejects_empty_alias_as_preinstall_failure);
+    RUN_TEST(legacy_remove_preserves_empty_alias_noop_compatibility);
+    RUN_TEST(alias_obligation_capture_binds_canonical_home_and_stable_directories);
+    RUN_TEST(absent_alias_obligation_rejects_later_ssh_directory_without_mutation);
+    RUN_TEST(alias_obligation_rejects_replaced_ssh_directory_without_mutation);
+    RUN_TEST(alias_obligation_rejects_retargeted_home_without_mutation);
+    RUN_TEST(alias_obligation_success_revalidates_until_directory_replacement);
+    RUN_TEST(alias_obligation_capture_failure_clears_output);
     RUN_TEST(byte_identical_config_skips_all_write_and_sync_work);
     RUN_TEST(byte_identical_safe_config_rechecks_mode_before_noop);
     RUN_TEST(byte_identical_safe_config_rebinds_final_public_directory);
@@ -2412,6 +4004,10 @@ TEST_MAIN_BEGIN()
     RUN_TEST(descriptor_relative_first_creation_ignores_home_retarget);
     RUN_TEST(symlinked_home_retarget_during_parent_sync_fails_preinstall);
     RUN_TEST(config_registration_failure_is_atomic_and_retryable);
+    RUN_TEST(initial_temp_fstat_failure_retains_untracked_generation);
+    RUN_TEST(replacement_temp_generation_survives_failed_commit);
+    RUN_TEST(temp_cleanup_unlink_failure_is_reported_and_retried);
+    RUN_TEST(successful_temp_cleanup_unregisters_completed_obligation);
     RUN_TEST(postrename_dirsync_failure_is_durability_uncertain_without_temp);
     RUN_TEST(postrename_verification_failure_reports_installed_unverified);
     RUN_TEST(ctime_only_drift_revalidates_exact_pinned_bytes);

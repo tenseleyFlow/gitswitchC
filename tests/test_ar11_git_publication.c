@@ -448,6 +448,8 @@ TEST(default_runner_exports_exact_sealed_global_publication) {
     publication_identity_t expected_program;
     publication_identity_t expected_ssh_program;
     publication_identity_t empty_identity;
+    const publication_record_t *generation_records[1];
+    const publication_record_t *live_generation = NULL;
     gpg_config_t gpg_config;
     account_t account;
     account_t other_account;
@@ -614,7 +616,34 @@ TEST(default_runner_exports_exact_sealed_global_publication) {
     CHECK_EQ_INT(git_get_config_value(GIT_CONFIG_USER_NAME, restored_value,
                                       sizeof(restored_value),
                                       GIT_SCOPE_GLOBAL), -1);
+
+    rc = git_config_snapshot(GIT_SCOPE_GLOBAL);
+    CHECK_EQ_INT(rc, 0);
+    if (rc != 0) goto cleanup;
+    snapshot_active = true;
+    rc = git_set_config(&account, GIT_SCOPE_GLOBAL);
+    CHECK_EQ_INT(rc, 0);
+    if (rc != 0) goto cleanup;
+    rc = gpg_configure_git_signing(&gpg_config, &account,
+                                   GIT_SCOPE_GLOBAL);
+    CHECK_EQ_INT(rc, 0);
+    if (rc != 0) goto cleanup;
+    rc = git_config_seal();
+    CHECK_EQ_INT(rc, 0);
+    if (rc != 0) goto cleanup;
+    rc = git_config_export_sealed_publication(&record,
+                                               TEST_SOURCE_SELECTOR);
+    CHECK_EQ_INT(rc, 0);
+    if (rc != 0) goto cleanup;
+
+    /* Closing the transaction's retained descriptor must not invalidate the
+     * exact publication generation exported by the production seal path. */
     git_config_commit();
+    snapshot_active = false;
+    generation_records[0] = &record;
+    CHECK_EQ_INT(publication_record_verify_live_destination(
+                     &record, generation_records, 1U, &live_generation), 0);
+    CHECK(live_generation == &record);
     CHECK_EQ_INT(git_config_restore(), 0);
 
 cleanup:

@@ -154,9 +154,83 @@ static int write_all_fd(int fd, const void *data, size_t length) {
     return 0;
 }
 
-/* Base sandbox: throwaway HOME (with a dummy 0600 SSH key and 0700 config
- * dirs) + throwaway XDG_RUNTIME_DIR. The accounts.toml body is supplied per
- * test via sandbox_write_cfg (0600). */
+static int find_fixture_executable(const char *name, char *resolved,
+                                   size_t resolved_size) {
+    const char *path_env = getenv("PATH");
+    const char *cursor;
+
+    if (!name || !*name || !resolved || resolved_size == 0U ||
+        !path_env || !*path_env || strchr(name, '/')) {
+        return -1;
+    }
+
+    cursor = path_env;
+    while (*cursor) {
+        const char *colon = strchr(cursor, ':');
+        size_t dir_length = colon ? (size_t)(colon - cursor) : strlen(cursor);
+        size_t name_length = strlen(name);
+        char candidate[4096], canonical[4096];
+        struct stat st;
+
+        if (dir_length > 0U && cursor[0] == '/' &&
+            dir_length + 1U + name_length + 1U <= sizeof(candidate)) {
+            memcpy(candidate, cursor, dir_length);
+            candidate[dir_length] = '/';
+            memcpy(candidate + dir_length + 1U, name, name_length + 1U);
+            if (realpath(candidate, canonical) &&
+                stat(canonical, &st) == 0 && S_ISREG(st.st_mode) &&
+                access(canonical, R_OK | X_OK) == 0 &&
+                strlen(canonical) < resolved_size) {
+                memcpy(resolved, canonical, strlen(canonical) + 1U);
+                return 0;
+            }
+        }
+        if (!colon) break;
+        cursor = colon + 1;
+    }
+    return -1;
+}
+
+static int generate_fixture_ssh_key(const char *path) {
+    char ssh_keygen[4096];
+    pid_t child;
+    pid_t waited;
+    int status;
+
+    if (!path ||
+        find_fixture_executable("ssh-keygen", ssh_keygen,
+                                sizeof(ssh_keygen)) != 0) {
+        return -1;
+    }
+    child = fork();
+    if (child < 0) return -1;
+    if (child == 0) {
+        const char *const argv[] = {
+            ssh_keygen, "-q", "-t", "ed25519", "-N", "", "-f",
+            path, NULL
+        };
+        int null_fd = open("/dev/null", O_RDWR);
+
+        if (null_fd < 0 ||
+            dup2(null_fd, STDOUT_FILENO) < 0 ||
+            dup2(null_fd, STDERR_FILENO) < 0) {
+            _exit(126);
+        }
+        if (null_fd > STDERR_FILENO) close(null_fd);
+        execv(ssh_keygen, (char *const *)argv);
+        _exit(127);
+    }
+    do {
+        waited = waitpid(child, &status, 0);
+    } while (waited < 0 && errno == EINTR);
+    if (waited != child) return -1;
+    if (!WIFEXITED(status) || WEXITSTATUS(status) != 0) return -1;
+    return chmod(path, 0600);
+}
+
+/* Base sandbox: throwaway HOME (with a real throwaway 0600 SSH key and 0700
+ * config dirs) + throwaway XDG_RUNTIME_DIR. The accounts.toml body is supplied
+ * per test via sandbox_write_cfg (0600). */
 static int sandbox_setup(sandbox_t *sb) {
     char path[512];
 
@@ -166,9 +240,7 @@ static int sandbox_setup(sandbox_t *sb) {
     }
 
     snprintf(sb->key, sizeof(sb->key), "%s/key_ed25519", sb->home);
-    if (write_file_mode(sb->key,
-                        "-----BEGIN OPENSSH PRIVATE KEY-----\nfixture\n",
-                        0600) != 0) return -1;
+    if (generate_fixture_ssh_key(sb->key) != 0) return -1;
 
     snprintf(path, sizeof(path), "%s/.config", sb->home);
     if (mkdir(path, 0700) != 0) return -1;
@@ -532,6 +604,30 @@ static int write_cfg_work_other(sandbox_t *sb, const char *active) {
              active ? active : "",
              active ? "\"\n" : "",
              sb->key);
+    return sandbox_write_cfg(sb, cfg);
+}
+
+/* Unknown/ambiguous selector rejection is a legacy-document migration test,
+ * not an SSH-key validation test. Keep its fixture credentialless so the
+ * portable BSD key parser does not correctly create its bounded
+ * gitswitch-key-validation staging directory while loading the document.
+ * That staging is unrelated to switch publication and would make the test's
+ * stronger "no command runtime artifacts" assertion platform-dependent. */
+static int write_legacy_cfg_work_other_credentialless(sandbox_t *sb) {
+    static const char cfg[] =
+        "[settings]\n"
+        "default_scope = \"global\"\n"
+        "\n"
+        "[accounts.1]\n"
+        "name = \"work\"\n"
+        "email = \"w@example.com\"\n"
+        "description = \"credentialless legacy work fixture\"\n"
+        "\n"
+        "[accounts.2]\n"
+        "name = \"other\"\n"
+        "email = \"o@example.com\"\n"
+        "description = \"credentialless legacy other fixture\"\n";
+
     return sandbox_write_cfg(sb, cfg);
 }
 
@@ -1152,7 +1248,7 @@ static void assert_rejected_legacy_switch_is_nonmutating(
     const char *argv[] = { "gitswitch", selector, NULL };
 
     if (sandbox_setup(&sb) != 0) { CHECK(!"sandbox setup failed"); return; }
-    CHECK_EQ_INT(write_cfg_work_other(&sb, NULL), 0);
+    CHECK_EQ_INT(write_legacy_cfg_work_other_credentialless(&sb), 0);
     before_len = slurp(sb.cfg, before, sizeof(before));
     CHECK(before_len > 0);
     CHECK_EQ_INT(lstat(sb.cfg, &before_stat), 0);

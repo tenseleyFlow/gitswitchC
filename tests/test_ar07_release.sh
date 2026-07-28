@@ -337,6 +337,7 @@ check_install_staging_contract()
     install_real_chmod=$(command -v chmod) ||
         fail "install-race chmod is unavailable"
     install_real_mv=$(command -v mv) || fail "install-race mv is unavailable"
+    install_real_rm=$(command -v rm) || fail "install-race rm is unavailable"
     install_tmp=$(mktemp -d "${TMPDIR:-/tmp}/gitswitch-install-contract.XXXXXX") ||
         fail "cannot create install-race temporary directory"
     install_builddir=$install_tmp/build
@@ -419,6 +420,47 @@ fi
 exit "$status"
 EOF
     chmod 0755 "$install_shims/sh" || fail "cannot activate install-race shim"
+cat >"$install_shims/mv" <<'EOF'
+#!/bin/sh
+case ${AR14_COMPLETION_FAIL_MODE-} in
+    publish) candidate=${3-} ;;
+    retire) candidate=${2-} ;;
+    *) candidate= ;;
+esac
+if [ -n "${AR14_COMPLETION_FAIL_PATH-}" ] &&
+   [ "$candidate" = "$AR14_COMPLETION_FAIL_PATH" ] &&
+   [ ! -e "$AR14_COMPLETION_FAIL_MARKER" ]; then
+    : >"$AR14_COMPLETION_FAIL_MARKER" || exit 98
+    exit 97
+fi
+if [ -n "${AR14_RESTORE_FAIL_PATH-}" ] &&
+   [ "${3-}" = "$AR14_RESTORE_FAIL_PATH" ] &&
+   [ -e "${AR14_COMPLETION_FAIL_MARKER-}" ] &&
+   [ ! -e "$AR14_RESTORE_FAIL_MARKER" ]; then
+    : >"$AR14_RESTORE_FAIL_MARKER" || exit 98
+    exit 96
+fi
+exec "$AR11_INSTALL_REAL_MV" "$@"
+EOF
+    chmod 0755 "$install_shims/mv" ||
+        fail "cannot activate completion-publication race shim"
+cat >"$install_shims/rm" <<'EOF'
+#!/bin/sh
+if [ -n "${AR14_RM_FAIL_PREFIX-}" ] &&
+   [ ! -e "$AR14_RM_FAIL_MARKER" ]; then
+    for candidate do
+        case $candidate in
+            "$AR14_RM_FAIL_PREFIX"*)
+                : >"$AR14_RM_FAIL_MARKER" || exit 98
+                exit 95
+                ;;
+        esac
+    done
+fi
+exec "$AR11_INSTALL_REAL_RM" "$@"
+EOF
+    chmod 0755 "$install_shims/rm" ||
+        fail "cannot activate uninstall-cleanup failure shim"
 
     # Corrupt only the validator's distinct staged argument. The fixed recipe
     # must reject it before atomic publication, preserve a pre-existing final
@@ -440,6 +482,7 @@ EOF
         AR11_INSTALL_REAL_CP="$install_real_cp" \
         AR11_INSTALL_REAL_CHMOD="$install_real_chmod" \
         AR11_INSTALL_REAL_MV="$install_real_mv" \
+        AR11_INSTALL_REAL_RM="$install_real_rm" \
         AR11_INSTALL_SWAP_BINARY="$install_replacement" \
         AR11_INSTALL_SWAP_REPORT="$install_report" \
         AR11_INSTALL_STAGE_STATE="$install_stage_state" \
@@ -479,8 +522,13 @@ EOF
     set -- "$install_reject_bin/.${install_target}.install."*
     { [ "$#" -eq 1 ] && [ ! -e "$1" ] && [ ! -L "$1" ]; } ||
         fail "failed install left a private binary temporary"
-    [ ! -e "$install_reject_stage$install_prefix/share" ] ||
-        fail "failed binary validation installed completion assets"
+    for rejected_completion in \
+        "$install_reject_stage$install_prefix/share/bash-completion/completions/$install_target" \
+        "$install_reject_stage$install_prefix/share/zsh/site-functions/_$install_target" \
+        "$install_reject_stage$install_prefix/share/fish/vendor_completions.d/$install_target.fish"; do
+        { [ ! -e "$rejected_completion" ] && [ ! -L "$rejected_completion" ]; } ||
+            fail "failed binary validation installed a completion asset"
+    done
 
     # Then let the real validator succeed and replace the private source plus
     # any still-named staged path afterward. Publication must already have
@@ -491,6 +539,7 @@ EOF
         AR11_INSTALL_REAL_CP="$install_real_cp" \
         AR11_INSTALL_REAL_CHMOD="$install_real_chmod" \
         AR11_INSTALL_REAL_MV="$install_real_mv" \
+        AR11_INSTALL_REAL_RM="$install_real_rm" \
         AR11_INSTALL_SWAP_BINARY="$install_replacement" \
         AR11_INSTALL_SWAP_REPORT="$install_report" \
         AR11_INSTALL_STAGE_STATE="$install_stage_state" \
@@ -531,9 +580,204 @@ EOF
     { [ "$#" -eq 1 ] && [ ! -e "$1" ] && [ ! -L "$1" ]; } ||
         fail "successful install left a private binary temporary"
 
+    # AR-14 L38: the binary and three completion assets are one transaction.
+    # Exercise a destination containing shell-significant whitespace/glob
+    # characters, fail the second publication after Bash has committed, and
+    # prove rollback restores the exact prior generation. Then apply the same
+    # causal failure to uninstall after Bash has been retired.
+    completion_stage="$install_tmp/completion stage [literal]"
+    completion_root=$completion_stage$install_prefix
+    completion_binary=$completion_root/bin/$install_target
+    completion_bash=$completion_root/share/bash-completion/completions/$install_target
+    completion_zsh=$completion_root/share/zsh/site-functions/_$install_target
+    completion_fish=$completion_root/share/fish/vendor_completions.d/$install_target.fish
+    completion_marker=$install_tmp/completion-failure.marker
+    mkdir -p "${completion_binary%/*}" "${completion_bash%/*}" "${completion_zsh%/*}" \
+        "${completion_fish%/*}" ||
+        fail "cannot create completion transaction fixture"
+    "$install_real_cp" "$install_sentinel" "$completion_binary" ||
+        fail "cannot seed prior installed binary"
+    printf '%s\n' old-bash >"$completion_bash"
+    printf '%s\n' old-zsh >"$completion_zsh"
+    printf '%s\n' old-fish >"$completion_fish"
+    chmod 0600 "$completion_bash" "$completion_zsh" "$completion_fish"
+    chmod 0700 "$completion_binary"
+    cp "$completion_binary" "$install_tmp/old-binary"
+    cp "$completion_bash" "$install_tmp/old-bash"
+    cp "$completion_zsh" "$install_tmp/old-zsh"
+    cp "$completion_fish" "$install_tmp/old-fish"
+    "$install_real_cp" "$install_expected" "$install_built" ||
+        fail "cannot restore completion fixture release binary"
+    rm -f "$install_report" "$install_stage_state" "$completion_marker"
+    if PATH="$install_shims:$PATH" \
+        AR11_INSTALL_REAL_SH="$install_real_sh" \
+        AR11_INSTALL_REAL_CP="$install_real_cp" \
+        AR11_INSTALL_REAL_CHMOD="$install_real_chmod" \
+        AR11_INSTALL_REAL_MV="$install_real_mv" \
+        AR11_INSTALL_REAL_RM="$install_real_rm" \
+        AR11_INSTALL_SWAP_BINARY="$install_replacement" \
+        AR11_INSTALL_SWAP_REPORT="$install_report" \
+        AR11_INSTALL_STAGE_STATE="$install_stage_state" \
+        AR11_INSTALL_SWAP_MODE=none \
+        AR14_COMPLETION_FAIL_MODE=publish \
+        AR14_COMPLETION_FAIL_PATH="$completion_zsh" \
+        AR14_COMPLETION_FAIL_MARKER="$completion_marker" \
+        "$install_make" -C "$install_root" BUILD_TYPE=release \
+            BUILDDIR="$install_builddir" TARGET="$install_target" \
+            install DESTDIR="$completion_stage" PREFIX="$install_prefix" \
+            >"$install_out" 2>&1; then
+        fail "completion install accepted an injected partial publication"
+    fi
+    [ -e "$completion_marker" ] || {
+        sed -n '1,200p' "$install_out" >&2
+        fail "completion publication failure shim was not exercised"
+    }
+    cmp -s "$install_tmp/old-binary" "$completion_binary" &&
+        cmp -s "$install_tmp/old-bash" "$completion_bash" &&
+        cmp -s "$install_tmp/old-zsh" "$completion_zsh" &&
+        cmp -s "$install_tmp/old-fish" "$completion_fish" ||
+        fail "failed install publication left a mixed generation"
+    [ "$(find "$completion_binary" -prune -type f -perm 0700 -print)" = \
+        "$completion_binary" ] ||
+        fail "binary rollback changed the prior mode"
+    for completion in "$completion_bash" "$completion_zsh" "$completion_fish"; do
+        [ "$(find "$completion" -prune -type f -perm 0600 -print)" = "$completion" ] ||
+            fail "completion rollback changed the prior mode: $completion"
+    done
+    if find "$completion_root/share" -name '.*completion.*' -print |
+        grep . >/dev/null; then
+        fail "failed completion publication left transaction residue"
+    fi
+    set -- "${completion_binary%/*}/.${install_target}.install."*
+    { [ "$#" -eq 1 ] && [ ! -e "$1" ] && [ ! -L "$1" ]; } ||
+        fail "failed install left a private binary stage"
+    set -- "${completion_binary%/*}/.${install_target}.install.rollback."*
+    { [ "$#" -eq 1 ] && [ ! -e "$1" ] && [ ! -L "$1" ]; } ||
+        fail "successful rollback left a binary backup"
+
+    # If restoration itself fails, the transaction must fail and retain the
+    # exact old binary under its rollback-owned name instead of deleting it.
+    restore_marker=$install_tmp/restore-failure.marker
+    rm -f "$completion_marker" "$restore_marker"
+    if PATH="$install_shims:$PATH" \
+        AR11_INSTALL_REAL_SH="$install_real_sh" \
+        AR11_INSTALL_REAL_CP="$install_real_cp" \
+        AR11_INSTALL_REAL_CHMOD="$install_real_chmod" \
+        AR11_INSTALL_REAL_MV="$install_real_mv" \
+        AR11_INSTALL_REAL_RM="$install_real_rm" \
+        AR11_INSTALL_SWAP_BINARY="$install_replacement" \
+        AR11_INSTALL_SWAP_REPORT="$install_report" \
+        AR11_INSTALL_STAGE_STATE="$install_stage_state" \
+        AR11_INSTALL_SWAP_MODE=none \
+        AR14_COMPLETION_FAIL_MODE=publish \
+        AR14_COMPLETION_FAIL_PATH="$completion_zsh" \
+        AR14_COMPLETION_FAIL_MARKER="$completion_marker" \
+        AR14_RESTORE_FAIL_PATH="$completion_binary" \
+        AR14_RESTORE_FAIL_MARKER="$restore_marker" \
+        "$install_make" -C "$install_root" BUILD_TYPE=release \
+            BUILDDIR="$install_builddir" TARGET="$install_target" \
+            install DESTDIR="$completion_stage" PREFIX="$install_prefix" \
+            >"$install_out" 2>&1; then
+        fail "install reported success after binary restoration failed"
+    fi
+    [ -e "$restore_marker" ] ||
+        fail "binary restoration failure shim was not exercised"
+    { [ ! -e "$completion_binary" ] && [ ! -L "$completion_binary" ]; } ||
+        fail "failed binary restoration left transaction-owned bytes canonical"
+    set -- "${completion_binary%/*}/.${install_target}.install.rollback."*
+    [ "$#" -eq 1 ] && [ -f "$1" ] ||
+        fail "failed binary restoration did not retain one recovery backup"
+    cmp -s "$install_tmp/old-binary" "$1" ||
+        fail "retained binary recovery backup has wrong bytes"
+    "$install_real_mv" -f "$1" "$completion_binary" ||
+        fail "cannot recover binary after deterministic restore failure"
+    chmod 0700 "$completion_binary"
+
+    "$install_make" -C "$install_root" BUILD_TYPE=release \
+        BUILDDIR="$install_builddir" TARGET="$install_target" \
+        install DESTDIR="$completion_stage" PREFIX="$install_prefix" \
+        >"$install_out" 2>&1 ||
+        fail "completion install failed for a quoted destination"
+    cmp -s "$install_root/completions/gitswitch.bash" "$completion_bash" &&
+        cmp -s "$install_root/completions/gitswitch.zsh" "$completion_zsh" &&
+        cmp -s "$install_root/completions/gitswitch.fish" "$completion_fish" ||
+        fail "successful completion install published wrong bytes"
+    for completion in "$completion_bash" "$completion_zsh" "$completion_fish"; do
+        [ "$(find "$completion" -prune -type f -perm 0644 -print)" = "$completion" ] ||
+            fail "successful completion install used the wrong mode: $completion"
+    done
+
+    rm -f "$completion_marker"
+    if PATH="$install_shims:$PATH" \
+        AR11_INSTALL_REAL_MV="$install_real_mv" \
+        AR11_INSTALL_REAL_RM="$install_real_rm" \
+        AR14_COMPLETION_FAIL_MODE=retire \
+        AR14_COMPLETION_FAIL_PATH="$completion_zsh" \
+        AR14_COMPLETION_FAIL_MARKER="$completion_marker" \
+        "$install_make" -C "$install_root" TARGET="$install_target" \
+            uninstall DESTDIR="$completion_stage" PREFIX="$install_prefix" \
+            >"$install_out" 2>&1; then
+        fail "completion uninstall accepted an injected partial retirement"
+    fi
+    [ -e "$completion_marker" ] ||
+        fail "completion uninstall failure shim was not exercised"
+    [ -x "$completion_root/bin/$install_target" ] &&
+        cmp -s "$install_root/completions/gitswitch.bash" "$completion_bash" &&
+        cmp -s "$install_root/completions/gitswitch.zsh" "$completion_zsh" &&
+        cmp -s "$install_root/completions/gitswitch.fish" "$completion_fish" ||
+        fail "failed completion uninstall did not restore the live generation"
+
+    # Once every canonical name is retired, cleanup failure is post-commit:
+    # report failure, keep canonical names absent, and retain recoverable
+    # transaction-owned residue rather than falsely claiming completion.
+    cleanup_marker=$install_tmp/uninstall-cleanup-failure.marker
+    rm -f "$cleanup_marker"
+    if PATH="$install_shims:$PATH" \
+        AR11_INSTALL_REAL_MV="$install_real_mv" \
+        AR11_INSTALL_REAL_RM="$install_real_rm" \
+        AR14_RM_FAIL_PREFIX="${completion_binary}.uninstall." \
+        AR14_RM_FAIL_MARKER="$cleanup_marker" \
+        "$install_make" -C "$install_root" TARGET="$install_target" \
+            uninstall DESTDIR="$completion_stage" PREFIX="$install_prefix" \
+            >"$install_out" 2>&1; then
+        fail "uninstall reported success after committed cleanup failed"
+    fi
+    [ -e "$cleanup_marker" ] ||
+        fail "uninstall cleanup failure shim was not exercised"
+    for removed in "$completion_binary" "$completion_bash" \
+        "$completion_zsh" "$completion_fish"; do
+        { [ ! -e "$removed" ] && [ ! -L "$removed" ]; } ||
+            fail "post-commit cleanup failure resurrected canonical path: $removed"
+    done
+    set -- "${completion_binary}.uninstall."*
+    [ "$#" -eq 1 ] && [ -f "$1" ] ||
+        fail "post-commit binary cleanup failure retained no recovery residue"
+    cmp -s "$install_expected" "$1" ||
+        fail "post-commit binary retirement residue has wrong bytes"
+    "$install_real_rm" -f \
+        "${completion_binary}.uninstall."* \
+        "${completion_bash}.uninstall."* \
+        "${completion_zsh}.uninstall."* \
+        "${completion_fish}.uninstall."*
+
+    "$install_make" -C "$install_root" BUILD_TYPE=release \
+        BUILDDIR="$install_builddir" TARGET="$install_target" \
+        install DESTDIR="$completion_stage" PREFIX="$install_prefix" \
+        >"$install_out" 2>&1 ||
+        fail "reinstall after committed cleanup failure failed"
+    "$install_make" -C "$install_root" TARGET="$install_target" \
+        uninstall DESTDIR="$completion_stage" PREFIX="$install_prefix" \
+        >"$install_out" 2>&1 ||
+        fail "successful quoted uninstall failed"
+    for removed in "$completion_root/bin/$install_target" \
+        "$completion_bash" "$completion_zsh" "$completion_fish"; do
+        { [ ! -e "$removed" ] && [ ! -L "$removed" ]; } ||
+            fail "successful uninstall retained an installed artifact: $removed"
+    done
+
     trap - 0 1 2 3 15
     rm -rf "$install_tmp"
-    printf 'ar07-release: PASS (staged install rejects corruption and seals publication)\n'
+    printf 'ar07-release: PASS (staged binary and completion transactions)\n'
 }
 
 expect_artifact_rejection()
@@ -1380,6 +1624,12 @@ check_manifest_contract()
     rpm_alpha_pid=
     rpm_beta_pid=
     rpm_retire_pid=
+    rpm_produced_swap_pid=
+    rpm_produced_swap_release=
+    rpm_subset_pid=
+    rpm_subset_release=
+    rpm_publish_swap_pid=
+    rpm_publish_swap_release=
     stop_background()
     {
         background_pid=$1
@@ -1416,6 +1666,18 @@ check_manifest_contract()
         stop_background "$rpm_alpha_pid"
         stop_background "$rpm_beta_pid"
         stop_background "$rpm_retire_pid"
+        if [ -n "$rpm_produced_swap_release" ]; then
+            : >"$rpm_produced_swap_release" 2>/dev/null || :
+        fi
+        if [ -n "$rpm_subset_release" ]; then
+            : >"$rpm_subset_release" 2>/dev/null || :
+        fi
+        if [ -n "$rpm_publish_swap_release" ]; then
+            : >"$rpm_publish_swap_release" 2>/dev/null || :
+        fi
+        stop_background "$rpm_produced_swap_pid"
+        stop_background "$rpm_subset_pid"
+        stop_background "$rpm_publish_swap_pid"
         if [ -n "$copy_status_release" ]; then
             : >"$copy_status_release" 2>/dev/null || :
         fi
@@ -1738,6 +2000,66 @@ EOF
     copy_platform=$(uname -s) ||
         fail "cannot identify release publisher test platform"
 
+    # AR-14: descriptor identities come from fstat(2), not stat(1) on
+    # /dev/fd/N. FreeBSD's fdescfs reports the descriptor-node identity for
+    # that pathname. Pin a regular file, replace its pathname, and prove the
+    # internal ABI reports the exact still-open generation. Also reject every
+    # descriptor class the RPM shell must not accept.
+    fd_identity_path=$tmp/fd-identity
+    fd_identity_pinned=$tmp/fd-identity.pinned
+    fd_identity_empty=$tmp/fd-identity.empty
+    printf '%s\n' 'pinned descriptor generation' >"$fd_identity_path" ||
+        fail "cannot create descriptor-identity fixture"
+    : >"$fd_identity_empty" ||
+        fail "cannot create empty descriptor-identity fixture"
+    case $copy_platform in
+        Linux)
+            fd_identity_expected=$(stat -L -c '%d:%i:%s' \
+                "$fd_identity_path") ||
+                fail "cannot identify descriptor-identity fixture"
+            ;;
+        Darwin|FreeBSD)
+            fd_identity_expected=$(stat -L -f '%d:%i:%z' \
+                "$fd_identity_path") ||
+                fail "cannot identify descriptor-identity fixture"
+            ;;
+        *) fail "unsupported descriptor-identity platform: $copy_platform" ;;
+    esac
+    exec 7<"$fd_identity_path" ||
+        fail "cannot pin descriptor-identity fixture"
+    mv "$fd_identity_path" "$fd_identity_pinned" ||
+        fail "cannot replace descriptor-identity pathname"
+    printf '%s\n' 'replacement pathname generation' >"$fd_identity_path" ||
+        fail "cannot create descriptor-identity replacement"
+    fd_identity_actual=$(
+        "$named_publish_helper" --internal-regular-fd-identity-v1 7
+    ) || fail "release publisher rejected an inherited regular descriptor"
+    [ "$fd_identity_actual" = "$fd_identity_expected" ] ||
+        fail "release publisher identified the replacement pathname instead of the exact open fd"
+    exec 7<&-
+    if "$named_publish_helper" --internal-regular-fd-identity-v1 7 \
+        >"$tmp/fd-identity-closed.out" 2>&1; then
+        fail "release publisher accepted a closed inherited descriptor"
+    fi
+    exec 7<"$fd_identity_empty" ||
+        fail "cannot open empty descriptor-identity fixture"
+    if "$named_publish_helper" --internal-regular-fd-identity-v1 7 \
+        >"$tmp/fd-identity-empty.out" 2>&1; then
+        fail "release publisher accepted an empty regular descriptor"
+    fi
+    exec 7<&-
+    exec 7</dev/null ||
+        fail "cannot open nonregular descriptor-identity fixture"
+    if "$named_publish_helper" --internal-regular-fd-identity-v1 7 \
+        >"$tmp/fd-identity-nonregular.out" 2>&1; then
+        fail "release publisher accepted a nonregular inherited descriptor"
+    fi
+    exec 7<&-
+    if "$named_publish_helper" --internal-regular-fd-identity-v1 invalid \
+        >"$tmp/fd-identity-invalid.out" 2>&1; then
+        fail "release publisher accepted a nonnumeric inherited descriptor"
+    fi
+
     # AR-11 L42: distcheck consumes a descriptor-pinned private archive and
     # never publishes the canonical name. Force the named fallback on every
     # host to prove normal retirement/retention, post-validation substitution,
@@ -1972,8 +2294,9 @@ EOF
         for private_fork_signal in HUP INT QUIT TERM; do
             private_fork_label=$private_fork_target-$private_fork_signal
             private_fork_report=$tmp/private-fork-$private_fork_label.report
+            private_fork_cleanup=$tmp/private-fork-$private_fork_label.cleanup
             rm -f "$private_capture" "$private_marker" "$private_release" \
-                "$private_fork_report" \
+                "$private_fork_report" "$private_fork_cleanup" \
                 "$private_consume_root/build/dist"/.archive.tar.gz.tmp.*
             private_fork_status=0
             # The selected producer child, not this test shell, expands its
@@ -1986,6 +2309,7 @@ EOF
                 GITSWITCH_RELEASE_TEST_FORK_SIGNAL=$private_fork_signal \
                 GITSWITCH_RELEASE_TEST_FORK_REPORT_FD=9 \
                 GITSWITCH_RELEASE_TEST_FORK_TARGET=$private_fork_target \
+                GITSWITCH_RELEASE_TEST_SIGNAL_CLEANUP_MARKER=$private_fork_cleanup \
                 "$named_publish_helper" --internal-release-tree-consume-v1 \
                 "$private_consume_root" build dist archive.tar.gz -- \
                 /bin/sh -c '
@@ -2042,17 +2366,29 @@ EOF
             [ ! -e "$private_consume_root/build/dist/archive.tar.gz" ] &&
             [ ! -L "$private_consume_root/build/dist/archive.tar.gz" ] ||
                 private_fork_violations="$private_fork_violations $private_fork_label-published"
+            cmp -s "$private_fork_cleanup" - <<'EOF' ||
+cleanup
+EOF
+                private_fork_violations="$private_fork_violations $private_fork_label-cleanup-owner"
             set -- "$private_consume_root/build/dist"/.archive.tar.gz.tmp.*
-            if [ "$#" -ne 1 ] || [ ! -f "$1" ] || [ -L "$1" ]; then
-                private_fork_violations="$private_fork_violations $private_fork_label-temp-shape"
-            else
-                if [ "$private_fork_target" = consumer ] &&
-                   [ "$(cat "$1")" != private-consume-payload ]; then
-                    private_fork_violations="$private_fork_violations $private_fork_label-temp-bytes"
-                fi
-                rm -f "$1" ||
-                    private_fork_violations="$private_fork_violations $private_fork_label-temp-cleanup"
-            fi
+            case $copy_platform in
+                FreeBSD)
+                    { [ "$#" -eq 1 ] && [ ! -e "$1" ] && [ ! -L "$1" ]; } ||
+                        private_fork_violations="$private_fork_violations $private_fork_label-temp-residue"
+                    ;;
+                *)
+                    if [ "$#" -ne 1 ] || [ ! -f "$1" ] || [ -L "$1" ]; then
+                        private_fork_violations="$private_fork_violations $private_fork_label-temp-shape"
+                    else
+                        if [ "$private_fork_target" = consumer ] &&
+                           [ "$(cat "$1")" != private-consume-payload ]; then
+                            private_fork_violations="$private_fork_violations $private_fork_label-temp-bytes"
+                        fi
+                        rm -f "$1" ||
+                            private_fork_violations="$private_fork_violations $private_fork_label-temp-cleanup"
+                    fi
+                    ;;
+            esac
         done
     done
     [ -z "$private_fork_violations" ] ||
@@ -2170,8 +2506,11 @@ EOF
     rm -f "$private_temp" "$private_original"
 
     rm -f "$private_capture" "$private_marker" "$private_release"
+    private_signal_cleanup=$tmp/private-signal.cleanup
+    rm -f "$private_signal_cleanup"
     AR11_PRIVATE_MODE=signal AR11_PRIVATE_CAPTURE=$private_capture \
     AR11_PRIVATE_MARKER=$private_marker \
+    GITSWITCH_RELEASE_TEST_SIGNAL_CLEANUP_MARKER=$private_signal_cleanup \
         "$named_publish_helper" --internal-release-tree-consume-v1 \
         "$private_consume_root" build dist archive.tar.gz -- \
         /bin/sh -c 'printf private-consume-payload' \
@@ -2218,15 +2557,28 @@ EOF
         fail "private archive helper did not preserve TERM status"
     [ "$(cat "$private_capture")" = private-consume-payload ] ||
         fail "signalled private consumer received wrong archive bytes"
+    cmp -s "$private_signal_cleanup" - <<'EOF' ||
+cleanup
+EOF
+        fail "signalled private consumer bypassed normal cleanup ownership"
     set -- "$private_consume_root/build/dist"/.archive.tar.gz.tmp.*
-    { [ "$#" -eq 1 ] && [ -f "$1" ] && [ ! -L "$1" ]; } ||
-        fail "signalled named private archive was not safely retained"
-    [ "$(cat "$1")" = private-consume-payload ] ||
-        fail "signalled named private archive changed bytes"
+    case $copy_platform in
+        FreeBSD)
+            { [ "$#" -eq 1 ] && [ ! -e "$1" ] && [ ! -L "$1" ]; } ||
+                fail "signalled named private archive left staging residue"
+            ;;
+        *)
+            { [ "$#" -eq 1 ] && [ -f "$1" ] && [ ! -L "$1" ]; } ||
+                fail "signalled named private archive was not safely retained"
+            [ "$(cat "$1")" = private-consume-payload ] ||
+                fail "signalled named private archive changed bytes"
+            rm -f "$1" ||
+                fail "cannot retire signalled private archive fixture"
+            ;;
+    esac
     [ ! -e "$private_consume_root/build/dist/archive.tar.gz" ] &&
     [ ! -L "$private_consume_root/build/dist/archive.tar.gz" ] ||
         fail "signalled private consumer published a canonical name"
-    rm -f "$1" || fail "cannot retire signalled private archive fixture"
 
     # AR-11 M46: the publisher owns the fixed repository -> build -> dist
     # hierarchy.  A fresh root proves both components are created through the
@@ -2735,22 +3087,25 @@ EOF
     for copy_signal in HUP INT QUIT TERM; do
         copy_signal_pid_file=$tmp/copy-signal-$copy_signal.pid
         copy_signal_delayed=$tmp/copy-signal-$copy_signal.delayed
+        copy_signal_cleanup=$tmp/copy-signal-$copy_signal.cleanup
         copy_signal_producer_pid=
         rm -f "$copy_signal_pid_file" "$copy_signal_delayed" \
+            "$copy_signal_cleanup" \
             "$copy_archive" "$copy_dir"/.archive.tar.gz.tmp.*
-        copy_signal_status=0
         if AR11_COPY_SIGNAL=$copy_signal \
             AR11_COPY_SIGNAL_PID=$copy_signal_pid_file \
             AR11_COPY_SIGNAL_DELAYED=$copy_signal_delayed \
             AR11_COPY_SIGNAL_DIR=$copy_dir \
             AR11_COPY_SIGNAL_EXPECTED=$copy_signal_expected \
             GITSWITCH_RELEASE_TEST_FATAL_DEFAULTS=1 \
+            GITSWITCH_RELEASE_TEST_SIGNAL_CLEANUP_MARKER=$copy_signal_cleanup \
+            "$named_publish_helper" --test-wait-signal "$copy_signal" -- \
             "$named_publish_helper" "$copy_dir" "$copy_canonical" \
                 archive.tar.gz -- /bin/sh -c "$copy_signal_command" \
                 >"$out" 2>&1; then
-            copy_signal_status=0
+            :
         else
-            copy_signal_status=$?
+            copy_signal_violations="$copy_signal_violations $copy_signal-waitpid-status"
         fi
         if [ ! -s "$copy_signal_pid_file" ]; then
             copy_signal_violations="$copy_signal_violations $copy_signal-no-pid"
@@ -2760,17 +3115,6 @@ EOF
             case $copy_signal_producer_pid in
                 ''|0|*[!0-9]*)
                     fail "$copy_signal fixture published an invalid producer PID"
-                    ;;
-            esac
-        fi
-        if [ "$copy_signal_status" -le 128 ]; then
-            copy_signal_violations="$copy_signal_violations $copy_signal-status-$copy_signal_status"
-        else
-            copy_signal_observed=$(kill -l "$copy_signal_status" 2>/dev/null || :)
-            case $copy_signal_observed in
-                "$copy_signal"|"SIG$copy_signal") ;;
-                *)
-                    copy_signal_violations="$copy_signal_violations $copy_signal-status-$copy_signal_status"
                     ;;
             esac
         fi
@@ -2793,22 +3137,181 @@ EOF
         copy_signal_producer_pid=
         { [ ! -e "$copy_archive" ] && [ ! -L "$copy_archive" ]; } ||
             copy_signal_violations="$copy_signal_violations $copy_signal-published"
+        cmp -s "$copy_signal_cleanup" - <<'EOF' ||
+cleanup
+EOF
+            copy_signal_violations="$copy_signal_violations $copy_signal-cleanup-owner"
         set -- "$copy_dir"/.archive.tar.gz.tmp.*
-        if [ "$#" -ne 1 ] || [ ! -f "$1" ]; then
-            copy_signal_violations="$copy_signal_violations $copy_signal-temp-shape"
-        else
-            cmp -s "$copy_signal_expected" "$1" ||
-                copy_signal_violations="$copy_signal_violations $copy_signal-temp-bytes"
-            [ "$(find "$1" -prune -type f -perm 0600 -print)" = "$1" ] ||
-                copy_signal_violations="$copy_signal_violations $copy_signal-temp-mode"
-        fi
-        rm -f "$copy_archive" "$copy_dir"/.archive.tar.gz.tmp.*
-        set -- "$copy_dir"/.archive.tar.gz.tmp.*
-        { [ "$#" -eq 1 ] && [ ! -e "$1" ] && [ ! -L "$1" ]; } ||
-            copy_signal_violations="$copy_signal_violations $copy_signal-temp-residue"
+        case $copy_platform in
+            FreeBSD)
+                { [ "$#" -eq 1 ] && [ ! -e "$1" ] && [ ! -L "$1" ]; } ||
+                    copy_signal_violations="$copy_signal_violations $copy_signal-temp-residue"
+                ;;
+            *)
+                if [ "$#" -ne 1 ] || [ ! -f "$1" ]; then
+                    copy_signal_violations="$copy_signal_violations $copy_signal-temp-shape"
+                else
+                    cmp -s "$copy_signal_expected" "$1" ||
+                        copy_signal_violations="$copy_signal_violations $copy_signal-temp-bytes"
+                    [ "$(find "$1" -prune -type f -perm 0600 -print)" = "$1" ] ||
+                        copy_signal_violations="$copy_signal_violations $copy_signal-temp-mode"
+                    rm -f "$1" ||
+                        copy_signal_violations="$copy_signal_violations $copy_signal-temp-cleanup"
+                fi
+                ;;
+        esac
     done
     [ -z "$copy_signal_violations" ] ||
         fail "fatal-signal forwarding violations:$copy_signal_violations"
+
+    # A fatal signal made pending inside the blocked publication critical
+    # section must be observed before the no-replace link/clone can commit.
+    publication_signal_final=publication-signal.tar
+    publication_signal_cleanup=$tmp/publication-signal.cleanup
+    rm -f "$publication_signal_cleanup" \
+        "$copy_dir/$publication_signal_final" \
+        "$copy_dir"/."$publication_signal_final".tmp.*
+    if ! GITSWITCH_RELEASE_TEST_FATAL_DEFAULTS=1 \
+        GITSWITCH_RELEASE_TEST_PUBLICATION_SIGNAL=TERM \
+        GITSWITCH_RELEASE_TEST_SIGNAL_CLEANUP_MARKER=$publication_signal_cleanup \
+        "$named_publish_helper" --test-wait-signal TERM -- \
+        "$named_publish_helper" "$copy_dir" "$copy_canonical" \
+            "$publication_signal_final" -- \
+            /bin/sh -c 'printf publication-signal-payload' \
+            >"$out" 2>&1; then
+        fail "waitpid oracle rejected publication-critical signal termination"
+    fi
+    cmp -s "$publication_signal_cleanup" - <<'EOF' ||
+cleanup
+EOF
+        fail "publication-critical signal bypassed normal cleanup"
+    [ ! -e "$copy_dir/$publication_signal_final" ] &&
+    [ ! -L "$copy_dir/$publication_signal_final" ] ||
+        fail "pending fatal signal crossed the canonical publication commit"
+    set -- "$copy_dir"/."$publication_signal_final".tmp.*
+    case $copy_platform in
+        FreeBSD)
+            { [ "$#" -eq 1 ] && [ ! -e "$1" ] && [ ! -L "$1" ]; } ||
+                fail "publication-critical signal left FreeBSD staging residue"
+            ;;
+        *)
+            { [ "$#" -eq 1 ] && [ -f "$1" ] && [ ! -L "$1" ]; } ||
+                fail "publication-critical signal did not safely retain staging"
+            rm -f "$1" ||
+                fail "cannot retire publication-critical signal fixture"
+            ;;
+    esac
+
+    # The real internal archive controller must receive the original signal,
+    # remove the private workspace it actually created, and be reaped with that
+    # exact signal before the outer publisher performs its own cleanup/death.
+    internal_signal=TERM
+    # POSIX kill -l accepts a numeric exit status; accepting a symbolic signal
+    # name is a bash extension that Ubuntu's /bin/sh (dash) rejects.
+    internal_signal_number=15
+    internal_archive_tmp=$tmp/internal-archive-tmp
+    internal_archive_ready=$tmp/internal-archive.ready
+    internal_archive_cleanup=$tmp/internal-archive.cleanup
+    internal_archive_reap=$tmp/internal-archive.reap
+    internal_archive_oracle_pid=$tmp/internal-archive.oracle-pid
+    internal_archive_outer_cleanup=$tmp/internal-archive.outer-cleanup
+    internal_archive_final=internal-signal.tar
+    internal_archive_repo=$tmp/internal-archive-repo
+    internal_archive_dist=$internal_archive_repo/build/dist
+    mkdir -m 0700 "$internal_archive_tmp" ||
+        fail "cannot create internal archive fixture TMPDIR"
+    git clone --quiet "$root" "$internal_archive_repo" ||
+        fail "cannot clone internal archive signal fixture"
+    rm -f "$internal_archive_ready" "$internal_archive_cleanup" \
+        "$internal_archive_reap" "$internal_archive_oracle_pid" \
+        "$internal_archive_outer_cleanup" \
+        "$internal_archive_dist/$internal_archive_final" \
+        "$internal_archive_dist"/."$internal_archive_final".tmp.*
+    internal_archive_commit=$(git -C "$internal_archive_repo" rev-parse HEAD) ||
+        fail "cannot resolve internal archive fixture commit"
+    TMPDIR=$internal_archive_tmp \
+    GITSWITCH_RELEASE_TEST_FATAL_DEFAULTS=1 \
+    GITSWITCH_RELEASE_TEST_WAIT_ORACLE_PID_REPORT=$internal_archive_oracle_pid \
+    GITSWITCH_RELEASE_TEST_INTERNAL_ARCHIVE_READY=$internal_archive_ready \
+    GITSWITCH_RELEASE_TEST_INTERNAL_ARCHIVE_CLEANUP_REPORT=$internal_archive_cleanup \
+    GITSWITCH_RELEASE_TEST_INTERNAL_ARCHIVE_REAP_REPORT=$internal_archive_reap \
+    GITSWITCH_RELEASE_TEST_SIGNAL_CLEANUP_MARKER=$internal_archive_outer_cleanup \
+        "$named_publish_helper" --test-wait-signal "$internal_signal" -- \
+        "$named_publish_helper" --internal-release-tree-v1 \
+            "$internal_archive_repo" build dist "$internal_archive_final" -- \
+            --internal-release-archive-v1 "$internal_archive_repo" \
+            "$internal_archive_commit" internal-signal-proof -- VERSION \
+            >"$out" 2>&1 &
+    copy_pid=$!
+    attempt=0
+    while { [ ! -s "$internal_archive_oracle_pid" ] ||
+            [ ! -s "$internal_archive_ready" ]; } &&
+          kill -0 "$copy_pid" 2>/dev/null && [ "$attempt" -lt 300 ]; do
+        sleep 0.1
+        attempt=$((attempt + 1))
+    done
+    { [ -s "$internal_archive_oracle_pid" ] &&
+      [ -s "$internal_archive_ready" ]; } ||
+        fail "internal archive controller did not reach its workspace boundary"
+    IFS= read -r copy_signal_producer_pid <"$internal_archive_oracle_pid" ||
+        fail "cannot read internal archive outer publisher PID"
+    internal_archive_pid=$(sed -n 's/^pid=//p' "$internal_archive_ready")
+    internal_archive_workspace=$(sed -n 's/^workspace=//p' \
+        "$internal_archive_ready")
+    case $copy_signal_producer_pid:$internal_archive_pid in
+        *[!0-9:]*|:*|*:) fail "internal archive fixture reported invalid PIDs" ;;
+    esac
+    [ -n "$internal_archive_workspace" ] ||
+        fail "internal archive fixture did not report its workspace"
+    kill -s "$internal_signal" "$copy_signal_producer_pid" ||
+        fail "cannot signal internal archive outer publisher"
+    if ! wait "$copy_pid"; then
+        copy_pid=
+        fail "waitpid oracle rejected internal archive signal termination"
+    fi
+    copy_pid=
+    copy_signal_producer_pid=
+    grep -Fx "pid=$internal_archive_pid" "$internal_archive_cleanup" \
+        >/dev/null ||
+        fail "internal archive cleanup proof came from the wrong role"
+    grep -Fx "signal=$internal_signal_number" "$internal_archive_cleanup" \
+        >/dev/null ||
+        fail "internal archive controller did not receive the original signal"
+    grep -Fx 'cleanup=ok' "$internal_archive_cleanup" >/dev/null ||
+        fail "internal archive workspace cleanup did not succeed"
+    grep -Fx "workspace=$internal_archive_workspace" \
+        "$internal_archive_cleanup" >/dev/null ||
+        fail "internal archive cleanup proof changed workspace identity"
+    [ ! -e "$internal_archive_workspace" ] &&
+    [ ! -L "$internal_archive_workspace" ] ||
+        fail "internal archive private workspace survived deferred cleanup"
+    grep -Fx "pid=$internal_archive_pid" "$internal_archive_reap" >/dev/null ||
+        fail "outer publisher reaped a different internal archive controller"
+    grep -Fx 'signaled=1' "$internal_archive_reap" >/dev/null ||
+        fail "internal archive controller was not reaped as signal-terminated"
+    grep -Fx "signal=$internal_signal_number" "$internal_archive_reap" \
+        >/dev/null ||
+        fail "internal archive controller was reaped with the wrong signal"
+    cmp -s "$internal_archive_outer_cleanup" - <<'EOF' ||
+cleanup
+EOF
+        fail "internal archive outer publisher bypassed normal cleanup"
+    [ ! -e "$internal_archive_dist/$internal_archive_final" ] &&
+    [ ! -L "$internal_archive_dist/$internal_archive_final" ] ||
+        fail "signalled internal archive published a canonical artifact"
+    set -- "$internal_archive_dist"/."$internal_archive_final".tmp.*
+    case $copy_platform in
+        FreeBSD)
+            { [ "$#" -eq 1 ] && [ ! -e "$1" ] && [ ! -L "$1" ]; } ||
+                fail "signalled internal archive left FreeBSD staging residue"
+            ;;
+        *)
+            { [ "$#" -eq 1 ] && [ -f "$1" ] && [ ! -L "$1" ]; } ||
+                fail "signalled internal archive did not safely retain staging"
+            rm -f "$1" ||
+                fail "cannot retire internal archive signal fixture"
+            ;;
+    esac
 
     # An ignored disposition is an intentional caller policy (for example,
     # nohup), not a request for the publisher to install a forwarding handler.
@@ -3263,12 +3766,14 @@ EOF
     copy_reap_violations=
     for copy_reap_signal in HUP INT QUIT TERM; do
         copy_reap_report=$tmp/copy-reap-$copy_reap_signal.report
-        rm -f "$copy_reap_report" "$copy_archive" \
+        copy_reap_cleanup=$tmp/copy-reap-$copy_reap_signal.cleanup
+        rm -f "$copy_reap_report" "$copy_reap_cleanup" "$copy_archive" \
             "$copy_dir"/.archive.tar.gz.tmp.*
         copy_reap_status=0
         if GITSWITCH_RELEASE_TEST_FATAL_DEFAULTS=1 \
             GITSWITCH_RELEASE_TEST_REAP_SIGNAL=$copy_reap_signal \
             GITSWITCH_RELEASE_TEST_REAP_REPORT_FD=9 \
+            GITSWITCH_RELEASE_TEST_SIGNAL_CLEANUP_MARKER=$copy_reap_cleanup \
             "$named_publish_helper" "$copy_dir" "$copy_canonical" \
                 archive.tar.gz -- /bin/sh -c \
                 'printf reap-transition-payload' \
@@ -3290,21 +3795,31 @@ EOF
         fi
         cmp -s "$copy_reap_report_expected" "$copy_reap_report" ||
             copy_reap_violations="$copy_reap_violations $copy_reap_signal-guard"
+        cmp -s "$copy_reap_cleanup" - <<'EOF' ||
+cleanup
+EOF
+            copy_reap_violations="$copy_reap_violations $copy_reap_signal-cleanup-owner"
         { [ ! -e "$copy_archive" ] && [ ! -L "$copy_archive" ]; } ||
             copy_reap_violations="$copy_reap_violations $copy_reap_signal-published"
         set -- "$copy_dir"/.archive.tar.gz.tmp.*
-        if [ "$#" -ne 1 ] || [ ! -f "$1" ]; then
-            copy_reap_violations="$copy_reap_violations $copy_reap_signal-temp-shape"
-        else
-            cmp -s "$copy_reap_expected" "$1" ||
-                copy_reap_violations="$copy_reap_violations $copy_reap_signal-temp-bytes"
-            [ "$(find "$1" -prune -type f -perm 0600 -print)" = "$1" ] ||
-                copy_reap_violations="$copy_reap_violations $copy_reap_signal-temp-mode"
-        fi
-        rm -f "$copy_archive" "$copy_dir"/.archive.tar.gz.tmp.*
-        set -- "$copy_dir"/.archive.tar.gz.tmp.*
-        { [ "$#" -eq 1 ] && [ ! -e "$1" ] && [ ! -L "$1" ]; } ||
-            copy_reap_violations="$copy_reap_violations $copy_reap_signal-temp-residue"
+        case $copy_platform in
+            FreeBSD)
+                { [ "$#" -eq 1 ] && [ ! -e "$1" ] && [ ! -L "$1" ]; } ||
+                    copy_reap_violations="$copy_reap_violations $copy_reap_signal-temp-residue"
+                ;;
+            *)
+                if [ "$#" -ne 1 ] || [ ! -f "$1" ]; then
+                    copy_reap_violations="$copy_reap_violations $copy_reap_signal-temp-shape"
+                else
+                    cmp -s "$copy_reap_expected" "$1" ||
+                        copy_reap_violations="$copy_reap_violations $copy_reap_signal-temp-bytes"
+                    [ "$(find "$1" -prune -type f -perm 0600 -print)" = "$1" ] ||
+                        copy_reap_violations="$copy_reap_violations $copy_reap_signal-temp-mode"
+                    rm -f "$1" ||
+                        copy_reap_violations="$copy_reap_violations $copy_reap_signal-temp-cleanup"
+                fi
+                ;;
+        esac
     done
     [ -z "$copy_reap_violations" ] ||
         fail "guarded producer-reap violations:$copy_reap_violations"
@@ -3313,7 +3828,8 @@ EOF
     # and may auto-reap children. The publisher must establish its own wait
     # ownership before fork so the same guarded retirement proof still runs.
     copy_reap_chld_report=$tmp/copy-reap-sigchld.report
-    rm -f "$copy_reap_chld_report" "$copy_archive" \
+    copy_reap_chld_cleanup=$tmp/copy-reap-sigchld.cleanup
+    rm -f "$copy_reap_chld_report" "$copy_reap_chld_cleanup" "$copy_archive" \
         "$copy_dir"/.archive.tar.gz.tmp.*
     copy_reap_status=0
     if (
@@ -3321,9 +3837,11 @@ EOF
         GITSWITCH_RELEASE_TEST_FATAL_DEFAULTS=1
         GITSWITCH_RELEASE_TEST_REAP_SIGNAL=TERM
         GITSWITCH_RELEASE_TEST_REAP_REPORT_FD=9
+        GITSWITCH_RELEASE_TEST_SIGNAL_CLEANUP_MARKER=$copy_reap_chld_cleanup
         export GITSWITCH_RELEASE_TEST_FATAL_DEFAULTS
         export GITSWITCH_RELEASE_TEST_REAP_SIGNAL
         export GITSWITCH_RELEASE_TEST_REAP_REPORT_FD
+        export GITSWITCH_RELEASE_TEST_SIGNAL_CLEANUP_MARKER
         exec "$named_publish_helper" "$copy_dir" "$copy_canonical" \
             archive.tar.gz -- /bin/sh -c 'printf reap-transition-payload' \
             9>"$copy_reap_chld_report" >"$out" 2>&1
@@ -3343,16 +3861,28 @@ EOF
     esac
     cmp -s "$copy_reap_report_expected" "$copy_reap_chld_report" ||
         fail "inherited SIGCHLD bypassed guarded producer retirement"
+    cmp -s "$copy_reap_chld_cleanup" - <<'EOF' ||
+cleanup
+EOF
+        fail "inherited SIGCHLD bypassed normal cleanup ownership"
     { [ ! -e "$copy_archive" ] && [ ! -L "$copy_archive" ]; } ||
         fail "inherited-SIGCHLD transition left a canonical artifact"
     set -- "$copy_dir"/.archive.tar.gz.tmp.*
-    { [ "$#" -eq 1 ] && [ -f "$1" ]; } ||
-        fail "inherited-SIGCHLD transition did not retain one private temporary"
-    cmp -s "$copy_reap_expected" "$1" ||
-        fail "inherited-SIGCHLD transition changed captured bytes"
-    [ "$(find "$1" -prune -type f -perm 0600 -print)" = "$1" ] ||
-        fail "inherited-SIGCHLD transition left a non-private temporary"
-    rm -f "$copy_archive" "$copy_dir"/.archive.tar.gz.tmp.*
+    case $copy_platform in
+        FreeBSD)
+            { [ "$#" -eq 1 ] && [ ! -e "$1" ] && [ ! -L "$1" ]; } ||
+                fail "inherited-SIGCHLD transition left private staging residue"
+            ;;
+        *)
+            { [ "$#" -eq 1 ] && [ -f "$1" ]; } ||
+                fail "inherited-SIGCHLD transition did not retain one private temporary"
+            cmp -s "$copy_reap_expected" "$1" ||
+                fail "inherited-SIGCHLD transition changed captured bytes"
+            [ "$(find "$1" -prune -type f -perm 0600 -print)" = "$1" ] ||
+                fail "inherited-SIGCHLD transition left a non-private temporary"
+            rm -f "$1"
+            ;;
+    esac
 
     # Restoring the exact entry mask matters: a signal blocked by the caller
     # must remain pending and blocked after retirement, not be unconditionally
@@ -3400,10 +3930,12 @@ EOF
     copy_reap_terminate_expected=$tmp/copy-reap-terminate.expected
     copy_reap_terminate_report=$tmp/copy-reap-terminate.report
     copy_reap_terminate_delayed=$tmp/copy-reap-terminate.delayed
+    copy_reap_terminate_cleanup=$tmp/copy-reap-terminate.cleanup
     printf '%s' reap-terminate-payload >"$copy_reap_terminate_expected" ||
         fail "cannot create terminate-reap expected payload"
     rm -f "$copy_reap_terminate_report" \
-        "$copy_reap_terminate_delayed" "$copy_archive" \
+        "$copy_reap_terminate_delayed" "$copy_reap_terminate_cleanup" \
+        "$copy_archive" \
         "$copy_dir"/.archive.tar.gz.tmp.*
     copy_reap_status=0
     # The producer, not this parent shell, expands the fixture variables.
@@ -3412,6 +3944,7 @@ EOF
         GITSWITCH_RELEASE_TEST_FATAL_DEFAULTS=1 \
         GITSWITCH_RELEASE_TEST_REAP_SIGNAL=TERM \
         GITSWITCH_RELEASE_TEST_REAP_REPORT_FD=9 \
+        GITSWITCH_RELEASE_TEST_SIGNAL_CLEANUP_MARKER=$copy_reap_terminate_cleanup \
         "$named_publish_helper" "$copy_dir" "$copy_canonical" \
             archive.tar.gz -- /bin/sh -c '
                 printf reap-terminate-payload
@@ -3432,21 +3965,30 @@ EOF
     esac
     cmp -s "$copy_reap_report_expected" "$copy_reap_terminate_report" ||
         fail "terminate-reap transition exposed stale producer ownership"
+    cmp -s "$copy_reap_terminate_cleanup" - <<'EOF' ||
+cleanup
+EOF
+        fail "terminate-reap transition bypassed normal cleanup ownership"
     [ ! -e "$copy_reap_terminate_delayed" ] ||
         fail "terminate-reap producer survived group teardown"
     { [ ! -e "$copy_archive" ] && [ ! -L "$copy_archive" ]; } ||
         fail "terminate-reap transition left a canonical artifact"
     set -- "$copy_dir"/.archive.tar.gz.tmp.*
-    { [ "$#" -eq 1 ] && [ -f "$1" ]; } ||
-        fail "terminate-reap transition did not retain one private temporary"
-    cmp -s "$copy_reap_terminate_expected" "$1" ||
-        fail "terminate-reap transition changed captured bytes"
-    [ "$(find "$1" -prune -type f -perm 0600 -print)" = "$1" ] ||
-        fail "terminate-reap transition left a non-private temporary"
-    rm -f "$copy_archive" "$copy_dir"/.archive.tar.gz.tmp.*
-    set -- "$copy_dir"/.archive.tar.gz.tmp.*
-    { [ "$#" -eq 1 ] && [ ! -e "$1" ] && [ ! -L "$1" ]; } ||
-        fail "terminate-reap transition left temporary residue"
+    case $copy_platform in
+        FreeBSD)
+            { [ "$#" -eq 1 ] && [ ! -e "$1" ] && [ ! -L "$1" ]; } ||
+                fail "terminate-reap transition left temporary residue"
+            ;;
+        *)
+            { [ "$#" -eq 1 ] && [ -f "$1" ]; } ||
+                fail "terminate-reap transition did not retain one private temporary"
+            cmp -s "$copy_reap_terminate_expected" "$1" ||
+                fail "terminate-reap transition changed captured bytes"
+            [ "$(find "$1" -prune -type f -perm 0600 -print)" = "$1" ] ||
+                fail "terminate-reap transition left a non-private temporary"
+            rm -f "$1"
+            ;;
+    esac
 
     # A descendant that never closes the inherited stream must not hang the
     # release indefinitely or leave a canonical artifact. The named test
@@ -4558,45 +5100,24 @@ EOF
         fail "cannot create hostile user RPM macro fixture"
     cp "$rpm_home/.rpmmacros" "$rpm_fixture/rpmmacros.expected" ||
         fail "cannot preserve hostile user RPM macros"
-    rpm_real_cmp=$(command -v cmp) || fail "cmp is unavailable for RPM fixture"
-    printf '%s\n' "$rpm_real_cmp" >"$rpm_shims/real-cmp" ||
-        fail "cannot record real cmp for RPM fixture"
-    cat >"$rpm_shims/cmp" <<'EOF'
-#!/bin/sh
-shim_dir=${0%/*}
-IFS= read -r real_cmp <"$shim_dir/real-cmp" || exit 96
-"$real_cmp" "$@"
-cmp_status=$?
-if [ "$cmp_status" -eq 0 ] &&
-   [ "${AR11_RPM_MODE-}" = symlink-srpms ] &&
-   [ "$#" -eq 3 ] && [ "$1" = -s ]; then
-    cmp_canonical=false
-    cmp_private=false
-    case $2 in
-        "$AR11_RPM_REPO_ROOT/build/dist/"*.tar.gz) cmp_canonical=true ;;
-    esac
-    case $3 in
-        "$AR11_RPM_HOME/.gitswitch-rpmbuild."??????/SOURCES/*.tar.gz)
-            cmp_private=true ;;
-    esac
-    if [ "$cmp_canonical" = true ] && [ "$cmp_private" = true ] &&
-       [ ! -e "$AR11_RPM_STATE/archive-swap.marker" ]; then
-        cp "$2" "$AR11_RPM_STATE/archive-swap.original" || exit 95
-        chmod 0600 "$2" || exit 94
-        printf '%s\n' 'canonical archive replaced after private-copy proof' \
-            >"$2" || exit 93
-        : >"$AR11_RPM_STATE/archive-swap.marker" || exit 92
-    fi
-fi
-exit "$cmp_status"
-EOF
-    chmod 0700 "$rpm_shims/cmp" ||
-        fail "cannot activate canonical-archive swap shim"
-
     git clone --quiet "$root" "$rpm_alpha_repo" ||
         fail "cannot clone alpha RPM fixture"
     git clone --quiet "$root" "$rpm_beta_repo" ||
         fail "cannot clone beta RPM fixture"
+    cp "$root/tools/release_rpm.sh" "$rpm_alpha_repo/tools/release_rpm.sh" ||
+        fail "cannot refresh alpha RPM helper from the working tree"
+    cp "$root/tools/release_rpm.sh" "$rpm_beta_repo/tools/release_rpm.sh" ||
+        fail "cannot refresh beta RPM helper from the working tree"
+    cp "$root/tools/release_publish.c" \
+        "$rpm_alpha_repo/tools/release_publish.c" ||
+        fail "cannot refresh alpha release publisher from the working tree"
+    cp "$root/tools/release_publish.c" \
+        "$rpm_beta_repo/tools/release_publish.c" ||
+        fail "cannot refresh beta release publisher from the working tree"
+    cp "$root/Makefile" "$rpm_alpha_repo/Makefile" ||
+        fail "cannot refresh alpha release-publisher build rules"
+    cp "$root/Makefile" "$rpm_beta_repo/Makefile" ||
+        fail "cannot refresh beta release-publisher build rules"
     for rpm_lane in alpha beta; do
         case $rpm_lane in
             alpha) rpm_lane_repo=$rpm_alpha_repo ;;
@@ -4608,7 +5129,9 @@ EOF
         printf '\nAR11_RPM_SOURCE: %s\n' "$rpm_lane" \
             >>"$rpm_lane_repo/README.md" ||
             fail "cannot mark $rpm_lane RPM source"
-        git -C "$rpm_lane_repo" add -- gitswitcher.spec README.md ||
+        git -C "$rpm_lane_repo" add -- \
+            Makefile gitswitcher.spec README.md \
+            tools/release_rpm.sh tools/release_publish.c ||
             fail "cannot stage $rpm_lane RPM fixture"
         git -C "$rpm_lane_repo" \
             -c user.name='AR-11 RPM fixture' \
@@ -4743,7 +5266,7 @@ esac
 [ "$rpm_specdir" = "$rpm_topdir/SPECS" ] &&
 [ "$rpm_srcrpmdir" = "$rpm_topdir/SRPMS" ] &&
 [ "$rpm_tmppath" = "$rpm_topdir/TMP" ] ||
-    rpm_die "subordinate RPM macros escaped the private _topdir"
+    rpm_die "rpmbuild macros escaped the pinned private namespace"
 [ "$rpm_filename_macro" = \
     '%{ARCH}/%{NAME}-%{VERSION}-%{RELEASE}.%{ARCH}.rpm' ] ||
     rpm_die "RPM output filename layout was not pinned"
@@ -4759,10 +5282,31 @@ for rpm_component in BUILD BUILDROOT PUBLISH RPMS SOURCES SPECS SRPMS TMP; do
         -print 2>/dev/null)" = "$rpm_component_path" ] ||
         rpm_die "private $rpm_component directory is not mode 0700"
 done
-[ "$rpm_spec" = "$rpm_topdir/SPECS/gitswitcher.spec" ] ||
-    rpm_die "-ba did not receive the private spec"
-[ -f "$rpm_spec" ] && [ ! -L "$rpm_spec" ] ||
-    rpm_die "private spec is not a regular file"
+[ "$rpm_spec" = /dev/fd/9 ] ||
+    rpm_die "-ba did not receive descriptor-pinned spec fd 9"
+
+rpm_spec_fd=$rpm_spec
+rpm_named_spec=$rpm_topdir/SPECS/gitswitcher.spec
+if [ "$AR11_RPM_MODE" = descriptor-inputs ]; then
+    mv "$rpm_named_spec" "$AR11_RPM_STATE/descriptor-inputs.spec.original" ||
+        rpm_die "cannot move the descriptor-pinned spec pathname"
+    printf '%s\n' '# substituted private spec pathname' >"$rpm_named_spec" ||
+        rpm_die "cannot install substituted private spec pathname"
+    : >"$AR11_RPM_STATE/descriptor-inputs.spec-swapped" ||
+        rpm_die "cannot record private spec substitution"
+fi
+
+# Plain FreeBSD fdescfs duplicates fd 9 with a shared offset, and pathname
+# type predicates inspect the fdescfs node rather than the opened file. The
+# production C identity ABI already proved fd 9 is regular and nonempty;
+# consume it exactly once after the causal pathname substitution, then prove
+# and perform every fixture read against a private regular snapshot.
+rpm_spec=$AR11_RPM_STATE/.spec-snapshot.$AR11_RPM_MODE.$$
+(umask 077 && /bin/cat "$rpm_spec_fd" >"$rpm_spec") ||
+    rpm_die "cannot snapshot descriptor-pinned spec"
+chmod 0600 "$rpm_spec" || rpm_die "cannot secure private spec snapshot"
+[ -s "$rpm_spec" ] && [ -f "$rpm_spec" ] && [ ! -L "$rpm_spec" ] ||
+    rpm_die "private spec snapshot is not a nonempty regular file"
 
 rpm_lane=$(sed -n 's/^# AR11_RPM_LANE: //p' "$rpm_spec" | sed -n '1p')
 case $rpm_lane in
@@ -4776,11 +5320,24 @@ rpm_version=$(sed -n 's/^Version:[[:space:]]*//p' "$rpm_spec" | sed -n '1p')
 rpm_source=$rpm_topdir/SOURCES/$rpm_package-$rpm_version.tar.gz
 rpm_canonical_source=$AR11_RPM_REPO_ROOT/build/dist/$rpm_package-$rpm_version.tar.gz
 [ -f "$rpm_source" ] && [ ! -L "$rpm_source" ] ||
-    rpm_die "private Source0 is not a regular file"
+    rpm_die "descriptor-relative Source0 is not a regular file"
 rpm_source_oracle=$rpm_canonical_source
-if [ "$AR11_RPM_MODE" = symlink-srpms ] &&
-   [ -f "$AR11_RPM_STATE/archive-swap.marker" ]; then
-    rpm_source_oracle=$AR11_RPM_STATE/archive-swap.original
+case $AR11_RPM_MODE in
+    descriptor-inputs|symlink-srpms)
+        cp "$rpm_canonical_source" \
+            "$AR11_RPM_STATE/$AR11_RPM_MODE.archive-swap.original" ||
+            rpm_die "cannot preserve the descriptor-pinned canonical archive"
+        chmod 0600 "$rpm_canonical_source" ||
+            rpm_die "cannot make the canonical archive pathname mutable"
+        printf '%s\n' 'canonical archive pathname substituted after fd pin' \
+            >"$rpm_canonical_source" ||
+            rpm_die "cannot substitute the canonical archive pathname"
+        : >"$AR11_RPM_STATE/$AR11_RPM_MODE.archive-swap.marker" ||
+            rpm_die "cannot record canonical archive substitution"
+        rpm_source_oracle=$AR11_RPM_STATE/$AR11_RPM_MODE.archive-swap.original
+        ;;
+esac
+if [ "$rpm_source_oracle" != "$rpm_canonical_source" ]; then
     if cmp -s "$rpm_canonical_source" "$rpm_source"; then
         rpm_die "canonical archive swap did not separate the private source"
     fi
@@ -4802,15 +5359,29 @@ cmp -s "$rpm_archived_spec" "$rpm_spec" ||
 grep -Fx "AR11_RPM_SOURCE: $rpm_lane" "$rpm_archived_readme" >/dev/null ||
     rpm_die "private Source0 belongs to the other build"
 rm -f "$rpm_archived_spec" "$rpm_archived_readme"
-if [ "$AR11_RPM_MODE" = symlink-srpms ]; then
-    cp "$AR11_RPM_STATE/archive-swap.original" "$rpm_canonical_source" ||
+case $AR11_RPM_MODE in
+    descriptor-inputs|symlink-srpms)
+    cp "$AR11_RPM_STATE/$AR11_RPM_MODE.archive-swap.original" \
+        "$rpm_canonical_source" ||
         rpm_die "cannot restore canonical archive after private extraction"
     chmod 0444 "$rpm_canonical_source" ||
         rpm_die "cannot restore canonical archive mode"
-    cmp -s "$AR11_RPM_STATE/archive-swap.original" "$rpm_canonical_source" ||
+    cmp -s "$AR11_RPM_STATE/$AR11_RPM_MODE.archive-swap.original" \
+        "$rpm_canonical_source" ||
         rpm_die "restored canonical archive changed bytes"
-    : >"$AR11_RPM_STATE/archive-swap.restored" ||
+    : >"$AR11_RPM_STATE/$AR11_RPM_MODE.archive-swap.restored" ||
         rpm_die "cannot record private archive extraction proof"
+    ;;
+esac
+if [ "$AR11_RPM_MODE" = descriptor-inputs ]; then
+    rm -f "$rpm_named_spec" ||
+        rpm_die "cannot remove substituted private spec pathname"
+    mv "$AR11_RPM_STATE/descriptor-inputs.spec.original" "$rpm_named_spec" ||
+        rpm_die "cannot restore the descriptor-pinned spec pathname"
+    cmp -s "$rpm_spec" "$rpm_named_spec" ||
+        rpm_die "restored spec pathname differs from pinned spec"
+    : >"$AR11_RPM_STATE/descriptor-inputs.spec-restored" ||
+        rpm_die "cannot record private spec restoration"
 fi
 
 rpm_source_hash=$(git hash-object "$rpm_source") ||
@@ -4825,6 +5396,7 @@ printf '%s\n%s\n%s\n%s\n%s\n' \
     rpm_die "cannot record private RPM inputs"
 mv "$rpm_report_tmp" "$rpm_report" ||
     rpm_die "cannot publish private RPM input report"
+rm -f "$rpm_spec" || rpm_die "cannot retire private spec snapshot"
 
 rpm_wait_for_pair()
 {
@@ -4862,6 +5434,18 @@ if [ "$AR11_RPM_MODE" = concurrent ]; then
     rpm_wait_for_pair checked
 fi
 
+if [ "$AR11_RPM_MODE" = descriptor-dirs ]; then
+    for rpm_swapped_component in RPMS SRPMS PUBLISH; do
+        mv "$rpm_topdir/$rpm_swapped_component" \
+            "$AR11_RPM_STATE/descriptor-dirs.$rpm_swapped_component.original" ||
+            rpm_die "cannot move pinned $rpm_swapped_component directory"
+        mkdir -m 0700 "$rpm_topdir/$rpm_swapped_component" ||
+            rpm_die "cannot install replacement $rpm_swapped_component directory"
+    done
+    : >"$AR11_RPM_STATE/descriptor-dirs.swapped" ||
+        rpm_die "cannot record private directory substitutions"
+fi
+
 rpm_binary_dir=$rpm_topdir/RPMS/noarch
 mkdir -m 0700 "$rpm_binary_dir" || rpm_die "cannot create binary RPM directory"
 rpm_binary_name=$rpm_package-$rpm_version-1.noarch.rpm
@@ -4872,6 +5456,17 @@ printf 'kind=binary\nlane=%s\nmode=%s\nsource=%s\nspec=%s\n' \
 cp "$rpm_binary" \
     "$AR11_RPM_STATE/$AR11_RPM_MODE.$rpm_lane.binary.expected" ||
     rpm_die "cannot preserve expected binary RPM"
+if [ "$AR11_RPM_MODE" = binary-subset ]; then
+    rpm_binary_extra_name=$rpm_package-extra-$rpm_version-1.noarch.rpm
+    rpm_binary_extra=$rpm_binary_dir/$rpm_binary_extra_name
+    printf 'kind=binary-extra\nlane=%s\nmode=%s\nsource=%s\nspec=%s\n' \
+        "$rpm_lane" "$AR11_RPM_MODE" "$rpm_source_hash" "$rpm_spec_hash" \
+        >"$rpm_binary_extra" ||
+        rpm_die "cannot create second causal binary RPM"
+    cp "$rpm_binary_extra" \
+        "$AR11_RPM_STATE/$AR11_RPM_MODE.$rpm_lane.binary-extra.expected" ||
+        rpm_die "cannot preserve expected second binary RPM"
+fi
 
 if [ "$AR11_RPM_MODE" = symlink-srpms ]; then
     rpm_escape_dir=$AR11_RPM_STATE/symlink-srpms.$rpm_lane.escape
@@ -4889,8 +5484,14 @@ printf 'kind=source\nlane=%s\nmode=%s\nsource=%s\nspec=%s\n' \
 cp "$rpm_built_source" \
     "$AR11_RPM_STATE/$AR11_RPM_MODE.$rpm_lane.source.expected" ||
     rpm_die "cannot preserve expected source RPM"
-printf '%s\n' 'must not be published' >"$rpm_topdir/RPMS/ignored.txt" ||
-    rpm_die "cannot create non-RPM output decoy"
+if [ "$AR11_RPM_MODE" = source0-swap ]; then
+    mv "$rpm_source" "$AR11_RPM_STATE/source0-swap.original" ||
+        rpm_die "cannot move the pinned Source0 pathname"
+    printf '%s\n' 'persistent substituted Source0 pathname' >"$rpm_source" ||
+        rpm_die "cannot install substituted Source0 pathname"
+    : >"$AR11_RPM_STATE/source0-swap.marker" ||
+        rpm_die "cannot record persistent Source0 substitution"
+fi
 EOF
     chmod 0700 "$rpm_shims/rpmbuild" ||
         fail "cannot activate private-rpmbuild shim"
@@ -5101,6 +5702,22 @@ EOF
     [ -f "$rpm_beta_named_publisher" ] &&
     [ ! -L "$rpm_beta_named_publisher" ] ||
         fail "beta RPM fixture lacks its named-test release publisher"
+    rpm_beta_race_publisher=$rpm_shims/race-publisher
+    cat >"$rpm_beta_race_publisher" <<'EOF'
+#!/bin/sh
+set -u
+: "${AR11_RPM_NAMED_PUBLISHER:?}"
+if [ "${1-}" = --internal-release-tree-from-dir-v1 ] &&
+   [ -n "${GITSWITCH_RELEASE_TEST_RELEASE_SOURCE_MARKER-}" ] &&
+   [ -e "$GITSWITCH_RELEASE_TEST_RELEASE_SOURCE_MARKER" ] &&
+   [ -e "${GITSWITCH_RELEASE_TEST_RELEASE_SOURCE_RELEASE-}" ]; then
+    unset GITSWITCH_RELEASE_TEST_RELEASE_SOURCE_MARKER
+    unset GITSWITCH_RELEASE_TEST_RELEASE_SOURCE_RELEASE
+fi
+exec "$AR11_RPM_NAMED_PUBLISHER" "$@"
+EOF
+    chmod 0700 "$rpm_beta_race_publisher" ||
+        fail "cannot activate RPM C-helper race wrapper"
     rpm_helper=$rpm_beta_repo/tools/release_rpm.sh
     [ -f "$rpm_helper" ] && [ ! -L "$rpm_helper" ] ||
         fail "RPM release helper is unavailable to direct fixtures"
@@ -5108,6 +5725,395 @@ EOF
     rpm_fixture_dist_root=gitswitcher-$rpm_fixture_version
     rpm_binary_name=gitswitcher-$rpm_fixture_version-1.noarch.rpm
     rpm_source_name=gitswitcher-$rpm_fixture_version-1.src.rpm
+
+    # AR-14 M27: these pathname spellings are the vulnerable reopen sites.
+    # Keep mutation-visible structural guards beside the causal shims so a
+    # later refactor cannot silently restore pathname consumption while still
+    # satisfying the happy-path package assertions.
+    if grep -F "cp \"\$rpm_archive\"" "$rpm_helper" >/dev/null ||
+       grep -F "cmp -s \"\$rpm_archive\"" "$rpm_helper" >/dev/null; then
+        fail "RPM helper restored canonical archive pathname consumption"
+    fi
+    grep -F -- "--define \"_rpmdir \$rpm_topdir/RPMS\"" \
+        "$rpm_helper" >/dev/null &&
+    grep -F -- "--define \"_srcrpmdir \$rpm_topdir/SRPMS\"" \
+        "$rpm_helper" >/dev/null &&
+    grep -F -- "--define \"_sourcedir \$rpm_topdir/SOURCES\"" \
+        "$rpm_helper" >/dev/null &&
+    grep -F -- '-ba /dev/fd/9' "$rpm_helper" >/dev/null ||
+        fail "RPM helper lost its portable rpmbuild/spec ABI"
+    if grep -F -- "-ba \"\$rpm_spec\"" "$rpm_helper" >/dev/null; then
+        fail "RPM helper restored private spec pathname consumption"
+    fi
+    grep -F -- "--internal-rpm-stage-v1 3 \"\$rpm_rpms_device\"" \
+        "$rpm_helper" >/dev/null &&
+    grep -F -- '--internal-regular-fd-identity-v1' \
+        "$rpm_helper" >/dev/null &&
+    grep -F "4 \"\$rpm_srpms_device\" \"\$rpm_srpms_inode\"" \
+        "$rpm_helper" >/dev/null &&
+    grep -F "5 \"\$rpm_publish_device\" \"\$rpm_publish_inode\"" \
+        "$rpm_helper" >/dev/null &&
+    grep -F -- '--internal-release-tree-from-dir-v1' \
+        "$rpm_helper" >/dev/null ||
+        fail "RPM helper lost descriptor-relative C staging/publication"
+    if grep -F "/bin/cat \"\$rpm_private_file\"" \
+        "$rpm_helper" >/dev/null; then
+        fail "RPM helper restored staged RPM pathname consumption"
+    fi
+    if grep -E "/dev/fd/[345]/|\"\\\\\$rpm_topdir\"/(RPMS|SRPMS|PUBLISH)/?\\\\\\*" \
+        "$rpm_helper" >/dev/null; then
+        fail "RPM helper restored descriptor-child or glob enumeration"
+    fi
+
+    # Replace and restore both canonical input pathnames after the helper has
+    # pinned archive/Source0 through fd 6/fd 8 and passed the spec to rpmbuild
+    # through fd 9. The package retains the original committed archive/spec.
+    rm -f "$rpm_beta_repo/build/dist/$rpm_binary_name" \
+        "$rpm_beta_repo/build/dist/$rpm_source_name" ||
+        fail "cannot reset descriptor-input RPM outputs"
+    rpm_descriptor_input_out=$rpm_fixture/descriptor-inputs.out
+    HOME="$rpm_home" PATH="$rpm_shims:$PATH" \
+    AR11_RPM_STATE="$rpm_state" AR11_RPM_MODE=descriptor-inputs \
+    AR11_RPM_HOME="$rpm_home" AR11_RPM_REPO_ROOT="$rpm_beta_root" \
+        sh "$rpm_helper" "$rpm_beta_root" "$rpm_beta_archive" \
+        "$rpm_archive_name" "$rpm_fixture_dist_root" gitswitcher \
+        "$rpm_beta_publisher" >"$rpm_descriptor_input_out" 2>&1 || {
+        sed -n '1,240p' "$rpm_descriptor_input_out" >&2
+        fail "descriptor-pinned RPM input substitution fixture failed"
+    }
+    for rpm_descriptor_marker in \
+        descriptor-inputs.archive-swap.marker \
+        descriptor-inputs.archive-swap.restored \
+        descriptor-inputs.spec-swapped \
+        descriptor-inputs.spec-restored; do
+        [ -f "$rpm_state/$rpm_descriptor_marker" ] ||
+            fail "RPM input substitution missed $rpm_descriptor_marker"
+    done
+    cmp -s "$rpm_state/descriptor-inputs.archive-swap.original" \
+        "$rpm_beta_archive" ||
+        fail "descriptor-input fixture did not restore canonical archive bytes"
+    rpm_assert_publication "$rpm_beta_repo" beta descriptor-inputs
+    rpm_descriptor_input_topdir=$(sed -n '1p' \
+        "$rpm_state/descriptor-inputs.beta.observed")
+    [ -n "$rpm_descriptor_input_topdir" ] ||
+        fail "descriptor-input fixture omitted its private topdir"
+    rpm_assert_private_retirement "$rpm_descriptor_input_topdir" \
+        "$rpm_descriptor_input_out"
+    rpm_assert_no_private_residue "$rpm_beta_repo"
+
+    # A persistent Source0 replacement is detectable even though stock
+    # rpmbuild necessarily opens that mandatory named leaf. This is distinct
+    # from the documented colluding replace/read/restore residual: the helper
+    # must re-prove the original Source0 generation after rpmbuild returns.
+    rm -f "$rpm_beta_repo/build/dist/$rpm_binary_name" \
+        "$rpm_beta_repo/build/dist/$rpm_source_name" ||
+        fail "cannot reset persistent Source0 substitution outputs"
+    rpm_source0_swap_out=$rpm_fixture/source0-swap.out
+    if HOME="$rpm_home" PATH="$rpm_shims:$PATH" \
+        AR11_RPM_STATE="$rpm_state" AR11_RPM_MODE=source0-swap \
+        AR11_RPM_HOME="$rpm_home" AR11_RPM_REPO_ROOT="$rpm_beta_root" \
+        sh "$rpm_helper" "$rpm_beta_root" "$rpm_beta_archive" \
+        "$rpm_archive_name" "$rpm_fixture_dist_root" gitswitcher \
+        "$rpm_beta_publisher" >"$rpm_source0_swap_out" 2>&1; then
+        fail "RPM helper accepted a persistent Source0 replacement"
+    fi
+    [ -f "$rpm_state/source0-swap.marker" ] ||
+        fail "persistent Source0 substitution did not reach rpmbuild"
+    cmp -s "$rpm_state/source0-swap.original" "$rpm_beta_archive" ||
+        fail "persistent Source0 fixture did not preserve original bytes"
+    [ ! -e "$rpm_beta_repo/build/dist/$rpm_binary_name" ] &&
+    [ ! -L "$rpm_beta_repo/build/dist/$rpm_binary_name" ] &&
+    [ ! -e "$rpm_beta_repo/build/dist/$rpm_source_name" ] &&
+    [ ! -L "$rpm_beta_repo/build/dist/$rpm_source_name" ] ||
+        fail "persistent Source0 replacement exposed a public RPM"
+    rpm_source0_swap_topdir=$(sed -n '1p' \
+        "$rpm_state/source0-swap.beta.observed")
+    [ -n "$rpm_source0_swap_topdir" ] ||
+        fail "persistent Source0 substitution omitted its private topdir"
+    rpm_assert_private_retirement "$rpm_source0_swap_topdir" \
+        "$rpm_source0_swap_out"
+    rpm_assert_no_private_residue "$rpm_beta_repo"
+
+    # Pause the C staging helper after it pins and hashes the selected produced
+    # leaf. Replacing the descriptor-relative pathname at that exact boundary
+    # may preserve the already-open generation or fail closed; attacker bytes
+    # must never reach PUBLISH or build/dist.
+    for rpm_produced_swap_mode in binary-leaf-swap source-leaf-swap; do
+        rpm_produced_swap_pid=
+        rpm_produced_swap_release=
+        rm -f "$rpm_beta_repo/build/dist/$rpm_binary_name" \
+            "$rpm_beta_repo/build/dist/$rpm_source_name" ||
+            fail "cannot reset $rpm_produced_swap_mode outputs"
+        rpm_produced_swap_out=$rpm_fixture/$rpm_produced_swap_mode.out
+        rpm_produced_swap_marker=$rpm_state/$rpm_produced_swap_mode.hook
+        rpm_produced_swap_release=$rpm_state/$rpm_produced_swap_mode.release
+        case $rpm_produced_swap_mode in
+            binary-leaf-swap) rpm_produced_swap_name=$rpm_binary_name ;;
+            source-leaf-swap) rpm_produced_swap_name=$rpm_source_name ;;
+        esac
+        HOME="$rpm_home" PATH="$rpm_shims:$PATH" \
+            AR11_RPM_STATE="$rpm_state" \
+            AR11_RPM_MODE="$rpm_produced_swap_mode" \
+            AR11_RPM_HOME="$rpm_home" AR11_RPM_REPO_ROOT="$rpm_beta_root" \
+            AR11_RPM_NAMED_PUBLISHER="$rpm_beta_named_publisher" \
+            GITSWITCH_RELEASE_TEST_RPM_STAGE_MARKER="$rpm_produced_swap_marker" \
+            GITSWITCH_RELEASE_TEST_RPM_STAGE_RELEASE="$rpm_produced_swap_release" \
+            GITSWITCH_RELEASE_TEST_RPM_STAGE_TARGET="$rpm_produced_swap_name" \
+            sh "$rpm_helper" "$rpm_beta_root" "$rpm_beta_archive" \
+            "$rpm_archive_name" "$rpm_fixture_dist_root" gitswitcher \
+            "$rpm_beta_race_publisher" >"$rpm_produced_swap_out" 2>&1 &
+        rpm_produced_swap_pid=$!
+        rpm_produced_swap_wait=0
+        while [ ! -e "$rpm_produced_swap_marker" ] &&
+              kill -0 "$rpm_produced_swap_pid" 2>/dev/null &&
+              [ "$rpm_produced_swap_wait" -lt 100 ]; do
+            sleep 0.1
+            rpm_produced_swap_wait=$((rpm_produced_swap_wait + 1))
+        done
+        [ -f "$rpm_produced_swap_marker" ] || {
+            sed -n '1,240p' "$rpm_produced_swap_out" >&2
+            fail "$rpm_produced_swap_mode missed its digest-proof boundary"
+        }
+        rpm_produced_swap_topdir=$(sed -n '1p' \
+            "$rpm_state/$rpm_produced_swap_mode.beta.observed")
+        [ -n "$rpm_produced_swap_topdir" ] ||
+            fail "$rpm_produced_swap_mode omitted its private topdir"
+        case $rpm_produced_swap_mode in
+            binary-leaf-swap)
+                rpm_produced_swap_expected=$rpm_state/$rpm_produced_swap_mode.beta.binary.expected
+                rpm_produced_swap_path=$rpm_produced_swap_topdir/RPMS/noarch/$rpm_produced_swap_name
+                ;;
+            source-leaf-swap)
+                rpm_produced_swap_expected=$rpm_state/$rpm_produced_swap_mode.beta.source.expected
+                rpm_produced_swap_path=$rpm_produced_swap_topdir/SRPMS/$rpm_produced_swap_name
+                ;;
+        esac
+        mv "$rpm_produced_swap_path" \
+            "$rpm_state/$rpm_produced_swap_mode.$rpm_produced_swap_name.original" ||
+            fail "cannot move $rpm_produced_swap_mode pinned generation"
+        printf '%s\n' 'substituted produced RPM pathname' \
+            >"$rpm_produced_swap_path" ||
+            fail "cannot install $rpm_produced_swap_mode replacement"
+        : >"$rpm_produced_swap_release" ||
+            fail "cannot release $rpm_produced_swap_mode C helper"
+        if wait "$rpm_produced_swap_pid"; then
+            rpm_produced_swap_status=0
+        else
+            rpm_produced_swap_status=$?
+        fi
+        rpm_produced_swap_pid=
+        rpm_produced_swap_release=
+        cmp -s \
+            "$rpm_state/$rpm_produced_swap_mode.$rpm_produced_swap_name.original" \
+            "$rpm_produced_swap_expected" ||
+            fail "$rpm_produced_swap_mode changed the pinned output bytes"
+        if [ "$rpm_produced_swap_status" -eq 0 ]; then
+            rpm_assert_publication "$rpm_beta_repo" beta \
+                "$rpm_produced_swap_mode"
+        else
+            [ ! -e "$rpm_beta_repo/build/dist/$rpm_binary_name" ] &&
+            [ ! -L "$rpm_beta_repo/build/dist/$rpm_binary_name" ] &&
+            [ ! -e "$rpm_beta_repo/build/dist/$rpm_source_name" ] &&
+            [ ! -L "$rpm_beta_repo/build/dist/$rpm_source_name" ] ||
+                fail "$rpm_produced_swap_mode exposed a public RPM"
+        fi
+        rpm_assert_private_retirement "$rpm_produced_swap_topdir" \
+            "$rpm_produced_swap_out"
+        rpm_assert_no_private_residue "$rpm_beta_repo"
+    done
+
+    # The C stager must enumerate the already-open RPMS generation, not a
+    # replacement pathname exposing only one of two valid binary outputs.
+    rpm_binary_extra_name=gitswitcher-extra-$rpm_fixture_version-1.noarch.rpm
+    rm -f "$rpm_beta_repo/build/dist/$rpm_binary_name" \
+        "$rpm_beta_repo/build/dist/$rpm_binary_extra_name" \
+        "$rpm_beta_repo/build/dist/$rpm_source_name" ||
+        fail "cannot reset complete-enumeration RPM outputs"
+    rpm_subset_out=$rpm_fixture/binary-subset.out
+    rpm_subset_marker=$rpm_state/binary-subset.hook
+    rpm_subset_pid=
+    rpm_subset_release=
+    rpm_subset_release=$rpm_state/binary-subset.release
+    HOME="$rpm_home" PATH="$rpm_shims:$PATH" \
+        AR11_RPM_STATE="$rpm_state" AR11_RPM_MODE=binary-subset \
+        AR11_RPM_HOME="$rpm_home" AR11_RPM_REPO_ROOT="$rpm_beta_root" \
+        AR11_RPM_NAMED_PUBLISHER="$rpm_beta_named_publisher" \
+        GITSWITCH_RELEASE_TEST_RPM_STAGE_MARKER="$rpm_subset_marker" \
+        GITSWITCH_RELEASE_TEST_RPM_STAGE_RELEASE="$rpm_subset_release" \
+        GITSWITCH_RELEASE_TEST_RPM_STAGE_TARGET="$rpm_binary_name" \
+        sh "$rpm_helper" "$rpm_beta_root" "$rpm_beta_archive" \
+        "$rpm_archive_name" "$rpm_fixture_dist_root" gitswitcher \
+        "$rpm_beta_race_publisher" >"$rpm_subset_out" 2>&1 &
+    rpm_subset_pid=$!
+    rpm_subset_wait=0
+    while [ ! -e "$rpm_subset_marker" ] &&
+          kill -0 "$rpm_subset_pid" 2>/dev/null &&
+          [ "$rpm_subset_wait" -lt 100 ]; do
+        sleep 0.1
+        rpm_subset_wait=$((rpm_subset_wait + 1))
+    done
+    [ -f "$rpm_subset_marker" ] || {
+        sed -n '1,240p' "$rpm_subset_out" >&2
+        fail "complete-enumeration fixture missed its pinned-leaf boundary"
+    }
+    rpm_subset_topdir=$(sed -n '1p' \
+        "$rpm_state/binary-subset.beta.observed")
+    [ -n "$rpm_subset_topdir" ] ||
+        fail "complete-enumeration fixture omitted its private topdir"
+    mv "$rpm_subset_topdir/RPMS" "$rpm_state/binary-subset.RPMS.original" ||
+        fail "cannot move the enumerated RPMS generation"
+    mkdir -m 0700 "$rpm_subset_topdir/RPMS" \
+        "$rpm_subset_topdir/RPMS/noarch" ||
+        fail "cannot install subset RPMS replacement"
+    cp "$rpm_state/binary-subset.RPMS.original/noarch/$rpm_binary_name" \
+        "$rpm_subset_topdir/RPMS/noarch/$rpm_binary_name" ||
+        fail "cannot seed one-leaf RPMS replacement"
+    : >"$rpm_subset_release" ||
+        fail "cannot release complete-enumeration C helper"
+    if wait "$rpm_subset_pid"; then
+        rpm_subset_status=0
+    else
+        rpm_subset_status=$?
+    fi
+    rpm_subset_pid=
+    rpm_subset_release=
+    if [ "$rpm_subset_status" -eq 0 ]; then
+        set -- "$rpm_beta_repo/build/dist"/*.rpm
+        [ "$#" -eq 3 ] ||
+            fail "descriptor-relative enumeration published a package subset"
+        cmp -s "$rpm_beta_repo/build/dist/$rpm_binary_name" \
+            "$rpm_state/binary-subset.beta.binary.expected" &&
+        cmp -s "$rpm_beta_repo/build/dist/$rpm_binary_extra_name" \
+            "$rpm_state/binary-subset.beta.binary-extra.expected" &&
+        cmp -s "$rpm_beta_repo/build/dist/$rpm_source_name" \
+            "$rpm_state/binary-subset.beta.source.expected" ||
+            fail "descriptor-relative enumeration published wrong package bytes"
+    else
+        grep -F 'cannot validate and stage the complete RPM output set' \
+            "$rpm_subset_out" >/dev/null ||
+            fail "subset race did not fail at complete-set staging"
+        if grep -F 'RPM set publication is incomplete' \
+            "$rpm_subset_out" >/dev/null; then
+            fail "failed complete-set staging leaked partial records"
+        fi
+        [ ! -e "$rpm_beta_repo/build/dist/$rpm_binary_name" ] &&
+        [ ! -L "$rpm_beta_repo/build/dist/$rpm_binary_name" ] &&
+        [ ! -e "$rpm_beta_repo/build/dist/$rpm_binary_extra_name" ] &&
+        [ ! -L "$rpm_beta_repo/build/dist/$rpm_binary_extra_name" ] &&
+        [ ! -e "$rpm_beta_repo/build/dist/$rpm_source_name" ] &&
+        [ ! -L "$rpm_beta_repo/build/dist/$rpm_source_name" ] ||
+            fail "failed-closed enumeration exposed a package subset"
+    fi
+    rm -f "$rpm_beta_repo/build/dist/$rpm_binary_name" \
+        "$rpm_beta_repo/build/dist/$rpm_binary_extra_name" \
+        "$rpm_beta_repo/build/dist/$rpm_source_name" ||
+        fail "cannot reset complete-enumeration publications"
+    rpm_assert_private_retirement "$rpm_subset_topdir" "$rpm_subset_out"
+    rpm_assert_no_private_residue "$rpm_beta_repo"
+
+    # Pause publication after the C helper proves the staged source identity
+    # and digest. It must publish from that open generation, not reopen the
+    # substituted PUBLISH pathname.
+    rm -f "$rpm_beta_repo/build/dist/$rpm_binary_name" \
+        "$rpm_beta_repo/build/dist/$rpm_source_name" ||
+        fail "cannot reset staged-leaf substitution outputs"
+    rpm_publish_swap_out=$rpm_fixture/publish-leaf-swap.out
+    rpm_publish_swap_marker=$rpm_state/publish-leaf-swap.hook
+    rpm_publish_swap_pid=
+    rpm_publish_swap_release=
+    rpm_publish_swap_release=$rpm_state/publish-leaf-swap.release
+    HOME="$rpm_home" PATH="$rpm_shims:$PATH" \
+        AR11_RPM_STATE="$rpm_state" AR11_RPM_MODE=publish-leaf-swap \
+        AR11_RPM_HOME="$rpm_home" AR11_RPM_REPO_ROOT="$rpm_beta_root" \
+        AR11_RPM_NAMED_PUBLISHER="$rpm_beta_named_publisher" \
+        GITSWITCH_RELEASE_TEST_RELEASE_SOURCE_MARKER="$rpm_publish_swap_marker" \
+        GITSWITCH_RELEASE_TEST_RELEASE_SOURCE_RELEASE="$rpm_publish_swap_release" \
+        sh "$rpm_helper" "$rpm_beta_root" "$rpm_beta_archive" \
+        "$rpm_archive_name" "$rpm_fixture_dist_root" gitswitcher \
+        "$rpm_beta_race_publisher" >"$rpm_publish_swap_out" 2>&1 &
+    rpm_publish_swap_pid=$!
+    rpm_publish_swap_wait=0
+    while [ ! -e "$rpm_publish_swap_marker" ] &&
+          kill -0 "$rpm_publish_swap_pid" 2>/dev/null &&
+          [ "$rpm_publish_swap_wait" -lt 100 ]; do
+        sleep 0.1
+        rpm_publish_swap_wait=$((rpm_publish_swap_wait + 1))
+    done
+    [ -f "$rpm_publish_swap_marker" ] || {
+        sed -n '1,240p' "$rpm_publish_swap_out" >&2
+        fail "staged-leaf substitution missed its digest-proof boundary"
+    }
+    rpm_publish_swap_topdir=$(sed -n '1p' \
+        "$rpm_state/publish-leaf-swap.beta.observed")
+    [ -n "$rpm_publish_swap_topdir" ] ||
+        fail "staged-leaf substitution omitted its private topdir"
+    rpm_publish_swap_path=$rpm_publish_swap_topdir/PUBLISH/$rpm_binary_name
+    mv "$rpm_publish_swap_path" \
+        "$rpm_state/publish-leaf-swap.$rpm_binary_name.original" ||
+        fail "cannot move descriptor-pinned staged RPM"
+    printf '%s\n' 'substituted staged RPM pathname' >"$rpm_publish_swap_path" ||
+        fail "cannot install substituted staged RPM pathname"
+    : >"$rpm_publish_swap_release" ||
+        fail "cannot release staged-leaf publication helper"
+    if wait "$rpm_publish_swap_pid"; then
+        rpm_publish_swap_status=0
+    else
+        rpm_publish_swap_status=$?
+    fi
+    rpm_publish_swap_pid=
+    rpm_publish_swap_release=
+    if [ "$rpm_publish_swap_status" -eq 0 ]; then
+        rpm_assert_publication "$rpm_beta_repo" beta publish-leaf-swap
+    else
+        [ ! -e "$rpm_beta_repo/build/dist/$rpm_binary_name" ] &&
+        [ ! -L "$rpm_beta_repo/build/dist/$rpm_binary_name" ] &&
+        [ ! -e "$rpm_beta_repo/build/dist/$rpm_source_name" ] &&
+        [ ! -L "$rpm_beta_repo/build/dist/$rpm_source_name" ] ||
+            fail "failed-closed staged substitution exposed a public RPM"
+    fi
+    rpm_assert_private_retirement "$rpm_publish_swap_topdir" \
+        "$rpm_publish_swap_out"
+    rpm_assert_no_private_residue "$rpm_beta_repo"
+
+    # Replace all three output-directory pathnames during rpmbuild. Stock
+    # rpmbuild may write into those hostile generations, but the helper's
+    # post-build identity fence must reject them before the descriptor-relative
+    # C staging helper can inspect or publish any package.
+    rm -f "$rpm_beta_repo/build/dist/$rpm_binary_name" \
+        "$rpm_beta_repo/build/dist/$rpm_source_name" ||
+        fail "cannot reset descriptor-directory substitution outputs"
+    rpm_descriptor_dirs_out=$rpm_fixture/descriptor-dirs.out
+    if HOME="$rpm_home" PATH="$rpm_shims:$PATH" \
+        AR11_RPM_STATE="$rpm_state" AR11_RPM_MODE=descriptor-dirs \
+        AR11_RPM_HOME="$rpm_home" AR11_RPM_REPO_ROOT="$rpm_beta_root" \
+        sh "$rpm_helper" "$rpm_beta_root" "$rpm_beta_archive" \
+        "$rpm_archive_name" "$rpm_fixture_dist_root" gitswitcher \
+        "$rpm_beta_publisher" >"$rpm_descriptor_dirs_out" 2>&1; then
+        rpm_descriptor_dirs_status=0
+    else
+        rpm_descriptor_dirs_status=$?
+    fi
+    [ -f "$rpm_state/descriptor-dirs.swapped" ] ||
+        fail "descriptor-directory substitution did not reach rpmbuild"
+    [ -z "$(find "$rpm_state/descriptor-dirs.RPMS.original" \
+        -mindepth 1 -print -quit)" ] &&
+    [ -z "$(find "$rpm_state/descriptor-dirs.SRPMS.original" \
+        -mindepth 1 -print -quit)" ] ||
+        fail "rpmbuild unexpectedly wrote through the moved directory generation"
+    rpm_descriptor_dirs_topdir=$(sed -n '1p' \
+        "$rpm_state/descriptor-dirs.beta.observed")
+    [ -n "$rpm_descriptor_dirs_topdir" ] ||
+        fail "descriptor-directory substitution omitted its private topdir"
+    [ "$rpm_descriptor_dirs_status" -ne 0 ] ||
+        fail "RPM helper accepted replaced output-directory pathnames"
+    [ ! -e "$rpm_beta_repo/build/dist/$rpm_binary_name" ] &&
+    [ ! -L "$rpm_beta_repo/build/dist/$rpm_binary_name" ] &&
+    [ ! -e "$rpm_beta_repo/build/dist/$rpm_source_name" ] &&
+    [ ! -L "$rpm_beta_repo/build/dist/$rpm_source_name" ] ||
+        fail "rejected directory substitution exposed an RPM"
+    rpm_assert_private_retirement "$rpm_descriptor_dirs_topdir" \
+        "$rpm_descriptor_dirs_out"
+    rpm_assert_no_private_residue "$rpm_beta_repo"
 
     # A wrong generation must not begin a partial walk. This fixture also
     # contains an external symlink: FreeBSD 14.4 can bind its removal to an
@@ -5440,16 +6446,18 @@ EOF
             sed -n '1,200p' "$rpm_incomplete_log" >&2
             fail "partial RPM publication lacked explicit recovery guidance"
         fi
-        if ! grep -E 'inspect and remove only .*exact no-replace outputs' \
+        if ! grep -F \
+            'inspect these exact no-replace outputs before retry; remove a leaf only after its digest matches:' \
             "$rpm_incomplete_log" >/dev/null; then
             sed -n '1,200p' "$rpm_incomplete_log" >&2
-            fail "partial RPM publication lacked exact cleanup guidance"
+            fail "partial RPM publication lacked digest-conditioned cleanup guidance"
         fi
         for rpm_incomplete_name in "$rpm_binary_name" "$rpm_source_name"; do
-            grep -F "build/dist/$rpm_incomplete_name" \
+            grep -E \
+                "build/dist/$rpm_incomplete_name \\(expected sha256 [0-9a-f]{64}; inspect before removal\\)" \
                 "$rpm_incomplete_log" >/dev/null || {
                 sed -n '1,200p' "$rpm_incomplete_log" >&2
-                fail "partial RPM diagnostic omitted $rpm_incomplete_name"
+                fail "partial RPM diagnostic omitted $rpm_incomplete_name digest"
             }
         done
     }
@@ -5476,7 +6484,18 @@ set -u
 if [ "${1-}" = --internal-retire-tree-v1 ]; then
     exec "$AR11_RPM_REAL_PUBLISHER" "$@"
 fi
-[ "${1-}" = --internal-release-tree-v1 ] || exit 93
+if [ "${1-}" = --internal-regular-fd-identity-v1 ]; then
+    [ "$#" -eq 2 ] || exit 89
+    exec "$AR11_RPM_REAL_PUBLISHER" "$@"
+fi
+if [ "${1-}" = --internal-rpm-stage-v1 ]; then
+    [ "$#" -eq 10 ] && [ "$2" = 3 ] && [ "$5" = 4 ] && [ "$8" = 5 ] ||
+        exit 93
+    exec "$AR11_RPM_REAL_PUBLISHER" "$@"
+fi
+[ "${1-}" = --internal-release-tree-from-dir-v1 ] || exit 92
+[ "$#" -eq 12 ] || exit 91
+[ "$6" = 5 ] || exit 90
 partial_count=0
 if [ -f "$AR11_RPM_PUBLISH_COUNT" ]; then
     IFS= read -r partial_count <"$AR11_RPM_PUBLISH_COUNT" || exit 96
@@ -5665,11 +6684,12 @@ EOF
         sed -n '1,240p' "$rpm_symlink_out" >&2
         fail "SRPMS substitution fixture failed before rpmbuild"
     }
-    [ -f "$rpm_state/archive-swap.marker" ] &&
-    [ -f "$rpm_state/archive-swap.original" ] &&
-    [ -f "$rpm_state/archive-swap.restored" ] ||
+    [ -f "$rpm_state/symlink-srpms.archive-swap.marker" ] &&
+    [ -f "$rpm_state/symlink-srpms.archive-swap.original" ] &&
+    [ -f "$rpm_state/symlink-srpms.archive-swap.restored" ] ||
         fail "private-source fixture did not replace the canonical archive"
-    cmp -s "$rpm_state/archive-swap.original" "$rpm_alpha_archive" ||
+    cmp -s "$rpm_state/symlink-srpms.archive-swap.original" \
+        "$rpm_alpha_archive" ||
         fail "private-source fixture did not restore the canonical archive"
     rpm_symlink_topdir=$(sed -n '1p' "$rpm_symlink_report")
     [ -n "$rpm_symlink_topdir" ] ||

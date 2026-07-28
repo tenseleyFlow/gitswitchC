@@ -30,6 +30,18 @@ grep -F '#include "../src/freebsd_compat.h"' \
     "$root/tools/release_publish.c" >/dev/null ||
     fail "release publisher does not consume the FreeBSD floor contract"
 
+# A descriptor may retain the pre-rename spelling reported by F_KINFO even
+# after that pathname selects a replacement directory. SSH socket operations
+# therefore have to stay relative to the already-held runtime directory with
+# connectat(2); falling back to an F_KINFO-derived pathname would discard the
+# transaction's namespace authority.
+connectat_count=$(grep -F -c 'connectat(' "$root/src/ssh_manager.c" || true)
+[ "$connectat_count" -ge 2 ] ||
+    fail "ssh_manager lacks descriptor-relative FreeBSD socket operations"
+if grep -F ', F_KINFO,' "$root/src/ssh_manager.c" >/dev/null; then
+    fail "ssh_manager must not derive socket paths through F_KINFO"
+fi
+
 min_version=$(sed -n \
     's/^#define GITSWITCH_FREEBSD_MIN_VERSION \([0-9][0-9]*\)$/\1/p' \
     "$contract")

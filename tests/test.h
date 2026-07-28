@@ -281,6 +281,42 @@ static inline void ts_cleanup_tmpdirs(void) {
     ts_tmpdir_count = 0;
 }
 
+/* Release one completed fixture before process exit. Long-running suites must
+ * not retain one pinned root descriptor per finished test: Darwin's default
+ * descriptor limit can otherwise make an unrelated late subprocess fail.
+ * The remaining records are compacted so the atexit sweep keeps owning every
+ * still-live fixture exactly once. */
+static inline int ts_cleanup_tracked_tmpdir(const char *path) {
+    int entry_errno = errno;
+
+    if (!path || path[0] == '\0') {
+        errno = EINVAL;
+        return -1;
+    }
+    for (int i = 0; i < ts_tmpdir_count; i++) {
+        if (!ts_tmpdirs[i].path ||
+            strcmp(ts_tmpdirs[i].path, path) != 0) {
+            continue;
+        }
+        ts_cleanup_pinned_root(ts_tmpdirs[i].path,
+                               ts_tmpdirs[i].root_fd,
+                               ts_tmpdirs[i].dev,
+                               ts_tmpdirs[i].ino);
+        free(ts_tmpdirs[i].path);
+        for (int j = i + 1; j < ts_tmpdir_count; j++) {
+            ts_tmpdirs[j - 1] = ts_tmpdirs[j];
+        }
+        ts_tmpdir_count--;
+        memset(&ts_tmpdirs[ts_tmpdir_count], 0,
+               sizeof(ts_tmpdirs[ts_tmpdir_count]));
+        ts_tmpdirs[ts_tmpdir_count].root_fd = -1;
+        errno = entry_errno;
+        return 0;
+    }
+    errno = ENOENT;
+    return -1;
+}
+
 static inline char *ts_mkdtemp(char *tmpl) {
     char *created = mkdtemp(tmpl);
     if (!created) return NULL;
@@ -652,6 +688,7 @@ static inline int ts_test_finish(void) {
         ts_tests_passed++;                                                   \
         printf("[ ok ] %s\n", #fn);                                         \
     }                                                                       \
+    (void)fflush(stdout);                                                    \
 } while (0)
 
 /* AR-10: suites sandbox HOME themselves but inherited GNUPGHOME leaked

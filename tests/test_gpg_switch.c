@@ -20,6 +20,7 @@
 #include "test.h"
 #include "gitswitch.h"
 #include "gpg_manager.h"
+#include "runner_internal.h"
 #include "utils.h"
 #include "error.h"
 #include "signals.h"
@@ -49,6 +50,66 @@
 
 static int g_gpg_execs;
 static const char *env_lookup(const char *const *envp, const char *prefix);
+
+/* The M20 production path binds the exact paired gpg/gpgconf toolchain before
+ * changing an agent config. Model its metadata and reload calls from the
+ * trusted command fixture, and certify every successful injected launch with
+ * the generation actually named by argv[0]. */
+static int prepare_runner_call(const char *const argv[],
+                               const run_opts_t *opts,
+                               run_result_t *result,
+                               bool *handled) {
+    const char *slash;
+    int written;
+
+    if (!argv || !argv[0] || !handled) return -1;
+    *handled = false;
+    if (result) {
+        memset(result, 0, sizeof(*result));
+        result->spawned = true;
+        if (!run_launch_witness_capture(
+                argv[0], &result->launch_witness)) {
+            return -1;
+        }
+    }
+    if (opts && opts->out && opts->out_size > 0) opts->out[0] = '\0';
+
+    if (ts_command_is(argv[0], "gpgconf")) {
+        slash = strrchr(argv[0], '/');
+        if (!slash) return -1;
+        if (argv[1] && strcmp(argv[1], "--list-components") == 0 &&
+            !argv[2]) {
+            if (!opts || !opts->out || opts->out_size == 0) return -1;
+            written = snprintf(
+                opts->out, opts->out_size,
+                "gpg:OpenPGP:%.*s/gpg:\n",
+                (int)(slash - argv[0]), argv[0]);
+            if (written < 0 || (size_t)written >= opts->out_size) return -1;
+            if (result) result->out_len = (size_t)written;
+        } else if (argv[1] && argv[2] && !argv[3] &&
+                   strcmp(argv[1], "--reload") == 0 &&
+                   strcmp(argv[2], "gpg-agent") == 0) {
+            /* The exact paired gpgconf launch is the reload witness; this
+             * command intentionally produces no modeled output. */
+        } else {
+            return -1;
+        }
+        *handled = true;
+    }
+    return 0;
+}
+
+static int toolchain_runner(const char *const argv[], const run_opts_t *opts,
+                            run_result_t *result) {
+    bool handled;
+
+    if (prepare_runner_call(argv, opts, result, &handled) != 0 ||
+        !handled) {
+        if (result) result->exit_code = 8;
+        return -1;
+    }
+    return 0;
+}
 
 static int make_xdg(char *path, size_t path_size, const char *template) {
     if (!path || !template ||
@@ -91,11 +152,10 @@ static bool has_gpg_config_scratch(const char *home) {
  * record, so the switch's already-present fast path is taken. */
 static int counting_runner(const char *const argv[], const run_opts_t *opts,
                            run_result_t *result) {
-    if (result) {
-        memset(result, 0, sizeof(*result));
-        result->spawned = true;
-    }
-    if (opts && opts->out && opts->out_size > 0) opts->out[0] = '\0';
+    bool handled;
+
+    if (prepare_runner_call(argv, opts, result, &handled) != 0) return -1;
+    if (handled) return 0;
 
     if (ts_command_is(argv[0], "gpg") || ts_command_is(argv[0], "gpg2")) {
         g_gpg_execs++;
@@ -134,15 +194,13 @@ static int swapping_listing_runner(const char *const argv[],
                                    const run_opts_t *opts,
                                    run_result_t *result) {
     bool listing = false;
+    bool handled;
     struct stat cwd_st;
     struct stat named_st;
     const char *gh = NULL;
 
-    if (result) {
-        memset(result, 0, sizeof(*result));
-        result->spawned = true;
-    }
-    if (opts && opts->out && opts->out_size > 0) opts->out[0] = '\0';
+    if (prepare_runner_call(argv, opts, result, &handled) != 0) return -1;
+    if (handled) return 0;
     if (ts_command_is(argv[0], "gpg") || ts_command_is(argv[0], "gpg2")) {
         for (int i = 1; argv[i]; i++) {
             if (strcmp(argv[i], "--list-secret-keys") == 0) listing = true;
@@ -299,11 +357,10 @@ static int truncating_export_runner(const char *const argv[],
                                     const run_opts_t *opts,
                                     run_result_t *result) {
     bool is_export = false, is_import = false, is_listing = false;
-    if (result) {
-        memset(result, 0, sizeof(*result));
-        result->spawned = true;
-    }
-    if (opts && opts->out && opts->out_size > 0) opts->out[0] = '\0';
+    bool handled;
+
+    if (prepare_runner_call(argv, opts, result, &handled) != 0) return -1;
+    if (handled) return 0;
 
     if (ts_command_is(argv[0], "gpg") || ts_command_is(argv[0], "gpg2")) {
         for (int i = 1; argv[i]; i++) {
@@ -421,11 +478,10 @@ static const char *env_lookup(const char *const *envp, const char *prefix) {
 static int import_flow_runner(const char *const argv[], const run_opts_t *opts,
                               run_result_t *result) {
     bool is_export = false, is_import = false, is_listing = false;
-    if (result) {
-        memset(result, 0, sizeof(*result));
-        result->spawned = true;
-    }
-    if (opts && opts->out && opts->out_size > 0) opts->out[0] = '\0';
+    bool handled;
+
+    if (prepare_runner_call(argv, opts, result, &handled) != 0) return -1;
+    if (handled) return 0;
 
     if (ts_command_is(argv[0], "gpg") || ts_command_is(argv[0], "gpg2")) {
         for (int i = 1; argv[i]; i++) {
@@ -1258,11 +1314,10 @@ static int truncated_probe_runner(const char *const argv[],
                                   const run_opts_t *opts,
                                   run_result_t *result) {
     bool is_listing = false;
-    if (result) {
-        memset(result, 0, sizeof(*result));
-        result->spawned = true;
-    }
-    if (opts && opts->out && opts->out_size > 0) opts->out[0] = '\0';
+    bool handled;
+
+    if (prepare_runner_call(argv, opts, result, &handled) != 0) return -1;
+    if (handled) return 0;
 
     if (ts_command_is(argv[0], "gpg") || ts_command_is(argv[0], "gpg2")) {
         for (int i = 1; argv[i]; i++) {
@@ -1328,6 +1383,7 @@ TEST_MAIN_BEGIN()
         "gpg", "gpgconf", NULL
     };
     ts_trusted_command_fixture_t command_fixture = {0};
+    command_runner_fn previous_runner;
 
     error_init(LOG_LEVEL_ERROR, NULL);
     if (ts_trusted_command_fixture_install(
@@ -1337,6 +1393,7 @@ TEST_MAIN_BEGIN()
                 "HARNESS FAIL: cannot install trusted GPG command fixtures\n");
         return 1;
     }
+    previous_runner = run_set_runner(toolchain_runner);
     RUN_TEST(repeat_isolated_switch_spawns_gpg_once);
     RUN_TEST(isolated_switch_fails_when_current_cannot_be_retargeted);
     RUN_TEST(truncated_secret_key_export_is_never_imported);
@@ -1353,6 +1410,7 @@ TEST_MAIN_BEGIN()
     RUN_TEST(gpg_current_snapshot_and_conditional_restore_are_compare_and_swap);
     RUN_TEST(gpg_current_snapshot_blocks_on_base_lock);
     RUN_TEST(truncated_idempotency_probe_is_not_signing_evidence);
+    run_set_runner(previous_runner);
     if (ts_trusted_command_fixture_restore(&command_fixture) != 0) {
         fprintf(stderr,
                 "HARNESS FAIL: cannot restore PATH after GPG switch tests\n");

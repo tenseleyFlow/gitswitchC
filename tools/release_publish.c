@@ -125,8 +125,11 @@ static void usage(const char *program)
             "usage: %s OUTPUT_DIRECTORY CANONICAL_DIRECTORY FINAL_NAME -- COMMAND [ARG ...]\n"
             "       %s --internal-release-tree-v1 ROOT BUILD_COMPONENT DIST_COMPONENT FINAL_NAME -- COMMAND [ARG ...]\n"
             "       %s --internal-release-tree-consume-v1 ROOT BUILD_COMPONENT DIST_COMPONENT PRIVATE_NAME -- PRODUCER [ARG ...] --internal-consumer-v1 CONSUMER [ARG ...]\n"
+            "       %s --internal-release-tree-from-dir-v1 ROOT BUILD_COMPONENT DIST_COMPONENT FINAL_NAME SOURCE_DIR_FD SOURCE_DIR_DEV SOURCE_DIR_INO EXPECTED_DEV EXPECTED_INO EXPECTED_SIZE EXPECTED_SHA256\n"
+            "       %s --internal-rpm-stage-v1 RPMS_FD RPMS_DEV RPMS_INO SRPMS_FD SRPMS_DEV SRPMS_INO PUBLISH_FD PUBLISH_DEV PUBLISH_INO\n"
+            "       %s --internal-regular-fd-identity-v1 FD\n"
             "       %s --internal-retire-tree-v1 HOME PRIVATE_NAME EXPECTED_DEV EXPECTED_INO\n",
-            program, program, program, program);
+            program, program, program, program, program, program, program);
 }
 
 static bool same_identity(const struct stat *left, const struct stat *right)
@@ -945,8 +948,9 @@ static int sha256_final(sha256_context_t *context,
     return 0;
 }
 
-static int digest_read_only_regular_descriptor(
-    int fd, off_t expected_size, unsigned char digest[SHA256_DIGEST_SIZE])
+static int digest_regular_descriptor(
+    int fd, off_t expected_size, mode_t expected_permissions,
+    unsigned char digest[SHA256_DIGEST_SIZE])
 {
     unsigned char buffer[64U * 1024U];
     sha256_context_t context;
@@ -963,8 +967,8 @@ static int digest_read_only_regular_descriptor(
         return -1;
     }
     if (!S_ISREG(before.st_mode) || before.st_size != expected_size ||
-        (before.st_mode & 07777) !=
-            (S_IRUSR | S_IRGRP | S_IROTH)) {
+        (expected_permissions != (mode_t)-1 &&
+         (before.st_mode & 07777) != expected_permissions)) {
         errno = ESTALE;
         return -1;
     }
@@ -996,12 +1000,19 @@ static int digest_read_only_regular_descriptor(
         return -1;
     }
     if (!same_identity(&before, &after) || after.st_size != expected_size ||
-        (after.st_mode & 07777) !=
-            (S_IRUSR | S_IRGRP | S_IROTH)) {
+        (expected_permissions != (mode_t)-1 &&
+         (after.st_mode & 07777) != expected_permissions)) {
         errno = ESTALE;
         return -1;
     }
     return sha256_final(&context, digest);
+}
+
+static int digest_read_only_regular_descriptor(
+    int fd, off_t expected_size, unsigned char digest[SHA256_DIGEST_SIZE])
+{
+    return digest_regular_descriptor(
+        fd, expected_size, S_IRUSR | S_IRGRP | S_IROTH, digest);
 }
 
 #if defined(GITSWITCH_RELEASE_TEST_DIGEST)
@@ -1190,6 +1201,8 @@ static int verify_named_temp_identity(int directory_fd, const char *temp_name,
 #if defined(GITSWITCH_RELEASE_TEST_CLEANUP_RACE) || \
     defined(GITSWITCH_RELEASE_TEST_ADOPTION_RACE) || \
     defined(GITSWITCH_RELEASE_TEST_DURABILITY) || \
+    defined(GITSWITCH_RELEASE_TEST_RPM_STAGE_RACE) || \
+    defined(GITSWITCH_RELEASE_TEST_RELEASE_SOURCE_RACE) || \
     (defined(__FreeBSD__) && \
      defined(GITSWITCH_RELEASE_TEST_PUBLICATION_RACE))
 static int run_test_race_hook(const char *marker_variable,
@@ -1258,6 +1271,38 @@ static int run_final_tree_race_hook(void)
     return run_test_race_hook("GITSWITCH_RELEASE_TEST_FINAL_TREE_MARKER",
                               "GITSWITCH_RELEASE_TEST_FINAL_TREE_RELEASE",
                               &hook_used);
+#else
+    return 0;
+#endif
+}
+
+static int run_rpm_stage_race_hook(const char *name)
+{
+#if defined(GITSWITCH_RELEASE_TEST_RPM_STAGE_RACE)
+    const char *target =
+        getenv("GITSWITCH_RELEASE_TEST_RPM_STAGE_TARGET"); /* Flawfinder: ignore -- named-fixture-only leaf selector */
+    static bool hook_used;
+
+    if (target != NULL && strcmp(target, name) != 0) {
+        return 0;
+    }
+    return run_test_race_hook("GITSWITCH_RELEASE_TEST_RPM_STAGE_MARKER",
+                              "GITSWITCH_RELEASE_TEST_RPM_STAGE_RELEASE",
+                              &hook_used);
+#else
+    (void)name;
+    return 0;
+#endif
+}
+
+static int run_release_source_race_hook(void)
+{
+#if defined(GITSWITCH_RELEASE_TEST_RELEASE_SOURCE_RACE)
+    static bool hook_used;
+
+    return run_test_race_hook(
+        "GITSWITCH_RELEASE_TEST_RELEASE_SOURCE_MARKER",
+        "GITSWITCH_RELEASE_TEST_RELEASE_SOURCE_RELEASE", &hook_used);
 #else
     return 0;
 #endif
@@ -1906,6 +1951,13 @@ static int archive_workspace_cleanup(archive_workspace_t *workspace)
     }
     return 0;
 }
+
+static void report_deferred_fatal_cleanup(void);
+static int finish_deferred_fatal_signal(void);
+static int run_internal_archive_signal_test_hook(
+    const archive_workspace_t *workspace);
+static void report_internal_archive_signal_cleanup(
+    const archive_workspace_t *workspace, int cleanup_result);
 
 static int archive_write_minimal_git_config(
     const archive_workspace_t *workspace, archive_object_format_t format)
@@ -2780,6 +2832,12 @@ static int run_internal_release_archive(char *const arguments[])
                 strerror(errno));
         goto cleanup;
     }
+    if (run_internal_archive_signal_test_hook(&workspace) != 0) {
+        fprintf(stderr,
+                "release-archive: ERROR: cannot complete internal signal fixture: %s\n",
+                strerror(errno));
+        goto cleanup;
+    }
     if (archive_set_clean_environment(path_copy, &workspace) != 0 ||
         archive_resolve_object_database(resolved_root, &workspace) != 0) {
         fprintf(stderr,
@@ -2856,6 +2914,9 @@ cleanup:
                 strerror(errno));
         result = EXIT_FAILURE;
     }
+    report_internal_archive_signal_cleanup(&workspace, cleanup_result);
+    report_deferred_fatal_cleanup();
+    (void)finish_deferred_fatal_signal();
     return result;
 }
 
@@ -2863,11 +2924,22 @@ cleanup:
  * retained. In particular, a successful direct child can become waitable
  * while a descendant still owns the output pipe. */
 static volatile sig_atomic_t fatal_signal_producer = 0;
+static volatile sig_atomic_t fatal_signal_producer_defers_cleanup = 0;
+static volatile sig_atomic_t fatal_signal_pending = 0;
 _Static_assert(sizeof(sig_atomic_t) >= sizeof(pid_t),
                "pid_t must fit in sig_atomic_t for release-child publication");
 static const int forwarded_fatal_signals[] = {
     SIGINT, SIGTERM, SIGHUP, SIGQUIT
 };
+static struct sigaction saved_fatal_actions[
+    sizeof(forwarded_fatal_signals) / sizeof(forwarded_fatal_signals[0])];
+static bool fatal_action_installed[
+    sizeof(forwarded_fatal_signals) / sizeof(forwarded_fatal_signals[0])];
+static sigset_t saved_fatal_mask;
+static bool fatal_signal_state_saved = false;
+#if defined(GITSWITCH_RELEASE_TEST_SIGNAL_DEFAULT)
+static char internal_archive_cleanup_report_path[PATH_MAX];
+#endif
 #if defined(GITSWITCH_RELEASE_TEST_REAP_TRANSITION)
 static volatile sig_atomic_t test_reap_transition_active = 0;
 static int test_reap_transition_signal = 0;
@@ -3090,6 +3162,7 @@ static producer_reap_result_t reap_and_retire_producer(pid_t child,
          (result.waited < 0 && result.wait_errno == ECHILD)) &&
         (pid_t)fatal_signal_producer == child) {
         fatal_signal_producer = 0;
+        fatal_signal_producer_defers_cleanup = 0;
     }
     if (sigprocmask(SIG_SETMASK, &saved_mask, NULL) != 0) {
         result.mask_errno = errno;
@@ -3395,18 +3468,27 @@ static producer_stream_result_t copy_producer_stream(int input_fd,
     }
 }
 
-/* AR-10 L30: the producer runs in its own process group as the helper's
+/* AR-10 L30 / AR-14 L21: the producer runs in its own process group as the
  * lifetime boundary — which also removes it from the terminal's foreground
- * group, so a fatal signal delivered to the helper used to kill only the
- * helper and abandon the still-running producer group. The handler covers
- * SIGINT, SIGTERM, SIGHUP, and SIGQUIT: kill the group, then die by the same
- * signal with default disposition so the caller observes a truthful
- * signal-death status. kill/signal/raise are all async-signal-safe. */
+ * group. The handler records only the first fatal signal. The internal archive
+ * producer receives that exact signal so its own normal flow can remove its
+ * private workspace; an arbitrary external producer/consumer receives SIGKILL
+ * because it may ignore the requested fatal signal. The handler then returns:
+ * parent-owned staging cleanup and exact signal reproduction belong to normal
+ * control flow. */
 
 static void forward_fatal_signal(int signal_number)
 {
+    int saved_errno = errno;
     pid_t child = (pid_t)fatal_signal_producer;
+    int producer_signal =
+        fatal_signal_producer_defers_cleanup != 0 ? signal_number : SIGKILL;
 
+    if (fatal_signal_pending != 0) {
+        errno = saved_errno;
+        return;
+    }
+    fatal_signal_pending = (sig_atomic_t)signal_number;
     if (child > 0) {
 #if defined(GITSWITCH_RELEASE_TEST_REAP_TRANSITION)
         if (test_reap_transition_active != 0) {
@@ -3415,17 +3497,103 @@ static void forward_fatal_signal(int signal_number)
             report_reap_transition(stale_ownership);
             /* Never let the deliberate test mutant signal a numeric identity
              * after waitpid has made it reusable. */
-            _exit(90);
+            errno = saved_errno;
+            return;
         }
 #endif
-        (void)kill(-child, SIGKILL);
-        (void)kill(child, SIGKILL);
+        (void)kill(-child, producer_signal);
+        (void)kill(child, producer_signal);
     }
-    (void)signal(signal_number, SIG_DFL);
-    (void)raise(signal_number);
+    errno = saved_errno;
 }
 
 #if defined(GITSWITCH_RELEASE_TEST_SIGNAL_DEFAULT)
+static int write_signal_test_report(const char *path,
+                                    const unsigned char *bytes, size_t size)
+{
+    int report_fd;
+    int saved_errno;
+
+    report_fd = open(path, O_WRONLY | O_CREAT | O_EXCL | O_NOFOLLOW |
+                               O_CLOEXEC,
+                     S_IRUSR | S_IWUSR);
+    if (report_fd < 0) {
+        return -1;
+    }
+    if (write_all(report_fd, bytes, size) != 0) {
+        saved_errno = errno;
+        (void)close(report_fd);
+        errno = saved_errno;
+        return -1;
+    }
+    return close(report_fd);
+}
+
+static int run_internal_archive_signal_test_hook(
+    const archive_workspace_t *workspace)
+{
+    const char *ready_path =
+        getenv("GITSWITCH_RELEASE_TEST_INTERNAL_ARCHIVE_READY"); /* Flawfinder: ignore — named-fixture-only report path */
+    const char *cleanup_path =
+        getenv("GITSWITCH_RELEASE_TEST_INTERNAL_ARCHIVE_CLEANUP_REPORT"); /* Flawfinder: ignore — named-fixture-only report path */
+    char report[PATH_MAX + 64U];
+    struct timespec interval = {0, 10 * 1000 * 1000};
+    int length;
+    int attempts;
+
+    if (ready_path == NULL && cleanup_path == NULL) {
+        return 0;
+    }
+    if (ready_path == NULL || ready_path[0] == '\0' ||
+        cleanup_path == NULL || cleanup_path[0] == '\0' ||
+        strlen(cleanup_path) >= sizeof(internal_archive_cleanup_report_path)) {
+        errno = EINVAL;
+        return -1;
+    }
+    memcpy(internal_archive_cleanup_report_path, cleanup_path,
+           strlen(cleanup_path) + 1U);
+    length = snprintf(report, sizeof(report), "pid=%ld\nworkspace=%s\n",
+                      (long)getpid(), workspace->root);
+    if (length < 0 || (size_t)length >= sizeof(report) ||
+        write_signal_test_report(
+            ready_path, (const unsigned char *)report, (size_t)length) != 0) {
+        return -1;
+    }
+    for (attempts = 0; fatal_signal_pending == 0 && attempts < 3000;
+         attempts++) {
+        if (nanosleep(&interval, NULL) != 0 && errno != EINTR) {
+            return -1;
+        }
+    }
+    if (fatal_signal_pending == 0) {
+        errno = ETIMEDOUT;
+        return -1;
+    }
+    return 0;
+}
+
+static void report_internal_archive_signal_cleanup(
+    const archive_workspace_t *workspace, int cleanup_result)
+{
+    char report[PATH_MAX + 96U];
+    int length;
+
+    if (internal_archive_cleanup_report_path[0] == '\0') {
+        return;
+    }
+    length = snprintf(report, sizeof(report),
+                      "pid=%ld\nsignal=%d\ncleanup=%s\nworkspace=%s\n",
+                      (long)getpid(), (int)fatal_signal_pending,
+                      cleanup_result == 0 ? "ok" : "failed",
+                      workspace->root);
+    if (length < 0 || (size_t)length >= sizeof(report)) {
+        return;
+    }
+    (void)write_signal_test_report(
+        internal_archive_cleanup_report_path,
+        (const unsigned char *)report, (size_t)length);
+}
+
 /* A shell cannot restore a signal that was ignored when the shell started.
  * The named-temp test helper uses this opt-in seam to give the fatal-signal
  * contract a deterministic default, unblocked starting state in every CI
@@ -3459,9 +3627,24 @@ static int reset_fatal_signals_for_test(void)
     }
     return sigprocmask(SIG_UNBLOCK, &fatal_set, NULL);
 }
+#else
+static int run_internal_archive_signal_test_hook(
+    const archive_workspace_t *workspace)
+{
+    (void)workspace;
+    return 0;
+}
+
+static void report_internal_archive_signal_cleanup(
+    const archive_workspace_t *workspace, int cleanup_result)
+{
+    (void)workspace;
+    (void)cleanup_result;
+}
 #endif
 
-#if defined(GITSWITCH_RELEASE_TEST_REAP_TRANSITION) || \
+#if defined(GITSWITCH_RELEASE_TEST_SIGNAL_DEFAULT) || \
+    defined(GITSWITCH_RELEASE_TEST_REAP_TRANSITION) || \
     defined(GITSWITCH_RELEASE_TEST_FORK_TRANSITION)
 static int parse_fatal_test_signal(const char *signal_name,
                                    int *selected_signal)
@@ -3479,6 +3662,111 @@ static int parse_fatal_test_signal(const char *signal_name,
         return -1;
     }
     return 0;
+}
+#endif
+
+#if defined(GITSWITCH_RELEASE_TEST_SIGNAL_DEFAULT)
+static int run_signal_wait_oracle(int argc, char **argv)
+{
+    const char *pid_report =
+        getenv("GITSWITCH_RELEASE_TEST_WAIT_ORACLE_PID_REPORT"); /* Flawfinder: ignore — named-fixture-only report path */
+    char report[64];
+    int expected_signal;
+    int length;
+    int status;
+    pid_t child;
+    pid_t waited;
+
+    if (argc < 5 || strcmp(argv[3], "--") != 0 ||
+        parse_fatal_test_signal(argv[2], &expected_signal) != 0) {
+        fprintf(stderr,
+                "ERROR: signal wait oracle requires SIGNAL -- COMMAND\n");
+        return EXIT_FAILURE;
+    }
+    child = fork();
+    if (child < 0) {
+        fprintf(stderr, "ERROR: signal wait oracle cannot fork: %s\n",
+                strerror(errno));
+        return EXIT_FAILURE;
+    }
+    if (child == 0) {
+        execvp(argv[4], &argv[4]); /* Flawfinder: ignore — named-fixture-only exact argv oracle */
+        _exit(errno == ENOENT ? 127 : 126);
+    }
+    if (pid_report != NULL) {
+        length = snprintf(report, sizeof(report), "%ld\n", (long)child);
+        if (pid_report[0] == '\0' || length < 0 ||
+            (size_t)length >= sizeof(report) ||
+            write_signal_test_report(
+                pid_report, (const unsigned char *)report,
+                (size_t)length) != 0) {
+            int saved_errno = errno;
+
+            (void)kill(child, SIGKILL);
+            do {
+                waited = waitpid(child, &status, 0);
+            } while (waited < 0 && errno == EINTR);
+            fprintf(stderr,
+                    "ERROR: signal wait oracle cannot publish child PID: %s\n",
+                    strerror(saved_errno));
+            return EXIT_FAILURE;
+        }
+    }
+    do {
+        waited = waitpid(child, &status, 0);
+    } while (waited < 0 && errno == EINTR);
+    if (waited != child) {
+        fprintf(stderr, "ERROR: signal wait oracle cannot reap child: %s\n",
+                strerror(errno));
+        return EXIT_FAILURE;
+    }
+    if (!WIFSIGNALED(status) || WTERMSIG(status) != expected_signal) {
+        if (WIFEXITED(status)) {
+            fprintf(stderr,
+                    "ERROR: signal wait oracle observed exit status %d, expected signal %d\n",
+                    WEXITSTATUS(status), expected_signal);
+        } else if (WIFSIGNALED(status)) {
+            fprintf(stderr,
+                    "ERROR: signal wait oracle observed signal %d, expected %d\n",
+                    WTERMSIG(status), expected_signal);
+        } else {
+            fprintf(stderr,
+                    "ERROR: signal wait oracle observed non-terminal status\n");
+        }
+        return EXIT_FAILURE;
+    }
+    return EXIT_SUCCESS;
+}
+
+static void report_internal_archive_reap(char *const command[], pid_t child,
+                                         int status)
+{
+    const char *report_path =
+        getenv("GITSWITCH_RELEASE_TEST_INTERNAL_ARCHIVE_REAP_REPORT"); /* Flawfinder: ignore — named-fixture-only report path */
+    char report[96];
+    int length;
+
+    if (report_path == NULL ||
+        strcmp(command[0], ARCHIVE_INTERNAL_TOKEN) != 0) {
+        return;
+    }
+    length = snprintf(report, sizeof(report),
+                      "pid=%ld\nsignaled=%d\nsignal=%d\n",
+                      (long)child, WIFSIGNALED(status) ? 1 : 0,
+                      WIFSIGNALED(status) ? WTERMSIG(status) : 0);
+    if (length < 0 || (size_t)length >= sizeof(report)) {
+        return;
+    }
+    (void)write_signal_test_report(
+        report_path, (const unsigned char *)report, (size_t)length);
+}
+#else
+static void report_internal_archive_reap(char *const command[], pid_t child,
+                                         int status)
+{
+    (void)command;
+    (void)child;
+    (void)status;
 }
 #endif
 
@@ -3586,31 +3874,276 @@ static int establish_producer_wait_ownership(void)
 /* Preserve an inherited SIG_IGN (nohup semantics); otherwise forward. */
 static int install_fatal_signal_forwarding(void)
 {
+    sigset_t fatal_set;
     size_t index;
 
+    if (build_forwarded_fatal_signal_set(&fatal_set) != 0 ||
+        sigprocmask(SIG_SETMASK, NULL, &saved_fatal_mask) != 0) {
+        return -1;
+    }
+    fatal_signal_state_saved = true;
     for (index = 0;
          index < sizeof(forwarded_fatal_signals) /
                      sizeof(forwarded_fatal_signals[0]);
          index++) {
-        struct sigaction current;
         struct sigaction forwarding;
 
-        if (sigaction(forwarded_fatal_signals[index], NULL, &current) != 0) {
-            return -1;
+        if (sigaction(forwarded_fatal_signals[index], NULL,
+                      &saved_fatal_actions[index]) != 0) {
+            break;
         }
-        if (current.sa_handler == SIG_IGN) {
+        if (saved_fatal_actions[index].sa_handler == SIG_IGN) {
             continue;
         }
         memset(&forwarding, 0, sizeof(forwarding));
         forwarding.sa_handler = forward_fatal_signal;
-        if (sigemptyset(&forwarding.sa_mask) != 0 ||
-            sigaction(forwarded_fatal_signals[index], &forwarding, NULL) !=
-                0) {
-            return -1;
+        forwarding.sa_mask = fatal_set;
+        if (sigaction(forwarded_fatal_signals[index], &forwarding, NULL) != 0) {
+            break;
         }
+        fatal_action_installed[index] = true;
+    }
+    if (index != sizeof(forwarded_fatal_signals) /
+                     sizeof(forwarded_fatal_signals[0])) {
+        int saved_errno = errno;
+
+        while (index > 0U) {
+            index--;
+            if (fatal_action_installed[index]) {
+                (void)sigaction(forwarded_fatal_signals[index],
+                                &saved_fatal_actions[index], NULL);
+                fatal_action_installed[index] = false;
+            }
+        }
+        fatal_signal_state_saved = false;
+        errno = saved_errno;
+        return -1;
     }
     return 0;
 }
+
+static int restore_fatal_signal_forwarding(void)
+{
+    size_t index;
+    int first_errno = 0;
+
+    if (!fatal_signal_state_saved) {
+        return 0;
+    }
+    for (index = 0;
+         index < sizeof(forwarded_fatal_signals) /
+                     sizeof(forwarded_fatal_signals[0]);
+         index++) {
+        if (fatal_action_installed[index] &&
+            sigaction(forwarded_fatal_signals[index],
+                      &saved_fatal_actions[index], NULL) != 0 &&
+            first_errno == 0) {
+            first_errno = errno;
+        }
+        fatal_action_installed[index] = false;
+    }
+    fatal_signal_state_saved = false;
+    if (first_errno != 0) {
+        errno = first_errno;
+        return -1;
+    }
+    return 0;
+}
+
+#if defined(GITSWITCH_RELEASE_TEST_SIGNAL_DEFAULT)
+static void report_deferred_fatal_cleanup(void)
+{
+    static const unsigned char proof[] = "cleanup\n";
+    const char *marker =
+        getenv("GITSWITCH_RELEASE_TEST_SIGNAL_CLEANUP_MARKER"); /* Flawfinder: ignore — named-fixture-only cleanup proof path */
+    int marker_fd;
+
+    if (fatal_signal_pending == 0 || marker == NULL || marker[0] == '\0') {
+        return;
+    }
+    marker_fd = open(marker, O_WRONLY | O_CREAT | O_EXCL | O_NOFOLLOW |
+                                O_CLOEXEC,
+                     S_IRUSR | S_IWUSR);
+    if (marker_fd < 0) {
+        return;
+    }
+    (void)write_all(marker_fd, proof, sizeof(proof) - 1U);
+    (void)close(marker_fd);
+}
+#else
+static void report_deferred_fatal_cleanup(void)
+{
+}
+#endif
+
+/* Block the forwarding set across the final pending-state sample so a signal
+ * arriving after cleanup cannot slip between the sample and handler restore.
+ * A handler-recorded signal is reproduced with its exact number and default
+ * disposition only after the saved dispositions/mask have been restored. */
+static int finish_deferred_fatal_signal(void)
+{
+    sigset_t fatal_set;
+    sigset_t blocked_mask;
+    sigset_t delivery_mask;
+    struct sigaction default_action;
+    int signal_number;
+
+    if (!fatal_signal_state_saved) {
+        return 0;
+    }
+    if (build_forwarded_fatal_signal_set(&fatal_set) != 0 ||
+        sigprocmask(SIG_BLOCK, &fatal_set, &blocked_mask) != 0) {
+        return -1;
+    }
+    (void)blocked_mask;
+    signal_number = (int)fatal_signal_pending;
+    if (restore_fatal_signal_forwarding() != 0) {
+        return -1;
+    }
+    if (signal_number == 0) {
+        return sigprocmask(SIG_SETMASK, &saved_fatal_mask, NULL);
+    }
+
+    delivery_mask = saved_fatal_mask;
+    if (sigaddset(&delivery_mask, signal_number) != 0 ||
+        sigprocmask(SIG_SETMASK, &delivery_mask, NULL) != 0) {
+        _exit(128 + signal_number);
+    }
+    memset(&default_action, 0, sizeof(default_action));
+    default_action.sa_handler = SIG_DFL;
+    if (sigemptyset(&default_action.sa_mask) != 0 ||
+        sigaction(signal_number, &default_action, NULL) != 0 ||
+        sigdelset(&delivery_mask, signal_number) != 0 ||
+        sigprocmask(SIG_SETMASK, &delivery_mask, NULL) != 0) {
+        _exit(128 + signal_number);
+    }
+    (void)kill(getpid(), signal_number);
+    _exit(128 + signal_number);
+}
+
+/* Fatal delivery is a publication boundary, not merely an error check. Block
+ * the complete forwarding set, reject every signal already recorded by the
+ * handler (and every newly pending signal that the caller did not itself keep
+ * blocked), then keep the set blocked through the one no-replace namespace
+ * syscall. A signal arriving after that sample is delivered only after the
+ * canonical commit has linearized. */
+static int begin_fatal_publication_guard(sigset_t *saved_mask)
+{
+    sigset_t fatal_set;
+    sigset_t pending_set;
+    size_t index;
+    int abort_publication;
+
+    if (build_forwarded_fatal_signal_set(&fatal_set) != 0 ||
+        sigprocmask(SIG_BLOCK, &fatal_set, saved_mask) != 0) {
+        return -1;
+    }
+#if defined(GITSWITCH_RELEASE_TEST_SIGNAL_DEFAULT)
+    {
+        static bool publication_signal_used;
+        const char *publication_signal =
+            getenv("GITSWITCH_RELEASE_TEST_PUBLICATION_SIGNAL"); /* Flawfinder: ignore — named-fixture-only exact signal selector */
+
+        if (!publication_signal_used && publication_signal != NULL) {
+            if (strcmp(publication_signal, "TERM") != 0) {
+                int saved_errno = EINVAL;
+
+                (void)sigprocmask(SIG_SETMASK, saved_mask, NULL);
+                errno = saved_errno;
+                return -1;
+            }
+            publication_signal_used = true;
+            if (raise(SIGTERM) != 0) {
+                int saved_errno = errno;
+
+                (void)sigprocmask(SIG_SETMASK, saved_mask, NULL);
+                errno = saved_errno;
+                return -1;
+            }
+        }
+    }
+#endif
+    abort_publication = fatal_signal_pending != 0;
+    if (sigpending(&pending_set) != 0) {
+        int saved_errno = errno;
+
+        (void)sigprocmask(SIG_SETMASK, saved_mask, NULL);
+        errno = saved_errno;
+        return -1;
+    }
+    for (index = 0U;
+         !abort_publication &&
+         index < sizeof(forwarded_fatal_signals) /
+                     sizeof(forwarded_fatal_signals[0]);
+         index++) {
+        int signal_number = forwarded_fatal_signals[index];
+
+        if (sigismember(&saved_fatal_mask, signal_number) == 0 &&
+            sigismember(&pending_set, signal_number) == 1) {
+            abort_publication = 1;
+        }
+    }
+    if (abort_publication) {
+        int restore_result = sigprocmask(SIG_SETMASK, saved_mask, NULL);
+
+        if (restore_result == 0) {
+            errno = EINTR;
+        }
+        return -1;
+    }
+    return 0;
+}
+
+/* Return 1 only when the canonical commit succeeded but exact mask restoration
+ * failed, matching publish_output's existing post-commit uncertainty result. */
+static int finish_fatal_publication_guard(const sigset_t *saved_mask,
+                                          int commit_result,
+                                          int commit_errno)
+{
+    if (sigprocmask(SIG_SETMASK, saved_mask, NULL) != 0) {
+        return commit_result == 0 ? 1 : -1;
+    }
+    errno = commit_errno;
+    return commit_result;
+}
+
+#if !defined(__APPLE__)
+static int commit_linkat_without_pending_fatal(
+    int old_directory_fd, const char *old_path, int new_directory_fd,
+    const char *new_path, int flags)
+{
+    sigset_t saved_mask;
+    int commit_result;
+    int commit_errno;
+
+    if (begin_fatal_publication_guard(&saved_mask) != 0) {
+        return -1;
+    }
+    commit_result = linkat(old_directory_fd, old_path, new_directory_fd,
+                           new_path, flags);
+    commit_errno = errno;
+    return finish_fatal_publication_guard(&saved_mask, commit_result,
+                                          commit_errno);
+}
+#endif
+
+#if defined(__APPLE__)
+static int commit_clone_without_pending_fatal(int source_fd, int directory_fd,
+                                              const char *final_name)
+{
+    sigset_t saved_mask;
+    int commit_result;
+    int commit_errno;
+
+    if (begin_fatal_publication_guard(&saved_mask) != 0) {
+        return -1;
+    }
+    commit_result = fclonefileat(source_fd, directory_fd, final_name, 0);
+    commit_errno = errno;
+    return finish_fatal_publication_guard(&saved_mask, commit_result,
+                                          commit_errno);
+}
+#endif
 
 static int wait_for_producer(pid_t child, int64_t deadline, int *status)
 {
@@ -3799,6 +4332,8 @@ static int run_to_descriptor(int output_fd, int directory_fd,
 #endif
     /* Publish the producer while every forwarding signal remains blocked.
      * Exact-mask restoration below is the first point that can deliver one. */
+    fatal_signal_producer_defers_cleanup =
+        strcmp(command[0], ARCHIVE_INTERNAL_TOKEN) == 0 ? 1 : 0;
     fatal_signal_producer = (sig_atomic_t)child;
     (void)close(pipe_fds[1]);
     /* Close the fork/setpgid race from the parent side as well. EACCES/ESRCH
@@ -3834,6 +4369,7 @@ static int run_to_descriptor(int output_fd, int directory_fd,
         saved_errno = errno;
         (void)close(pipe_fds[0]);
         if (stream_result == PRODUCER_STREAM_FAILURE) {
+            report_internal_archive_reap(command, child, status);
             report_producer_failure(status);
             errno = EIO;
             return -1;
@@ -3871,6 +4407,7 @@ static int run_to_descriptor(int output_fd, int directory_fd,
         terminate_producer(child);
         return -1;
     }
+    report_internal_archive_reap(command, child, status);
     /* The complete inherited stream is captured, group-directed SIGKILL was
      * issued while the direct PID still pinned the owned group identity, and
      * the guarded reap retired handler ownership before making it reusable. */
@@ -3902,12 +4439,21 @@ static int link_descriptor(int source_fd, int directory_fd,
         run_publication_race_hook() != 0) {
         return -1;
     }
-    return linkat(directory_fd, source_name, directory_fd, final_name, 0);
+    return commit_linkat_without_pending_fatal(
+        directory_fd, source_name, directory_fd, final_name, 0);
 #else
     (void)source_name;
 #if defined(AT_EMPTY_PATH) && AT_EMPTY_PATH != 0
-    if (linkat(source_fd, "", directory_fd, final_name, AT_EMPTY_PATH) == 0) {
-        return 0;
+    {
+        int commit_result = commit_linkat_without_pending_fatal(
+            source_fd, "", directory_fd, final_name, AT_EMPTY_PATH);
+
+        if (commit_result == 0) {
+            return 0;
+        }
+        if (commit_result > 0) {
+            return 1;
+        }
     }
     if (errno == EEXIST) {
         return -1;
@@ -3923,8 +4469,9 @@ static int link_descriptor(int source_fd, int directory_fd,
             errno = ENAMETOOLONG;
             return -1;
         }
-        return linkat(AT_FDCWD, descriptor_path, directory_fd, final_name,
-                      AT_SYMLINK_FOLLOW);
+        return commit_linkat_without_pending_fatal(
+            AT_FDCWD, descriptor_path, directory_fd, final_name,
+            AT_SYMLINK_FOLLOW);
     }
 #else
     (void)source_fd;
@@ -4000,6 +4547,800 @@ static bool valid_directory_component(const char *component)
     }
     length = strlen(component);
     return length <= (size_t)NAME_MAX;
+}
+
+#define RPM_STAGE_MAX_LEAVES 1024U
+
+typedef struct rpm_stage_record {
+    char name[NAME_MAX + 1U];
+    struct stat identity;
+    unsigned char digest[SHA256_DIGEST_SIZE];
+} rpm_stage_record_t;
+
+static bool same_directory_generation(const struct stat *before,
+                                      const struct stat *after)
+{
+    if (!same_directory_identity(before, after) ||
+        before->st_size != after->st_size) {
+        return false;
+    }
+#if defined(__APPLE__)
+    return before->st_mtimespec.tv_sec == after->st_mtimespec.tv_sec &&
+           before->st_mtimespec.tv_nsec == after->st_mtimespec.tv_nsec &&
+           before->st_ctimespec.tv_sec == after->st_ctimespec.tv_sec &&
+           before->st_ctimespec.tv_nsec == after->st_ctimespec.tv_nsec;
+#else
+    return before->st_mtim.tv_sec == after->st_mtim.tv_sec &&
+           before->st_mtim.tv_nsec == after->st_mtim.tv_nsec &&
+           before->st_ctim.tv_sec == after->st_ctim.tv_sec &&
+           before->st_ctim.tv_nsec == after->st_ctim.tv_nsec;
+#endif
+}
+
+static bool valid_rpm_component(const char *component, bool require_suffix)
+{
+    const unsigned char *cursor = (const unsigned char *)component;
+    size_t length;
+
+    if (!valid_directory_component(component)) {
+        return false;
+    }
+    length = strlen(component);
+    if (strchr(component, ',') != NULL ||
+        (require_suffix &&
+         (length < 5U || strcmp(component + length - 4U, ".rpm") != 0))) {
+        return false;
+    }
+    while (*cursor != '\0') {
+        if (!((*cursor >= (unsigned char)'a' &&
+               *cursor <= (unsigned char)'z') ||
+              (*cursor >= (unsigned char)'A' &&
+               *cursor <= (unsigned char)'Z') ||
+              (*cursor >= (unsigned char)'0' &&
+               *cursor <= (unsigned char)'9') ||
+              strchr("._+-~", (int)*cursor) != NULL)) {
+            return false;
+        }
+        cursor++;
+    }
+    return true;
+}
+
+static bool source_rpm_name_is_valid(const char *name)
+{
+    static const char suffix[] = ".src.rpm";
+    size_t length = strlen(name);
+
+    return valid_rpm_component(name, true) &&
+           length > sizeof(suffix) - 1U &&
+           strcmp(name + length - (sizeof(suffix) - 1U), suffix) == 0;
+}
+
+static int parse_inherited_fd(const char *text, int *fd)
+{
+    uintmax_t value;
+    int flags;
+
+    if (parse_decimal_identity(text, &value) != 0 ||
+        value < 3U || value > (uintmax_t)INT_MAX) {
+        errno = EINVAL;
+        return -1;
+    }
+    flags = fcntl((int)value, F_GETFD);
+    if (flags < 0) {
+        return -1;
+    }
+    if (fcntl((int)value, F_SETFD, flags | FD_CLOEXEC) != 0) {
+        return -1;
+    }
+    *fd = (int)value;
+    return 0;
+}
+
+static int validate_inherited_directory(int fd, struct stat *identity)
+{
+    if (fstat(fd, identity) != 0) {
+        return -1;
+    }
+    if (!S_ISDIR(identity->st_mode)) {
+        errno = ENOTDIR;
+        return -1;
+    }
+    return 0;
+}
+
+/* Internal release-shell ABI: pathname stat(1) cannot portably identify an
+ * already-open descriptor. In particular, FreeBSD's /dev/fd is fdescfs and
+ * stat(1) reports that vnode rather than the regular file behind the open fd.
+ * Keep the output to three bounded canonical decimal fields so the shell can
+ * compare it directly with pathname identities without parsing diagnostics. */
+static int report_inherited_regular_identity(const char *fd_text)
+{
+    struct stat identity;
+    int fd;
+
+    if (parse_inherited_fd(fd_text, &fd) != 0 ||
+        fstat(fd, &identity) != 0) {
+        return -1;
+    }
+    if (!S_ISREG(identity.st_mode) || identity.st_size <= 0) {
+        errno = EINVAL;
+        return -1;
+    }
+    if (printf("%" PRIuMAX ":%" PRIuMAX ":%" PRIuMAX "\n",
+               (uintmax_t)identity.st_dev, (uintmax_t)identity.st_ino,
+               (uintmax_t)identity.st_size) < 0 ||
+        fflush(stdout) != 0) {
+        return -1;
+    }
+    return 0;
+}
+
+static int copy_regular_descriptor(int source_fd, off_t size,
+                                   int destination_fd)
+{
+    unsigned char buffer[64U * 1024U];
+    off_t offset = 0;
+
+    while (offset < size) {
+        off_t remaining = size - offset;
+        size_t wanted = sizeof(buffer);
+        ssize_t count;
+
+        if (remaining < (off_t)wanted) {
+            wanted = (size_t)remaining;
+        }
+        do {
+            count = pread(source_fd, buffer, wanted, offset);
+        } while (count < 0 && errno == EINTR);
+        if (count <= 0) {
+            if (count == 0) {
+                errno = ESTALE;
+            }
+            return -1;
+        }
+        if (write_all(destination_fd, buffer, (size_t)count) != 0) {
+            return -1;
+        }
+        offset += count;
+    }
+    return 0;
+}
+
+static bool rpm_record_name_exists(const rpm_stage_record_t *records,
+                                   size_t count, const char *name)
+{
+    size_t index;
+
+    for (index = 0U; index < count; index++) {
+        if (strcmp(records[index].name, name) == 0) {
+            return true;
+        }
+    }
+    return false;
+}
+
+static int stage_rpm_leaf(int source_directory_fd, const char *name,
+                          int publish_fd, rpm_stage_record_t *records,
+                          size_t *record_count)
+{
+    struct stat path_before;
+    struct stat source_before;
+    struct stat source_after;
+    struct stat staged_stat;
+    struct stat staged_path_stat;
+    unsigned char source_digest[SHA256_DIGEST_SIZE];
+    int source_fd = -1;
+    int staged_fd = -1;
+    int saved_errno;
+    int result = -1;
+
+    if (!valid_rpm_component(name, true) ||
+        *record_count >= RPM_STAGE_MAX_LEAVES ||
+        rpm_record_name_exists(records, *record_count, name)) {
+        errno = EINVAL;
+        return -1;
+    }
+    if (fstatat(source_directory_fd, name, &path_before,
+                AT_SYMLINK_NOFOLLOW) != 0 ||
+        !S_ISREG(path_before.st_mode) || path_before.st_size <= 0) {
+        if (errno == 0) {
+            errno = EINVAL;
+        }
+        return -1;
+    }
+    do {
+        source_fd = openat(source_directory_fd, name,
+                           O_RDONLY | O_NOFOLLOW | O_CLOEXEC);
+    } while (source_fd < 0 && errno == EINTR);
+    if (source_fd < 0 || fstat(source_fd, &source_before) != 0 ||
+        !same_identity(&path_before, &source_before) ||
+        source_before.st_size <= 0) {
+        if (errno == 0) {
+            errno = ESTALE;
+        }
+        goto cleanup;
+    }
+    if (digest_regular_descriptor(source_fd, source_before.st_size,
+                                  (mode_t)-1, source_digest) != 0) {
+        goto cleanup;
+    }
+    if (run_rpm_stage_race_hook(name) != 0) {
+        goto cleanup;
+    }
+    do {
+        staged_fd = openat(publish_fd, name,
+                           O_RDWR | O_CREAT | O_EXCL | O_NOFOLLOW |
+                               O_CLOEXEC,
+                           S_IRUSR);
+    } while (staged_fd < 0 && errno == EINTR);
+    if (staged_fd < 0 ||
+        copy_regular_descriptor(source_fd, source_before.st_size,
+                                staged_fd) != 0 ||
+        fchmod(staged_fd, S_IRUSR) != 0 ||
+        full_fsync(staged_fd) != 0 ||
+        fstat(staged_fd, &staged_stat) != 0 ||
+        staged_stat.st_size != source_before.st_size ||
+        (staged_stat.st_mode & 07777) != S_IRUSR ||
+        digest_regular_descriptor(staged_fd, staged_stat.st_size,
+                                  S_IRUSR,
+                                  records[*record_count].digest) != 0 ||
+        memcmp(source_digest, records[*record_count].digest,
+               SHA256_DIGEST_SIZE) != 0 ||
+        fstatat(publish_fd, name, &staged_path_stat,
+                AT_SYMLINK_NOFOLLOW) != 0 ||
+        !same_identity(&staged_stat, &staged_path_stat) ||
+        fstat(source_fd, &source_after) != 0 ||
+        !same_identity(&source_before, &source_after) ||
+        source_after.st_size != source_before.st_size ||
+        fstatat(source_directory_fd, name, &path_before,
+                AT_SYMLINK_NOFOLLOW) != 0 ||
+        !same_identity(&source_after, &path_before)) {
+        if (errno == 0) {
+            errno = ESTALE;
+        }
+        goto cleanup;
+    }
+    memcpy(&records[*record_count].identity, &staged_stat,
+           sizeof(staged_stat));
+    memcpy(records[*record_count].name, name, strlen(name) + 1U);
+    (*record_count)++;
+    result = 0;
+
+cleanup:
+    saved_errno = errno;
+    if (staged_fd >= 0 && close(staged_fd) != 0 && result == 0) {
+        result = -1;
+        saved_errno = errno;
+    }
+    if (source_fd >= 0 && close(source_fd) != 0 && result == 0) {
+        result = -1;
+        saved_errno = errno;
+    }
+    errno = saved_errno;
+    return result;
+}
+
+static int reprove_staged_records(
+    int publish_fd, const rpm_stage_record_t *records, size_t count)
+{
+    bool seen[RPM_STAGE_MAX_LEAVES] = {false};
+    struct stat generation_before;
+    struct stat generation_after;
+    DIR *stream;
+    int stream_fd;
+    size_t observed_count = 0U;
+    size_t index;
+
+    if (count > RPM_STAGE_MAX_LEAVES) {
+        errno = EINVAL;
+        return -1;
+    }
+    if (fstat(publish_fd, &generation_before) != 0) {
+        return -1;
+    }
+    if (!S_ISDIR(generation_before.st_mode)) {
+        errno = ENOTDIR;
+        return -1;
+    }
+    do {
+        stream_fd = openat(publish_fd, ".",
+                           O_RDONLY | O_DIRECTORY | O_NOFOLLOW | O_CLOEXEC);
+    } while (stream_fd < 0 && errno == EINTR);
+    if (stream_fd < 0) {
+        return -1;
+    }
+    stream = fdopendir(stream_fd);
+    if (stream == NULL) {
+        int saved_errno = errno;
+        (void)close(stream_fd);
+        errno = saved_errno;
+        return -1;
+    }
+    for (;;) {
+        struct dirent *entry;
+        struct stat path_stat;
+        size_t record_index;
+
+        errno = 0;
+        entry = readdir(stream);
+        if (entry == NULL) {
+            if (errno != 0) {
+                int saved_errno = errno;
+                (void)closedir(stream);
+                errno = saved_errno;
+                return -1;
+            }
+            break;
+        }
+        if (strcmp(entry->d_name, ".") == 0 ||
+            strcmp(entry->d_name, "..") == 0) {
+            continue;
+        }
+        if (!valid_rpm_component(entry->d_name, true) ||
+            fstatat(publish_fd, entry->d_name, &path_stat,
+                    AT_SYMLINK_NOFOLLOW) != 0 ||
+            !S_ISREG(path_stat.st_mode)) {
+            int saved_errno = errno != 0 ? errno : EINVAL;
+            (void)closedir(stream);
+            errno = saved_errno;
+            return -1;
+        }
+        for (record_index = 0U; record_index < count; record_index++) {
+            if (strcmp(records[record_index].name, entry->d_name) == 0) {
+                break;
+            }
+        }
+        if (record_index == count || seen[record_index] ||
+            !same_identity(&records[record_index].identity, &path_stat)) {
+            (void)closedir(stream);
+            errno = ESTALE;
+            return -1;
+        }
+        seen[record_index] = true;
+        observed_count++;
+    }
+    if (closedir(stream) != 0) {
+        return -1;
+    }
+    if (observed_count != count) {
+        errno = ESTALE;
+        return -1;
+    }
+    for (index = 0U; index < count; index++) {
+        struct stat descriptor_stat;
+        struct stat path_stat;
+        unsigned char digest[SHA256_DIGEST_SIZE];
+        int fd;
+
+        do {
+            fd = openat(publish_fd, records[index].name,
+                        O_RDONLY | O_NOFOLLOW | O_CLOEXEC);
+        } while (fd < 0 && errno == EINTR);
+        if (fd < 0 || fstat(fd, &descriptor_stat) != 0 ||
+            fstatat(publish_fd, records[index].name, &path_stat,
+                    AT_SYMLINK_NOFOLLOW) != 0 ||
+            !same_identity(&descriptor_stat, &path_stat) ||
+            !same_identity(&records[index].identity, &descriptor_stat) ||
+            descriptor_stat.st_size != records[index].identity.st_size ||
+            (descriptor_stat.st_mode & 07777) != S_IRUSR ||
+            digest_regular_descriptor(fd, descriptor_stat.st_size,
+                                      S_IRUSR, digest) != 0 ||
+            memcmp(digest, records[index].digest,
+                   SHA256_DIGEST_SIZE) != 0) {
+            int saved_errno = errno != 0 ? errno : ESTALE;
+            if (fd >= 0) {
+                (void)close(fd);
+            }
+            errno = saved_errno;
+            return -1;
+        }
+        if (close(fd) != 0) {
+            return -1;
+        }
+    }
+    if (fstat(publish_fd, &generation_after) != 0 ||
+        !same_directory_generation(&generation_before, &generation_after)) {
+        errno = ESTALE;
+        return -1;
+    }
+    return 0;
+}
+
+static int stage_direct_rpm_directory(int directory_fd, int publish_fd,
+                                      rpm_stage_record_t *records,
+                                      size_t *record_count,
+                                      size_t *leaf_count,
+                                      bool source_rpms)
+{
+    DIR *stream;
+    struct stat generation_before;
+    struct stat generation_after;
+    int stream_fd;
+    int result = 0;
+
+    if (fstat(directory_fd, &generation_before) != 0 ||
+        !S_ISDIR(generation_before.st_mode)) {
+        errno = ENOTDIR;
+        return -1;
+    }
+    do {
+        stream_fd = openat(directory_fd, ".",
+                           O_RDONLY | O_DIRECTORY | O_NOFOLLOW | O_CLOEXEC);
+    } while (stream_fd < 0 && errno == EINTR);
+    if (stream_fd < 0) {
+        return -1;
+    }
+    stream = fdopendir(stream_fd);
+    if (stream == NULL) {
+        int saved_errno = errno;
+        (void)close(stream_fd);
+        errno = saved_errno;
+        return -1;
+    }
+    for (;;) {
+        struct dirent *entry;
+
+        errno = 0;
+        entry = readdir(stream);
+        if (entry == NULL) {
+            if (errno != 0) {
+                result = -1;
+            }
+            break;
+        }
+        if (strcmp(entry->d_name, ".") == 0 ||
+            strcmp(entry->d_name, "..") == 0) {
+            continue;
+        }
+        if ((source_rpms &&
+             !source_rpm_name_is_valid(entry->d_name)) ||
+            (!source_rpms &&
+             source_rpm_name_is_valid(entry->d_name))) {
+            errno = EINVAL;
+            result = -1;
+            break;
+        }
+        if (stage_rpm_leaf(directory_fd, entry->d_name, publish_fd,
+                           records, record_count) != 0) {
+            result = -1;
+            break;
+        }
+        (*leaf_count)++;
+    }
+    {
+        int saved_errno = errno;
+        if (closedir(stream) != 0 && result == 0) {
+            return -1;
+        }
+        errno = saved_errno;
+    }
+    if (result == 0 &&
+        (fstat(directory_fd, &generation_after) != 0 ||
+         !same_directory_generation(&generation_before,
+                                    &generation_after))) {
+        errno = ESTALE;
+        return -1;
+    }
+    return result;
+}
+
+static int stage_binary_rpm_directory(int rpms_fd, int publish_fd,
+                                      rpm_stage_record_t *records,
+                                      size_t *record_count,
+                                      size_t *leaf_count)
+{
+    DIR *stream;
+    struct stat generation_before;
+    struct stat generation_after;
+    int stream_fd;
+    int result = 0;
+
+    if (fstat(rpms_fd, &generation_before) != 0 ||
+        !S_ISDIR(generation_before.st_mode)) {
+        errno = ENOTDIR;
+        return -1;
+    }
+    do {
+        stream_fd = openat(rpms_fd, ".",
+                           O_RDONLY | O_DIRECTORY | O_NOFOLLOW | O_CLOEXEC);
+    } while (stream_fd < 0 && errno == EINTR);
+    if (stream_fd < 0) {
+        return -1;
+    }
+    stream = fdopendir(stream_fd);
+    if (stream == NULL) {
+        int saved_errno = errno;
+        (void)close(stream_fd);
+        errno = saved_errno;
+        return -1;
+    }
+    for (;;) {
+        struct dirent *entry;
+        struct stat path_stat;
+        struct stat child_stat;
+        size_t before_count;
+        int child_fd = -1;
+
+        errno = 0;
+        entry = readdir(stream);
+        if (entry == NULL) {
+            if (errno != 0) {
+                result = -1;
+            }
+            break;
+        }
+        if (strcmp(entry->d_name, ".") == 0 ||
+            strcmp(entry->d_name, "..") == 0) {
+            continue;
+        }
+        if (!valid_rpm_component(entry->d_name, false) ||
+            fstatat(rpms_fd, entry->d_name, &path_stat,
+                    AT_SYMLINK_NOFOLLOW) != 0 ||
+            !S_ISDIR(path_stat.st_mode)) {
+            errno = EINVAL;
+            result = -1;
+            break;
+        }
+        do {
+            child_fd = openat(rpms_fd, entry->d_name,
+                              O_RDONLY | O_DIRECTORY | O_NOFOLLOW |
+                                  O_CLOEXEC);
+        } while (child_fd < 0 && errno == EINTR);
+        before_count = *leaf_count;
+        if (child_fd < 0 || fstat(child_fd, &child_stat) != 0 ||
+            !same_directory_identity(&path_stat, &child_stat) ||
+            stage_direct_rpm_directory(child_fd, publish_fd, records,
+                                       record_count, leaf_count, false) != 0 ||
+            *leaf_count == before_count ||
+            revalidate_directory_entry(rpms_fd, entry->d_name, child_fd,
+                                       &child_stat) != 0) {
+            if (errno == 0) {
+                errno = EINVAL;
+            }
+            result = -1;
+        }
+        if (child_fd >= 0 && close(child_fd) != 0 && result == 0) {
+            result = -1;
+        }
+        if (result != 0) {
+            break;
+        }
+    }
+    {
+        int saved_errno = errno;
+        if (closedir(stream) != 0 && result == 0) {
+            return -1;
+        }
+        errno = saved_errno;
+    }
+    if (result == 0 &&
+        (fstat(rpms_fd, &generation_after) != 0 ||
+         !same_directory_generation(&generation_before,
+                                    &generation_after))) {
+        errno = ESTALE;
+        return -1;
+    }
+    return result;
+}
+
+static int directory_is_empty(int directory_fd)
+{
+    DIR *stream;
+    int stream_fd;
+    int result = 1;
+
+    do {
+        stream_fd = openat(directory_fd, ".",
+                           O_RDONLY | O_DIRECTORY | O_NOFOLLOW | O_CLOEXEC);
+    } while (stream_fd < 0 && errno == EINTR);
+    if (stream_fd < 0) {
+        return -1;
+    }
+    stream = fdopendir(stream_fd);
+    if (stream == NULL) {
+        int saved_errno = errno;
+        (void)close(stream_fd);
+        errno = saved_errno;
+        return -1;
+    }
+    for (;;) {
+        struct dirent *entry;
+
+        errno = 0;
+        entry = readdir(stream);
+        if (entry == NULL) {
+            if (errno != 0) {
+                result = -1;
+            }
+            break;
+        }
+        if (strcmp(entry->d_name, ".") != 0 &&
+            strcmp(entry->d_name, "..") != 0) {
+            errno = EEXIST;
+            result = 0;
+            break;
+        }
+    }
+    {
+        int saved_errno = errno;
+        if (closedir(stream) != 0 && result >= 0) {
+            return -1;
+        }
+        errno = saved_errno;
+    }
+    return result;
+}
+
+static int emit_rpm_stage_records(const rpm_stage_record_t *records,
+                                  size_t count)
+{
+    static const char hex[] = "0123456789abcdef";
+    size_t index;
+
+    for (index = 0U; index < count; index++) {
+        char line[NAME_MAX + 192U];
+        char digest_hex[(SHA256_DIGEST_SIZE * 2U) + 1U];
+        size_t digest_index;
+        int length;
+
+        for (digest_index = 0U; digest_index < SHA256_DIGEST_SIZE;
+             digest_index++) {
+            digest_hex[digest_index * 2U] =
+                hex[records[index].digest[digest_index] >> 4U];
+            digest_hex[(digest_index * 2U) + 1U] =
+                hex[records[index].digest[digest_index] & 0x0fU];
+        }
+        digest_hex[SHA256_DIGEST_SIZE * 2U] = '\0';
+        length = snprintf(
+            line, sizeof(line), "%s,%" PRIuMAX ":%" PRIuMAX ":%" PRIuMAX
+                                ",%s\n",
+            records[index].name,
+            (uintmax_t)records[index].identity.st_dev,
+            (uintmax_t)records[index].identity.st_ino,
+            (uintmax_t)records[index].identity.st_size, digest_hex);
+        if (length < 0 || (size_t)length >= sizeof(line) ||
+            write_all(STDOUT_FILENO, (const unsigned char *)line,
+                      (size_t)length) != 0) {
+            return -1;
+        }
+    }
+    return 0;
+}
+
+static int parse_sha256_hex(const char *text,
+                            unsigned char digest[SHA256_DIGEST_SIZE])
+{
+    size_t index;
+
+    if (strlen(text) != SHA256_DIGEST_SIZE * 2U) {
+        errno = EINVAL;
+        return -1;
+    }
+    for (index = 0U; index < SHA256_DIGEST_SIZE; index++) {
+        unsigned char high = (unsigned char)text[index * 2U];
+        unsigned char low = (unsigned char)text[(index * 2U) + 1U];
+        unsigned int high_value;
+        unsigned int low_value;
+
+        if (high >= (unsigned char)'0' && high <= (unsigned char)'9') {
+            high_value = (unsigned int)(high - (unsigned char)'0');
+        } else if (high >= (unsigned char)'a' &&
+                   high <= (unsigned char)'f') {
+            high_value = (unsigned int)(high - (unsigned char)'a') + 10U;
+        } else {
+            errno = EINVAL;
+            return -1;
+        }
+        if (low >= (unsigned char)'0' && low <= (unsigned char)'9') {
+            low_value = (unsigned int)(low - (unsigned char)'0');
+        } else if (low >= (unsigned char)'a' &&
+                   low <= (unsigned char)'f') {
+            low_value = (unsigned int)(low - (unsigned char)'a') + 10U;
+        } else {
+            errno = EINVAL;
+            return -1;
+        }
+        digest[index] = (unsigned char)((high_value << 4U) | low_value);
+    }
+    return 0;
+}
+
+static int run_internal_rpm_stage(char *const arguments[])
+{
+    rpm_stage_record_t *records = NULL;
+    struct stat rpms_stat;
+    struct stat rpms_after;
+    struct stat srpms_stat;
+    struct stat srpms_after;
+    struct stat publish_stat;
+    struct stat publish_after;
+    size_t binary_count = 0U;
+    size_t source_count = 0U;
+    size_t record_count = 0U;
+    uintmax_t expected_rpms_device;
+    uintmax_t expected_rpms_inode;
+    uintmax_t expected_srpms_device;
+    uintmax_t expected_srpms_inode;
+    uintmax_t expected_publish_device;
+    uintmax_t expected_publish_inode;
+    int rpms_fd;
+    int srpms_fd;
+    int publish_fd;
+    int result = EXIT_FAILURE;
+
+    if (parse_inherited_fd(arguments[0], &rpms_fd) != 0 ||
+        parse_decimal_identity(arguments[1], &expected_rpms_device) != 0 ||
+        parse_decimal_identity(arguments[2], &expected_rpms_inode) != 0 ||
+        parse_inherited_fd(arguments[3], &srpms_fd) != 0 ||
+        parse_decimal_identity(arguments[4], &expected_srpms_device) != 0 ||
+        parse_decimal_identity(arguments[5], &expected_srpms_inode) != 0 ||
+        parse_inherited_fd(arguments[6], &publish_fd) != 0 ||
+        parse_decimal_identity(arguments[7], &expected_publish_device) != 0 ||
+        parse_decimal_identity(arguments[8], &expected_publish_inode) != 0 ||
+        rpms_fd == srpms_fd || rpms_fd == publish_fd ||
+        srpms_fd == publish_fd ||
+        validate_inherited_directory(rpms_fd, &rpms_stat) != 0 ||
+        validate_inherited_directory(srpms_fd, &srpms_stat) != 0 ||
+        validate_inherited_directory(publish_fd, &publish_stat) != 0 ||
+        (uintmax_t)rpms_stat.st_dev != expected_rpms_device ||
+        (uintmax_t)rpms_stat.st_ino != expected_rpms_inode ||
+        (uintmax_t)srpms_stat.st_dev != expected_srpms_device ||
+        (uintmax_t)srpms_stat.st_ino != expected_srpms_inode ||
+        (uintmax_t)publish_stat.st_dev != expected_publish_device ||
+        (uintmax_t)publish_stat.st_ino != expected_publish_inode ||
+        same_directory_identity(&rpms_stat, &srpms_stat) ||
+        same_directory_identity(&rpms_stat, &publish_stat) ||
+        same_directory_identity(&srpms_stat, &publish_stat) ||
+        rpms_stat.st_uid != geteuid() ||
+        srpms_stat.st_uid != geteuid() ||
+        publish_stat.st_uid != geteuid() ||
+        (rpms_stat.st_mode & (S_IWGRP | S_IWOTH)) != 0 ||
+        (srpms_stat.st_mode & (S_IWGRP | S_IWOTH)) != 0 ||
+        (publish_stat.st_mode & 07777) !=
+            (S_IRWXU)) {
+        fprintf(stderr, "ERROR: invalid inherited RPM directory descriptors\n");
+        return EXIT_FAILURE;
+    }
+    if (directory_is_empty(publish_fd) != 1) {
+        fprintf(stderr, "ERROR: RPM publication staging directory is not empty\n");
+        return EXIT_FAILURE;
+    }
+    records = calloc(RPM_STAGE_MAX_LEAVES, sizeof(*records));
+    if (records == NULL) {
+        fprintf(stderr, "ERROR: cannot allocate bounded RPM record table\n");
+        return EXIT_FAILURE;
+    }
+    if (stage_binary_rpm_directory(rpms_fd, publish_fd, records,
+                                   &record_count, &binary_count) != 0 ||
+        stage_direct_rpm_directory(srpms_fd, publish_fd, records,
+                                   &record_count, &source_count, true) != 0 ||
+        binary_count == 0U || source_count == 0U ||
+        fstat(rpms_fd, &rpms_after) != 0 ||
+        fstat(srpms_fd, &srpms_after) != 0 ||
+        fstat(publish_fd, &publish_after) != 0 ||
+        !same_directory_identity(&rpms_stat, &rpms_after) ||
+        !same_directory_identity(&srpms_stat, &srpms_after) ||
+        !same_directory_identity(&publish_stat, &publish_after) ||
+        rpms_after.st_uid != geteuid() ||
+        srpms_after.st_uid != geteuid() ||
+        publish_after.st_uid != geteuid() ||
+        (rpms_after.st_mode & (S_IWGRP | S_IWOTH)) != 0 ||
+        (srpms_after.st_mode & (S_IWGRP | S_IWOTH)) != 0 ||
+        (publish_after.st_mode & 07777) != S_IRWXU ||
+        reprove_staged_records(publish_fd, records, record_count) != 0 ||
+        full_fsync(publish_fd) != 0 ||
+        emit_rpm_stage_records(records, record_count) != 0) {
+        fprintf(stderr, "ERROR: cannot stage and prove RPM output tree: %s\n",
+                strerror(errno));
+        goto cleanup;
+    }
+    result = EXIT_SUCCESS;
+
+cleanup:
+    memset(records, 0, RPM_STAGE_MAX_LEAVES * sizeof(*records));
+    free(records);
+    return result;
 }
 
 static int verify_directory_entry(int parent_fd, const char *component,
@@ -4217,14 +5558,19 @@ static int publish_descriptor_clone(int source_fd, int directory_fd,
         return -1;
     }
 #endif
-    if (fclonefileat(source_fd, directory_fd, final_name, 0) != 0) {
-        saved_errno = errno;
+    {
+        int commit_result = commit_clone_without_pending_fatal(
+            source_fd, directory_fd, final_name);
+
+        if (commit_result != 0) {
+            saved_errno = errno;
 #if defined(GITSWITCH_RELEASE_TEST_FD_PRESSURE)
-        (void)setrlimit(RLIMIT_NOFILE, &saved_limit);
+            (void)setrlimit(RLIMIT_NOFILE, &saved_limit);
 #endif
-        (void)close(reserve_fd);
-        errno = saved_errno;
-        return -1;
+            (void)close(reserve_fd);
+            errno = saved_errno;
+            return commit_result;
+        }
     }
     (void)close(reserve_fd);
     if (run_adoption_race_hook() != 0) {
@@ -4288,9 +5634,13 @@ static int publish_output(int source_fd, int directory_fd,
     return publish_descriptor_clone(source_fd, directory_fd, final_name,
                                     published_fd);
 #else
-    if (link_descriptor(source_fd, directory_fd, source_name,
-                        final_name) != 0) {
-        return -1;
+    {
+        int commit_result = link_descriptor(source_fd, directory_fd,
+                                            source_name, final_name);
+
+        if (commit_result != 0) {
+            return commit_result;
+        }
     }
     *published_fd = source_fd;
     return 0;
@@ -4386,6 +5736,7 @@ static int run_private_consumer(int archive_fd, int directory_fd,
 #else
     saved_errno = 0;
 #endif
+    fatal_signal_producer_defers_cleanup = 0;
     fatal_signal_producer = (sig_atomic_t)child;
     (void)setpgid(child, child);
     if (restore_fatal_fork_guard(&saved_mask) != 0 && saved_errno == 0) {
@@ -4459,6 +5810,8 @@ int main(int argc, char **argv)
     int root_fd = -1;
     int build_fd = -1;
     int directory_fd = -1;
+    int source_directory_fd = -1;
+    int source_fd = -1;
     int output_fd = -1;
     int published_fd = -1;
     int publish_rc;
@@ -4467,10 +5820,19 @@ int main(int argc, char **argv)
     unsigned char expected_digest[SHA256_DIGEST_SIZE];
     unsigned char published_digest[SHA256_DIGEST_SIZE];
     struct stat existing;
+    struct stat source_directory_stat;
+    struct stat source_stat;
     struct stat output_stat;
     int result = EXIT_FAILURE;
     bool consume_mode = false;
+    bool source_directory_mode = false;
     bool tree_mode = false;
+    uintmax_t expected_source_device = 0U;
+    uintmax_t expected_source_inode = 0U;
+    uintmax_t expected_source_size = 0U;
+    uintmax_t expected_source_directory_device = 0U;
+    uintmax_t expected_source_directory_inode = 0U;
+    unsigned char source_digest[SHA256_DIGEST_SIZE];
 #if defined(GITSWITCH_RELEASE_TEST_SIGNAL_DEFAULT)
     const char *test_signal_defaults;
 #endif
@@ -4480,6 +5842,11 @@ int main(int argc, char **argv)
     if (reserve_standard_descriptors() != 0) {
         return EXIT_FAILURE;
     }
+#if defined(GITSWITCH_RELEASE_TEST_SIGNAL_DEFAULT)
+    if (argc >= 2 && strcmp(argv[1], "--test-wait-signal") == 0) {
+        return run_signal_wait_oracle(argc, argv);
+    }
+#endif
     if (argc >= 2 &&
         strcmp(argv[1], "--internal-retire-tree-v1") == 0) {
         if (argc != 6) {
@@ -4487,6 +5854,50 @@ int main(int argc, char **argv)
             return EXIT_FAILURE;
         }
         return run_internal_retire_tree(argv[2], argv[3], argv[4], argv[5]);
+    }
+    if (argc >= 2 &&
+        strcmp(argv[1], "--internal-regular-fd-identity-v1") == 0) {
+        if (argc != 3 ||
+            report_inherited_regular_identity(argv[2]) != 0) {
+            fprintf(stderr,
+                    "ERROR: invalid inherited regular-file descriptor\n");
+            return EXIT_FAILURE;
+        }
+        return EXIT_SUCCESS;
+    }
+    if (argc >= 2 && strcmp(argv[1], "--internal-rpm-stage-v1") == 0) {
+        if (argc != 11) {
+            usage(argv[0]);
+            return EXIT_FAILURE;
+        }
+        return run_internal_rpm_stage(&argv[2]);
+    }
+    if (argc >= 2 &&
+        strcmp(argv[1], "--internal-release-tree-from-dir-v1") == 0) {
+        if (argc != 13 ||
+            parse_inherited_fd(argv[6], &source_directory_fd) != 0 ||
+            validate_inherited_directory(source_directory_fd,
+                                         &source_directory_stat) != 0 ||
+            source_directory_stat.st_uid != geteuid() ||
+            (source_directory_stat.st_mode & 07777) != S_IRWXU ||
+            parse_decimal_identity(
+                argv[7], &expected_source_directory_device) != 0 ||
+            parse_decimal_identity(
+                argv[8], &expected_source_directory_inode) != 0 ||
+            (uintmax_t)source_directory_stat.st_dev !=
+                expected_source_directory_device ||
+            (uintmax_t)source_directory_stat.st_ino !=
+                expected_source_directory_inode ||
+            parse_decimal_identity(argv[9], &expected_source_device) != 0 ||
+            parse_decimal_identity(argv[10], &expected_source_inode) != 0 ||
+            parse_decimal_identity(argv[11], &expected_source_size) != 0 ||
+            expected_source_size == 0U ||
+            expected_source_size > (uintmax_t)INT64_MAX ||
+            parse_sha256_hex(argv[12], source_digest) != 0) {
+            fprintf(stderr,
+                    "ERROR: invalid descriptor-relative release arguments\n");
+            return EXIT_FAILURE;
+        }
     }
 #if defined(GITSWITCH_RELEASE_TEST_DIGEST)
     if (argc == 2 && strcmp(argv[1], "--test-sha256") == 0) {
@@ -4536,7 +5947,15 @@ int main(int argc, char **argv)
         return EXIT_FAILURE;
     }
 
-    if (argc >= 11 &&
+    if (argc == 13 &&
+        strcmp(argv[1], "--internal-release-tree-from-dir-v1") == 0) {
+        source_directory_mode = true;
+        tree_mode = true;
+        root_path = argv[2];
+        build_component = argv[3];
+        dist_component = argv[4];
+        final_name = argv[5];
+    } else if (argc >= 11 &&
         strcmp(argv[1], "--internal-release-tree-consume-v1") == 0 &&
         strcmp(argv[6], "--") == 0) {
         int index;
@@ -4553,7 +5972,7 @@ int main(int argc, char **argv)
                 if (consumer_index >= 0 || index == command_index ||
                     index + 1 >= argc) {
                     usage(argv[0]);
-                    return EXIT_FAILURE;
+                    goto cleanup;
                 }
                 consumer_index = index + 1;
                 argv[index] = NULL;
@@ -4561,7 +5980,7 @@ int main(int argc, char **argv)
         }
         if (consumer_index < 0) {
             usage(argv[0]);
-            return EXIT_FAILURE;
+            goto cleanup;
         }
     } else if (argc >= 8 &&
         strcmp(argv[1], "--internal-release-tree-v1") == 0 &&
@@ -4579,17 +5998,23 @@ int main(int argc, char **argv)
         command_index = 5;
     } else {
         usage(argv[0]);
-        return EXIT_FAILURE;
+        goto cleanup;
     }
     if (final_name[0] == '\0' || strcmp(final_name, ".") == 0 ||
         strcmp(final_name, "..") == 0 || strchr(final_name, '/') != NULL) {
         fprintf(stderr, "ERROR: final archive name is not a single component\n");
-        return EXIT_FAILURE;
+        goto cleanup;
     }
-    if (establish_producer_wait_ownership() != 0) {
+    if (source_directory_mode &&
+        !valid_rpm_component(final_name, true)) {
+        fprintf(stderr,
+                "ERROR: staged RPM name is not a safe RPM component\n");
+        goto cleanup;
+    }
+    if (!source_directory_mode && establish_producer_wait_ownership() != 0) {
         fprintf(stderr, "ERROR: cannot establish archive-child ownership: %s\n",
                 strerror(errno));
-        return EXIT_FAILURE;
+        goto cleanup;
     }
 
     if (tree_mode) {
@@ -4664,6 +6089,41 @@ int main(int argc, char **argv)
             goto cleanup;
         }
     }
+    if (source_directory_mode) {
+        struct stat source_path_stat;
+        unsigned char observed_digest[SHA256_DIGEST_SIZE];
+
+        do {
+            source_fd = openat(source_directory_fd, final_name,
+                               O_RDONLY | O_NOFOLLOW | O_CLOEXEC);
+        } while (source_fd < 0 && errno == EINTR);
+        if (source_fd < 0 || fstat(source_fd, &source_stat) != 0 ||
+            fstatat(source_directory_fd, final_name, &source_path_stat,
+                    AT_SYMLINK_NOFOLLOW) != 0 ||
+            !same_identity(&source_stat, &source_path_stat) ||
+            (uintmax_t)source_stat.st_dev != expected_source_device ||
+            (uintmax_t)source_stat.st_ino != expected_source_inode ||
+            source_stat.st_size <= 0 ||
+            (uintmax_t)source_stat.st_size != expected_source_size ||
+            (source_stat.st_mode & 07777) != S_IRUSR ||
+            digest_regular_descriptor(source_fd, source_stat.st_size,
+                                      S_IRUSR, observed_digest) != 0 ||
+            memcmp(source_digest, observed_digest,
+                   SHA256_DIGEST_SIZE) != 0 ||
+            fstat(source_directory_fd, &source_path_stat) != 0 ||
+            !same_directory_identity(&source_directory_stat,
+                                     &source_path_stat) ||
+            source_path_stat.st_uid != geteuid() ||
+            (source_path_stat.st_mode & 07777) != S_IRWXU) {
+            if (errno == 0) {
+                errno = ESTALE;
+            }
+            fprintf(stderr,
+                    "ERROR: staged RPM identity or digest does not match its record: %s\n",
+                    strerror(errno));
+            goto cleanup;
+        }
+    }
 
     output_fd = create_temp(directory_fd, final_name, temp_name,
                             sizeof(temp_name), &has_name);
@@ -4672,9 +6132,43 @@ int main(int argc, char **argv)
                 strerror(errno));
         goto cleanup;
     }
-    if (run_to_descriptor(output_fd, directory_fd,
-                          &argv[command_index],
-                          GITSWITCH_RELEASE_PRODUCER_TIMEOUT_MS) != 0) {
+    if (source_directory_mode) {
+        struct stat source_after;
+        struct stat source_directory_after;
+        unsigned char observed_digest[SHA256_DIGEST_SIZE];
+
+        if (run_release_source_race_hook() != 0 ||
+            copy_regular_descriptor(source_fd, source_stat.st_size,
+                                    output_fd) != 0 ||
+            digest_regular_descriptor(source_fd, source_stat.st_size,
+                                      S_IRUSR, observed_digest) != 0 ||
+            memcmp(source_digest, observed_digest,
+                   SHA256_DIGEST_SIZE) != 0 ||
+            fstat(source_fd, &source_after) != 0 ||
+            !same_identity(&source_stat, &source_after) ||
+            source_after.st_size != source_stat.st_size ||
+            fstat(source_directory_fd, &source_directory_after) != 0 ||
+            !same_directory_identity(&source_directory_stat,
+                                     &source_directory_after) ||
+            source_directory_after.st_uid != geteuid() ||
+            (source_directory_after.st_mode & 07777) != S_IRWXU) {
+            if (errno == 0) {
+                errno = ESTALE;
+            }
+            fprintf(stderr,
+                    "ERROR: staged RPM changed during descriptor copy: %s\n",
+                    strerror(errno));
+            goto cleanup;
+        }
+    } else {
+        if (run_to_descriptor(output_fd, directory_fd,
+                              &argv[command_index],
+                              GITSWITCH_RELEASE_PRODUCER_TIMEOUT_MS) != 0) {
+            goto cleanup;
+        }
+    }
+    if (fatal_signal_pending != 0) {
+        errno = EINTR;
         goto cleanup;
     }
     if (fstat(output_fd, &output_stat) != 0 ||
@@ -4699,6 +6193,13 @@ int main(int argc, char **argv)
                 strerror(errno));
         goto cleanup;
     }
+    if (source_directory_mode &&
+        memcmp(source_digest, expected_digest, SHA256_DIGEST_SIZE) != 0) {
+        errno = ESTALE;
+        fprintf(stderr,
+                "ERROR: descriptor-copied RPM digest differs from its staged record\n");
+        goto cleanup;
+    }
     if (has_name &&
         verify_named_temp_identity(directory_fd, temp_name, output_fd) != 0) {
         has_name = false;
@@ -4716,6 +6217,10 @@ int main(int argc, char **argv)
         }
         if (run_private_consumer(output_fd, directory_fd,
                                  &argv[consumer_index]) != 0) {
+            goto cleanup;
+        }
+        if (fatal_signal_pending != 0) {
+            errno = EINTR;
             goto cleanup;
         }
         if (digest_read_only_regular_descriptor(output_fd,
@@ -4918,6 +6423,12 @@ cleanup:
     if (output_fd >= 0 && close(output_fd) != 0) {
         result = EXIT_FAILURE;
     }
+    if (source_fd >= 0 && close(source_fd) != 0) {
+        result = EXIT_FAILURE;
+    }
+    if (source_directory_fd >= 0 && close(source_directory_fd) != 0) {
+        result = EXIT_FAILURE;
+    }
     if (directory_fd >= 0 && close(directory_fd) != 0) {
         result = EXIT_FAILURE;
     }
@@ -4925,6 +6436,10 @@ cleanup:
         result = EXIT_FAILURE;
     }
     if (root_fd >= 0 && close(root_fd) != 0) {
+        result = EXIT_FAILURE;
+    }
+    report_deferred_fatal_cleanup();
+    if (finish_deferred_fatal_signal() != 0) {
         result = EXIT_FAILURE;
     }
     return result;

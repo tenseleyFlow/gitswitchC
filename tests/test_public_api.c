@@ -14,8 +14,10 @@
 #include "git_ops.h"
 #include "gitswitch.h"
 #include "gpg_manager.h"
+#include "process_fork_internal.h"
 #include "prompt.h"
 #include "publication.h"
+#include "runner_internal.h"
 #include "signals.h"
 #include "ssh_manager.h"
 #include "toml_parser.h"
@@ -56,6 +58,7 @@ TEST(all_retained_public_apis_compile_and_link) {
     REQUIRE_PUBLIC_API(accounts_remove_abort);
     REQUIRE_PUBLIC_API(accounts_remove_commit);
     REQUIRE_PUBLIC_API(accounts_remove_finalize);
+    REQUIRE_PUBLIC_API(accounts_remove_recover_incomplete);
     REQUIRE_PUBLIC_API(accounts_reset_retirement_cancel);
     REQUIRE_PUBLIC_API(accounts_reset_retirement_finalize);
     REQUIRE_PUBLIC_API(accounts_reset_retirement_prepare);
@@ -65,9 +68,7 @@ TEST(all_retained_public_apis_compile_and_link) {
     REQUIRE_PUBLIC_API(accounts_show_status);
     REQUIRE_PUBLIC_API(accounts_switch);
     REQUIRE_PUBLIC_API(accounts_switch_abort);
-    REQUIRE_PUBLIC_API(accounts_switch_commit);
     REQUIRE_PUBLIC_API(accounts_switch_commit_result);
-    REQUIRE_PUBLIC_API(accounts_switch_prepare);
     REQUIRE_PUBLIC_API(accounts_switch_prepare_result);
     REQUIRE_PUBLIC_API(accounts_switch_publication);
     REQUIRE_PUBLIC_API(accounts_transaction_begin);
@@ -107,6 +108,7 @@ TEST(all_retained_public_apis_compile_and_link) {
     REQUIRE_PUBLIC_API(config_publication_preflight);
     REQUIRE_PUBLIC_API(config_publication_preflight_destination);
     REQUIRE_PUBLIC_API(config_refresh_retirement_publications_transactional);
+    REQUIRE_PUBLIC_API(config_revalidate_loaded_source);
     REQUIRE_PUBLIC_API(config_remove_account);
     REQUIRE_PUBLIC_API(config_remove_account_owned);
     REQUIRE_PUBLIC_API(config_restore_active_account);
@@ -115,10 +117,25 @@ TEST(all_retained_public_apis_compile_and_link) {
     REQUIRE_PUBLIC_API(config_resume_hint_snapshot_capture);
     REQUIRE_PUBLIC_API(config_resume_hint_snapshot_clear);
     REQUIRE_PUBLIC_API(config_resume_hint_snapshot_restore);
+    REQUIRE_PUBLIC_API(config_resume_hint_snapshot_settle);
+    REQUIRE_PUBLIC_API(config_switch_guard_abandon);
+    REQUIRE_PUBLIC_API(config_switch_guard_clear);
+    REQUIRE_PUBLIC_API(config_switch_guard_retain);
+    REQUIRE_PUBLIC_API(config_switch_guard_install_or_adopt);
+    REQUIRE_PUBLIC_API(config_switch_guard_probe);
+    REQUIRE_PUBLIC_API(config_switch_guard_reconcile_preintent);
+    REQUIRE_PUBLIC_API(config_switch_guard_was_created);
     REQUIRE_PUBLIC_API(config_retirement_guard_abandon);
+    REQUIRE_PUBLIC_API(config_retirement_guard_adopt);
+    REQUIRE_PUBLIC_API(config_retirement_guard_adopt_with_ssh_alias_obligation);
+    REQUIRE_PUBLIC_API(config_retirement_guard_revalidate);
+    REQUIRE_PUBLIC_API(config_retirement_guard_prepare_clear);
     REQUIRE_PUBLIC_API(config_retirement_guard_clear);
+    REQUIRE_PUBLIC_API(config_retirement_guard_clear_with_barrier);
     REQUIRE_PUBLIC_API(config_retirement_guard_install_or_adopt);
+    REQUIRE_PUBLIC_API(config_retirement_guard_install_or_adopt_with_ssh_alias_obligation);
     REQUIRE_PUBLIC_API(config_retirement_guard_probe);
+    REQUIRE_PUBLIC_API(config_retirement_guard_recovery_probe);
     REQUIRE_PUBLIC_API(config_retirement_guard_was_created);
     REQUIRE_PUBLIC_API(config_save);
     REQUIRE_PUBLIC_API(config_save_active_account);
@@ -193,6 +210,7 @@ TEST(all_retained_public_apis_compile_and_link) {
     REQUIRE_PUBLIC_API(git_config_seal);
     REQUIRE_PUBLIC_API(git_config_snapshot);
     REQUIRE_PUBLIC_API(git_config_snapshot_export_destination);
+    REQUIRE_PUBLIC_API(git_config_snapshot_export_destinations);
     REQUIRE_PUBLIC_API(git_configure_gpg);
     REQUIRE_PUBLIC_API(git_configure_openpgp_publication);
     REQUIRE_PUBLIC_API(git_configure_ssh);
@@ -244,14 +262,27 @@ TEST(all_retained_public_apis_compile_and_link) {
     REQUIRE_PUBLIC_API(gpg_manager_set_agent_conf_precommit_fn);
     REQUIRE_PUBLIC_API(gpg_manager_set_agent_conf_preopen_fn);
     REQUIRE_PUBLIC_API(gpg_manager_set_agent_conf_sync_fn);
+#ifdef GITSWITCH_TESTING
+    REQUIRE_PUBLIC_API(gpg_manager_set_agent_conf_publication_hook_fn);
+    REQUIRE_PUBLIC_API(gpg_manager_set_agent_conf_terminal_preopen_fn);
+    REQUIRE_PUBLIC_API(gpg_manager_set_agent_conf_postclose_fn);
+#endif
+    REQUIRE_PUBLIC_API(gpg_manager_set_base_warning_probe_fn);
     REQUIRE_PUBLIC_API(gpg_manager_set_cleanup_predelete_fn);
+    REQUIRE_PUBLIC_API(gpg_manager_set_identity_unlink_fn);
+    REQUIRE_PUBLIC_API(gpg_manager_set_key_cache_post_scan_hook_fn);
+    REQUIRE_PUBLIC_API(gpg_manager_set_memory_backed_probe_fn);
     REQUIRE_PUBLIC_API(gpg_manager_set_mount_identity_probe_fn);
+    REQUIRE_PUBLIC_API(gpg_manager_set_process_generation_failure_for_test);
     REQUIRE_PUBLIC_API(gpg_manager_set_readdir_fn);
     REQUIRE_PUBLIC_API(gpg_manager_set_rename_noreplace_fn);
     REQUIRE_PUBLIC_API(gpg_manager_set_reset_current_hook_fn);
+    REQUIRE_PUBLIC_API(gpg_manager_set_reset_postvalidate_hook_fn);
     REQUIRE_PUBLIC_API(gpg_manager_set_reset_quarantine_hook_fn);
+    REQUIRE_PUBLIC_API(gpg_manager_set_reset_retire_hook_fn);
     REQUIRE_PUBLIC_API(gpg_manager_set_reset_final_hook_fn);
     REQUIRE_PUBLIC_API(gpg_manager_set_retarget_commit_hook_fn);
+    REQUIRE_PUBLIC_API(gpg_manager_set_retarget_forward_hook_fn);
     REQUIRE_PUBLIC_API(gpg_manager_set_retarget_restore_hook_fn);
     REQUIRE_PUBLIC_API(gpg_manager_set_rollback_hook_fn);
     REQUIRE_PUBLIC_API(gpg_manager_set_setenv_fn);
@@ -299,6 +330,11 @@ TEST(all_retained_public_apis_compile_and_link) {
     REQUIRE_PUBLIC_API(read_file_to_string);
     REQUIRE_PUBLIC_API(run_argv);
     REQUIRE_PUBLIC_API(run_argv_real);
+    REQUIRE_PUBLIC_API(run_argv_with_expected_launch);
+    REQUIRE_PUBLIC_API(run_deadline_after_millis);
+    REQUIRE_PUBLIC_API(run_launch_witness_capture);
+    REQUIRE_PUBLIC_API(run_launch_witness_matches);
+    REQUIRE_PUBLIC_API(run_launch_witness_revalidate);
     REQUIRE_PUBLIC_API(run_set_runner);
     REQUIRE_PUBLIC_API(run_test_fd_close_bulk_supported);
     REQUIRE_PUBLIC_API(run_test_get_fd_close_observation);
@@ -310,15 +346,28 @@ TEST(all_retained_public_apis_compile_and_link) {
     REQUIRE_PUBLIC_API(run_test_set_fork_failure);
     REQUIRE_PUBLIC_API(run_test_set_post_fork_pre_publish_hook);
 #ifdef GITSWITCH_TESTING
+    REQUIRE_PUBLIC_API(run_test_clear_launch_witness_epochs);
+    REQUIRE_PUBLIC_API(run_test_set_launch_witness_epoch);
+    REQUIRE_PUBLIC_API(run_test_set_child_setup_delay);
+    REQUIRE_PUBLIC_API(run_test_set_monotonic_failure);
+    REQUIRE_PUBLIC_API(run_test_set_monotonic_rollback);
+    REQUIRE_PUBLIC_API(run_test_set_monotonic_timespec);
+    REQUIRE_PUBLIC_API(run_test_set_poll_failure);
+    REQUIRE_PUBLIC_API(run_test_set_pre_group_release_hook);
     REQUIRE_PUBLIC_API(run_test_set_exec_parse_failure);
     REQUIRE_PUBLIC_API(run_test_set_path_candidate_failure);
     REQUIRE_PUBLIC_API(run_test_set_directory_open_failure);
     REQUIRE_PUBLIC_API(run_test_set_exec_acl_failure);
 #endif
     REQUIRE_PUBLIC_API(run_uses_default_runner);
+    REQUIRE_PUBLIC_API(process_fork_child_cleanup_register);
     REQUIRE_PUBLIC_API(runtime_lock_test_fail_release_stat);
+    REQUIRE_PUBLIC_API(runtime_state_lock_abandon_inherited);
     REQUIRE_PUBLIC_API(runtime_state_lock_acquire);
     REQUIRE_PUBLIC_API(runtime_state_lock_release);
+#ifdef GITSWITCH_TESTING
+    REQUIRE_PUBLIC_API(runtime_lock_test_descriptors);
+#endif
     REQUIRE_PUBLIC_API(safe_calloc);
     REQUIRE_PUBLIC_API(safe_malloc);
     REQUIRE_PUBLIC_API(safe_memcpy);
@@ -349,6 +398,7 @@ TEST(all_retained_public_apis_compile_and_link) {
     REQUIRE_PUBLIC_API(signals_pending);
     REQUIRE_PUBLIC_API(signals_pending_signal);
     REQUIRE_PUBLIC_API(signals_reset_for_child);
+    REQUIRE_PUBLIC_API(signals_reset_inherited_transaction_state);
     REQUIRE_PUBLIC_API(signals_restore_after_child_spawn);
     REQUIRE_PUBLIC_API(signals_rollback_begin);
     REQUIRE_PUBLIC_API(signals_rollback_begin_owned);
@@ -356,13 +406,17 @@ TEST(all_retained_public_apis_compile_and_link) {
     REQUIRE_PUBLIC_API(signals_rollback_end_owned);
     REQUIRE_PUBLIC_API(signals_rollback_active);
     REQUIRE_PUBLIC_API(signals_scratch_cleanup);
+    REQUIRE_PUBLIC_API(signals_scratch_cleanup_identities_at);
     REQUIRE_PUBLIC_API(signals_scratch_register);
+    REQUIRE_PUBLIC_API(signals_scratch_register_identity);
     REQUIRE_PUBLIC_API(signals_scratch_unregister);
 #ifdef GITSWITCH_TESTING
     REQUIRE_PUBLIC_API(signals_test_fail_dispatch);
+    REQUIRE_PUBLIC_API(signals_test_fail_scratch_unlink);
     REQUIRE_PUBLIC_API(signals_test_fail_sigaction);
     REQUIRE_PUBLIC_API(signals_test_set_guard_end_hook);
     REQUIRE_PUBLIC_API(signals_test_set_post_wait_hook);
+    REQUIRE_PUBLIC_API(signals_test_set_scratch_upgrade_hook);
     REQUIRE_PUBLIC_API(signals_test_published_child);
 #endif
     REQUIRE_PUBLIC_API(sort_accounts);
@@ -407,7 +461,9 @@ TEST(all_retained_public_apis_compile_and_link) {
     REQUIRE_PUBLIC_API(ssh_manager_test_publish_current_link);
     REQUIRE_PUBLIC_API(ssh_manager_test_socket_has_key);
     REQUIRE_PUBLIC_API(ssh_manager_test_write_pid_sidecar);
+    REQUIRE_PUBLIC_API(ssh_manager_test_capture_process_generation);
     REQUIRE_PUBLIC_API(ssh_remove_host_alias);
+    REQUIRE_PUBLIC_API(ssh_remove_host_alias_result);
     REQUIRE_PUBLIC_API(ssh_start_isolated_agent);
     REQUIRE_PUBLIC_API(ssh_stop_agent);
     REQUIRE_PUBLIC_API(ssh_switch_account);

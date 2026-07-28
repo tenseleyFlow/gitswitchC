@@ -238,6 +238,8 @@ TEST(public_cross_type_entrypoints_and_finalizers_preserve_owner) {
     accounts_transaction_token_t token = 0;
     accounts_transaction_token_t rejected =
         UINT64_C(0x5A5A5A5A5A5A5A5A);
+    accounts_switch_prepare_state_t prepare_state =
+        ACCOUNTS_SWITCH_PREPARE_ABORT_REQUIRED;
     accounts_switch_commit_state_t state =
         ACCOUNTS_SWITCH_COMMIT_ALIAS_CLEANUP_FAILED;
 
@@ -254,13 +256,15 @@ TEST(public_cross_type_entrypoints_and_finalizers_preserve_owner) {
     CHECK_EQ_INT(accounts_init(&contender), -1);
     CHECK_EQ_INT(accounts_session_cleanup(), -1);
     CHECK_EQ_INT(accounts_switch(NULL, NULL), -1);
-    CHECK_EQ_INT(accounts_switch_prepare(&contender, NULL), -1);
+    CHECK_EQ_INT(accounts_switch_prepare_result(
+                     &contender, NULL, &prepare_state),
+                 -1);
+    CHECK_EQ_INT(prepare_state, ACCOUNTS_SWITCH_PREPARE_CLEAN_FAILURE);
     CHECK_EQ_INT(accounts_add_interactive_prepare(&contender), -1);
     CHECK_EQ_INT(accounts_edit_interactive_prepare(&contender, NULL), -1);
     CHECK_EQ_INT(accounts_edit_candidate_prepare(&contender, &candidate), -1);
     CHECK_EQ_INT(accounts_remove(&contender, NULL), -1);
 
-    CHECK_EQ_INT(accounts_switch_commit(&contender), -1);
     CHECK_EQ_INT(accounts_switch_commit_result(&contender, &state), -1);
     CHECK_EQ_INT(state, ACCOUNTS_SWITCH_COMMIT_NOT_COMMITTED);
     CHECK_EQ_INT(accounts_switch_abort(&contender, false), -1);

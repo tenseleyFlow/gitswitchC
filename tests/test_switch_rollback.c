@@ -12,7 +12,9 @@
  *
  * External commands are intercepted with the recording-runner pattern from
  * test_security.c; the runtime symlinks live under a private fake
- * XDG_RUNTIME_DIR so no real agents are involved. */
+ * XDG_RUNTIME_DIR. Darwin's launch fixture uses a minimal protocol-capable
+ * child because its peer-credential proof intentionally requires a valid
+ * SSH-agent identity exchange; all key and Git commands remain intercepted. */
 
 /* Enable POSIX extensions for mkdtemp/symlink/fork. glibc-only: on macOS and
  * the BSDs the strict macros hide default-namespace declarations (mkdtemp,
@@ -30,6 +32,7 @@
 #include "signals.h"
 #include "ssh_manager.h"
 #include "gpg_manager.h"
+#include "runner_internal.h"
 #include "utils.h"
 #include "error.h"
 #include "scratch_registry_test.h"
@@ -37,6 +40,7 @@
 #include <dirent.h>
 #include <signal.h>
 #include <fcntl.h>
+#include <poll.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -45,7 +49,13 @@
 #include <sys/types.h>
 #include <sys/un.h>
 #include <sys/wait.h>
+#include <time.h>
 #include <unistd.h>
+
+#if defined(__APPLE__) || \
+    defined(GITSWITCH_TEST_FORCE_PROTOCOL_AGENT_FIXTURE)
+#define USE_PROTOCOL_AGENT_FIXTURE 1
+#endif
 
 /* ---- fake runtime dir ---------------------------------------------------- */
 
@@ -58,18 +68,82 @@ static char *g_gpg_saved_path;
 static bool g_gpg_saved_path_present;
 static bool g_gpg_command_fixture_active;
 static bool g_host_gpg_available;
+static int g_fake_agent_listener = -1;
+#ifdef USE_PROTOCOL_AGENT_FIXTURE
+static int g_fake_agent_control_fd = -1;
+static pid_t g_fake_agent_server_pid = -1;
+static pid_t g_fake_agent_server_owner = -1;
+#endif
+static gitswitch_ctx_t *g_finalizing_observer_ctx;
+static bool g_finalizing_phase_observed;
+
+static void observe_finalizing_switch_phase(void) {
+    accounts_switch_commit_state_t state =
+        ACCOUNTS_SWITCH_COMMIT_COMPLETE;
+    error_context_t saved_error = g_last_error;
+    char expected_phase[32];
+    int saved_errno = errno;
+
+    snprintf(expected_phase, sizeof(expected_phase), "phase %d",
+             ACCOUNTS_TRANSACTION_FINALIZING);
+    if (accounts_switch_commit_result(g_finalizing_observer_ctx, &state) == -1 &&
+        strstr(get_last_error()->message, expected_phase) != NULL) {
+        g_finalizing_phase_observed = true;
+    }
+    g_last_error = saved_error;
+    errno = saved_errno;
+}
+
+static void close_fake_agent_listener(void) {
+    if (g_fake_agent_listener >= 0) {
+        close(g_fake_agent_listener);
+        g_fake_agent_listener = -1;
+    }
+#ifdef USE_PROTOCOL_AGENT_FIXTURE
+    if (g_fake_agent_control_fd >= 0) {
+        close(g_fake_agent_control_fd);
+        g_fake_agent_control_fd = -1;
+    }
+    if (g_fake_agent_server_pid > 0 &&
+        g_fake_agent_server_owner == getpid()) {
+        static const struct timespec pause = {
+            .tv_sec = 0, .tv_nsec = 1000000L
+        };
+        int status;
+        pid_t waited = 0;
+
+        for (int attempt = 0; attempt < 500 && waited == 0; attempt++) {
+            do {
+                waited = waitpid(g_fake_agent_server_pid, &status, WNOHANG);
+            } while (waited < 0 && errno == EINTR);
+            if (waited == 0) (void)nanosleep(&pause, NULL);
+        }
+        if (waited == 0 || (waited < 0 && errno != ECHILD)) {
+            (void)kill(g_fake_agent_server_pid, SIGKILL);
+            do {
+                waited = waitpid(g_fake_agent_server_pid, &status, 0);
+            } while (waited < 0 && errno == EINTR);
+        }
+    }
+    g_fake_agent_server_pid = -1;
+    g_fake_agent_server_owner = -1;
+#endif
+}
 
 /* Create a fresh fake XDG_RUNTIME_DIR holding the pre-switch runtime state of
  * a "previous" account: a current.sock symlink and a GNUPGHOME `current`
  * symlink pointing at a real (empty) home dir. Returns 0 on success. */
 static int setup_runtime_dir(void) {
     char path[512];
+    int cleanup_result;
 
     /* Some SSH rollback cases intentionally leave a restored session active.
      * Later GPG cases may clear it on platforms where gpg is installed, which
      * made the signal tests accidentally depend on the hosted tool matrix.
      * Start every case from a clean process session before changing XDG. */
-    if (accounts_session_cleanup() != 0) return -1;
+    cleanup_result = accounts_session_cleanup();
+    close_fake_agent_listener();
+    if (cleanup_result != 0) return -1;
 
     snprintf(g_xdg, sizeof(g_xdg), "/tmp/gsw_rollback_XXXXXX");
     if (!ts_mkdtemp(g_xdg) ||
@@ -96,11 +170,58 @@ static int setup_runtime_dir(void) {
  * fixture for signal-lifecycle tests: prepare/abort can prove a complete Git
  * rollback without manufacturing an SSH agent solely for restoration. */
 static int setup_empty_runtime_dir(void) {
-    if (accounts_session_cleanup() != 0) return -1;
+    int cleanup_result = accounts_session_cleanup();
+
+    close_fake_agent_listener();
+    if (cleanup_result != 0) return -1;
     snprintf(g_xdg, sizeof(g_xdg), "/tmp/gsw_rollback_empty_XXXXXX");
     if (!ts_mkdtemp(g_xdg) ||
         ts_canonicalize_dir_path(g_xdg, sizeof(g_xdg)) != 0) return -1;
     return setenv("XDG_RUNTIME_DIR", g_xdg, 1);
+}
+
+static int capture_accounts_switch_output(gitswitch_ctx_t *ctx,
+                                          const char *account_name,
+                                          char *output,
+                                          size_t output_size,
+                                          int *switch_result) {
+    FILE *capture;
+    int saved_stdout;
+    int restore_result;
+    size_t length;
+
+    if (!ctx || !account_name || !output || output_size == 0U ||
+        !switch_result) {
+        return -1;
+    }
+    capture = tmpfile();
+    if (!capture) return -1;
+    saved_stdout = dup(STDOUT_FILENO);
+    if (saved_stdout < 0 || fflush(stdout) != 0) {
+        if (saved_stdout >= 0) close(saved_stdout);
+        fclose(capture);
+        return -1;
+    }
+    if (dup2(fileno(capture), STDOUT_FILENO) != STDOUT_FILENO) {
+        close(saved_stdout);
+        fclose(capture);
+        return -1;
+    }
+
+    *switch_result = accounts_switch(ctx, account_name);
+    if (fflush(stdout) != 0) {
+        (void)dup2(saved_stdout, STDOUT_FILENO);
+        close(saved_stdout);
+        fclose(capture);
+        return -1;
+    }
+    restore_result = dup2(saved_stdout, STDOUT_FILENO);
+    close(saved_stdout);
+    rewind(capture);
+    length = fread(output, 1, output_size - 1U, capture);
+    output[length] = '\0';
+    fclose(capture);
+    return restore_result == STDOUT_FILENO ? 0 : -1;
 }
 
 /* Runtime locks are process-scoped on some supported kernels, so a fresh
@@ -375,7 +496,12 @@ static int g_ssh_activation_commands;
 static int g_ssh_connection_probes;
 static int g_ssh_alias_probes;
 static int g_ssh_default_probes;
+static int g_deadlined_ssh_probes;
+static int g_deadlined_nonprobe_commands;
+static int64_t g_ssh_probe_deadline;
 static bool g_fail_ssh_probe;
+static bool g_timeout_ssh_probe;
+static bool g_spawn_fail_ssh_probe;
 static char g_ssh_probe_target[MAX_NAME_LEN + sizeof("git@")];
 static char g_ssh_probe_hostname[sizeof("HostName=") + MAX_NAME_LEN];
 static gitswitch_ctx_t *g_probe_expected_ctx;
@@ -395,6 +521,9 @@ static const char *g_retarget_gpg_on_user_name; /* simulate a later XDG writer *
 static FILE *g_log;                 /* when set, every argv is logged here */
 static char g_effective_signingkey_observed[MAX_GPG_FINGERPRINT_LEN];
 
+#define FAKE_AGENT_PID 1073741824
+#define FAKE_AGENT_FP "SHA256:AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA"
+
 static const int switch_guarded_signals[] = {
     SIGINT, SIGTERM, SIGHUP, SIGQUIT
 };
@@ -402,8 +531,9 @@ static const int switch_guarded_signals[] = {
     (sizeof(switch_guarded_signals) / sizeof(switch_guarded_signals[0]))
 
 static ssh_process_outcome_t refuse_session_agent_reap(
-    pid_t pid, const char *socket_arg, int runtime_dir_fd) {
-    (void)pid;
+    const ssh_agent_record_t *record, const char *socket_arg,
+    int runtime_dir_fd) {
+    (void)record;
     (void)socket_arg;
     (void)runtime_dir_fd;
     return SSH_PROCESS_OWNED;
@@ -418,7 +548,8 @@ static ssh_reap_fn g_session_reap_delegate;
  * accounts_session_cleanup(); a later call proves the checked abort reached
  * runtime rollback before the pending signal was re-raised. */
 static ssh_process_outcome_t signal_during_session_agent_reap(
-    pid_t pid, const char *socket_arg, int runtime_dir_fd) {
+    const ssh_agent_record_t *record, const char *socket_arg,
+    int runtime_dir_fd) {
     int call = ++g_session_reap_calls;
     ssh_process_outcome_t outcome;
 
@@ -435,7 +566,7 @@ static ssh_process_outcome_t signal_during_session_agent_reap(
         fflush(g_log);
     }
     outcome = g_session_reap_delegate
-                  ? g_session_reap_delegate(pid, socket_arg, runtime_dir_fd)
+                  ? g_session_reap_delegate(record, socket_arg, runtime_dir_fd)
                   : SSH_PROCESS_INDETERMINATE;
     return outcome;
 }
@@ -833,8 +964,25 @@ static int fake_runner(const char *const argv[], const run_opts_t *opts,
 
 /* ---- git+ssh runner for the SSH-restart rollback test (AR-02 #30) -------- */
 
-/* Bind a real (unserved) 0600 unix socket so validate_ssh_agent_socket sees a
- * genuine socket inode. Returns 0 on success. */
+static bool is_ssh_agent_command(const char *path) {
+    const char *base;
+
+    if (!path || !*path) return false;
+    base = strrchr(path, '/');
+    return strcmp(base ? base + 1 : path, "ssh-agent") == 0;
+}
+
+static int certify_agent_launch(const char *path, run_result_t *result) {
+    if (!path || !result ||
+        !run_launch_witness_capture(path, &result->launch_witness)) {
+        return -1;
+    }
+    return 0;
+}
+
+/* Bind and retain a real listening 0600 unix socket so both inode validation
+ * and the kernel-authenticated peer probe see a live fake agent endpoint. */
+#ifndef USE_PROTOCOL_AGENT_FIXTURE
 static int bind_fake_agent_socket(const char *path) {
     struct sockaddr_un addr;
     int fd = socket(AF_UNIX, SOCK_STREAM, 0);
@@ -845,16 +993,244 @@ static int bind_fake_agent_socket(const char *path) {
     memset(&addr, 0, sizeof(addr));
     addr.sun_family = AF_UNIX;
     strcpy(addr.sun_path, path);
-    if (bind(fd, (struct sockaddr *)&addr, sizeof(addr)) != 0) {
+    close_fake_agent_listener();
+    if (bind(fd, (struct sockaddr *)&addr, sizeof(addr)) != 0 ||
+        listen(fd, 8) != 0) {
         close(fd);
         return -1;
     }
-    close(fd); /* the socket inode persists; nobody needs to accept() */
-    return chmod(path, 0600);
+    if (chmod(path, 0600) != 0) {
+        close(fd);
+        return -1;
+    }
+    g_fake_agent_listener = fd;
+    return 0;
 }
+#else
+static int fixture_set_cloexec(int fd) {
+    int flags = fcntl(fd, F_GETFD);
+
+    return flags >= 0 && fcntl(fd, F_SETFD, flags | FD_CLOEXEC) == 0 ? 0 : -1;
+}
+
+static int fixture_pipe(int descriptors[2]) {
+    if (pipe(descriptors) != 0) return -1;
+    if (fixture_set_cloexec(descriptors[0]) != 0 ||
+        fixture_set_cloexec(descriptors[1]) != 0) {
+        int saved_errno = errno;
+
+        close(descriptors[0]);
+        close(descriptors[1]);
+        descriptors[0] = -1;
+        descriptors[1] = -1;
+        errno = saved_errno;
+        return -1;
+    }
+    return 0;
+}
+
+/* Return 1 for a complete read, 0 when the owner/control connection closes,
+ * and -1 for a client I/O failure. */
+static int fixture_agent_read_exact(int client_fd, int control_fd,
+                                    unsigned char *buffer, size_t length) {
+    size_t offset = 0;
+
+    while (offset < length) {
+        struct pollfd descriptors[2] = {
+            {.fd = client_fd, .events = POLLIN},
+            {.fd = control_fd, .events = POLLIN}
+        };
+        int poll_rc;
+
+        do {
+            poll_rc = poll(descriptors, 2, -1);
+        } while (poll_rc < 0 && errno == EINTR);
+        if (poll_rc < 0) return -1;
+        if (descriptors[1].revents != 0) return 0;
+        if ((descriptors[0].revents & (POLLERR | POLLNVAL)) != 0) return -1;
+        if ((descriptors[0].revents & POLLIN) != 0) {
+            ssize_t count;
+
+            do {
+                count = read(client_fd, buffer + offset, length - offset);
+            } while (count < 0 && errno == EINTR);
+            if (count <= 0) return count == 0 ? 0 : -1;
+            offset += (size_t)count;
+        } else if ((descriptors[0].revents & POLLHUP) != 0) {
+            return 0;
+        }
+    }
+    return 1;
+}
+
+static int fixture_agent_write_all(int fd, const unsigned char *buffer,
+                                   size_t length) {
+    size_t offset = 0;
+
+    while (offset < length) {
+        ssize_t count;
+
+        do {
+            count = write(fd, buffer + offset, length - offset);
+        } while (count < 0 && errno == EINTR);
+        if (count <= 0) return -1;
+        offset += (size_t)count;
+    }
+    return 0;
+}
+
+static int fixture_agent_serve_client(int client_fd, int control_fd) {
+    static const unsigned char identities_answer[] = {
+        0, 0, 0, 5, 12, 0, 0, 0, 0
+    };
+    static const unsigned char success_answer[] = {0, 0, 0, 1, 6};
+    static const unsigned char failure_answer[] = {0, 0, 0, 1, 5};
+    unsigned char header[4];
+    unsigned char request[256];
+
+    for (;;) {
+        uint32_t length;
+        int read_rc =
+            fixture_agent_read_exact(client_fd, control_fd, header,
+                                     sizeof(header));
+        if (read_rc <= 0) return read_rc;
+        length = ((uint32_t)header[0] << 24) |
+                 ((uint32_t)header[1] << 16) |
+                 ((uint32_t)header[2] << 8) |
+                 (uint32_t)header[3];
+        if (length == 0U || length > sizeof(request)) return -1;
+        read_rc = fixture_agent_read_exact(client_fd, control_fd, request,
+                                           (size_t)length);
+        if (read_rc <= 0) return read_rc;
+        if (length == 1U && request[0] == 11U) {
+            if (fixture_agent_write_all(
+                    client_fd, identities_answer,
+                    sizeof(identities_answer)) != 0) {
+                return -1;
+            }
+        } else if (length == 1U && request[0] == 19U) {
+            if (fixture_agent_write_all(
+                    client_fd, success_answer,
+                    sizeof(success_answer)) != 0) {
+                return -1;
+            }
+        } else if (fixture_agent_write_all(
+                       client_fd, failure_answer,
+                       sizeof(failure_answer)) != 0) {
+            return -1;
+        }
+    }
+}
+
+static void fixture_agent_server_main(const char *path, int cwd_fd,
+                                      int ready_fd, int control_fd) {
+    struct sockaddr_un addr;
+    int listener = -1;
+    char ready = 'E';
+
+    (void)signal(SIGPIPE, SIG_IGN);
+    if (cwd_fd >= 0 && fchdir(cwd_fd) != 0) goto ready;
+    listener = socket(AF_UNIX, SOCK_STREAM, 0);
+    if (listener < 0 || fixture_set_cloexec(listener) != 0 ||
+        strlen(path) >= sizeof(addr.sun_path)) {
+        goto ready;
+    }
+    memset(&addr, 0, sizeof(addr));
+    addr.sun_family = AF_UNIX;
+    strcpy(addr.sun_path, path);
+    if (bind(listener, (struct sockaddr *)&addr, sizeof(addr)) != 0 ||
+        listen(listener, 8) != 0 || chmod(path, 0600) != 0) {
+        goto ready;
+    }
+    ready = 'R';
+ready:
+    if (write(ready_fd, &ready, 1) != 1 || close(ready_fd) != 0 ||
+        ready != 'R') {
+        if (listener >= 0) close(listener);
+        close(control_fd);
+        _exit(1);
+    }
+    for (;;) {
+        struct pollfd descriptors[2] = {
+            {.fd = listener, .events = POLLIN},
+            {.fd = control_fd, .events = POLLIN}
+        };
+        int poll_rc;
+
+        do {
+            poll_rc = poll(descriptors, 2, -1);
+        } while (poll_rc < 0 && errno == EINTR);
+        if (poll_rc < 0 || descriptors[1].revents != 0) break;
+        if ((descriptors[0].revents & POLLIN) != 0) {
+            int client_fd;
+
+            do {
+                client_fd = accept(listener, NULL, NULL);
+            } while (client_fd < 0 && errno == EINTR);
+            if (client_fd >= 0) {
+                (void)fixture_set_cloexec(client_fd);
+                (void)fixture_agent_serve_client(client_fd, control_fd);
+                close(client_fd);
+            }
+        }
+    }
+    close(listener);
+    close(control_fd);
+    _exit(0);
+}
+#endif
 
 static int bind_fake_agent_socket_for_runner(const char *path,
                                              const run_opts_t *opts) {
+#ifdef USE_PROTOCOL_AGENT_FIXTURE
+    int ready_pipe[2] = {-1, -1};
+    int control_pipe[2] = {-1, -1};
+    int cwd_fd = opts && opts->use_cwd_fd ? opts->cwd_fd : -1;
+    pid_t server_pid;
+    char ready = '\0';
+    ssize_t count;
+
+    close_fake_agent_listener();
+    if (fixture_pipe(ready_pipe) != 0 ||
+        fixture_pipe(control_pipe) != 0) {
+        if (ready_pipe[0] >= 0) close(ready_pipe[0]);
+        if (ready_pipe[1] >= 0) close(ready_pipe[1]);
+        return -1;
+    }
+    server_pid = fork();
+    if (server_pid < 0) {
+        close(ready_pipe[0]);
+        close(ready_pipe[1]);
+        close(control_pipe[0]);
+        close(control_pipe[1]);
+        return -1;
+    }
+    if (server_pid == 0) {
+        close(ready_pipe[0]);
+        close(control_pipe[1]);
+        fixture_agent_server_main(path, cwd_fd, ready_pipe[1],
+                                  control_pipe[0]);
+    }
+    close(ready_pipe[1]);
+    close(control_pipe[0]);
+    do {
+        count = read(ready_pipe[0], &ready, 1);
+    } while (count < 0 && errno == EINTR);
+    close(ready_pipe[0]);
+    if (count != 1 || ready != 'R') {
+        int status;
+
+        close(control_pipe[1]);
+        do {
+            count = waitpid(server_pid, &status, 0);
+        } while (count < 0 && errno == EINTR);
+        return -1;
+    }
+    g_fake_agent_control_fd = control_pipe[1];
+    g_fake_agent_server_pid = server_pid;
+    g_fake_agent_server_owner = getpid();
+    return 0;
+#else
     int saved_cwd;
     int rc;
 
@@ -870,6 +1246,7 @@ static int bind_fake_agent_socket_for_runner(const char *path,
     if (fchdir(saved_cwd) != 0) rc = -1;
     close(saved_cwd);
     return rc;
+#endif
 }
 
 /* Extends fake_runner with a working fake ssh-agent (binds the -a socket), a
@@ -879,8 +1256,39 @@ static int bind_fake_agent_socket_for_runner(const char *path,
  * The reported agent PID is far above any platform's pid_max so the later
  * teardown's reaper can never find — let alone signal — a real process behind
  * it. */
-#define FAKE_AGENT_PID 1073741824
-#define FAKE_AGENT_FP "SHA256:AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA"
+static ssh_reap_test_ops_t g_previous_reap_ops;
+
+static int capture_rollback_process_generation(
+    pid_t pid, ssh_process_generation_t *generation) {
+    if (!generation) {
+        errno = EINVAL;
+        return -1;
+    }
+    if (pid == (pid_t)FAKE_AGENT_PID) {
+        *generation = (ssh_process_generation_t) {
+            .kind = SSH_PROCESS_GENERATION_LINUX,
+            .boot_hi = UINT64_C(0x0102030405060708),
+            .boot_lo = UINT64_C(0x1112131415161718),
+            .start_hi = UINT64_C(0x2122232425262728),
+            .start_lo = UINT64_C(0x3132333435363738),
+        };
+        return 0;
+    }
+    return ssh_manager_test_capture_process_generation(pid, generation);
+}
+
+static int retire_fixture_agent_pidfd_open(pid_t pid) {
+    if (pid == (pid_t)FAKE_AGENT_PID) {
+        close_fake_agent_listener();
+        errno = ESRCH;
+        return -1;
+    }
+    if (g_previous_reap_ops.pidfd_open) {
+        return g_previous_reap_ops.pidfd_open(pid);
+    }
+    errno = ENOSYS;
+    return -1;
+}
 
 static bool ssh_probe_observes_committed_switch(void) {
     char config[4096];
@@ -921,6 +1329,7 @@ static bool ssh_probe_observes_committed_switch(void) {
 
 static int ssh_git_runner(const char *const argv[], const run_opts_t *opts,
                           run_result_t *result) {
+    if (g_finalizing_observer_ctx) observe_finalizing_switch_phase();
     if (g_probe_failure_pending_observation && strcmp(argv[0], "ssh") != 0) {
         g_post_probe_error = *get_last_error();
         g_post_probe_errno = errno;
@@ -929,6 +1338,14 @@ static int ssh_git_runner(const char *const argv[], const run_opts_t *opts,
         g_probe_failure_pending_observation = false;
     }
     g_ssh_git_runner_calls++;
+    if (opts && opts->use_deadline) {
+        if (strcmp(argv[0], "ssh") == 0) {
+            g_deadlined_ssh_probes++;
+            g_ssh_probe_deadline = opts->deadline_millis;
+        } else {
+            g_deadlined_nonprobe_commands++;
+        }
+    }
     if (strcmp(argv[0], "ssh") == 0) {
         bool alias_probe = false;
 
@@ -958,11 +1375,18 @@ static int ssh_git_runner(const char *const argv[], const run_opts_t *opts,
             ssh_probe_observes_committed_switch();
         if (result) {
             memset(result, 0, sizeof(*result));
-            result->spawned = true;
-            result->exit_code = g_fail_ssh_probe ? 255 : 1;
+            result->spawned = !g_spawn_fail_ssh_probe;
+            result->exit_code =
+                g_spawn_fail_ssh_probe
+                    ? -1
+                    : (g_fail_ssh_probe || g_timeout_ssh_probe) ? 255 : 1;
+            result->timed_out = g_timeout_ssh_probe;
         }
         if (opts && opts->out && opts->out_size > 0) {
             if (g_fail_ssh_probe) {
+                snprintf(opts->out, opts->out_size,
+                         "git@github.com: Permission denied (publickey).");
+            } else if (g_timeout_ssh_probe || g_spawn_fail_ssh_probe) {
                 opts->out[0] = '\0';
             } else {
                 snprintf(opts->out, opts->out_size,
@@ -971,16 +1395,23 @@ static int ssh_git_runner(const char *const argv[], const run_opts_t *opts,
             }
             if (result) result->out_len = strlen(opts->out);
         }
-        if (g_fail_ssh_probe) {
+        if (g_fail_ssh_probe || g_timeout_ssh_probe ||
+            g_spawn_fail_ssh_probe) {
             g_probe_failure_pending_observation = true;
-            errno = EIO;
+            errno = g_timeout_ssh_probe
+                        ? ETIMEDOUT
+                        : g_spawn_fail_ssh_probe ? ENOENT : EACCES;
             set_system_error(ERR_SYSTEM_COMMAND_FAILED,
-                             "Injected SSH connection probe failure");
+                             g_timeout_ssh_probe
+                                 ? "Injected SSH connection probe timeout"
+                                 : g_spawn_fail_ssh_probe
+                                       ? "Injected SSH probe spawn failure"
+                                       : "Injected SSH authentication failure");
             return -1;
         }
         return 0;
     }
-    if (strcmp(argv[0], "ssh-agent") == 0) {
+    if (is_ssh_agent_command(argv[0])) {
         g_ssh_activation_commands++;
         /* Find "-a <path>" wherever it sits: the AR-03 H1 fix passes an
          * explicit -s ahead of it, so the socket is no longer argv[2]. */
@@ -997,6 +1428,7 @@ static int ssh_git_runner(const char *const argv[], const run_opts_t *opts,
             memset(result, 0, sizeof(*result));
             result->spawned = true;
         }
+        if (certify_agent_launch(argv[0], result) != 0) return -1;
         if (bind_fake_agent_socket_for_runner(sock, opts) != 0) return -1;
         if (opts && opts->out && opts->out_size > 0) {
             snprintf(opts->out, opts->out_size,
@@ -1209,6 +1641,32 @@ static gitswitch_ctx_t make_ctx(void) {
     return ctx;
 }
 
+static int prepare_switch_expect(
+    gitswitch_ctx_t *ctx, const char *identifier,
+    accounts_switch_prepare_state_t expected_state) {
+    accounts_switch_prepare_state_t state =
+        expected_state == ACCOUNTS_SWITCH_PREPARE_CLEAN_FAILURE
+            ? ACCOUNTS_SWITCH_PREPARE_PREPARED
+            : ACCOUNTS_SWITCH_PREPARE_CLEAN_FAILURE;
+    int rc = accounts_switch_prepare_result(ctx, identifier, &state);
+
+    CHECK_EQ_INT(state, expected_state);
+    return rc;
+}
+
+static int commit_switch_expect(
+    gitswitch_ctx_t *ctx,
+    accounts_switch_commit_state_t expected_state) {
+    accounts_switch_commit_state_t state =
+        expected_state == ACCOUNTS_SWITCH_COMMIT_NOT_COMMITTED
+            ? ACCOUNTS_SWITCH_COMMIT_COMPLETE
+            : ACCOUNTS_SWITCH_COMMIT_NOT_COMMITTED;
+    int rc = accounts_switch_commit_result(ctx, &state);
+
+    CHECK_EQ_INT(state, expected_state);
+    return rc;
+}
+
 /* Add the pre-switch account that owns the saved/current metadata. Runtime
  * capabilities are enabled by individual cases only when they are relevant. */
 static account_t *add_previous_account(gitswitch_ctx_t *ctx) {
@@ -1250,7 +1708,12 @@ static void seed_previous_git_identity(void) {
     g_ssh_connection_probes = 0;
     g_ssh_alias_probes = 0;
     g_ssh_default_probes = 0;
+    g_deadlined_ssh_probes = 0;
+    g_deadlined_nonprobe_commands = 0;
+    g_ssh_probe_deadline = -1;
     g_fail_ssh_probe = false;
+    g_timeout_ssh_probe = false;
+    g_spawn_fail_ssh_probe = false;
     g_ssh_probe_target[0] = '\0';
     g_ssh_probe_hostname[0] = '\0';
     g_probe_expected_ctx = NULL;
@@ -1362,7 +1825,8 @@ TEST(signal_guard_failure_aborts_before_switch_mutation) {
     clear_error();
     errno = 0;
     command_runner_fn previous = run_set_runner(fake_runner);
-    int rc = accounts_switch_prepare(&ctx, "testacct");
+    int rc = prepare_switch_expect(
+        &ctx, "testacct", ACCOUNTS_SWITCH_PREPARE_CLEAN_FAILURE);
     returned_errno = errno;
     failure = *get_last_error();
     seal_rc = git_config_seal();
@@ -1493,7 +1957,8 @@ TEST(late_runtime_teardown_failure_rolls_back_git_and_gpg) {
     g_log = NULL;
 
     command_runner_fn previous_runner = run_set_runner(fake_runner);
-    int rc = accounts_switch_prepare(&ctx, "testacct");
+    int rc = prepare_switch_expect(
+        &ctx, "testacct", ACCOUNTS_SWITCH_PREPARE_ABORT_REQUIRED);
     run_set_runner(previous_runner);
     g_fail_list_config = false;
 
@@ -1512,7 +1977,9 @@ TEST(late_runtime_teardown_failure_rolls_back_git_and_gpg) {
     CHECK(strstr(get_last_error()->details,
                  "[SSH runtime deactivation]") != NULL);
     CHECK(runtime_lock_available_to_child());
-    CHECK_EQ_INT(accounts_switch_commit(&ctx), -1);
+    CHECK_EQ_INT(commit_switch_expect(
+                     &ctx, ACCOUNTS_SWITCH_COMMIT_NOT_COMMITTED),
+                 -1);
     CHECK(strstr(get_last_error()->message, "can only be retried") != NULL);
 
     CHECK_EQ_INT(rmdir(lock_path), 0);
@@ -1544,9 +2011,10 @@ TEST(ssh_init_failure_keeps_previous_runtime_isolation) {
     gitswitch_ctx_t ctx = make_ctx();
     account_t *a = &ctx.accounts[0];
     a->ssh_enabled = true;
-    /* A real 0600 private-key-shaped file so the step-1 key validation
-     * (stat/mode/header — no PATH involved) passes and the switch reaches
-     * ssh_manager_init. */
+    /* A real 0600 private-key-shaped file. The injected SSH runner below
+     * supplies a valid OpenSSH fingerprint for this exact preflight, so the
+     * switch reaches ssh_manager_init even after PATH is intentionally
+     * reduced to an empty trusted directory. */
     snprintf(key_path, sizeof(key_path), "%s/key_ed25519", g_xdg);
     kf = fopen(key_path, "w");
     CHECK(kf != NULL);
@@ -1577,8 +2045,9 @@ TEST(ssh_init_failure_keeps_previous_runtime_isolation) {
     g_fail_user_name_set = false;
     g_raise_on_user_name = false;
     g_log = NULL;
-    command_runner_fn prev = run_set_runner(fake_runner);
-    int rc = accounts_switch_prepare(&ctx, "testacct");
+    command_runner_fn prev = run_set_runner(ssh_git_runner);
+    int rc = prepare_switch_expect(
+        &ctx, "testacct", ACCOUNTS_SWITCH_PREPARE_CLEAN_FAILURE);
     failure = *get_last_error();
     run_set_runner(prev);
     CHECK_EQ_INT(saved_path_present ? setenv("PATH", saved_path, 1)
@@ -1592,7 +2061,8 @@ TEST(ssh_init_failure_keeps_previous_runtime_isolation) {
     free(saved_path);
 
     CHECK_EQ_INT(rc, -1);
-    CHECK(strstr(failure.message, "Failed to set up SSH for account") != NULL);
+    CHECK_EQ_INT(failure.code, ERR_SSH_AGENT_NOT_FOUND);
+    CHECK(strstr(failure.message, "ssh-agent command not found") != NULL);
     /* The previous account's entry points were never disturbed and must
      * survive; pre-fix the abort path reaped them. */
     CHECK(symlink_present(g_ssh_sock));
@@ -1631,13 +2101,15 @@ TEST(prepared_ssh_switch_failure_releases_transaction_ownership) {
     seed_previous_git_identity();
     g_fail_ssh_add = true;
     previous_runner = run_set_runner(ssh_git_runner);
-    rc = accounts_switch_prepare(&ctx, "testacct");
+    rc = prepare_switch_expect(
+        &ctx, "testacct", ACCOUNTS_SWITCH_PREPARE_CLEAN_FAILURE);
     failure = *get_last_error();
     run_set_runner(previous_runner);
     g_fail_ssh_add = false;
 
     CHECK_EQ_INT(rc, -1);
-    CHECK(strstr(failure.message, "Failed to set up SSH for account") != NULL);
+    CHECK_EQ_INT(failure.code, ERR_SSH_KEY_LOAD_FAILED);
+    CHECK(strstr(failure.message, "Failed to add SSH key") != NULL);
     CHECK_STR_EQ(g_store_name, "Previous Name");
     CHECK_STR_EQ(g_store_email, "prev@example.com");
     CHECK(ctx.current_account == NULL);
@@ -1798,13 +2270,18 @@ TEST(repeated_switch_reap_failure_preserves_live_session) {
     ctx.account_count = 2;
 
     previous_reap = ssh_manager_set_reap_fn(refuse_session_agent_reap);
-    CHECK_EQ_INT(accounts_switch_prepare(&ctx, "second"), -1);
+    CHECK_EQ_INT(prepare_switch_expect(
+                     &ctx, "second",
+                     ACCOUNTS_SWITCH_PREPARE_ABORT_REQUIRED),
+                 -1);
     ssh_manager_set_reap_fn(previous_reap);
 
     CHECK(strstr(get_last_error()->details,
                  "[SSH runtime deactivation]") != NULL);
     CHECK(runtime_lock_available_to_child());
-    CHECK_EQ_INT(accounts_switch_commit(&ctx), -1);
+    CHECK_EQ_INT(commit_switch_expect(
+                     &ctx, ACCOUNTS_SWITCH_COMMIT_NOT_COMMITTED),
+                 -1);
     CHECK(strstr(get_last_error()->message, "can only be retried") != NULL);
     CHECK_EQ_INT(accounts_switch_abort(&ctx, false), 0);
 
@@ -1857,7 +2334,6 @@ TEST(repeated_signals_during_previous_session_cleanup_wait_for_abort) {
     g_fail_list_config = false;
     g_log = NULL;
     previous_runner = run_set_runner(ssh_git_runner);
-    CHECK_EQ_INT(accounts_switch(&ctx, "testacct"), 0);
 
     memset(&ctx.accounts[1], 0, sizeof(ctx.accounts[1]));
     ctx.accounts[1].id = 2;
@@ -1895,6 +2371,7 @@ TEST(repeated_signals_during_previous_session_cleanup_wait_for_abort) {
         if (pid == 0) {
             struct sigaction default_action;
 
+            if (accounts_switch(&ctx, "testacct") != 0) _exit(29);
             memset(&default_action, 0, sizeof(default_action));
             default_action.sa_handler = SIG_DFL;
             sigemptyset(&default_action.sa_mask);
@@ -2284,6 +2761,8 @@ TEST(fresh_alias_switch_runs_one_postcommit_probe) {
     char home[600], saved_home[4096], config_path[700], after[4096];
     gitswitch_ctx_t ctx;
     command_runner_fn previous_runner;
+    int64_t deadline_lower;
+    int64_t deadline_upper;
     int rc;
 
     if (!ssh_probe_fixture_available()) {
@@ -2299,13 +2778,19 @@ TEST(fresh_alias_switch_runs_one_postcommit_probe) {
     g_probe_expected_ctx = &ctx;
     g_probe_expected_config_path = config_path;
     g_probe_expected_alias = "github.com-tgt";
+    CHECK_EQ_INT(run_deadline_after_millis(0, &deadline_lower), 0);
     previous_runner = run_set_runner(ssh_git_runner);
     rc = accounts_switch(&ctx, "testacct");
+    CHECK_EQ_INT(run_deadline_after_millis(7000, &deadline_upper), 0);
 
     CHECK_EQ_INT(rc, 0);
     CHECK_EQ_INT(g_ssh_connection_probes, 1);
     CHECK_EQ_INT(g_ssh_alias_probes, 1);
     CHECK_EQ_INT(g_ssh_default_probes, 0);
+    CHECK_EQ_INT(g_deadlined_ssh_probes, 1);
+    CHECK_EQ_INT(g_deadlined_nonprobe_commands, 0);
+    CHECK(g_ssh_probe_deadline >= deadline_lower + 7000);
+    CHECK(g_ssh_probe_deadline <= deadline_upper);
     CHECK_STR_EQ(g_ssh_probe_target, "git@github.com-tgt");
     CHECK_STR_EQ(g_ssh_probe_hostname, "HostName=github.com");
     CHECK(g_ssh_activation_commands > 0);
@@ -2342,7 +2827,10 @@ TEST(prepared_verbose_fresh_switch_runs_one_default_probe) {
     CHECK_EQ_INT(enable_switch_target_ssh(&ctx, NULL), 0);
     seed_previous_git_identity();
     previous_runner = run_set_runner(ssh_git_runner);
-    CHECK_EQ_INT(accounts_switch_prepare(&ctx, "testacct"), 0);
+    CHECK_EQ_INT(prepare_switch_expect(
+                     &ctx, "testacct",
+                     ACCOUNTS_SWITCH_PREPARE_PREPARED),
+                 0);
     CHECK_EQ_INT(g_ssh_connection_probes, 0);
     g_probe_expected_ctx = &ctx;
     CHECK_EQ_INT(accounts_switch_commit_result(&ctx, &state), 0);
@@ -2362,13 +2850,14 @@ TEST(prepared_verbose_fresh_switch_runs_one_default_probe) {
     run_set_runner(previous_runner);
 }
 
-/* Authentication and transport failures are observational only. The probe
- * runner injects a structured operational error after verifying the exact
+/* Authentication, transport, and deadline failures are observational only.
+ * The probe runner injects a structured timeout after verifying the exact
  * committed state visible at invocation; the successful switch must retain
  * that state and restore the caller-visible diagnostic it had beforehand. */
 TEST(failed_postcommit_probe_preserves_switch_and_diagnostic) {
     static const char original[] = "Host personal\n  User old\n";
     char home[600], saved_home[4096], config_path[700], after[4096];
+    char output[4096];
     gitswitch_ctx_t ctx;
     command_runner_fn previous_runner;
     const error_context_t *observed_error;
@@ -2385,21 +2874,30 @@ TEST(failed_postcommit_probe_preserves_switch_and_diagnostic) {
     ctx = make_ctx();
     CHECK_EQ_INT(enable_switch_target_ssh(&ctx, "github.com-tgt"), 0);
     seed_previous_git_identity();
-    g_fail_ssh_probe = true;
+    g_timeout_ssh_probe = true;
     g_probe_expected_ctx = &ctx;
     g_probe_expected_config_path = config_path;
     g_probe_expected_alias = "github.com-tgt";
     clear_error();
     errno = 0;
     previous_runner = run_set_runner(ssh_git_runner);
-    rc = accounts_switch(&ctx, "testacct");
+    CHECK_EQ_INT(capture_accounts_switch_output(
+                     &ctx, "testacct", output, sizeof(output), &rc),
+                 0);
     observed_error = get_last_error();
     observed_errno = errno;
 
     CHECK_EQ_INT(rc, 0);
+    CHECK(strstr(output,
+                 "SSH connection could not be verified (github.com-tgt)") !=
+          NULL);
+    CHECK(strstr(output, "unreachable") == NULL);
     CHECK_EQ_INT(g_ssh_connection_probes, 1);
     CHECK_EQ_INT(g_ssh_alias_probes, 1);
     CHECK_EQ_INT(g_ssh_default_probes, 0);
+    CHECK_EQ_INT(g_deadlined_ssh_probes, 1);
+    CHECK_EQ_INT(g_deadlined_nonprobe_commands, 0);
+    CHECK(g_ssh_probe_deadline > 0);
     CHECK(g_probe_observed_committed_state);
     CHECK_EQ_INT(observed_error->code, g_probe_error_before.code);
     CHECK_STR_EQ(observed_error->message, g_probe_error_before.message);
@@ -2414,7 +2912,7 @@ TEST(failed_postcommit_probe_preserves_switch_and_diagnostic) {
                  g_probe_error_before.system_errno);
     CHECK_EQ_INT(g_post_probe_errno, g_probe_errno_before);
     CHECK(g_post_probe_generation == g_probe_generation_before);
-    CHECK(observed_errno != EIO);
+    CHECK(observed_errno != ETIMEDOUT);
     CHECK(ctx.current_account == &ctx.accounts[0]);
     CHECK_STR_EQ(ctx.config.active_account, "testacct");
     CHECK_STR_EQ(g_store_name, "testacct");
@@ -2428,13 +2926,59 @@ TEST(failed_postcommit_probe_preserves_switch_and_diagnostic) {
     CHECK(strstr(get_last_error()->message, "No prepared account switch") !=
           NULL);
 
-    g_fail_ssh_probe = false;
+    g_timeout_ssh_probe = false;
     g_probe_expected_ctx = NULL;
     g_probe_expected_config_path = NULL;
     g_probe_expected_alias = NULL;
     CHECK_EQ_INT(accounts_session_cleanup(), 0);
     run_set_runner(previous_runner);
     CHECK_EQ_INT(setenv("HOME", saved_home, 1), 0);
+}
+
+TEST(postcommit_probe_failure_messages_are_cause_neutral) {
+    static const char original[] = "Host personal\n  User old\n";
+    static const char *const causes[] = {
+        "timeout",
+        "authentication",
+        "spawn",
+    };
+    size_t i;
+
+    if (!ssh_probe_fixture_available()) {
+        TS_SKIP("openssh", "SSH command fixture prerequisites unavailable");
+    }
+    for (i = 0U; i < sizeof(causes) / sizeof(causes[0]); i++) {
+        char home[600], saved_home[4096], config_path[700], output[4096];
+        gitswitch_ctx_t ctx;
+        command_runner_fn previous_runner;
+        int rc;
+
+        CHECK_EQ_INT(setup_empty_runtime_dir(), 0);
+        CHECK_EQ_INT(setup_alias_config_file(
+                         home, sizeof(home), saved_home, sizeof(saved_home),
+                         config_path, sizeof(config_path), original), 0);
+        ctx = make_ctx();
+        CHECK_EQ_INT(enable_switch_target_ssh(&ctx, "github.com-tgt"), 0);
+        seed_previous_git_identity();
+        g_timeout_ssh_probe = strcmp(causes[i], "timeout") == 0;
+        g_fail_ssh_probe = strcmp(causes[i], "authentication") == 0;
+        g_spawn_fail_ssh_probe = strcmp(causes[i], "spawn") == 0;
+        previous_runner = run_set_runner(ssh_git_runner);
+
+        CHECK_EQ_INT(capture_accounts_switch_output(
+                         &ctx, "testacct", output, sizeof(output), &rc),
+                     0);
+        CHECK_EQ_INT(rc, 0);
+        CHECK(strstr(
+                  output,
+                  "SSH connection could not be verified (github.com-tgt)") !=
+              NULL);
+        CHECK(strstr(output, "unreachable") == NULL);
+
+        CHECK_EQ_INT(accounts_session_cleanup(), 0);
+        run_set_runner(previous_runner);
+        CHECK_EQ_INT(setenv("HOME", saved_home, 1), 0);
+    }
 }
 
 /* Each existing policy exclusion gets an independent full-switch witness.
@@ -2615,7 +3159,10 @@ TEST(postrename_alias_fsync_failure_retains_complete_prepared_switch) {
     g_raise_on_user_name = false;
     g_log = NULL;
     previous_runner = run_set_runner(ssh_git_runner);
-    CHECK_EQ_INT(accounts_switch_prepare(&ctx, "testacct"), 0);
+    CHECK_EQ_INT(prepare_switch_expect(
+                     &ctx, "testacct",
+                     ACCOUNTS_SWITCH_PREPARE_PREPARED),
+                 0);
     previous_sync = ssh_manager_set_dirsync_fn(fail_alias_dirsync);
     rc = accounts_switch_commit_result(&ctx, &state);
     safe_strncpy(detail, get_last_error()->message, sizeof(detail));
@@ -2679,7 +3226,10 @@ TEST(first_ssh_home_sync_failure_remains_abortable_preinstall) {
     g_raise_on_user_name = false;
     g_log = NULL;
     previous_runner = run_set_runner(ssh_git_runner);
-    CHECK_EQ_INT(accounts_switch_prepare(&ctx, "testacct"), 0);
+    CHECK_EQ_INT(prepare_switch_expect(
+                     &ctx, "testacct",
+                     ACCOUNTS_SWITCH_PREPARE_PREPARED),
+                 0);
     previous_sync = ssh_manager_set_dirsync_fn(fail_alias_dirsync);
     clear_error();
     rc = accounts_switch_commit_result(&ctx, &state);
@@ -2766,7 +3316,10 @@ TEST(identical_insecure_alias_prerename_failure_remains_abortable) {
     g_log = NULL;
     before_fds = test_open_fd_count();
     previous_runner = run_set_runner(ssh_git_runner);
-    CHECK_EQ_INT(accounts_switch_prepare(&ctx, "testacct"), 0);
+    CHECK_EQ_INT(prepare_switch_expect(
+                     &ctx, "testacct",
+                     ACCOUNTS_SWITCH_PREPARE_PREPARED),
+                 0);
     CHECK_EQ_INT(chmod(config_path, 0666), 0);
     CHECK_EQ_INT(stat(config_path, &before), 0);
     CHECK(S_ISREG(before.st_mode));
@@ -2865,7 +3418,10 @@ TEST(identical_insecure_alias_dirsync_failure_retains_normalized_commit) {
     g_log = NULL;
     before_fds = test_open_fd_count();
     previous_runner = run_set_runner(ssh_git_runner);
-    CHECK_EQ_INT(accounts_switch_prepare(&ctx, "testacct"), 0);
+    CHECK_EQ_INT(prepare_switch_expect(
+                     &ctx, "testacct",
+                     ACCOUNTS_SWITCH_PREPARE_PREPARED),
+                 0);
     CHECK_EQ_INT(chmod(config_path, 0666), 0);
     CHECK_EQ_INT(stat(config_path, &before), 0);
     CHECK(S_ISREG(before.st_mode));
@@ -2997,9 +3553,7 @@ TEST(incomplete_rollback_retry_survives_transient_runtime_lock_contention) {
     char after[4096], detail[sizeof(g_last_error.message)];
     gitswitch_ctx_t ctx;
     command_runner_fn previous_runner;
-    ssh_config_commit_hook_fn previous_hook;
     runtime_lock_holder_t holder = {0, -1};
-    int rc;
 
     CHECK_EQ_INT(setup_runtime_dir(), 0);
     CHECK_EQ_INT(setup_alias_config_file(
@@ -3014,15 +3568,16 @@ TEST(incomplete_rollback_retry_survives_transient_runtime_lock_contention) {
     g_raise_on_user_name = false;
     g_log = NULL;
     previous_runner = run_set_runner(ssh_git_runner);
-    previous_hook = ssh_manager_set_config_commit_hook_fn(
-        replace_git_name_and_fail_alias_commit);
-    rc = accounts_switch(&ctx, "testacct");
+    CHECK_EQ_INT(prepare_switch_expect(
+                     &ctx, "testacct",
+                     ACCOUNTS_SWITCH_PREPARE_PREPARED),
+                 0);
+    safe_strncpy(g_store_name, "Concurrent Name", sizeof(g_store_name));
+    CHECK_EQ_INT(accounts_switch_abort(&ctx, false), -1);
     safe_strncpy(detail, get_last_error()->message, sizeof(detail));
-    ssh_manager_set_config_commit_hook_fn(previous_hook);
 
     /* Integrated switch left an incomplete rollback retained for retry. */
-    CHECK_EQ_INT(rc, -1);
-    CHECK(strstr(detail, "retry ownership retained") != NULL);
+    CHECK(strstr(detail, "retry material retained") != NULL);
     after[0] = '\0';
     CHECK(read_file_to_string(config_path, after, sizeof(after)) >= 0);
     CHECK_STR_EQ(after, original);
@@ -3037,7 +3592,11 @@ TEST(incomplete_rollback_retry_survives_transient_runtime_lock_contention) {
      * owner was stranded in FINALIZING and this returned -1 ("Cannot abort
      * switch transaction from phase 4") forever. */
     safe_strncpy(g_store_name, "testacct", sizeof(g_store_name));
+    g_finalizing_observer_ctx = &ctx;
+    g_finalizing_phase_observed = false;
     CHECK_EQ_INT(accounts_switch_abort(&ctx, false), 0);
+    g_finalizing_observer_ctx = NULL;
+    CHECK(g_finalizing_phase_observed);
     CHECK_STR_EQ(g_store_name, "Previous Name");
     CHECK_EQ_INT(accounts_switch_abort(&ctx, false), -1);
     CHECK(strstr(get_last_error()->message,
@@ -3490,15 +4049,27 @@ static int gpg_git_runner(const char *const argv[], const run_opts_t *opts,
                           run_result_t *result) {
     if (strncmp(ts_command_basename(argv[0]), "gpg", 3) == 0) {
         bool listing = false;
+        bool list_components = false;
         if (result) {
             memset(result, 0, sizeof(*result));
             result->spawned = true;
+            if (!run_launch_witness_capture(
+                    argv[0], &result->launch_witness)) {
+                return -1;
+            }
         }
         if (opts && opts->out && opts->out_size > 0) opts->out[0] = '\0';
         for (int i = 1; argv[i]; i++) {
             if (strcmp(argv[i], "--list-secret-keys") == 0) listing = true;
+            if (strcmp(argv[i], "--list-components") == 0) {
+                list_components = true;
+            }
         }
-        if (listing && opts && opts->out) {
+        if (list_components && opts && opts->out) {
+            snprintf(opts->out, opts->out_size,
+                     "gpg:OpenPGP:%s/gpg:\n", g_gpg_command_dir);
+            if (result) result->out_len = strlen(opts->out);
+        } else if (listing && opts && opts->out) {
             snprintf(opts->out, opts->out_size, "%s", g_gpg_secret_listing);
             if (result) result->out_len = strlen(opts->out);
         }
@@ -3574,7 +4145,10 @@ TEST(abort_accumulates_git_then_gpg_failure_and_retries_exactly) {
     seed_previous_git_identity();
     previous_runner = run_set_runner(gpg_git_runner);
 
-    CHECK_EQ_INT(accounts_switch_prepare(&ctx, "testacct"), 0);
+    CHECK_EQ_INT(prepare_switch_expect(
+                     &ctx, "testacct",
+                     ACCOUNTS_SWITCH_PREPARE_PREPARED),
+                 0);
     CHECK_STR_EQ(g_store_name, "testacct");
     CHECK(getenv("GNUPGHOME") != NULL);
     if (getenv("GNUPGHOME")) {
@@ -3727,7 +4301,8 @@ TEST(signing_capability_failure_precedes_runtime_and_git_publication) {
     g_gpg_secret_listing = SEC_CERT_ONLY;
     command_runner_fn previous_runner = run_set_runner(gpg_git_runner);
 
-    int rc = accounts_switch_prepare(&ctx, "testacct");
+    int rc = prepare_switch_expect(
+        &ctx, "testacct", ACCOUNTS_SWITCH_PREPARE_CLEAN_FAILURE);
     failure = *get_last_error();
 
     run_set_runner(previous_runner);
@@ -3778,11 +4353,16 @@ TEST(prepared_commit_accepts_unchanged_gpg_selector_after_normalization) {
     g_gpg_secret_listing = SEC_SIGN;
     previous_runner = run_set_runner(gpg_git_runner);
 
-    CHECK_EQ_INT(accounts_switch_prepare(&ctx, "testacct"), 0);
+    CHECK_EQ_INT(prepare_switch_expect(
+                     &ctx, "testacct",
+                     ACCOUNTS_SWITCH_PREPARE_PREPARED),
+                 0);
     CHECK_STR_EQ(ctx.accounts[0].gpg_key_id, "FEEDFACE01234567");
     CHECK_STR_EQ(g_store_signingkey,
                  "0123456789ABCDEF0123456789ABCDEF01234567");
-    CHECK_EQ_INT(accounts_switch_commit(&ctx), 0);
+    CHECK_EQ_INT(commit_switch_expect(
+                     &ctx, ACCOUNTS_SWITCH_COMMIT_COMPLETE),
+                 0);
     CHECK_STR_EQ(ctx.accounts[0].gpg_key_id, "FEEDFACE01234567");
     CHECK_EQ_INT(accounts_session_cleanup(), 0);
 
@@ -4017,7 +4597,8 @@ TEST(late_seal_failure_restores_exact_gpg_selector_vectors) {
     g_mutate_name_before_seal = true;
     previous_runner = run_set_runner(gpg_git_runner);
 
-    rc = accounts_switch_prepare(&ctx, "testacct");
+    rc = prepare_switch_expect(
+        &ctx, "testacct", ACCOUNTS_SWITCH_PREPARE_ABORT_REQUIRED);
     g_mutate_name_before_seal = false;
 
     CHECK_EQ_INT(rc, -1);
@@ -4309,7 +4890,7 @@ TEST(pending_postcommit_signal_skips_ssh_probe) {
 /* AR-11 M4: the structured prepare result is a caller-lifetime contract.
  * Only an exact successful handoff is PREPARED; a failed call that publishes
  * an abort-only record says so explicitly, while validation or competing-
- * owner failures remain clean. The legacy wrapper keeps its integer result. */
+ * owner failures remain clean. */
 TEST(structured_prepare_result_tracks_exact_context_ownership) {
     gitswitch_ctx_t owner;
     gitswitch_ctx_t contender;
@@ -4324,7 +4905,10 @@ TEST(structured_prepare_result_tracks_exact_context_ownership) {
                  -1);
     CHECK_EQ_INT(state, ACCOUNTS_SWITCH_PREPARE_CLEAN_FAILURE);
     CHECK(accounts_transaction_context_release_safe(&owner));
-    CHECK_EQ_INT(accounts_switch_prepare(&owner, "missing"), -1);
+    CHECK_EQ_INT(prepare_switch_expect(
+                     &owner, "missing",
+                     ACCOUNTS_SWITCH_PREPARE_CLEAN_FAILURE),
+                 -1);
     CHECK(accounts_transaction_context_release_safe(&owner));
 
     CHECK_EQ_INT(setup_empty_runtime_dir(), 0);
@@ -4336,14 +4920,19 @@ TEST(structured_prepare_result_tracks_exact_context_ownership) {
                  0);
     CHECK_EQ_INT(state, ACCOUNTS_SWITCH_PREPARE_PREPARED);
     CHECK(!accounts_transaction_context_release_safe(&owner));
-    CHECK_EQ_INT(accounts_switch_commit(&owner), 0);
+    CHECK_EQ_INT(commit_switch_expect(
+                     &owner, ACCOUNTS_SWITCH_COMMIT_COMPLETE),
+                 0);
     CHECK(accounts_transaction_context_release_safe(&owner));
 
     CHECK_EQ_INT(setup_empty_runtime_dir(), 0);
     owner = make_ctx();
     contender = make_ctx();
     seed_previous_git_identity();
-    CHECK_EQ_INT(accounts_switch_prepare(&owner, "testacct"), 0);
+    CHECK_EQ_INT(prepare_switch_expect(
+                     &owner, "testacct",
+                     ACCOUNTS_SWITCH_PREPARE_PREPARED),
+                 0);
     CHECK(!accounts_transaction_context_release_safe(&owner));
     state = ACCOUNTS_SWITCH_PREPARE_ABORT_REQUIRED;
     CHECK_EQ_INT(accounts_switch_prepare_result(&contender, NULL, &state),
@@ -4363,7 +4952,9 @@ TEST(structured_prepare_result_tracks_exact_context_ownership) {
     g_mutate_name_before_seal = false;
     CHECK_EQ_INT(state, ACCOUNTS_SWITCH_PREPARE_ABORT_REQUIRED);
     CHECK(!accounts_transaction_context_release_safe(&owner));
-    CHECK_EQ_INT(accounts_switch_commit(&owner), -1);
+    CHECK_EQ_INT(commit_switch_expect(
+                     &owner, ACCOUNTS_SWITCH_COMMIT_NOT_COMMITTED),
+                 -1);
     CHECK(strstr(get_last_error()->message, "can only be retried") != NULL);
     safe_strncpy(g_store_name, "testacct", sizeof(g_store_name));
     CHECK_EQ_INT(accounts_switch_abort(&owner, false), 0);
@@ -4374,12 +4965,15 @@ TEST(structured_prepare_result_tracks_exact_context_ownership) {
 
 typedef enum {
     ACCOUNT_MUTATION_ID = 0,
+    ACCOUNT_MUTATION_INCARNATION,
+    ACCOUNT_MUTATION_INCARNATION_PERSISTED,
     ACCOUNT_MUTATION_NAME,
     ACCOUNT_MUTATION_EMAIL,
     ACCOUNT_MUTATION_DESCRIPTION,
     ACCOUNT_MUTATION_SCOPE,
     ACCOUNT_MUTATION_SSH_ENABLED,
     ACCOUNT_MUTATION_SSH_KEY_PATH,
+    ACCOUNT_MUTATION_SSH_KEY_SPELLING,
     ACCOUNT_MUTATION_SSH_HOST_ALIAS,
     ACCOUNT_MUTATION_SSH_HOSTNAME,
     ACCOUNT_MUTATION_GPG_ENABLED,
@@ -4393,6 +4987,14 @@ static void mutate_account_field(account_t *account,
     switch (field) {
         case ACCOUNT_MUTATION_ID:
             account->id = 101;
+            break;
+        case ACCOUNT_MUTATION_INCARNATION:
+            account->incarnation[0] =
+                account->incarnation[0] == 'A' ? 'B' : 'A';
+            break;
+        case ACCOUNT_MUTATION_INCARNATION_PERSISTED:
+            account->incarnation_persisted =
+                !account->incarnation_persisted;
             break;
         case ACCOUNT_MUTATION_NAME:
             CHECK_EQ_INT(safe_strncpy(account->name, "changed-name",
@@ -4417,6 +5019,11 @@ static void mutate_account_field(account_t *account,
         case ACCOUNT_MUTATION_SSH_KEY_PATH:
             CHECK_EQ_INT(safe_strncpy(account->ssh_key_path, "~/.ssh/changed",
                                       sizeof(account->ssh_key_path)), 0);
+            break;
+        case ACCOUNT_MUTATION_SSH_KEY_SPELLING:
+            CHECK_EQ_INT(safe_strncpy(account->ssh_key_spelling,
+                                      "~/.ssh/./spelling-only",
+                                      sizeof(account->ssh_key_spelling)), 0);
             break;
         case ACCOUNT_MUTATION_SSH_HOST_ALIAS:
             CHECK_EQ_INT(safe_strncpy(account->ssh_host_alias,
@@ -4455,6 +5062,7 @@ TEST(prepared_commit_rejects_every_frozen_account_field_change) {
     for (int field = 0; field < ACCOUNT_MUTATION_COUNT; field++) {
         gitswitch_ctx_t owner;
         gitswitch_ctx_t contender;
+        account_t before_mutation;
         accounts_switch_commit_state_t state =
             ACCOUNTS_SWITCH_COMMIT_ALIAS_CLEANUP_FAILED;
         int runner_calls;
@@ -4465,10 +5073,30 @@ TEST(prepared_commit_rejects_every_frozen_account_field_change) {
         owner = make_ctx();
         contender = make_ctx();
         seed_previous_git_identity();
-        CHECK_EQ_INT(accounts_switch_prepare(&owner, "testacct"), 0);
+        CHECK_EQ_INT(prepare_switch_expect(
+                         &owner, "testacct",
+                         ACCOUNTS_SWITCH_PREPARE_PREPARED),
+                     0);
         runner_calls = g_fake_runner_calls;
+        before_mutation = owner.accounts[0];
         mutate_account_field(&owner.accounts[0],
                              (account_mutation_field_t)field);
+        if (field == ACCOUNT_MUTATION_INCARNATION) {
+            CHECK(strcmp(owner.accounts[0].incarnation,
+                         before_mutation.incarnation) != 0);
+            CHECK_EQ_INT(owner.accounts[0].incarnation_persisted,
+                         before_mutation.incarnation_persisted);
+        } else if (field == ACCOUNT_MUTATION_INCARNATION_PERSISTED) {
+            CHECK_STR_EQ(owner.accounts[0].incarnation,
+                         before_mutation.incarnation);
+            CHECK(owner.accounts[0].incarnation_persisted !=
+                  before_mutation.incarnation_persisted);
+        } else if (field == ACCOUNT_MUTATION_SSH_KEY_SPELLING) {
+            CHECK_STR_EQ(owner.accounts[0].ssh_key_path,
+                         before_mutation.ssh_key_path);
+            CHECK(strcmp(owner.accounts[0].ssh_key_spelling,
+                         before_mutation.ssh_key_spelling) != 0);
+        }
 
         errno = 0;
         CHECK_EQ_INT(accounts_switch_commit_result(&owner, &state), -1);
@@ -4524,7 +5152,10 @@ TEST(prepared_switch_gates_public_account_model_mutation_matrix) {
                               sizeof(edited.description)), 0);
     seed_previous_git_identity();
     previous_runner = run_set_runner(fake_runner);
-    CHECK_EQ_INT(accounts_switch_prepare(&owner, "testacct"), 0);
+    CHECK_EQ_INT(prepare_switch_expect(
+                     &owner, "testacct",
+                     ACCOUNTS_SWITCH_PREPARE_PREPARED),
+                 0);
     owner_before = owner;
     contender_before = contender;
     runner_calls = g_fake_runner_calls;
@@ -4585,10 +5216,15 @@ TEST(prepared_commit_accepts_unchanged_tilde_ssh_path) {
     seed_previous_git_identity();
     previous_runner = run_set_runner(ssh_git_runner);
 
-    CHECK_EQ_INT(accounts_switch_prepare(&ctx, "testacct"), 0);
+    CHECK_EQ_INT(prepare_switch_expect(
+                     &ctx, "testacct",
+                     ACCOUNTS_SWITCH_PREPARE_PREPARED),
+                 0);
     CHECK_STR_EQ(ctx.accounts[0].ssh_key_path, "~/key_target");
     CHECK(strstr(g_store_sshcmd, key_path) != NULL);
-    CHECK_EQ_INT(accounts_switch_commit(&ctx), 0);
+    CHECK_EQ_INT(commit_switch_expect(
+                     &ctx, ACCOUNTS_SWITCH_COMMIT_COMPLETE),
+                 0);
     CHECK_STR_EQ(ctx.accounts[0].ssh_key_path, "~/key_target");
     CHECK_EQ_INT(accounts_session_cleanup(), 0);
 
@@ -4619,7 +5255,10 @@ TEST(clean_pending_switch_excludes_competing_entry_matrix) {
     seed_previous_git_identity();
     previous_runner = run_set_runner(fake_runner);
 
-    CHECK_EQ_INT(accounts_switch_prepare(&owner, "testacct"), 0);
+    CHECK_EQ_INT(prepare_switch_expect(
+                     &owner, "testacct",
+                     ACCOUNTS_SWITCH_PREPARE_PREPARED),
+                 0);
     CHECK_STR_EQ(g_store_name, "testacct");
     CHECK_STR_EQ(g_store_email, "test@example.com");
     CHECK(!runtime_lock_available_to_child());
@@ -4641,11 +5280,20 @@ TEST(clean_pending_switch_excludes_competing_entry_matrix) {
     CHECK(strstr(get_last_error()->message, "already pending") != NULL);
     CHECK_EQ_INT(accounts_switch(NULL, NULL), -1);
     CHECK(strstr(get_last_error()->message, "already pending") != NULL);
-    CHECK_EQ_INT(accounts_switch_prepare(&owner, "testacct"), -1);
+    CHECK_EQ_INT(prepare_switch_expect(
+                     &owner, "testacct",
+                     ACCOUNTS_SWITCH_PREPARE_CLEAN_FAILURE),
+                 -1);
     CHECK(strstr(get_last_error()->message, "already pending") != NULL);
-    CHECK_EQ_INT(accounts_switch_prepare(&contender, NULL), -1);
+    CHECK_EQ_INT(prepare_switch_expect(
+                     &contender, NULL,
+                     ACCOUNTS_SWITCH_PREPARE_CLEAN_FAILURE),
+                 -1);
     CHECK(strstr(get_last_error()->message, "already pending") != NULL);
-    CHECK_EQ_INT(accounts_switch_prepare(NULL, NULL), -1);
+    CHECK_EQ_INT(prepare_switch_expect(
+                     NULL, NULL,
+                     ACCOUNTS_SWITCH_PREPARE_CLEAN_FAILURE),
+                 -1);
     CHECK(strstr(get_last_error()->message, "already pending") != NULL);
 
     CHECK(memcmp(&owner, &owner_before, sizeof(owner)) == 0);
@@ -4664,7 +5312,10 @@ TEST(clean_pending_switch_excludes_competing_entry_matrix) {
         CHECK(switch_actions_equal(&observed, &guarded[i]));
     }
 
-    CHECK_EQ_INT(accounts_switch_commit(&contender), -1);
+    CHECK_EQ_INT(commit_switch_expect(
+                     &contender,
+                     ACCOUNTS_SWITCH_COMMIT_NOT_COMMITTED),
+                 -1);
     CHECK(strstr(get_last_error()->message,
                  "No prepared account switch") != NULL);
     CHECK_EQ_INT(accounts_switch_abort(&contender, false), -1);
@@ -4676,7 +5327,9 @@ TEST(clean_pending_switch_excludes_competing_entry_matrix) {
     CHECK_STR_EQ(g_store_email, "test@example.com");
     CHECK(!runtime_lock_available_to_child());
 
-    CHECK_EQ_INT(accounts_switch_commit(&owner), 0);
+    CHECK_EQ_INT(commit_switch_expect(
+                     &owner, ACCOUNTS_SWITCH_COMMIT_COMPLETE),
+                 0);
     CHECK(runtime_lock_available_to_child());
     CHECK_EQ_INT(git_config_seal(), -1);
     CHECK(strstr(get_last_error()->message, "No Git snapshot to seal") !=
@@ -4689,7 +5342,10 @@ TEST(clean_pending_switch_excludes_competing_entry_matrix) {
      * finalization paths reopen the public admission gate. */
     owner = make_ctx();
     seed_previous_git_identity();
-    CHECK_EQ_INT(accounts_switch_prepare(&owner, "testacct"), 0);
+    CHECK_EQ_INT(prepare_switch_expect(
+                     &owner, "testacct",
+                     ACCOUNTS_SWITCH_PREPARE_PREPARED),
+                 0);
     CHECK_EQ_INT(accounts_switch_abort(&owner, false), 0);
     CHECK_STR_EQ(g_store_name, "Previous Name");
     CHECK_STR_EQ(g_store_email, "prev@example.com");
@@ -4748,7 +5404,10 @@ TEST(abort_only_pending_switch_excludes_competing_entry_matrix) {
     seed_previous_git_identity();
     g_mutate_name_before_seal = true;
     previous_runner = run_set_runner(fake_runner);
-    CHECK_EQ_INT(accounts_switch_prepare(&owner, "testacct"), -1);
+    CHECK_EQ_INT(prepare_switch_expect(
+                     &owner, "testacct",
+                     ACCOUNTS_SWITCH_PREPARE_ABORT_REQUIRED),
+                 -1);
     g_mutate_name_before_seal = false;
     CHECK(strstr(get_last_error()->details,
                  "[Git configuration restore]") != NULL);
@@ -4769,11 +5428,20 @@ TEST(abort_only_pending_switch_excludes_competing_entry_matrix) {
     CHECK(strstr(get_last_error()->message, "already pending") != NULL);
     CHECK_EQ_INT(accounts_switch(NULL, NULL), -1);
     CHECK(strstr(get_last_error()->message, "already pending") != NULL);
-    CHECK_EQ_INT(accounts_switch_prepare(&owner, "testacct"), -1);
+    CHECK_EQ_INT(prepare_switch_expect(
+                     &owner, "testacct",
+                     ACCOUNTS_SWITCH_PREPARE_CLEAN_FAILURE),
+                 -1);
     CHECK(strstr(get_last_error()->message, "already pending") != NULL);
-    CHECK_EQ_INT(accounts_switch_prepare(&contender, NULL), -1);
+    CHECK_EQ_INT(prepare_switch_expect(
+                     &contender, NULL,
+                     ACCOUNTS_SWITCH_PREPARE_CLEAN_FAILURE),
+                 -1);
     CHECK(strstr(get_last_error()->message, "already pending") != NULL);
-    CHECK_EQ_INT(accounts_switch_prepare(NULL, NULL), -1);
+    CHECK_EQ_INT(prepare_switch_expect(
+                     NULL, NULL,
+                     ACCOUNTS_SWITCH_PREPARE_CLEAN_FAILURE),
+                 -1);
     CHECK(strstr(get_last_error()->message, "already pending") != NULL);
 
     CHECK(memcmp(&owner, &owner_before, sizeof(owner)) == 0);
@@ -4790,13 +5458,18 @@ TEST(abort_only_pending_switch_excludes_competing_entry_matrix) {
         CHECK(switch_actions_equal(&observed, &guarded[i]));
     }
 
-    CHECK_EQ_INT(accounts_switch_commit(&contender), -1);
+    CHECK_EQ_INT(commit_switch_expect(
+                     &contender,
+                     ACCOUNTS_SWITCH_COMMIT_NOT_COMMITTED),
+                 -1);
     CHECK(strstr(get_last_error()->message,
                  "No prepared account switch") != NULL);
     CHECK_EQ_INT(accounts_switch_abort(&contender, false), -1);
     CHECK(strstr(get_last_error()->message,
                  "No prepared account switch") != NULL);
-    CHECK_EQ_INT(accounts_switch_commit(&owner), -1);
+    CHECK_EQ_INT(commit_switch_expect(
+                     &owner, ACCOUNTS_SWITCH_COMMIT_NOT_COMMITTED),
+                 -1);
     CHECK(strstr(get_last_error()->message, "can only be retried") != NULL);
     CHECK(memcmp(&owner, &owner_before, sizeof(owner)) == 0);
     CHECK_EQ_INT(g_fake_runner_calls, runner_calls);
@@ -4827,7 +5500,9 @@ TEST(abort_only_pending_switch_excludes_competing_entry_matrix) {
     CHECK_STR_EQ(g_store_email, "prev@example.com");
     CHECK(signals_guard_active());
     CHECK(signals_rollback_active());
-    CHECK_EQ_INT(accounts_switch_commit(&owner), -1);
+    CHECK_EQ_INT(commit_switch_expect(
+                     &owner, ACCOUNTS_SWITCH_COMMIT_NOT_COMMITTED),
+                 -1);
     CHECK(strstr(get_last_error()->message, "can only be retried") != NULL);
     CHECK_EQ_INT(accounts_init(&contender), -1);
     CHECK(memcmp(&contender, &contender_before, sizeof(contender)) == 0);
@@ -4868,6 +5543,366 @@ TEST(abort_only_pending_switch_excludes_competing_entry_matrix) {
     }
 }
 
+/* AR-14 process-epoch boundary: fork copies the prepared-switch record, but
+ * it does not transfer ownership of the parent's runtime lock, switch guard,
+ * Git rollback image, or transaction token.  Both public finalizers must
+ * reject the inherited handle after abandoning only the child's copies.  A
+ * fresh child-local owner must then be usable, while the parent's live switch
+ * remains locked and exactly abortable. */
+TEST(forked_child_cannot_finalize_parent_pending_switch) {
+    gitswitch_ctx_t owner;
+    command_runner_fn previous_runner;
+
+    CHECK_EQ_INT(setup_empty_runtime_dir(), 0);
+    CHECK_EQ_INT(signals_guard_end(), 0);
+    signals_rollback_end();
+    owner = make_ctx();
+    seed_previous_git_identity();
+    previous_runner = run_set_runner(fake_runner);
+    CHECK_EQ_INT(prepare_switch_expect(
+                     &owner, "testacct",
+                     ACCOUNTS_SWITCH_PREPARE_PREPARED),
+                 0);
+    CHECK(!runtime_lock_available_to_child());
+    CHECK(signals_guard_active());
+    CHECK(signals_rollback_active());
+
+    for (int finalizer = 0; finalizer < 2; finalizer++) {
+        int status = 0;
+        pid_t child;
+
+        fflush(NULL);
+        child = fork();
+        CHECK(child >= 0);
+        if (child == 0) {
+            accounts_transaction_token_t child_token = 0;
+
+            errno = 0;
+            if (finalizer == 0) {
+                accounts_switch_commit_state_t state =
+                    ACCOUNTS_SWITCH_COMMIT_COMPLETE;
+
+                if (accounts_switch_commit_result(&owner, &state) != -1 ||
+                    errno != EINVAL ||
+                    state != ACCOUNTS_SWITCH_COMMIT_NOT_COMMITTED) {
+                    _exit(10);
+                }
+            } else {
+                if (accounts_switch_abort(&owner, false) != -1 ||
+                    errno != EINVAL) {
+                    _exit(11);
+                }
+            }
+            if (accounts_transaction_begin(
+                    &owner, ACCOUNTS_TRANSACTION_INITIALIZE,
+                    &child_token) != 0 ||
+                child_token == 0 ||
+                accounts_transaction_finish(
+                    &owner, ACCOUNTS_TRANSACTION_INITIALIZE,
+                    child_token) != 0 ||
+                !accounts_transaction_context_release_safe(&owner)) {
+                _exit(12);
+            }
+            _exit(0);
+        }
+        if (child > 0) {
+            CHECK(waitpid(child, &status, 0) == child);
+            CHECK(WIFEXITED(status));
+            if (WIFEXITED(status)) {
+                CHECK_EQ_INT(WEXITSTATUS(status), 0);
+            }
+        }
+
+        CHECK(!runtime_lock_available_to_child());
+        CHECK(signals_guard_active());
+        CHECK(signals_rollback_active());
+        CHECK(!accounts_transaction_context_release_safe(&owner));
+        CHECK_STR_EQ(g_store_name, "testacct");
+        CHECK_STR_EQ(g_store_email, "test@example.com");
+    }
+
+    CHECK_EQ_INT(accounts_switch_abort(&owner, false), 0);
+    CHECK_STR_EQ(g_store_name, "Previous Name");
+    CHECK_STR_EQ(g_store_email, "prev@example.com");
+    CHECK(runtime_lock_available_to_child());
+    CHECK(!signals_guard_active());
+    CHECK(!signals_rollback_active());
+    CHECK(accounts_transaction_context_release_safe(&owner));
+    run_set_runner(previous_runner);
+}
+
+/* Direct utility-level causal control for automatic fork cleanup. The
+ * grandchild remains alive after its holder exits; the lock must already be
+ * acquirable whether or not child code redundantly calls the explicit abandon
+ * API. The second branch also proves that API is idempotent. */
+TEST(runtime_lock_atfork_releases_inherited_flock_automatically) {
+    CHECK_EQ_INT(setup_empty_runtime_dir(), 0);
+
+    for (int abandon = 0; abandon < 2; abandon++) {
+        int ready[2] = {-1, -1};
+        int release[2] = {-1, -1};
+        int done[2] = {-1, -1};
+        int status = 0;
+        pid_t holder;
+        char marker = '\0';
+        ssize_t count;
+
+        CHECK_EQ_INT(pipe(ready), 0);
+        CHECK_EQ_INT(pipe(release), 0);
+        CHECK_EQ_INT(pipe(done), 0);
+        if (ready[0] < 0 || ready[1] < 0 ||
+            release[0] < 0 || release[1] < 0 ||
+            done[0] < 0 || done[1] < 0) {
+            return;
+        }
+
+        fflush(NULL);
+        holder = fork();
+        CHECK(holder >= 0);
+        if (holder == 0) {
+            int holder_lock = runtime_state_lock_acquire();
+            pid_t child;
+
+            close(ready[0]);
+            close(release[1]);
+            close(done[0]);
+            if (holder_lock < 0) _exit(40);
+            child = fork();
+            if (child < 0) _exit(41);
+            if (child == 0) {
+                if (abandon) {
+                    runtime_state_lock_abandon_inherited();
+                    runtime_state_lock_abandon_inherited();
+                }
+                marker = 'R';
+                do {
+                    count = write(ready[1], &marker, 1);
+                } while (count < 0 && errno == EINTR);
+                close(ready[1]);
+                if (count != 1) _exit(42);
+                do {
+                    count = read(release[0], &marker, 1);
+                } while (count < 0 && errno == EINTR);
+                close(release[0]);
+                if (count != 1) _exit(43);
+                /* Exercise the idempotent public boundary in both branches
+                 * before ending the synchronized child lifetime. */
+                runtime_state_lock_abandon_inherited();
+                marker = 'D';
+                do {
+                    count = write(done[1], &marker, 1);
+                } while (count < 0 && errno == EINTR);
+                close(done[1]);
+                _exit(count == 1 ? 0 : 44);
+            }
+
+            /* Model a holder that exits without an explicit LOCK_UN. The
+             * grandchild is the only remaining owner of copied descriptors. */
+            close(ready[1]);
+            close(release[0]);
+            close(done[1]);
+            _exit(0);
+        }
+
+        close(ready[1]);
+        close(release[0]);
+        close(done[1]);
+        CHECK(waitpid(holder, &status, 0) == holder);
+        CHECK(WIFEXITED(status));
+        if (WIFEXITED(status)) {
+            CHECK_EQ_INT(WEXITSTATUS(status), 0);
+        }
+        do {
+            count = read(ready[0], &marker, 1);
+        } while (count < 0 && errno == EINTR);
+        close(ready[0]);
+        CHECK_EQ_INT(count, 1);
+        CHECK_EQ_INT(marker, 'R');
+        CHECK(runtime_lock_available_to_child());
+
+        marker = 'X';
+        do {
+            count = write(release[1], &marker, 1);
+        } while (count < 0 && errno == EINTR);
+        close(release[1]);
+        CHECK_EQ_INT(count, 1);
+        do {
+            count = read(done[0], &marker, 1);
+        } while (count < 0 && errno == EINTR);
+        close(done[0]);
+        CHECK_EQ_INT(count, 1);
+        CHECK_EQ_INT(marker, 'D');
+        CHECK(runtime_lock_available_to_child());
+    }
+}
+
+/* Closing only the copied public runtime token is insufficient after fork:
+ * the private-lock registry also retains the real flock-bearing descriptor.
+ * Keep the child alive after its inherited-finalizer rejection, release the
+ * parent switch, and prove a third process can acquire immediately. */
+TEST(forked_child_abandons_private_runtime_lock_registry) {
+    gitswitch_ctx_t owner;
+    command_runner_fn previous_runner;
+    int ready[2] = {-1, -1};
+    int release[2] = {-1, -1};
+    int status = 0;
+    pid_t child;
+    char marker = '\0';
+    ssize_t count;
+
+    CHECK_EQ_INT(setup_empty_runtime_dir(), 0);
+    CHECK_EQ_INT(signals_guard_end(), 0);
+    signals_rollback_end();
+    owner = make_ctx();
+    seed_previous_git_identity();
+    previous_runner = run_set_runner(fake_runner);
+    CHECK_EQ_INT(prepare_switch_expect(
+                     &owner, "testacct",
+                     ACCOUNTS_SWITCH_PREPARE_PREPARED),
+                 0);
+    CHECK(!runtime_lock_available_to_child());
+    CHECK_EQ_INT(pipe(ready), 0);
+    CHECK_EQ_INT(pipe(release), 0);
+    if (ready[0] < 0 || ready[1] < 0 ||
+        release[0] < 0 || release[1] < 0) {
+        CHECK_EQ_INT(accounts_switch_abort(&owner, false), 0);
+        run_set_runner(previous_runner);
+        return;
+    }
+
+    fflush(NULL);
+    child = fork();
+    CHECK(child >= 0);
+    if (child == 0) {
+        close(ready[0]);
+        close(release[1]);
+        errno = 0;
+        if (accounts_switch_abort(&owner, false) != -1 ||
+            errno != EINVAL) {
+            _exit(30);
+        }
+        marker = 'R';
+        do {
+            count = write(ready[1], &marker, 1);
+        } while (count < 0 && errno == EINTR);
+        close(ready[1]);
+        if (count != 1) _exit(31);
+        do {
+            count = read(release[0], &marker, 1);
+        } while (count < 0 && errno == EINTR);
+        close(release[0]);
+        _exit(count == 1 ? 0 : 32);
+    }
+
+    close(ready[1]);
+    close(release[0]);
+    do {
+        count = read(ready[0], &marker, 1);
+    } while (count < 0 && errno == EINTR);
+    close(ready[0]);
+    CHECK_EQ_INT(count, 1);
+    CHECK_EQ_INT(marker, 'R');
+    CHECK(!runtime_lock_available_to_child());
+
+    CHECK_EQ_INT(accounts_switch_abort(&owner, false), 0);
+    /* The first child remains alive here. Its abandoned registry must not
+     * extend the parent's flock lifetime. */
+    CHECK(runtime_lock_available_to_child());
+
+    marker = 'X';
+    do {
+        count = write(release[1], &marker, 1);
+    } while (count < 0 && errno == EINTR);
+    close(release[1]);
+    CHECK_EQ_INT(count, 1);
+    CHECK(waitpid(child, &status, 0) == child);
+    CHECK(WIFEXITED(status));
+    if (WIFEXITED(status)) {
+        CHECK_EQ_INT(WEXITSTATUS(status), 0);
+    }
+    CHECK(runtime_lock_available_to_child());
+    CHECK(accounts_transaction_context_release_safe(&owner));
+    run_set_runner(previous_runner);
+}
+
+/* The first inherited entry disposes the child's copied switch ownership even
+ * when restoring inherited signal dispositions fails.  The next independent
+ * begin retries only that restoration: it must neither repeat switch disposal
+ * nor carry forward the inherited-finalizer rejection. */
+TEST(forked_child_signal_reset_retry_admits_fresh_switch_transaction) {
+    gitswitch_ctx_t owner;
+    command_runner_fn previous_runner;
+    int status = 0;
+    pid_t child;
+
+    CHECK_EQ_INT(setup_empty_runtime_dir(), 0);
+    CHECK_EQ_INT(signals_guard_end(), 0);
+    signals_rollback_end();
+    owner = make_ctx();
+    seed_previous_git_identity();
+    previous_runner = run_set_runner(fake_runner);
+    CHECK_EQ_INT(prepare_switch_expect(
+                     &owner, "testacct",
+                     ACCOUNTS_SWITCH_PREPARE_PREPARED),
+                 0);
+    CHECK(!runtime_lock_available_to_child());
+
+    fflush(NULL);
+    child = fork();
+    CHECK(child >= 0);
+    if (child == 0) {
+        accounts_transaction_token_t first_token = 0;
+        accounts_transaction_token_t second_token = 0;
+
+        signals_test_fail_sigaction(
+            SIGTERM, SIGNALS_TEST_SIGACTION_RESTORE, EIO);
+        errno = 0;
+        if (accounts_switch_abort(&owner, false) != -1 || errno != EIO) {
+            _exit(20);
+        }
+        if (accounts_transaction_begin(
+                &owner, ACCOUNTS_TRANSACTION_INITIALIZE,
+                &first_token) != 0 ||
+            first_token == 0 ||
+            accounts_transaction_finish(
+                &owner, ACCOUNTS_TRANSACTION_INITIALIZE,
+                first_token) != 0) {
+            _exit(21);
+        }
+        if (accounts_transaction_begin(
+                &owner, ACCOUNTS_TRANSACTION_INITIALIZE,
+                &second_token) != 0 ||
+            second_token <= first_token ||
+            accounts_transaction_finish(
+                &owner, ACCOUNTS_TRANSACTION_INITIALIZE,
+                second_token) != 0 ||
+            !accounts_transaction_context_release_safe(&owner)) {
+            _exit(22);
+        }
+        _exit(0);
+    }
+    if (child > 0) {
+        CHECK(waitpid(child, &status, 0) == child);
+        CHECK(WIFEXITED(status));
+        if (WIFEXITED(status)) {
+            CHECK_EQ_INT(WEXITSTATUS(status), 0);
+        }
+    }
+
+    CHECK(!runtime_lock_available_to_child());
+    CHECK(signals_guard_active());
+    CHECK(signals_rollback_active());
+    CHECK(!accounts_transaction_context_release_safe(&owner));
+    CHECK_STR_EQ(g_store_name, "testacct");
+    CHECK_STR_EQ(g_store_email, "test@example.com");
+    CHECK_EQ_INT(accounts_switch_abort(&owner, false), 0);
+    CHECK_STR_EQ(g_store_name, "Previous Name");
+    CHECK_STR_EQ(g_store_email, "prev@example.com");
+    CHECK(runtime_lock_available_to_child());
+    CHECK(accounts_transaction_context_release_safe(&owner));
+    run_set_runner(previous_runner);
+}
+
 /* AR-12 M1: failures in the post-commit finalization tail (ownership
  * release, signal-guard restore) occur after the switch's point of no
  * return: the alias has published and git_config_commit() discarded the
@@ -4887,7 +5922,10 @@ TEST(guard_restore_failure_after_commit_reports_committed_state) {
     ctx = make_ctx();
     seed_previous_git_identity();
     previous_runner = run_set_runner(fake_runner);
-    CHECK_EQ_INT(accounts_switch_prepare(&ctx, "testacct"), 0);
+    CHECK_EQ_INT(prepare_switch_expect(
+                     &ctx, "testacct",
+                     ACCOUNTS_SWITCH_PREPARE_PREPARED),
+                 0);
     signals_test_fail_sigaction(SIGTERM, SIGNALS_TEST_SIGACTION_RESTORE,
                                 EIO);
     rc = accounts_switch_commit_result(&ctx, &state);
@@ -4927,7 +5965,8 @@ TEST(guard_begin_partial_restore_is_synchronously_released) {
     ctx = make_ctx();
     seed_previous_git_identity();
     previous_runner = run_set_runner(fake_runner);
-    rc = accounts_switch_prepare(&ctx, "testacct");
+    rc = prepare_switch_expect(
+        &ctx, "testacct", ACCOUNTS_SWITCH_PREPARE_CLEAN_FAILURE);
     run_set_runner(previous_runner);
 
     CHECK_EQ_INT(rc, -1);
@@ -4979,7 +6018,8 @@ TEST(guard_begin_restore_retry_publishes_abort_only_handle) {
     ctx = make_ctx();
     seed_previous_git_identity();
     previous_runner = run_set_runner(fake_runner);
-    rc = accounts_switch_prepare(&ctx, "testacct");
+    rc = prepare_switch_expect(
+        &ctx, "testacct", ACCOUNTS_SWITCH_PREPARE_ABORT_REQUIRED);
     run_set_runner(previous_runner);
 
     CHECK_EQ_INT(rc, -1);
@@ -4989,7 +6029,9 @@ TEST(guard_begin_restore_retry_publishes_abort_only_handle) {
     CHECK_EQ_INT(git_config_seal(), -1);
     CHECK(strstr(get_last_error()->message, "No Git snapshot to seal") !=
           NULL);
-    CHECK_EQ_INT(accounts_switch_commit(&ctx), -1);
+    CHECK_EQ_INT(commit_switch_expect(
+                     &ctx, ACCOUNTS_SWITCH_COMMIT_NOT_COMMITTED),
+                 -1);
     CHECK(strstr(get_last_error()->message, "can only be retried") != NULL);
 
     signals_test_fail_sigaction(0, SIGNALS_TEST_SIGACTION_NONE, 0);
@@ -5045,7 +6087,8 @@ TEST(failed_prepare_releases_callers_signal_dispositions) {
     g_raise_on_user_name = false;
     g_log = NULL;
     previous_runner = run_set_runner(fake_runner);
-    rc = accounts_switch_prepare(&ctx, "testacct");
+    rc = prepare_switch_expect(
+        &ctx, "testacct", ACCOUNTS_SWITCH_PREPARE_CLEAN_FAILURE);
     run_set_runner(previous_runner);
     g_fail_user_name_set = false;
 
@@ -5105,7 +6148,8 @@ TEST(prepared_interruption_preserves_failure_diagnostic) {
     g_log = NULL;
     previous_runner = run_set_runner(fake_runner);
     clear_error();
-    rc = accounts_switch_prepare(&ctx, "testacct");
+    rc = prepare_switch_expect(
+        &ctx, "testacct", ACCOUNTS_SWITCH_PREPARE_CLEAN_FAILURE);
     failure = *get_last_error();
     run_set_runner(previous_runner);
     g_raise_on_user_name = false;
@@ -5140,7 +6184,8 @@ TEST(prepared_seal_failure_retains_abort_retry_handle) {
     seed_previous_git_identity();
     g_mutate_name_before_seal = true;
     previous_runner = run_set_runner(fake_runner);
-    rc = accounts_switch_prepare(&ctx, "testacct");
+    rc = prepare_switch_expect(
+        &ctx, "testacct", ACCOUNTS_SWITCH_PREPARE_ABORT_REQUIRED);
     run_set_runner(previous_runner);
     g_mutate_name_before_seal = false;
 
@@ -5152,7 +6197,9 @@ TEST(prepared_seal_failure_retains_abort_retry_handle) {
     CHECK(strstr(get_last_error()->details,
                  "[Git configuration restore]") != NULL);
     CHECK(runtime_lock_available_to_child());
-    CHECK_EQ_INT(accounts_switch_commit(&ctx), -1);
+    CHECK_EQ_INT(commit_switch_expect(
+                     &ctx, ACCOUNTS_SWITCH_COMMIT_NOT_COMMITTED),
+                 -1);
     CHECK(strstr(get_last_error()->message, "can only be retried") != NULL);
 
     safe_strncpy(g_store_name, "testacct", sizeof(g_store_name));
@@ -5348,6 +6395,10 @@ TEST(interrupted_switch_retains_pending_signal_on_restore_failure) {
         default_action.sa_handler = SIG_DFL;
         sigemptyset(&default_action.sa_mask);
         if (sigaction(SIGINT, &default_action, NULL) != 0) _exit(60);
+        /* Establish the child's independent accounts epoch before installing
+         * a child-local signal fault. The epoch reset intentionally discards
+         * inherited test seams along with inherited transaction state. */
+        if (!accounts_transaction_context_release_safe(&ctx)) _exit(59);
         g_fail_user_name_set = false;
         g_raise_on_user_name = true;
         g_log = NULL;
@@ -5402,6 +6453,8 @@ TEST(repeated_signals_wait_for_prepared_switch_rollback) {
         if (pid == 0) {
             struct sigaction default_action;
             gitswitch_ctx_t ctx = make_ctx();
+            accounts_switch_prepare_state_t state =
+                ACCOUNTS_SWITCH_PREPARE_CLEAN_FAILURE;
 
             memset(&default_action, 0, sizeof(default_action));
             default_action.sa_handler = SIG_DFL;
@@ -5412,7 +6465,11 @@ TEST(repeated_signals_wait_for_prepared_switch_rollback) {
             g_log = fopen(log_path, "w");
             if (!g_log) _exit(21);
             run_set_runner(fake_runner);
-            if (accounts_switch_prepare(&ctx, "testacct") != 0) _exit(22);
+            if (accounts_switch_prepare_result(
+                    &ctx, "testacct", &state) != 0) {
+                _exit(22);
+            }
+            if (state != ACCOUNTS_SWITCH_PREPARE_PREPARED) _exit(26);
             if (fputs("MARK-HANDOFF\n", g_log) == EOF || fflush(g_log) != 0)
                 _exit(23);
             raise(signal_number);
@@ -5476,6 +6533,8 @@ TEST(incomplete_prepared_abort_retains_signal_ownership_until_retry) {
         if (pid == 0) {
             struct sigaction default_action;
             gitswitch_ctx_t ctx = make_ctx();
+            accounts_switch_prepare_state_t state =
+                ACCOUNTS_SWITCH_PREPARE_CLEAN_FAILURE;
 
             memset(&default_action, 0, sizeof(default_action));
             default_action.sa_handler = SIG_DFL;
@@ -5486,7 +6545,11 @@ TEST(incomplete_prepared_abort_retains_signal_ownership_until_retry) {
             g_log = fopen(log_path, "w");
             if (!g_log) _exit(41);
             run_set_runner(fake_runner);
-            if (accounts_switch_prepare(&ctx, "testacct") != 0) _exit(42);
+            if (accounts_switch_prepare_result(
+                    &ctx, "testacct", &state) != 0) {
+                _exit(42);
+            }
+            if (state != ACCOUNTS_SWITCH_PREPARE_PREPARED) _exit(48);
 
             /* External writer after the sealed post-image. */
             safe_strncpy(g_store_name, "later-writer",
@@ -5557,11 +6620,17 @@ TEST(deferred_signal_survives_post_switch_window) {
     CHECK(pid >= 0);
     if (pid == 0) {
         gitswitch_ctx_t ctx = make_ctx();
+        accounts_switch_prepare_state_t state =
+            ACCOUNTS_SWITCH_PREPARE_CLEAN_FAILURE;
         g_fail_user_name_set = false;
         g_raise_on_user_name = false;
         g_log = NULL;
         run_set_runner(fake_runner);
-        if (accounts_switch_prepare(&ctx, "testacct") != 0) _exit(8);
+        if (accounts_switch_prepare_result(
+                &ctx, "testacct", &state) != 0) {
+            _exit(8);
+        }
+        if (state != ACCOUNTS_SWITCH_PREPARE_PREPARED) _exit(9);
         /* Ctrl-C in the prepared persistence gap. */
         raise(SIGINT);
         if (!signals_pending()) _exit(7);
@@ -5633,6 +6702,13 @@ TEST(sigint_mid_git_config_rolls_back_then_reraises) {
 }
 
 TEST_MAIN_BEGIN()
+    const ssh_reap_test_ops_t generation_ops = {
+        .generation = capture_rollback_process_generation,
+        .pidfd_open = retire_fixture_agent_pidfd_open,
+    };
+    ssh_reap_test_ops_t previous_reap_ops =
+        ssh_manager_set_reap_test_ops(&generation_ops);
+    g_previous_reap_ops = previous_reap_ops;
     error_init(LOG_LEVEL_WARNING, NULL);
     RUN_TEST(unpersisted_target_fails_before_switch_mutation);
     RUN_TEST(snapshot_failure_aborts_before_any_git_write);
@@ -5664,6 +6740,7 @@ TEST_MAIN_BEGIN()
     RUN_TEST(fresh_alias_switch_runs_one_postcommit_probe);
     RUN_TEST(prepared_verbose_fresh_switch_runs_one_default_probe);
     RUN_TEST(failed_postcommit_probe_preserves_switch_and_diagnostic);
+    RUN_TEST(postcommit_probe_failure_messages_are_cause_neutral);
     RUN_TEST(postcommit_probe_policy_skip_matrix);
     RUN_TEST(reused_agent_skips_postcommit_probe);
     RUN_TEST(pending_postcommit_signal_skips_ssh_probe);
@@ -5694,6 +6771,10 @@ TEST_MAIN_BEGIN()
     }
     RUN_TEST(structured_prepare_result_tracks_exact_context_ownership);
     RUN_TEST(clean_pending_switch_excludes_competing_entry_matrix);
+    RUN_TEST(forked_child_cannot_finalize_parent_pending_switch);
+    RUN_TEST(runtime_lock_atfork_releases_inherited_flock_automatically);
+    RUN_TEST(forked_child_abandons_private_runtime_lock_registry);
+    RUN_TEST(forked_child_signal_reset_retry_admits_fresh_switch_transaction);
     RUN_TEST(prepared_commit_rejects_every_frozen_account_field_change);
     RUN_TEST(prepared_switch_gates_public_account_model_mutation_matrix);
     RUN_TEST(prepared_commit_accepts_unchanged_tilde_ssh_path);
@@ -5712,4 +6793,6 @@ TEST_MAIN_BEGIN()
     RUN_TEST(incomplete_prepared_abort_retains_signal_ownership_until_retry);
     RUN_TEST(deferred_signal_survives_post_switch_window);
     RUN_TEST(sigint_mid_git_config_rolls_back_then_reraises);
+    close_fake_agent_listener();
+    ssh_manager_set_reap_test_ops(&previous_reap_ops);
 TEST_MAIN_END()

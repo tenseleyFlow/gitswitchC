@@ -10,6 +10,9 @@
 #include "utils.h"
 #include "error.h"
 #include "git_ops.h"
+#define GITSWITCH_INTERNAL_API
+#include "git_ops_internal.h"
+#undef GITSWITCH_INTERNAL_API
 #include "gpg_manager.h"
 #include <stdio.h>
 #include <string.h>
@@ -38,6 +41,10 @@ static int fk_effective_reads; /* atomic merged managed-key listing reads */
 static int fk_non_git_execs;
 static char fk_last_non_git_program[MAX_PATH_LEN];
 static const char *fk_allowed_gpg_program;
+static const run_launch_witness_t *fk_gpg_launch_witness;
+static bool fk_gpg_mismatch_witness;
+static int fk_gpg_reported_exit;
+static bool fk_gpg_env_hardened;
 static bool fk_is_repo;        /* what `git rev-parse --git-dir` reports */
 static const char *fk_repo_root_output;
 static int fk_repo_root_exit;
@@ -58,6 +65,10 @@ static void fk_reset(void) {
     fk_non_git_execs = 0;
     fk_last_non_git_program[0] = '\0';
     fk_allowed_gpg_program = NULL;
+    fk_gpg_launch_witness = NULL;
+    fk_gpg_mismatch_witness = false;
+    fk_gpg_reported_exit = 0;
+    fk_gpg_env_hardened = false;
     fk_is_repo = false;
     fk_repo_root_output = NULL;
     fk_repo_root_exit = 1;
@@ -210,6 +221,34 @@ static int fake_git_runner(const char *const argv[], const run_opts_t *opts,
         if (fk_allowed_gpg_program &&
             strcmp(argv[0], fk_allowed_gpg_program) == 0 && argv[1] &&
             strcmp(argv[1], "--list-secret-keys") == 0) {
+            bool saw_agent_info = false;
+            bool saw_builddir = false;
+            bool saw_build_root = false;
+            if (opts && opts->unset_env) {
+                for (size_t i = 0U; opts->unset_env[i]; i++) {
+                    if (strcmp(opts->unset_env[i], "GPG_AGENT_INFO") == 0)
+                        saw_agent_info = true;
+                    if (strcmp(opts->unset_env[i], "GNUPG_BUILDDIR") == 0)
+                        saw_builddir = true;
+                    if (strcmp(opts->unset_env[i], "GNUPG_BUILD_ROOT") == 0)
+                        saw_build_root = true;
+                }
+            }
+            fk_gpg_env_hardened =
+                saw_agent_info && saw_builddir && saw_build_root;
+            if (result && fk_gpg_launch_witness) {
+                result->launch_witness = *fk_gpg_launch_witness;
+                if (fk_gpg_mismatch_witness) {
+                    safe_strncpy(
+                        result->launch_witness.executable_path,
+                        "/mismatched/ar14/gpg",
+                        sizeof(result->launch_witness.executable_path));
+                }
+            }
+            if (fk_gpg_reported_exit != 0) {
+                if (result) result->exit_code = fk_gpg_reported_exit;
+                return 0;
+            }
             return fk_ret(result, 0);
         }
         return fk_ret(result, 1);
@@ -352,6 +391,18 @@ static bool fk_touch(const char *path) {
     if (!f) return false;
     fclose(f);
     return true;
+}
+
+static bool fk_write_executable_stub(const char *path) {
+    static const char body[] = "#!/bin/sh\nexit 0\n";
+    FILE *file = fopen(path, "w");
+    int write_result;
+    int close_result;
+
+    if (!file) return false;
+    write_result = fputs(body, file);
+    close_result = fclose(file);
+    return write_result >= 0 && close_result == 0 && chmod(path, 0700) == 0;
 }
 
 TEST(git_configure_ssh_rejects_single_quote_in_keypath) {
@@ -1230,7 +1281,7 @@ TEST(git_test_config_rejects_wrong_effective_signing_state) {
     CHECK_EQ_INT(git_set_config_value(GIT_CONFIG_GPG_OPENPGP_PROGRAM,
                                       expected_program,
                                       GIT_SCOPE_GLOBAL), 0);
-    gpg_manager_note_key_available(acct.gpg_key_id);
+    fk_allowed_gpg_program = expected_program;
     signing_key = fk_find("--global", GIT_CONFIG_USER_SIGNINGKEY);
     signing_enabled = fk_find("--global", GIT_CONFIG_COMMIT_GPGSIGN);
     CHECK(signing_key >= 0 && signing_enabled >= 0);
@@ -1361,11 +1412,12 @@ TEST(v5_fingerprint_survives_git_current_config_snapshot) {
     run_set_runner(prev);
 }
 
-/* AR-02 #14: git_test_config's GPG availability probe must be skipped when a
- * gpg spawn earlier in this process already proved the key present. The fake
- * runner refuses every non-git argv, so a gpg spawn here FAILS the check —
- * the post-memo success is only reachable via the skip. */
-TEST(git_test_config_skips_gpg_probe_when_key_seen) {
+/* A context-free selector note cannot authorize git_test_config's raw
+ * executable/home sanity probe. The fake refuses every non-git argv, so both
+ * calls must reach and fail that probe even after the compatibility memo is
+ * populated. This is causal coverage for removal of the obsolete production
+ * selector-cache branch. */
+TEST(git_test_config_selector_note_never_skips_raw_probe) {
     static const char expected_program[] = "/trusted/ar11/cached-gpg";
     git_ops_test_reset_caches();
     fk_reset();
@@ -1389,12 +1441,12 @@ TEST(git_test_config_skips_gpg_probe_when_key_seen) {
      * when nothing vouches for the key. */
     CHECK_EQ_INT(git_test_config(&acct, GIT_SCOPE_GLOBAL,
                                  expected_program), -1);
+    CHECK_EQ_INT(fk_non_git_execs, 1);
 
-    /* Once proven (as every real switch does before its read-back validation),
-     * the probe is skipped and the identical call succeeds with no gpg exec. */
     gpg_manager_note_key_available(acct.gpg_key_id);
     CHECK_EQ_INT(git_test_config(&acct, GIT_SCOPE_GLOBAL,
-                                 expected_program), 0);
+                                 expected_program), -1);
+    CHECK_EQ_INT(fk_non_git_execs, 2);
 
     run_set_runner(prev);
 }
@@ -1427,6 +1479,76 @@ TEST(git_test_config_probes_with_exact_absolute_program) {
                                  expected_program), 0);
     CHECK_EQ_INT(fk_non_git_execs, 1);
     CHECK_STR_EQ(fk_last_non_git_program, expected_program);
+
+    run_set_runner(prev);
+}
+
+TEST(git_test_config_bound_probe_requires_exact_certified_launch) {
+    static const char expected_program[] = "/trusted/ar14/bound-gpg";
+    account_t acct;
+    run_launch_witness_t expected;
+    run_launch_witness_t wrong_path;
+    command_runner_fn prev;
+    int execs_before;
+
+    git_ops_test_reset_caches();
+    fk_reset();
+    memset(&acct, 0, sizeof(acct));
+    safe_strncpy(acct.name, "AR14 Bound Probe User", sizeof(acct.name));
+    safe_strncpy(acct.email, "ar14-bound-probe@example.test",
+                 sizeof(acct.email));
+    acct.gpg_enabled = true;
+    acct.gpg_signing_enabled = true;
+    safe_strncpy(acct.gpg_key_id, "A14000000000BEEF",
+                 sizeof(acct.gpg_key_id));
+
+    memset(&expected, 0, sizeof(expected));
+    expected.valid = true;
+    safe_strncpy(expected.executable_path, expected_program,
+                 sizeof(expected.executable_path));
+    wrong_path = expected;
+    safe_strncpy(wrong_path.executable_path, "/trusted/ar14/other-gpg",
+                 sizeof(wrong_path.executable_path));
+
+    prev = run_set_runner(fake_git_runner);
+    CHECK_EQ_INT(git_set_config(&acct, GIT_SCOPE_GLOBAL), 0);
+    CHECK_EQ_INT(git_set_config_value(GIT_CONFIG_GPG_OPENPGP_PROGRAM,
+                                      expected_program,
+                                      GIT_SCOPE_GLOBAL), 0);
+    fk_allowed_gpg_program = expected_program;
+
+    /* The transaction-only entry point refuses an absent witness and a
+     * witness for a different executable spelling before launching GPG. */
+    execs_before = fk_execs;
+    CHECK_EQ_INT(git_test_config_with_gpg_witness(
+                     &acct, GIT_SCOPE_GLOBAL, expected_program, NULL), -1);
+    CHECK_EQ_INT(get_last_error()->code, ERR_INVALID_ARGS);
+    CHECK_EQ_INT(fk_execs, execs_before);
+    CHECK_EQ_INT(git_test_config_with_gpg_witness(
+                     &acct, GIT_SCOPE_GLOBAL, expected_program,
+                     &wrong_path), -1);
+    CHECK_EQ_INT(get_last_error()->code, ERR_INVALID_ARGS);
+    CHECK_EQ_INT(fk_execs, execs_before);
+
+    /* Injected runners must positively return the exact witness; an absent or
+     * altered certification is rejected even when the fake reports success. */
+    fk_gpg_launch_witness = NULL;
+    CHECK_EQ_INT(git_test_config_with_gpg_witness(
+                     &acct, GIT_SCOPE_GLOBAL, expected_program, &expected), -1);
+    fk_gpg_launch_witness = &expected;
+    fk_gpg_mismatch_witness = true;
+    CHECK_EQ_INT(git_test_config_with_gpg_witness(
+                     &acct, GIT_SCOPE_GLOBAL, expected_program, &expected), -1);
+    fk_gpg_mismatch_witness = false;
+    CHECK_EQ_INT(git_test_config_with_gpg_witness(
+                     &acct, GIT_SCOPE_GLOBAL, expected_program, &expected), 0);
+    CHECK(fk_gpg_env_hardened);
+
+    /* A runner return value alone is not success: the observed child status
+     * remains part of the transaction proof. */
+    fk_gpg_reported_exit = 17;
+    CHECK_EQ_INT(git_test_config_with_gpg_witness(
+                     &acct, GIT_SCOPE_GLOBAL, expected_program, &expected), -1);
 
     run_set_runner(prev);
 }
@@ -2336,7 +2458,7 @@ TEST(retire_leaves_foreign_ssh_command_in_place) {
 }
 
 TEST(published_ssh_retirement_uses_saved_command_after_program_removal) {
-    char root[MAX_PATH_LEN] = "/tmp/gsw-retire-published-ssh-XXXXXX";
+    char root[MAX_PATH_LEN] = "";
     char program[MAX_PATH_LEN];
     char command[GIT_CONFIG_VALUE_MAX];
     char *saved_path = NULL;
@@ -2345,31 +2467,53 @@ TEST(published_ssh_retirement_uses_saved_command_after_program_removal) {
     publication_record_t publication;
     command_runner_fn previous;
     size_t cleared = 99;
+    bool root_created = false;
+    bool path_changed = false;
+    int result;
 
     if (path_before) {
         saved_path = strdup(path_before);
         CHECK(saved_path != NULL);
-        if (!saved_path) return;
+        if (!saved_path) goto cleanup;
     }
-    CHECK(ts_mkdtemp(root) != NULL);
-    CHECK_EQ_INT(safe_snprintf(program, sizeof(program), "%s/ssh", root), 0);
-    CHECK(fk_touch(program));
-    CHECK_EQ_INT(chmod(program, 0700), 0);
-    CHECK_EQ_INT(safe_snprintf(
-                     command, sizeof(command),
-                     "'%s' -i '/historical/key' -F '/dev/null' "
-                     "-o IdentitiesOnly=yes",
-                     program), 0);
+    if (!ts_mkdtemp_trusted(root, sizeof(root),
+                            "gsw-retire-published-ssh")) {
+        CHECK(false);
+        goto cleanup;
+    }
+    root_created = true;
+    result = safe_snprintf(program, sizeof(program), "%s/ssh", root);
+    CHECK_EQ_INT(result, 0);
+    if (result != 0) goto cleanup;
+    if (!fk_write_executable_stub(program)) {
+        CHECK(false);
+        goto cleanup;
+    }
+    result = setenv("PATH", root, 1);
+    CHECK_EQ_INT(result, 0);
+    if (result != 0) goto cleanup;
+    path_changed = true;
 
     git_ops_test_reset_caches();
     fk_reset();
-    retire_fill_account(&acct, "/edited/account/key");
+    retire_fill_account(&acct, "/historical/key");
+    result = git_expected_ssh_command(&acct, command, sizeof(command));
+    CHECK_EQ_INT(result, 0);
+    if (result != 0) goto cleanup;
     retire_fill_ssh_publication(&publication, &acct, command, program);
+    result = safe_strncpy(acct.ssh_key_path, "/edited/account/key",
+                          sizeof(acct.ssh_key_path));
+    CHECK_EQ_INT(result, 0);
+    if (result != 0) goto cleanup;
     acct.gpg_enabled = false;
     acct.gpg_signing_enabled = false;
     acct.gpg_key_id[0] = '\0';
-    CHECK_EQ_INT(unlink(program), 0);
-    CHECK_EQ_INT(setenv("PATH", "/definitely/not/present", 1), 0);
+    result = unlink(program);
+    CHECK_EQ_INT(result, 0);
+    if (result != 0) goto cleanup;
+    result = setenv("PATH", "/definitely/not/present", 1);
+    CHECK_EQ_INT(result, 0);
+    if (result != 0) goto cleanup;
     fk_seed("--global", GIT_CONFIG_CORE_SSHCOMMAND, command);
 
     previous = run_set_runner(fake_git_runner);
@@ -2392,48 +2536,90 @@ TEST(published_ssh_retirement_uses_saved_command_after_program_removal) {
     CHECK_EQ_INT((int)cleared, 0);
     CHECK(fk_find("--global", GIT_CONFIG_CORE_SSHCOMMAND) >= 0);
 
-    if (saved_path) CHECK_EQ_INT(setenv("PATH", saved_path, 1), 0);
-    else CHECK_EQ_INT(unsetenv("PATH"), 0);
+cleanup:
+    if (path_changed) {
+        result = saved_path ? setenv("PATH", saved_path, 1)
+                            : unsetenv("PATH");
+        CHECK_EQ_INT(result, 0);
+    }
     free(saved_path);
-    ts_rm_rf(root);
+    git_ops_test_reset_caches();
+    if (root_created) ts_rm_rf(root);
 }
 
 TEST(published_ssh_retirement_ignores_current_global_override) {
-    char program_root[MAX_PATH_LEN] = "/tmp/gsw-retire-ssh-program-XXXXXX";
+    char program_root[MAX_PATH_LEN] = "";
     char program[MAX_PATH_LEN];
     char command[GIT_CONFIG_VALUE_MAX];
     char foreign_config[MAX_PATH_LEN];
+    char *saved_path = NULL;
+    const char *path_before = getenv("PATH");
     account_t acct;
     publication_record_t publication;
     command_runner_fn previous;
     size_t cleared = 99;
     int fd = -1;
+    int result;
+    bool root_created = false;
+    bool path_changed = false;
+    bool global_config_changed = false;
 
-    CHECK(ts_mkdtemp(program_root) != NULL);
-    CHECK_EQ_INT(safe_snprintf(program, sizeof(program), "%s/ssh",
-                               program_root), 0);
-    CHECK(fk_touch(program));
-    CHECK_EQ_INT(chmod(program, 0700), 0);
-    CHECK_EQ_INT(safe_snprintf(command, sizeof(command),
-                               "'%s' -i '/historical/key'", program), 0);
+    if (path_before) {
+        saved_path = strdup(path_before);
+        CHECK(saved_path != NULL);
+        if (!saved_path) goto cleanup;
+    }
+    if (!ts_mkdtemp_trusted(program_root, sizeof(program_root),
+                            "gsw-retire-ssh-program")) {
+        CHECK(false);
+        goto cleanup;
+    }
+    root_created = true;
+    result = safe_snprintf(program, sizeof(program), "%s/ssh", program_root);
+    CHECK_EQ_INT(result, 0);
+    if (result != 0) goto cleanup;
+    if (!fk_write_executable_stub(program)) {
+        CHECK(false);
+        goto cleanup;
+    }
+    result = setenv("PATH", program_root, 1);
+    CHECK_EQ_INT(result, 0);
+    if (result != 0) goto cleanup;
+    path_changed = true;
 
     git_ops_test_reset_caches();
     fk_reset();
-    retire_fill_account(&acct, "/current/key");
+    retire_fill_account(&acct, "/historical/key");
+    result = git_expected_ssh_command(&acct, command, sizeof(command));
+    CHECK_EQ_INT(result, 0);
+    if (result != 0) goto cleanup;
     retire_fill_ssh_publication(&publication, &acct, command, program);
+    result = safe_strncpy(acct.ssh_key_path, "/current/key",
+                          sizeof(acct.ssh_key_path));
+    CHECK_EQ_INT(result, 0);
+    if (result != 0) goto cleanup;
     acct.gpg_enabled = false;
     acct.gpg_signing_enabled = false;
     acct.gpg_key_id[0] = '\0';
-    CHECK_EQ_INT(safe_snprintf(foreign_config, sizeof(foreign_config),
-                               "%s/foreign-config-XXXXXX",
-                               retire_global_root), 0);
+    result = safe_snprintf(foreign_config, sizeof(foreign_config),
+                           "%s/foreign-config-XXXXXX",
+                           retire_global_root);
+    CHECK_EQ_INT(result, 0);
+    if (result != 0) goto cleanup;
     fd = mkstemp(foreign_config);
     CHECK(fd >= 0);
     if (fd < 0) goto cleanup;
-    CHECK_EQ_INT(close(fd), 0);
+    result = close(fd);
+    CHECK_EQ_INT(result, 0);
+    if (result != 0) goto cleanup;
     fd = -1;
-    CHECK_EQ_INT(chmod(foreign_config, 0600), 0);
-    CHECK_EQ_INT(setenv("GIT_CONFIG_GLOBAL", foreign_config, 1), 0);
+    result = chmod(foreign_config, 0600);
+    CHECK_EQ_INT(result, 0);
+    if (result != 0) goto cleanup;
+    result = setenv("GIT_CONFIG_GLOBAL", foreign_config, 1);
+    CHECK_EQ_INT(result, 0);
+    if (result != 0) goto cleanup;
+    global_config_changed = true;
     git_ops_test_reset_caches();
     fk_seed("--global", GIT_CONFIG_CORE_SSHCOMMAND, command);
 
@@ -2449,9 +2635,17 @@ TEST(published_ssh_retirement_ignores_current_global_override) {
 
 cleanup:
     if (fd >= 0) CHECK_EQ_INT(close(fd), 0);
-    CHECK_EQ_INT(setenv("GIT_CONFIG_GLOBAL", retire_global_config, 1), 0);
+    if (global_config_changed) {
+        CHECK_EQ_INT(setenv("GIT_CONFIG_GLOBAL", retire_global_config, 1), 0);
+    }
+    if (path_changed) {
+        result = saved_path ? setenv("PATH", saved_path, 1)
+                            : unsetenv("PATH");
+        CHECK_EQ_INT(result, 0);
+    }
+    free(saved_path);
     git_ops_test_reset_caches();
-    ts_rm_rf(program_root);
+    if (root_created) ts_rm_rf(program_root);
 }
 
 TEST(signing_key_identity_requires_exact_canonical_fingerprint) {
@@ -2683,8 +2877,9 @@ TEST_MAIN_BEGIN()
     RUN_TEST(git_test_config_rechecks_external_identity);
     RUN_TEST(git_test_config_rejects_wrong_effective_signing_state);
     RUN_TEST(v5_fingerprint_survives_git_current_config_snapshot);
-    RUN_TEST(git_test_config_skips_gpg_probe_when_key_seen);
+    RUN_TEST(git_test_config_selector_note_never_skips_raw_probe);
     RUN_TEST(git_test_config_probes_with_exact_absolute_program);
+    RUN_TEST(git_test_config_bound_probe_requires_exact_certified_launch);
     RUN_TEST(git_test_config_rejects_invalid_program_contract_before_exec);
     RUN_TEST(retire_global_publication_ignores_environment_but_checks_generation);
     RUN_TEST(retire_without_publication_record_preserves_signing_leg);

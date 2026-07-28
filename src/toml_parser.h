@@ -83,12 +83,14 @@ typedef void (*toml_writer_test_hook_fn)(toml_writer_test_stage_t stage,
 toml_writer_test_hook_fn toml_set_writer_test_hook_fn(
     toml_writer_test_hook_fn fn);
 
-/* Deterministic internal-boundary seam for descriptor revalidation and model
- * preflight operation counting. Production leaves it NULL; tests restore the
- * returned prior callback. */
+/* Deterministic internal-boundary seam for file-read mutation, descriptor
+ * revalidation, and model preflight operation counting. Production leaves it
+ * NULL; tests restore the returned prior callback. */
 typedef enum {
     TOML_METADATA_TEST_FD_REVALIDATE = 1,
-    TOML_METADATA_TEST_MODEL_PREFLIGHT = 2
+    TOML_METADATA_TEST_MODEL_PREFLIGHT = 2,
+    TOML_METADATA_TEST_FILE_BEFORE_READ = 3,
+    TOML_METADATA_TEST_FILE_AFTER_READ = 4
 } toml_metadata_test_stage_t;
 typedef bool (*toml_metadata_test_hook_fn)(toml_metadata_test_stage_t stage);
 toml_metadata_test_hook_fn toml_set_metadata_test_hook_fn(
@@ -118,6 +120,7 @@ void toml_init_document(toml_document_t *doc);
  * - A non-NULL doc is left invalid but safe to clean up on every failure
  * - Rejects symlinks and nonregular inputs without blocking, then reads only
  *   from the identity-validated descriptor
+ * - Requires EOF and an unchanged descriptor/path generation after the read
  * - Validates file size limits
  * - Sanitizes all input
  * - Checks for malicious patterns

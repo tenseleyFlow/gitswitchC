@@ -167,6 +167,48 @@ TEST(system_error_context_copies_mutable_provenance) {
     CHECK(strstr(error->message, "system provenance") != NULL);
 }
 
+TEST(system_error_and_logging_preserve_entry_errno) {
+    FILE *saved_log_file = g_log_file;
+    log_level_t saved_log_level = g_log_level;
+    bool saved_log_to_stderr = g_log_to_stderr;
+    FILE *broken_log = tmpfile();
+    int broken_fd = broken_log ? fileno(broken_log) : -1;
+
+    CHECK(broken_log != NULL);
+    CHECK(broken_fd >= 0);
+    if (!broken_log || broken_fd < 0) return;
+    CHECK_EQ_INT(close(broken_fd), 0);
+    g_log_file = broken_log;
+    g_log_level = LOG_LEVEL_DEBUG;
+    g_log_to_stderr = false;
+
+    errno = EEXIST;
+    log_message(LOG_LEVEL_INFO, "errno-contract.c", 1,
+                "logging_probe", "force a write to a closed log sink");
+    CHECK_EQ_INT(errno, EEXIST);
+
+    clearerr(broken_log);
+    errno = EEXIST;
+    CHECK_EQ_INT(set_system_error_context(
+                     ERR_FILE_IO, "errno-contract.c", 2,
+                     "system_error_probe", "causal failure"), 0);
+    CHECK_EQ_INT(errno, EEXIST);
+    CHECK_EQ_INT(get_last_error()->system_errno, EEXIST);
+    CHECK(strstr(get_last_error()->details, "errno=") != NULL);
+
+    clearerr(broken_log);
+    errno = ENOTTY;
+    CHECK_EQ_INT(set_error_context(
+                     ERR_UNKNOWN, "errno-contract.c", 3,
+                     "plain_error_probe", "non-system failure"), 0);
+    CHECK_EQ_INT(errno, ENOTTY);
+
+    g_log_file = saved_log_file;
+    g_log_level = saved_log_level;
+    g_log_to_stderr = saved_log_to_stderr;
+    (void)fclose(broken_log);
+}
+
 TEST(error_context_value_copy_has_independent_provenance) {
     char file[64] = "saved-source.c";
     char function[64] = "saved_function";
@@ -898,6 +940,7 @@ TEST_MAIN_BEGIN()
     RUN_TEST(null_observational_callback_publishes_api_misuse);
     RUN_TEST(direct_error_context_copies_mutable_provenance);
     RUN_TEST(system_error_context_copies_mutable_provenance);
+    RUN_TEST(system_error_and_logging_preserve_entry_errno);
     RUN_TEST(error_context_value_copy_has_independent_provenance);
     RUN_TEST(error_macro_keeps_static_provenance_exact);
     RUN_TEST(null_provenance_is_owned_and_printable);

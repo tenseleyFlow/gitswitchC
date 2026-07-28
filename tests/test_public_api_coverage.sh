@@ -17,6 +17,7 @@ fi
 
 root=$(CDPATH='' cd -- "$1" && pwd -P) || fail "cannot enter repository root"
 cc_command=${PUBLIC_API_CC:-cc}
+nm_command=${PUBLIC_API_NM:-nm}
 
 tmp_dir=$(mktemp -d "${TMPDIR:-/tmp}/gitswitch-public-api.XXXXXX") ||
     fail "cannot create temporary directory"
@@ -150,6 +151,62 @@ extract_registry() {
     [ -s "$output" ] || fail "$profile registry is empty"
 }
 
+assert_removed_switch_apis() {
+    profile=$1
+    declarations=$2
+    registry=$3
+
+    for symbol in accounts_switch_prepare accounts_switch_commit; do
+        if grep -qx "$symbol" "$declarations"; then
+            fail "$profile removed API declaration returned: $symbol"
+        fi
+        if grep -qx "$symbol" "$registry"; then
+            fail "$profile removed API registry entry returned: $symbol"
+        fi
+    done
+}
+
+assert_removed_switch_definitions() {
+    object=$tmp_dir/accounts.production.o
+    symbols=$tmp_dir/accounts.production.symbols
+    removed=$tmp_dir/accounts.production.removed
+
+    # Compile the production profile so the contract observes real linkage,
+    # not source formatting. PUBLIC_API_CC may be a launcher-plus-compiler.
+    # shellcheck disable=SC2086
+    $cc_command -std=gnu11 \
+        -DGITSWITCH_VERSION=\"public-api-coverage\" \
+        -DGITSWITCH_COMMIT=\"public-api-coverage\" \
+        -I"$root/src" -c "$root/src/accounts.c" -o "$object" ||
+        fail "production accounts symbol probe compilation failed"
+
+    # PUBLIC_API_NM deliberately permits a launcher-plus-tool form too.
+    # shellcheck disable=SC2086
+    $nm_command -g "$object" >"$symbols" ||
+        fail "production accounts symbol inspection failed"
+
+    awk '
+        {
+            name = $NF
+            type = $(NF - 1)
+            sub(/^_/, "", name)
+            if (type !~ /^[Uu]$/ &&
+                (name == "accounts_switch_prepare" ||
+                 name == "accounts_switch_commit"))
+                print name
+        }
+    ' "$symbols" >"$removed" ||
+        fail "production accounts symbol parsing failed"
+
+    if [ -s "$removed" ]; then
+        while IFS= read -r symbol; do
+            printf 'public API coverage: ERROR: removed wrapper symbol returned: %s\n' \
+                "$symbol" >&2
+        done <"$removed"
+        exit 1
+    fi
+}
+
 check_profile() {
     profile=$1
     declarations=$tmp_dir/$profile.declarations
@@ -159,6 +216,7 @@ check_profile() {
 
     extract_header_declarations "$profile" "$declarations"
     extract_registry "$profile" "$registry"
+    assert_removed_switch_apis "$profile" "$declarations" "$registry"
     comm -23 "$declarations" "$registry" >"$missing" ||
         fail "$profile missing-symbol comparison failed"
     comm -13 "$declarations" "$registry" >"$extra" ||
@@ -184,5 +242,6 @@ check_profile() {
         "$profile" "$count"
 }
 
+assert_removed_switch_definitions
 check_profile production
 check_profile testing

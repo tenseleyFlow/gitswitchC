@@ -4,12 +4,17 @@
 #include "ssh_manager.h"
 #include "utils.h"
 
+#include <signal.h>
 #include <stdbool.h>
 #include <string.h>
 
 static const char *g_listing;
 static size_t g_listing_len;
 static int g_exit_code;
+static int g_term_signal;
+static int g_runner_rc;
+static bool g_spawned;
+static bool g_timed_out;
 static bool g_force_truncated;
 static int g_calls;
 static int g_argc;
@@ -37,12 +42,14 @@ static int listing_runner(const char *const argv[], const run_opts_t *opts,
     }
     if (result) {
         memset(result, 0, sizeof(*result));
-        result->spawned = true;
+        result->spawned = g_spawned;
+        result->timed_out = g_timed_out;
         result->exit_code = g_exit_code;
+        result->term_signal = g_term_signal;
         result->out_len = copied;
         result->out_truncated = g_force_truncated || copied != full_len;
     }
-    return g_exit_code == 0 ? 0 : -1;
+    return g_runner_rc;
 }
 
 static void make_config(ssh_config_t *config) {
@@ -58,6 +65,10 @@ static void script_listing(const char *listing, int exit_code,
     g_listing = listing;
     g_listing_len = listing ? strlen(listing) : 0U;
     g_exit_code = exit_code;
+    g_term_signal = 0;
+    g_runner_rc = exit_code == 0 ? 0 : -1;
+    g_spawned = true;
+    g_timed_out = false;
     g_force_truncated = truncated;
     g_calls = 0;
     g_argc = 0;
@@ -68,6 +79,16 @@ static void script_listing_bytes(const char *listing, size_t listing_len,
     script_listing(NULL, exit_code, truncated);
     g_listing = listing;
     g_listing_len = listing_len;
+}
+
+static void script_failed_outcome(const char *listing, bool spawned,
+                                  bool timed_out, int term_signal,
+                                  int exit_code) {
+    script_listing(listing, exit_code, false);
+    g_spawned = spawned;
+    g_timed_out = timed_out;
+    g_term_signal = term_signal;
+    g_runner_rc = -1;
 }
 
 TEST(complete_listing_preserves_normal_output) {
@@ -176,9 +197,103 @@ TEST(nonzero_agent_result_keeps_legacy_failure_text) {
     make_config(&config);
     script_listing("The agent has no identities.\n", 1, false);
     previous = run_set_runner(listing_runner);
+    clear_error();
 
     CHECK_EQ_INT(ssh_list_keys(&config, output, sizeof(output)), -1);
     CHECK_STR_EQ(output, "No keys loaded in SSH agent");
+    CHECK_EQ_INT(get_last_error()->code, ERR_SUCCESS);
+
+    run_set_runner(previous);
+}
+
+TEST(exit_two_is_an_actionable_agent_failure) {
+    const error_context_t *error;
+    ssh_config_t config;
+    char output[128];
+    command_runner_fn previous;
+
+    make_config(&config);
+    script_failed_outcome("Error connecting to agent.\n", true, false, 0, 2);
+    previous = run_set_runner(listing_runner);
+    clear_error();
+
+    CHECK_EQ_INT(ssh_list_keys(&config, output, sizeof(output)), -1);
+    CHECK_STR_EQ(output, "");
+    error = get_last_error();
+    CHECK_EQ_INT(error->code, ERR_SSH_AGENT_FAILED);
+    CHECK(strstr(error->message, "ssh-add") != NULL);
+    CHECK(strstr(error->message, "exited with status 2") != NULL);
+    CHECK(strstr(error->message, "exit_status=2") != NULL);
+    CHECK(strstr(error->message, "No keys loaded") == NULL);
+
+    run_set_runner(previous);
+}
+
+TEST(spawn_failure_is_an_actionable_agent_failure) {
+    const error_context_t *error;
+    ssh_config_t config;
+    char output[128];
+    command_runner_fn previous;
+
+    make_config(&config);
+    script_failed_outcome("", false, false, 0, -1);
+    previous = run_set_runner(listing_runner);
+    clear_error();
+
+    CHECK_EQ_INT(ssh_list_keys(&config, output, sizeof(output)), -1);
+    CHECK_STR_EQ(output, "");
+    error = get_last_error();
+    CHECK_EQ_INT(error->code, ERR_SSH_AGENT_FAILED);
+    CHECK(strstr(error->message, "could not be started") != NULL);
+    CHECK(strstr(error->message, "spawned=false") != NULL);
+    CHECK(strstr(error->message, "No keys loaded") == NULL);
+
+    run_set_runner(previous);
+}
+
+TEST(timeout_is_an_actionable_agent_failure) {
+    const error_context_t *error;
+    ssh_config_t config;
+    char output[128];
+    command_runner_fn previous;
+
+    make_config(&config);
+    script_failed_outcome("", true, true, SIGKILL, -1);
+    previous = run_set_runner(listing_runner);
+    clear_error();
+
+    CHECK_EQ_INT(ssh_list_keys(&config, output, sizeof(output)), -1);
+    CHECK_STR_EQ(output, "");
+    error = get_last_error();
+    CHECK_EQ_INT(error->code, ERR_SSH_AGENT_FAILED);
+    CHECK(strstr(error->message, "timed out") != NULL);
+    CHECK(strstr(error->message, "timed_out=true") != NULL);
+    CHECK(strstr(error->message, "No keys loaded") == NULL);
+
+    run_set_runner(previous);
+}
+
+TEST(signal_is_an_actionable_agent_failure) {
+    const error_context_t *error;
+    ssh_config_t config;
+    char output[128];
+    char signal_detail[32];
+    command_runner_fn previous;
+
+    make_config(&config);
+    script_failed_outcome("", true, false, SIGTERM, -1);
+    previous = run_set_runner(listing_runner);
+    clear_error();
+
+    CHECK_EQ_INT(ssh_list_keys(&config, output, sizeof(output)), -1);
+    CHECK_STR_EQ(output, "");
+    error = get_last_error();
+    CHECK_EQ_INT(error->code, ERR_SSH_AGENT_FAILED);
+    CHECK(strstr(error->message, "terminated by signal") != NULL);
+    CHECK(snprintf(signal_detail, sizeof(signal_detail), "signal=%d",
+                   SIGTERM) > 0);
+    CHECK(strstr(error->message, signal_detail) != NULL);
+    CHECK(strstr(error->message, "No keys loaded") == NULL);
 
     run_set_runner(previous);
 }
@@ -191,4 +306,8 @@ TEST_MAIN_BEGIN()
     RUN_TEST(explicit_runner_truncation_never_returns_success);
     RUN_TEST(binary_listing_never_returns_a_successful_prefix);
     RUN_TEST(nonzero_agent_result_keeps_legacy_failure_text);
+    RUN_TEST(exit_two_is_an_actionable_agent_failure);
+    RUN_TEST(spawn_failure_is_an_actionable_agent_failure);
+    RUN_TEST(timeout_is_an_actionable_agent_failure);
+    RUN_TEST(signal_is_an_actionable_agent_failure);
 TEST_MAIN_END()

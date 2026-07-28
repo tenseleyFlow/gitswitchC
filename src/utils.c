@@ -16,6 +16,7 @@
 #include <fcntl.h>
 #include <dirent.h>
 #include <poll.h>
+#include <pthread.h>
 #include <errno.h>
 #include <pwd.h>
 #include <termios.h>
@@ -29,15 +30,30 @@
 #include <sys/acl.h>
 #endif
 
-#if defined(__linux__)
+#if defined(__linux__) || defined(__APPLE__) || defined(__FreeBSD__)
 #include <sys/mman.h>
+#endif
+
+#if defined(__linux__)
 #include <linux/random.h>
 #include <sys/syscall.h>
 #endif
 
 #include "utils.h"
 #include "error.h"
+#include "process_fork_internal.h"
+#include "runner_internal.h"
+#define GITSWITCH_SIGNALS_RUNNER_INTERNAL
 #include "signals.h"
+#undef GITSWITCH_SIGNALS_RUNNER_INTERNAL
+
+#ifdef GITSWITCH_TESTING
+void run_test_set_child_process_group_failure(int system_errno);
+void run_test_set_supervisor_pending_signal(int signal_number);
+void run_test_set_post_replay_signal(int signal_number);
+void run_test_set_supervisor_failure(
+    run_test_supervisor_failure_stage_t stage, int system_errno);
+#endif
 
 /* POSIX exposes the process environment through this external object, but
  * Darwin and FreeBSD do not declare it from <unistd.h> under every feature
@@ -75,6 +91,7 @@ static terminal_echo_state_t g_terminal_echo_state = {
 #define RUNTIME_LOCK_CONTEXTS 8
 #define PRIVATE_LOCK_INODES 64
 #define PRIVATE_LOCK_CONTEXTS 64
+#define PROCESS_FORK_CHILD_CLEANUP_SLOTS 8
 
 typedef struct {
     bool active;
@@ -118,6 +135,10 @@ static private_lock_context_t g_private_lock_contexts[PRIVATE_LOCK_CONTEXTS];
 static pid_t g_private_lock_pid;
 static pid_t g_runtime_lock_pid;
 static uint64_t g_private_lock_next_generation;
+static pthread_once_t g_private_lock_atfork_once = PTHREAD_ONCE_INIT;
+static int g_private_lock_atfork_error;
+static process_fork_child_cleanup_fn
+    g_process_fork_child_cleanups[PROCESS_FORK_CHILD_CLEANUP_SLOTS];
 
 static int dup_cloexec(int fd, int minimum);
 static int private_lock_create_token(int *token_fd, int *guard_fd,
@@ -1252,45 +1273,135 @@ static int private_lock_create_token(int *token_fd, int *guard_fd,
     return 0;
 }
 
-/* flock state is inherited across fork because parent and child initially
- * share the same open descriptions.  The child must discard that inherited
- * bookkeeping before trying to acquire anything: treating it as reentrant
- * ownership would let the child enter while the parent still holds the lock.
- * Identity checks avoid closing an unrelated descriptor if test/application
- * code closed and reused an exposed token before its first post-fork acquire. */
-static void private_lock_prepare_process(void) {
-    pid_t pid = getpid();
+/* The child hook runs before fork() returns to application code, so no
+ * child-side reuse has happened yet. Parent-side code may already have closed
+ * and reused an exposed/stale number, hence each close remains identity-gated.
+ * close()/fstat() are async-signal-safe; the handler performs no allocation,
+ * locking, or namespace operation. */
+static void process_fork_atfork_child(void) {
+    for (size_t i = 0; i < RUNTIME_LOCK_CONTEXTS; i++) {
+        runtime_lock_context_t *ctx = &g_runtime_locks[i];
 
-    if (g_private_lock_pid == 0) {
-        g_private_lock_pid = pid;
-        return;
+        if (!ctx->active) continue;
+        if (private_lock_fd_has_identity(
+                ctx->parent_fd, ctx->parent_dev, ctx->parent_ino)) {
+            close(ctx->parent_fd);
+        }
+        if (private_lock_fd_has_identity(
+                ctx->dir_fd, ctx->dir_dev, ctx->dir_ino)) {
+            close(ctx->dir_fd);
+        }
+        ctx->active = false;
+        ctx->lock_fd = -1;
+        ctx->parent_fd = -1;
+        ctx->dir_fd = -1;
     }
-    if (g_private_lock_pid == pid) return;
-
     for (size_t i = 0; i < PRIVATE_LOCK_CONTEXTS; i++) {
         private_lock_context_t *ctx = &g_private_lock_contexts[i];
-        if (ctx->active &&
-            private_lock_fd_has_identity(ctx->token_fd, ctx->token_dev,
-                                         ctx->token_ino)) {
+
+        if (!ctx->active) continue;
+        if (private_lock_fd_has_identity(
+                ctx->token_fd, ctx->token_dev, ctx->token_ino)) {
             close(ctx->token_fd);
         }
-        if (ctx->active &&
-            private_lock_fd_has_identity(ctx->guard_fd, ctx->guard_dev,
-                                         ctx->guard_ino)) {
+        if (private_lock_fd_has_identity(
+                ctx->guard_fd, ctx->guard_dev, ctx->guard_ino)) {
             close(ctx->guard_fd);
         }
+        ctx->active = false;
+        ctx->token_fd = -1;
+        ctx->guard_fd = -1;
     }
     for (size_t i = 0; i < PRIVATE_LOCK_INODES; i++) {
         private_lock_inode_t *inode = &g_private_lock_inodes[i];
+
         if (inode->active &&
-            private_lock_fd_has_identity(inode->fd, inode->dev, inode->ino)) {
+            private_lock_fd_has_identity(
+                inode->fd, inode->dev, inode->ino)) {
             close(inode->fd);
         }
+        inode->active = false;
+        inode->fd = -1;
+        inode->refs = 0;
     }
+    g_private_lock_next_generation = 0;
+    g_private_lock_pid = getpid();
+    g_runtime_lock_pid = g_private_lock_pid;
+
+    for (size_t i = 0; i < PROCESS_FORK_CHILD_CLEANUP_SLOTS; i++) {
+        process_fork_child_cleanup_fn cleanup =
+            g_process_fork_child_cleanups[i];
+
+        if (cleanup) cleanup();
+    }
+}
+
+static void process_fork_register_atfork(void) {
+    g_private_lock_atfork_error =
+        pthread_atfork(NULL, NULL, process_fork_atfork_child);
+}
+
+static int private_lock_ensure_atfork(void) {
+    int once_error =
+        pthread_once(&g_private_lock_atfork_once,
+                     process_fork_register_atfork);
+
+    if (once_error != 0) {
+        errno = once_error;
+        return -1;
+    }
+    if (g_private_lock_atfork_error != 0) {
+        errno = g_private_lock_atfork_error;
+        return -1;
+    }
+    return 0;
+}
+
+int process_fork_child_cleanup_register(
+    process_fork_child_cleanup_fn cleanup) {
+    if (!cleanup) {
+        errno = EINVAL;
+        return -1;
+    }
+    if (private_lock_ensure_atfork() != 0) return -1;
+
+    for (size_t i = 0; i < PROCESS_FORK_CHILD_CLEANUP_SLOTS; i++) {
+        process_fork_child_cleanup_fn registered =
+            g_process_fork_child_cleanups[i];
+
+        if (registered == cleanup) return 0;
+    }
+    for (size_t i = 0; i < PROCESS_FORK_CHILD_CLEANUP_SLOTS; i++) {
+        if (!g_process_fork_child_cleanups[i]) {
+            g_process_fork_child_cleanups[i] = cleanup;
+            return 0;
+        }
+    }
+
+    errno = ENOSPC;
+    return -1;
+}
+
+/* flock state is inherited across fork because parent and child initially
+ * share the same open descriptions. The atfork hook normally clears it before
+ * child code can reuse a number. The PID fallback exists for non-fork process
+ * epoch changes and deliberately forgets raw numbers without closing them:
+ * after caller code can run, descriptor identity cannot disambiguate ABA. */
+static int private_lock_prepare_process(void) {
+    pid_t pid = getpid();
+
+    if (private_lock_ensure_atfork() != 0) return -1;
+    if (g_private_lock_pid == 0) {
+        g_private_lock_pid = pid;
+        return 0;
+    }
+    if (g_private_lock_pid == pid) return 0;
+
     memset(g_private_lock_contexts, 0, sizeof(g_private_lock_contexts));
     memset(g_private_lock_inodes, 0, sizeof(g_private_lock_inodes));
     g_private_lock_next_generation = 0;
     g_private_lock_pid = pid;
+    return 0;
 }
 
 static int private_lock_allocate_generation(uint64_t *generation_out) {
@@ -1393,7 +1504,11 @@ static int lock_private_file_at_mode(int dir_fd, const char *name,
         set_error(ERR_INVALID_ARGS, "Invalid private lock file");
         return -1;
     }
-    private_lock_prepare_process();
+    if (private_lock_prepare_process() != 0) {
+        set_system_error(ERR_SYSTEM_CALL,
+                         "Cannot install private-lock fork handler");
+        return -1;
+    }
     for (size_t i = 0; i < PRIVATE_LOCK_CONTEXTS; i++) {
         if (!g_private_lock_contexts[i].active) {
             context_slot = i;
@@ -1533,7 +1648,7 @@ int verify_private_lock_file_at(int token_fd, int dir_fd, const char *name) {
         errno = EINVAL;
         return -1;
     }
-    private_lock_prepare_process();
+    if (private_lock_prepare_process() != 0) return -1;
     if (fstat(token_fd, &token) != 0) {
         errno = ESTALE;
         return -1;
@@ -1626,7 +1741,10 @@ void unlock_private_file(int token_fd) {
     private_lock_context_t *oldest = NULL;
     int saved_errno = errno;
 
-    private_lock_prepare_process();
+    if (private_lock_prepare_process() != 0) {
+        errno = saved_errno;
+        return;
+    }
     if (token_fd < 0) {
         errno = saved_errno;
         return;
@@ -1656,32 +1774,72 @@ void unlock_private_file(int token_fd) {
     errno = saved_errno;
 }
 
-static void runtime_lock_prepare_process(void) {
+#ifdef GITSWITCH_TESTING
+static void runtime_lock_test_append_descriptor(
+    int fd, int *seen, size_t *count) {
+    if (fd < 0 || !count) return;
+    for (size_t i = 0; i < *count; i++) {
+        if (seen[i] == fd) return;
+    }
+    seen[*count] = fd;
+    (*count)++;
+}
+
+size_t runtime_lock_test_descriptors(int *fds, size_t capacity) {
+    int seen[PRIVATE_LOCK_CONTEXTS * 2U + PRIVATE_LOCK_INODES +
+             RUNTIME_LOCK_CONTEXTS * 3U];
+    size_t count = 0U;
+
+    for (size_t i = 0; i < PRIVATE_LOCK_CONTEXTS; i++) {
+        const private_lock_context_t *ctx = &g_private_lock_contexts[i];
+
+        if (!ctx->active) continue;
+        runtime_lock_test_append_descriptor(ctx->token_fd, seen, &count);
+        runtime_lock_test_append_descriptor(ctx->guard_fd, seen, &count);
+    }
+    for (size_t i = 0; i < PRIVATE_LOCK_INODES; i++) {
+        const private_lock_inode_t *inode = &g_private_lock_inodes[i];
+
+        if (inode->active) {
+            runtime_lock_test_append_descriptor(inode->fd, seen, &count);
+        }
+    }
+    for (size_t i = 0; i < RUNTIME_LOCK_CONTEXTS; i++) {
+        const runtime_lock_context_t *ctx = &g_runtime_locks[i];
+
+        if (!ctx->active) continue;
+        runtime_lock_test_append_descriptor(ctx->lock_fd, seen, &count);
+        runtime_lock_test_append_descriptor(ctx->parent_fd, seen, &count);
+        runtime_lock_test_append_descriptor(ctx->dir_fd, seen, &count);
+    }
+    if (fds) {
+        size_t copied = count < capacity ? count : capacity;
+        memcpy(fds, seen, copied * sizeof(*fds));
+    }
+    return count;
+}
+#endif
+
+static int runtime_lock_prepare_process(void) {
     pid_t pid = getpid();
 
-    /* Reset the generic registry first, before opening anything that could
-     * reuse a descriptor number closed explicitly by post-fork caller code. */
-    private_lock_prepare_process();
+    if (private_lock_prepare_process() != 0) return -1;
     if (g_runtime_lock_pid == 0) {
         g_runtime_lock_pid = pid;
-        return;
+        return 0;
     }
-    if (g_runtime_lock_pid == pid) return;
+    if (g_runtime_lock_pid == pid) return 0;
 
-    for (size_t i = 0; i < RUNTIME_LOCK_CONTEXTS; i++) {
-        runtime_lock_context_t *ctx = &g_runtime_locks[i];
-        if (!ctx->active) continue;
-        if (private_lock_fd_has_identity(ctx->dir_fd, ctx->dir_dev,
-                                         ctx->dir_ino)) {
-            close(ctx->dir_fd);
-        }
-        if (private_lock_fd_has_identity(ctx->parent_fd, ctx->parent_dev,
-                                         ctx->parent_ino)) {
-            close(ctx->parent_fd);
-        }
-    }
     memset(g_runtime_locks, 0, sizeof(g_runtime_locks));
     g_runtime_lock_pid = pid;
+    return 0;
+}
+
+void runtime_state_lock_abandon_inherited(void) {
+    /* The atfork child hook already closed and reset inherited descriptors
+     * before child code could reuse their numbers. This explicit API merely
+     * ensures registration and applies the close-free PID fallback. */
+    (void)runtime_lock_prepare_process();
 }
 
 int runtime_state_lock_acquire(void) {
@@ -1695,7 +1853,11 @@ int runtime_state_lock_acquire(void) {
     uint64_t lock_generation = 0;
     int written;
 
-    runtime_lock_prepare_process();
+    if (runtime_lock_prepare_process() != 0) {
+        set_system_error(ERR_SYSTEM_CALL,
+                         "Cannot install runtime-lock fork handler");
+        return -1;
+    }
     parent_fd = open_runtime_parent_impl(runtime_parent,
                                          sizeof(runtime_parent),
                                          &anchor_slot);
@@ -1820,7 +1982,7 @@ int runtime_state_lock_acquire(void) {
 }
 
 void runtime_state_lock_release(int fd) {
-    runtime_lock_prepare_process();
+    if (runtime_lock_prepare_process() != 0) return;
     if (fd >= 0) {
         size_t selected = RUNTIME_LOCK_CONTEXTS;
 
@@ -2215,10 +2377,12 @@ int copy_file(const char *src_path, const char *dst_path) {
     size_t bytes;
     int result = 0;
     int operation_errno = 0;
+    int src_fd = -1;
     int parent_fd = -1;
     int dst_fd = -1;
     int verify_fd = -1;
     int named_parent_fd = -1;
+    int src_flags = O_RDONLY;
     int dst_flags = O_WRONLY | O_CREAT;
     int parent_flags = O_RDONLY;
     struct stat src_stat;
@@ -2245,23 +2409,84 @@ int copy_file(const char *src_path, const char *dst_path) {
         return -1;
     }
     
-    src = fopen(src_path, "rbe");
-    if (!src) {
-        set_system_error(ERR_FILE_IO, "Failed to open source file: %s", src_path);
-        result = -1;
-        goto cleanup;
-    }
-    
-    /* Capture metadata from the same source object whose bytes are copied. */
-    if (fstat(fileno(src), &src_stat) != 0) {
+#ifdef O_CLOEXEC
+    src_flags |= O_CLOEXEC;
+#endif
+#ifdef O_NOFOLLOW
+    src_flags |= O_NOFOLLOW;
+#endif
+#ifdef O_NONBLOCK
+    /* A pre-existing FIFO or device must not make a copy attempt wait for a
+     * peer. Normalize the descriptor only after fstat proves a regular file. */
+    src_flags |= O_NONBLOCK;
+#endif
+    src_fd = open(src_path, src_flags);
+    if (src_fd < 0) {
         int saved_errno = errno;
-        (void)fclose(src);
-        src = NULL;
+
         errno = saved_errno;
-        set_system_error(ERR_FILE_IO, "Failed to inspect source file: %s", src_path);
+        if (saved_errno == ELOOP
+#if defined(__FreeBSD__)
+            || saved_errno == EMLINK
+#endif
+        ) {
+            set_error(ERR_INVALID_ARGS,
+                      "Refusing symlink source: %s", src_path);
+        } else {
+            set_system_error(ERR_FILE_IO,
+                             "Failed to open source file: %s", src_path);
+        }
         result = -1;
         goto cleanup;
     }
+#ifndef O_CLOEXEC
+    {
+        int fd_flags = fcntl(src_fd, F_GETFD);
+        if (fd_flags < 0 ||
+            fcntl(src_fd, F_SETFD, fd_flags | FD_CLOEXEC) != 0) {
+            set_system_error(ERR_FILE_IO,
+                             "Failed to secure source descriptor: %s",
+                             src_path);
+            result = -1;
+            goto cleanup;
+        }
+    }
+#endif
+    /* Capture metadata from the same source object whose bytes are copied. */
+    if (fstat(src_fd, &src_stat) != 0) {
+        set_system_error(ERR_FILE_IO,
+                         "Failed to inspect source file: %s", src_path);
+        result = -1;
+        goto cleanup;
+    }
+    if (!S_ISREG(src_stat.st_mode)) {
+        errno = EINVAL;
+        set_system_error(ERR_FILE_IO,
+                         "Source is not a regular file: %s", src_path);
+        result = -1;
+        goto cleanup;
+    }
+#ifdef O_NONBLOCK
+    {
+        int status_flags = fcntl(src_fd, F_GETFL);
+        if (status_flags < 0 ||
+            fcntl(src_fd, F_SETFL, status_flags & ~O_NONBLOCK) != 0) {
+            set_system_error(ERR_FILE_IO,
+                             "Failed to normalize source descriptor: %s",
+                             src_path);
+            result = -1;
+            goto cleanup;
+        }
+    }
+#endif
+    src = fdopen(src_fd, "rb");
+    if (!src) {
+        set_system_error(ERR_FILE_IO,
+                         "Failed to open source stream: %s", src_path);
+        result = -1;
+        goto cleanup;
+    }
+    src_fd = -1; /* fdopen owns it from here. */
 
 #ifdef O_DIRECTORY
     parent_flags |= O_DIRECTORY;
@@ -2542,6 +2767,7 @@ cleanup: {
         if (dst) (void)fclose(dst);
         else if (dst_fd >= 0) close(dst_fd);
         if (src) (void)fclose(src);
+        else if (src_fd >= 0) close(src_fd);
         if (verify_fd >= 0) close(verify_fd);
         if (named_parent_fd >= 0) close(named_parent_fd);
         if (parent_fd >= 0) close(parent_fd);
@@ -2635,6 +2861,122 @@ static bool exec_stat_identity_matches(const struct stat *expected,
            expected->st_ctim.tv_sec == observed->st_ctim.tv_sec &&
            expected->st_ctim.tv_nsec == observed->st_ctim.tv_nsec;
 #endif
+}
+
+static bool run_launch_witness_is_well_formed(
+    const run_launch_witness_t *witness) {
+    if (!witness || !witness->valid ||
+        witness->executable_path[0] != '/' ||
+        !memchr(witness->executable_path, '\0',
+                sizeof(witness->executable_path))) {
+        return false;
+    }
+    if (!witness->is_script) {
+        return !witness->has_interpreter_arg &&
+               witness->interpreter_argv0[0] == '\0' &&
+               witness->interpreter_arg[0] == '\0';
+    }
+    if (witness->interpreter_argv0[0] != '/' ||
+        !memchr(witness->interpreter_argv0, '\0',
+                sizeof(witness->interpreter_argv0)) ||
+        !memchr(witness->interpreter_arg, '\0',
+                sizeof(witness->interpreter_arg))) {
+        return false;
+    }
+    return witness->has_interpreter_arg
+               ? witness->interpreter_arg[0] != '\0'
+               : witness->interpreter_arg[0] == '\0';
+}
+
+#ifdef GITSWITCH_TESTING
+enum { RUN_TEST_LAUNCH_WITNESS_EPOCH_SLOTS = 4 };
+
+typedef struct {
+    char path[MAX_PATH_LEN];
+    unsigned int epoch;
+} run_test_launch_witness_epoch_t;
+
+static run_test_launch_witness_epoch_t
+    g_run_test_launch_witness_epochs[RUN_TEST_LAUNCH_WITNESS_EPOCH_SLOTS];
+
+int run_test_set_launch_witness_epoch(const char *program_path,
+                                      unsigned int epoch) {
+    size_t available = RUN_TEST_LAUNCH_WITNESS_EPOCH_SLOTS;
+
+    if (!program_path || program_path[0] != '/' || epoch == 0U ||
+        epoch >= 1000000000U ||
+        strlen(program_path) >= MAX_PATH_LEN) {
+        errno = EINVAL;
+        return -1;
+    }
+    for (size_t i = 0; i < RUN_TEST_LAUNCH_WITNESS_EPOCH_SLOTS; i++) {
+        if (g_run_test_launch_witness_epochs[i].path[0] == '\0') {
+            if (available == RUN_TEST_LAUNCH_WITNESS_EPOCH_SLOTS) {
+                available = i;
+            }
+            continue;
+        }
+        if (strcmp(g_run_test_launch_witness_epochs[i].path,
+                   program_path) == 0) {
+            g_run_test_launch_witness_epochs[i].epoch = epoch;
+            return 0;
+        }
+    }
+    if (available == RUN_TEST_LAUNCH_WITNESS_EPOCH_SLOTS) {
+        errno = ENOSPC;
+        return -1;
+    }
+    memcpy(g_run_test_launch_witness_epochs[available].path, program_path,
+           strlen(program_path) + 1U);
+    g_run_test_launch_witness_epochs[available].epoch = epoch;
+    return 0;
+}
+
+void run_test_clear_launch_witness_epochs(void) {
+    memset(g_run_test_launch_witness_epochs, 0,
+           sizeof(g_run_test_launch_witness_epochs));
+}
+
+static void run_test_apply_launch_witness_epoch(
+    const char *program_path, struct stat *identity) {
+    unsigned int epoch = 0U;
+
+    if (!program_path || !identity) return;
+    for (size_t i = 0; i < RUN_TEST_LAUNCH_WITNESS_EPOCH_SLOTS; i++) {
+        if (g_run_test_launch_witness_epochs[i].path[0] != '\0' &&
+            strcmp(g_run_test_launch_witness_epochs[i].path,
+                   program_path) == 0) {
+            epoch = g_run_test_launch_witness_epochs[i].epoch;
+            break;
+        }
+    }
+    if (epoch == 0U) return;
+#if defined(__APPLE__)
+    identity->st_ctimespec.tv_nsec =
+        (identity->st_ctimespec.tv_nsec + (long)epoch) % 1000000000L;
+#else
+    identity->st_ctim.tv_nsec =
+        (identity->st_ctim.tv_nsec + (long)epoch) % 1000000000L;
+#endif
+}
+#endif
+
+bool run_launch_witness_matches(
+    const run_launch_witness_t *a, const run_launch_witness_t *b) {
+    if (!run_launch_witness_is_well_formed(a) ||
+        !run_launch_witness_is_well_formed(b) ||
+        a->is_script != b->is_script ||
+        a->has_interpreter_arg != b->has_interpreter_arg ||
+        strcmp(a->executable_path, b->executable_path) != 0 ||
+        !exec_stat_identity_matches(&a->executable_identity,
+                                    &b->executable_identity)) {
+        return false;
+    }
+    if (!a->is_script) return true;
+    return strcmp(a->interpreter_argv0, b->interpreter_argv0) == 0 &&
+           strcmp(a->interpreter_arg, b->interpreter_arg) == 0 &&
+           exec_stat_identity_matches(&a->interpreter_identity,
+                                      &b->interpreter_identity);
 }
 
 /* Reserve low child slots for status (3), the executable/script (4), and a
@@ -2910,6 +3252,57 @@ static int prepare_trusted_script_launch(
     return 0;
 }
 
+static int run_launch_witness_from_opened(
+    const char *resolved_path, int exec_fd,
+    const struct stat *opened_executable_identity,
+    const trusted_script_launch_t *launch, run_launch_witness_t *out) {
+    struct stat current_executable_identity;
+
+    if (!resolved_path || resolved_path[0] != '/' || exec_fd < 0 ||
+        !opened_executable_identity || !launch || !out ||
+        strlen(resolved_path) >= sizeof(out->executable_path)) {
+        errno = EINVAL;
+        return -1;
+    }
+    memset(out, 0, sizeof(*out));
+    if (fstat(exec_fd, &current_executable_identity) != 0) return -1;
+    if (!exec_stat_identity_matches(opened_executable_identity,
+                                    &current_executable_identity)) {
+        errno = ESTALE;
+        return -1;
+    }
+    if (launch->is_script) {
+        struct stat current_interpreter_identity;
+
+        if (launch->interpreter_fd < 0 ||
+            fstat(launch->interpreter_fd,
+                  &current_interpreter_identity) != 0) {
+            return -1;
+        }
+        if (!exec_stat_identity_matches(&launch->interpreter_identity,
+                                        &current_interpreter_identity)) {
+            errno = ESTALE;
+            return -1;
+        }
+        out->interpreter_identity = current_interpreter_identity;
+        out->has_interpreter_arg = launch->has_interpreter_arg;
+        memcpy(out->interpreter_argv0, launch->interpreter_argv0,
+               sizeof(out->interpreter_argv0));
+        memcpy(out->interpreter_arg, launch->interpreter_arg,
+               sizeof(out->interpreter_arg));
+    }
+    out->executable_identity = current_executable_identity;
+    memcpy(out->executable_path, resolved_path,
+           strlen(resolved_path) + 1U);
+    out->is_script = launch->is_script;
+    out->valid = true;
+#ifdef GITSWITCH_TESTING
+    run_test_apply_launch_witness_epoch(
+        resolved_path, &out->executable_identity);
+#endif
+    return 0;
+}
+
 static int set_nonblock(int fd) {
     int fl = fcntl(fd, F_GETFL, 0);
     if (fl == -1) return -1;
@@ -3092,6 +3485,14 @@ static run_test_post_fork_pre_publish_hook_fn
     g_test_post_fork_pre_publish_hook;
 static int g_test_fork_failure_errno;
 #ifdef GITSWITCH_TESTING
+static int g_test_child_process_group_failure_errno;
+static int g_test_supervisor_pending_signal;
+static int g_test_post_replay_signal;
+static run_test_supervisor_failure_stage_t
+    g_test_supervisor_failure_stage;
+static int g_test_supervisor_failure_errno;
+static run_test_pre_group_release_hook_fn
+    g_test_pre_group_release_hook;
 static unsigned int g_test_path_candidate_failure_ordinal;
 static int g_test_path_candidate_failure_errno;
 static unsigned int g_test_directory_open_failure_ordinal;
@@ -3300,6 +3701,61 @@ void run_test_set_fork_failure(int system_errno) {
 }
 
 #ifdef GITSWITCH_TESTING
+void run_test_set_child_process_group_failure(int system_errno) {
+    g_test_child_process_group_failure_errno =
+        system_errno > 0 ? system_errno : 0;
+}
+
+void run_test_set_supervisor_pending_signal(int signal_number) {
+    switch (signal_number) {
+        case SIGINT:
+        case SIGTERM:
+        case SIGHUP:
+        case SIGQUIT:
+        case SIGTSTP:
+        case SIGKILL:
+            g_test_supervisor_pending_signal = signal_number;
+            break;
+        default:
+            g_test_supervisor_pending_signal = 0;
+            break;
+    }
+}
+
+void run_test_set_post_replay_signal(int signal_number) {
+    switch (signal_number) {
+        case SIGINT:
+        case SIGTERM:
+        case SIGHUP:
+        case SIGQUIT:
+        case SIGTSTP:
+            g_test_post_replay_signal = signal_number;
+            break;
+        default:
+            g_test_post_replay_signal = 0;
+            break;
+    }
+}
+
+void run_test_set_supervisor_failure(
+    run_test_supervisor_failure_stage_t stage, int system_errno) {
+    if (stage < RUN_TEST_SUPERVISOR_FAILURE_WORKER_RELEASE_PIPE ||
+        stage > RUN_TEST_SUPERVISOR_FAILURE_RELEASE_WRITE ||
+        system_errno <= 0) {
+        g_test_supervisor_failure_stage =
+            RUN_TEST_SUPERVISOR_FAILURE_NONE;
+        g_test_supervisor_failure_errno = 0;
+        return;
+    }
+    g_test_supervisor_failure_stage = stage;
+    g_test_supervisor_failure_errno = system_errno;
+}
+
+void run_test_set_pre_group_release_hook(
+    run_test_pre_group_release_hook_fn hook) {
+    g_test_pre_group_release_hook = hook;
+}
+
 void run_test_set_exec_parse_failure(unsigned int parse_ordinal,
                                      int system_errno) {
     g_test_exec_parse_failure_ordinal =
@@ -3404,12 +3860,337 @@ static int child_close_fds_from(
 }
 
 typedef enum {
-    CHILD_STAGE_STDIO = 1,
+    CHILD_STAGE_PROCESS_GROUP = 1,
+    CHILD_STAGE_STDIO,
     CHILD_STAGE_CWD,
     CHILD_STAGE_FD_CLOSE,
     CHILD_STAGE_ENV,
     CHILD_STAGE_EXEC
 } child_stage_t;
+
+typedef struct {
+    int fd;
+    pid_t foreground_pgid;
+    bool transferred;
+} runner_tty_state_t;
+
+static int runner_write_byte(int fd, unsigned char byte) {
+    ssize_t written;
+    do {
+        written = write(fd, &byte, 1U);
+    } while (written < 0 && errno == EINTR);
+    return written == 1 ? 0 : -1;
+}
+
+static int runner_read_byte(int fd, unsigned char expected) {
+    unsigned char byte = 0U;
+    ssize_t got;
+    do {
+        got = read(fd, &byte, 1U);
+    } while (got < 0 && errno == EINTR);
+    if (got == 1 && byte == expected) return 0;
+    if (got == 0) errno = EPIPE;
+    else if (got == 1) errno = EPROTO;
+    return -1;
+}
+
+static int runner_tcsetpgrp_masked(int fd, pid_t pgid) {
+    sigset_t block;
+    sigset_t saved;
+    int operation_errno = 0;
+    int restore_errno = 0;
+
+    if (sigemptyset(&block) != 0 || sigaddset(&block, SIGTTOU) != 0 ||
+        sigprocmask(SIG_BLOCK, &block, &saved) != 0) {
+        return -1;
+    }
+    if (tcsetpgrp(fd, pgid) != 0) operation_errno = errno;
+    if (sigprocmask(SIG_SETMASK, &saved, NULL) != 0) restore_errno = errno;
+    if (operation_errno != 0 || restore_errno != 0) {
+        errno = operation_errno != 0 ? operation_errno : restore_errno;
+        return -1;
+    }
+    return 0;
+}
+
+static int runner_tty_prepare(runner_tty_state_t *state) {
+    pid_t foreground;
+
+    memset(state, 0, sizeof(*state));
+    state->fd = -1;
+    state->fd = open("/dev/tty", O_RDWR | O_NOCTTY);
+    if (state->fd < 0) {
+        if (errno == ENXIO || errno == ENODEV || errno == ENOTTY ||
+            errno == EACCES) {
+            state->fd = -1;
+            return 0;
+        }
+        return -1;
+    }
+    foreground = tcgetpgrp(state->fd);
+    if (foreground < 0) {
+        int saved = errno;
+        close(state->fd);
+        state->fd = -1;
+        if (saved == ENOTTY) return 0;
+        errno = saved;
+        return -1;
+    }
+    if (foreground != getpgrp()) {
+        close(state->fd);
+        state->fd = -1;
+        return 0;
+    }
+    state->foreground_pgid = foreground;
+    return 0;
+}
+
+static int runner_tty_transfer(runner_tty_state_t *state, pid_t pgid) {
+    if (!state || state->fd < 0) return 0;
+    if (runner_tcsetpgrp_masked(state->fd, pgid) != 0) return -1;
+    state->transferred = true;
+    return 0;
+}
+
+static int runner_tty_restore(runner_tty_state_t *state) {
+    int restore_errno = 0;
+
+    if (!state) return 0;
+    if (state->transferred &&
+        runner_tcsetpgrp_masked(state->fd, state->foreground_pgid) != 0) {
+        restore_errno = errno;
+    }
+    if (state->fd >= 0) close(state->fd);
+    state->fd = -1;
+    state->transferred = false;
+    if (restore_errno != 0) {
+        errno = restore_errno;
+        return -1;
+    }
+    return 0;
+}
+
+static void runner_signal_child(pid_t pid, bool group_proven,
+                                int signal_number) {
+    if (pid <= 0) return;
+    (void)kill(group_proven ? -pid : pid, signal_number);
+}
+
+static void runner_accept_group_relay(pid_t pid, bool group_proven,
+                                      int signal_number) {
+    if (signal_number == SIGTSTP) {
+        /* A separate foreground pgrp cannot leave both supervisor and worker
+         * stopped or the background parent would wait forever. Full shell
+         * stop/continue proxying is outside the guarded-signal contract;
+         * fail this run closed and restore terminal ownership instead. */
+        runner_signal_child(pid, group_proven, SIGCONT);
+        runner_signal_child(pid, group_proven, SIGKILL);
+        return;
+    }
+    signals_record_relayed_group_signal(signal_number);
+}
+
+static volatile sig_atomic_t g_runner_relay_fd = -1;
+static const int g_runner_relay_signals[] = {
+    SIGINT, SIGTERM, SIGHUP, SIGQUIT, SIGTSTP
+};
+#define RUNNER_RELAY_SIGNAL_COUNT \
+    (sizeof(g_runner_relay_signals) / sizeof(g_runner_relay_signals[0]))
+
+static void runner_group_signal_relay(int signal_number) {
+    int saved_errno = errno;
+    unsigned char byte = (unsigned char)signal_number;
+    int fd = (int)g_runner_relay_fd;
+    if (fd >= 0) {
+        ssize_t ignored = write(fd, &byte, 1U);
+        (void)ignored;
+    }
+    if (signal_number == SIGTSTP) {
+        /* Once the worker is released, stopping both members of the isolated
+         * group can strand the parent in its setup-status read forever. The
+         * inherited-mask contract still wins: this handler cannot run while
+         * SIGTSTP was caller-blocked. For an unblocked stop request, report
+         * the relay and fail the complete group closed. */
+        (void)kill(0, SIGCONT);
+        (void)kill(0, SIGKILL);
+    }
+    errno = saved_errno;
+}
+
+static int runner_build_group_relay_set(sigset_t *relay_set) {
+    if (!relay_set || sigemptyset(relay_set) != 0) return -1;
+    for (size_t i = 0U; i < RUNNER_RELAY_SIGNAL_COUNT; i++) {
+        if (sigaddset(relay_set, g_runner_relay_signals[i]) != 0) {
+            return -1;
+        }
+    }
+    return 0;
+}
+
+static int runner_install_group_relay(int relay_fd,
+                                      sigset_t *installed_set) {
+    struct sigaction current;
+    struct sigaction relay;
+
+    if (!installed_set || sigemptyset(installed_set) != 0) return -1;
+    memset(&relay, 0, sizeof(relay));
+    relay.sa_handler = runner_group_signal_relay;
+    if (sigemptyset(&relay.sa_mask) != 0) return -1;
+    int flags = fcntl(relay_fd, F_GETFL, 0);
+    if (flags < 0 || fcntl(relay_fd, F_SETFL, flags | O_NONBLOCK) != 0) {
+        return -1;
+    }
+    for (size_t i = 0U; i < RUNNER_RELAY_SIGNAL_COUNT; i++) {
+        int signal_number = g_runner_relay_signals[i];
+        if (sigaction(signal_number, NULL, &current) != 0) return -1;
+        if (current.sa_handler != SIG_IGN &&
+            sigaddset(installed_set, signal_number) != 0) {
+            return -1;
+        }
+    }
+    /* The outer child blocked every relay candidate before beginning process
+     * setup. Capture only dispositions we actually replace; inherited
+     * SIG_IGN remains untouched and the worker restores the caller's mask. */
+    g_runner_relay_fd = (sig_atomic_t)relay_fd;
+    for (size_t i = 0U; i < RUNNER_RELAY_SIGNAL_COUNT; i++) {
+        int signal_number = g_runner_relay_signals[i];
+        int installed = sigismember(installed_set, signal_number);
+        if (installed < 0) return -1;
+        if (installed == 1 &&
+            sigaction(signal_number, &relay, NULL) != 0) {
+            return -1;
+        }
+    }
+    return 0;
+}
+
+static void runner_reset_group_relay_for_exec(void) {
+    struct sigaction current;
+    struct sigaction action;
+
+    memset(&action, 0, sizeof(action));
+    action.sa_handler = SIG_DFL;
+    (void)sigemptyset(&action.sa_mask);
+    for (size_t i = 0U; i < RUNNER_RELAY_SIGNAL_COUNT; i++) {
+        int signal_number = g_runner_relay_signals[i];
+        if (sigaction(signal_number, NULL, &current) == 0 &&
+            current.sa_handler == runner_group_signal_relay) {
+            (void)sigaction(signal_number, &action, NULL);
+        }
+    }
+    g_runner_relay_fd = -1;
+}
+
+static int runner_consume_pending_signal(int signal_number) {
+    sigset_t one_signal;
+    int consumed = 0;
+    int wait_error;
+
+    if (sigemptyset(&one_signal) != 0 ||
+        sigaddset(&one_signal, signal_number) != 0) {
+        return -1;
+    }
+    do {
+        wait_error = sigwait(&one_signal, &consumed);
+    } while (wait_error == EINTR);
+    if (wait_error != 0) {
+        errno = wait_error;
+        return -1;
+    }
+    if (consumed != signal_number) {
+        errno = EIO;
+        return -1;
+    }
+    return 0;
+}
+
+/* The process-group leader can receive a blocked group signal before it has
+ * forked the actual exec worker. Transfer each such supervisor-only pending
+ * instance while the worker is held behind a private pipe. Signals already
+ * pending in the worker coalesce normally, so this never creates two
+ * deliveries there. A caller-blocked signal remains blocked and pending
+ * across exec; an unblocked signal additionally receives one parent-visible
+ * relay credit in place of the supervisor handler we synchronously consume. */
+static int runner_replay_pending_group_signals(
+    pid_t worker, int relay_fd, const sigset_t *installed_set,
+    const sigset_t *inherited_mask, bool *worker_killed) {
+    sigset_t pending;
+
+    if (!installed_set || !inherited_mask || !worker_killed) {
+        errno = EINVAL;
+        return -1;
+    }
+    *worker_killed = false;
+    if (sigpending(&pending) != 0) return -1;
+    for (size_t i = 0U; i < RUNNER_RELAY_SIGNAL_COUNT; i++) {
+        int signal_number = g_runner_relay_signals[i];
+        int installed = sigismember(installed_set, signal_number);
+        int is_pending = sigismember(&pending, signal_number);
+        int inherited_blocked =
+            sigismember(inherited_mask, signal_number);
+
+        if (installed < 0 || is_pending < 0 || inherited_blocked < 0) {
+            return -1;
+        }
+        if (installed == 0 || is_pending == 0) continue;
+        if (runner_consume_pending_signal(signal_number) != 0) return -1;
+
+        if (signal_number == SIGTSTP && inherited_blocked == 0) {
+            if (runner_write_byte(
+                    relay_fd, (unsigned char)signal_number) != 0) {
+                return -1;
+            }
+            (void)kill(worker, SIGCONT);
+            if (kill(worker, SIGKILL) != 0) return -1;
+            *worker_killed = true;
+            continue;
+        }
+        if (kill(worker, signal_number) != 0) return -1;
+        if (inherited_blocked == 0 &&
+            runner_write_byte(relay_fd,
+                              (unsigned char)signal_number) != 0) {
+            return -1;
+        }
+    }
+    return 0;
+}
+
+static void runner_kill_and_reap_worker(pid_t worker,
+                                        const sigset_t *relay_set) {
+    sigset_t previous_mask;
+    pid_t waited;
+
+    if (!relay_set ||
+        sigprocmask(SIG_BLOCK, relay_set, &previous_mask) != 0) {
+        (void)kill(worker, SIGKILL);
+        do {
+            waited = waitpid(worker, NULL, 0);
+        } while (waited < 0 && errno == EINTR);
+        return;
+    }
+    (void)kill(worker, SIGKILL);
+    do {
+        waited = waitpid(worker, NULL, 0);
+    } while (waited < 0 && errno == EINTR);
+    if (waited != worker) return;
+    (void)sigprocmask(SIG_SETMASK, &previous_mask, NULL);
+}
+
+static void runner_supervisor_exit_for_status(pid_t child, int status) {
+    if (WIFEXITED(status)) _exit(WEXITSTATUS(status));
+    if (WIFSIGNALED(status)) {
+        int signal_number = WTERMSIG(status);
+        sigset_t unblock;
+        (void)signal(signal_number, SIG_DFL);
+        if (sigemptyset(&unblock) == 0 &&
+            sigaddset(&unblock, signal_number) == 0) {
+            (void)sigprocmask(SIG_UNBLOCK, &unblock, NULL);
+        }
+        (void)raise(signal_number);
+    }
+    (void)kill(child, SIGKILL);
+    _exit(127);
+}
 
 typedef enum {
     CHILD_STATUS_FAILURE = 1,
@@ -3462,18 +4243,52 @@ static int child_report_fd_close_observation(
     return child_write_status(status_fd, &status);
 }
 
+typedef struct {
+    bool enabled;
+    bool observed;
+    int64_t deadline;
+    int64_t last_now;
+} run_deadline_state_t;
+
+static int run_deadline_observe(run_deadline_state_t *state,
+                                int *remaining_millis);
+static int runner_poll(struct pollfd *fds, nfds_t count, int timeout_millis);
+
 /* Returns 0 for the CLOEXEC EOF that proves exec succeeded, 1 for a complete
- * child failure report, and -1 for a malformed/failed status read.  Optional
- * observation messages can precede either EOF or a later setup failure. */
+ * child failure report, -1 for a malformed/failed status read, -2 for
+ * deadline expiry, and -3 for a monotonic-clock failure. Optional observation
+ * messages can precede either EOF or a later setup failure. */
 static int read_child_status(
     int fd, child_status_t *failure,
-    run_test_fd_close_observation_t *observation, bool *observation_valid) {
+    run_test_fd_close_observation_t *observation, bool *observation_valid,
+    run_deadline_state_t *deadline) {
     *observation_valid = false;
     for (;;) {
         child_status_t status = {0};
         char *bytes = (char *)&status;
         size_t offset = 0;
         while (offset < sizeof(status)) {
+            if (deadline && deadline->enabled) {
+                int remaining = 0;
+                int deadline_rc = run_deadline_observe(
+                    deadline, &remaining);
+                if (deadline_rc > 0) return -2;
+                if (deadline_rc < 0) return -3;
+
+                struct pollfd pfd = {
+                    .fd = fd,
+                    .events = POLLIN
+                };
+                int poll_rc = runner_poll(&pfd, 1, remaining);
+                if (poll_rc == 0) {
+                    errno = ETIMEDOUT;
+                    return -2;
+                }
+                if (poll_rc < 0) {
+                    if (errno == EINTR) continue;
+                    return -1;
+                }
+            }
             ssize_t got = read(fd, bytes + offset, sizeof(status) - offset);
             if (got > 0) {
                 offset += (size_t)got;
@@ -3504,17 +4319,218 @@ static int read_child_status(
     }
 }
 
-static int64_t monotonic_millis(void) {
+#ifdef GITSWITCH_TESTING
+static unsigned int g_monotonic_call_count;
+static unsigned int g_test_monotonic_failure_ordinal;
+static int g_test_monotonic_failure_errno;
+static unsigned int g_test_monotonic_rollback_ordinal;
+static int64_t g_test_monotonic_rollback_millis;
+static unsigned int g_test_monotonic_timespec_ordinal;
+static int64_t g_test_monotonic_timespec_seconds;
+static long g_test_monotonic_timespec_nanoseconds;
+static unsigned int g_test_poll_call_count;
+static unsigned int g_test_poll_failure_ordinal;
+static int g_test_poll_failure_errno;
+static int64_t g_test_child_setup_delay_millis;
+
+void run_test_set_monotonic_failure(unsigned int call_ordinal,
+                                    int system_errno) {
+    g_monotonic_call_count = 0;
+    g_test_monotonic_failure_ordinal = call_ordinal;
+    g_test_monotonic_failure_errno = system_errno;
+    g_test_monotonic_rollback_ordinal = 0;
+    g_test_monotonic_rollback_millis = 0;
+    g_test_monotonic_timespec_ordinal = 0;
+}
+
+void run_test_set_monotonic_rollback(unsigned int call_ordinal,
+                                     int64_t rollback_millis) {
+    g_monotonic_call_count = 0;
+    g_test_monotonic_failure_ordinal = 0;
+    g_test_monotonic_failure_errno = 0;
+    g_test_monotonic_rollback_ordinal = call_ordinal;
+    g_test_monotonic_rollback_millis = rollback_millis;
+    g_test_monotonic_timespec_ordinal = 0;
+}
+
+void run_test_set_monotonic_timespec(unsigned int call_ordinal,
+                                     int64_t seconds, long nanoseconds) {
+    g_monotonic_call_count = 0;
+    g_test_monotonic_failure_ordinal = 0;
+    g_test_monotonic_failure_errno = 0;
+    g_test_monotonic_rollback_ordinal = 0;
+    g_test_monotonic_rollback_millis = 0;
+    g_test_monotonic_timespec_ordinal = call_ordinal;
+    g_test_monotonic_timespec_seconds = seconds;
+    g_test_monotonic_timespec_nanoseconds = nanoseconds;
+}
+
+void run_test_set_poll_failure(unsigned int call_ordinal,
+                               int system_errno) {
+    g_test_poll_call_count = 0;
+    g_test_poll_failure_ordinal = call_ordinal;
+    g_test_poll_failure_errno = system_errno;
+}
+
+void run_test_set_child_setup_delay(int64_t delay_millis) {
+    g_test_child_setup_delay_millis = delay_millis;
+}
+#endif
+
+static int runner_poll(struct pollfd *fds, nfds_t count, int timeout_millis) {
+#ifdef GITSWITCH_TESTING
+    g_test_poll_call_count++;
+    if (g_test_poll_failure_errno != 0 &&
+        g_test_poll_call_count == g_test_poll_failure_ordinal) {
+        int injected_errno = g_test_poll_failure_errno;
+        g_test_poll_failure_errno = 0;
+        g_test_poll_failure_ordinal = 0;
+        errno = injected_errno;
+        return -1;
+    }
+#endif
+    return poll(fds, count, timeout_millis);
+}
+
+static int monotonic_millis(int64_t *millis) {
     struct timespec now;
+    if (!millis) {
+        errno = EINVAL;
+        return -1;
+    }
+#ifdef GITSWITCH_TESTING
+    g_monotonic_call_count++;
+    if (g_test_monotonic_failure_errno != 0 &&
+        g_monotonic_call_count == g_test_monotonic_failure_ordinal) {
+        int injected_errno = g_test_monotonic_failure_errno;
+        g_test_monotonic_failure_errno = 0;
+        g_test_monotonic_failure_ordinal = 0;
+        errno = injected_errno;
+        return -1;
+    }
+#endif
     if (clock_gettime(CLOCK_MONOTONIC, &now) != 0) return -1;
-    return (int64_t)now.tv_sec * 1000 + now.tv_nsec / 1000000;
+#ifdef GITSWITCH_TESTING
+    if (g_test_monotonic_timespec_ordinal != 0 &&
+        g_monotonic_call_count == g_test_monotonic_timespec_ordinal) {
+        now.tv_sec = (time_t)g_test_monotonic_timespec_seconds;
+        now.tv_nsec = g_test_monotonic_timespec_nanoseconds;
+        g_test_monotonic_timespec_ordinal = 0;
+    }
+#endif
+    if (now.tv_nsec < 0 || now.tv_nsec >= 1000000000L) {
+        errno = ERANGE;
+        return -1;
+    }
+    int64_t fractional_millis = now.tv_nsec / 1000000;
+    if (now.tv_sec < 0 ||
+        (uint64_t)now.tv_sec > (uint64_t)INT64_MAX / 1000U ||
+        ((uint64_t)now.tv_sec == (uint64_t)INT64_MAX / 1000U &&
+         fractional_millis > INT64_MAX % 1000)) {
+        errno = EOVERFLOW;
+        return -1;
+    }
+    *millis = (int64_t)now.tv_sec * 1000 + fractional_millis;
+#ifdef GITSWITCH_TESTING
+    if (g_test_monotonic_rollback_millis > 0 &&
+        g_monotonic_call_count == g_test_monotonic_rollback_ordinal) {
+        int64_t rollback = g_test_monotonic_rollback_millis;
+        g_test_monotonic_rollback_millis = 0;
+        g_test_monotonic_rollback_ordinal = 0;
+        if (*millis < INT64_MIN + rollback) {
+            errno = EOVERFLOW;
+            return -1;
+        }
+        *millis -= rollback;
+    }
+#endif
+    return 0;
+}
+
+static int64_t monotonic_millis_add_saturating(int64_t base,
+                                                int64_t delta) {
+    if (delta > 0 && base > INT64_MAX - delta) return INT64_MAX;
+    if (delta < 0 && base < INT64_MIN - delta) return INT64_MIN;
+    return base + delta;
+}
+
+int run_deadline_after_millis(int64_t timeout_ms, int64_t *deadline_millis) {
+    int64_t now;
+    if (!deadline_millis || timeout_ms < 0) {
+        errno = EINVAL;
+        return -1;
+    }
+    if (monotonic_millis(&now) != 0) return -1;
+    if (timeout_ms > INT64_MAX - now) {
+        errno = EOVERFLOW;
+        return -1;
+    }
+    *deadline_millis = now + timeout_ms;
+    return 0;
+}
+
+/* 0 => live, 1 => expired, -1 => the monotonic clock contract failed. */
+static int run_deadline_observe(run_deadline_state_t *state,
+                                int *remaining_millis) {
+    int64_t now;
+    if (!state || !state->enabled) {
+        if (remaining_millis) *remaining_millis = INT_MAX;
+        return 0;
+    }
+    if (monotonic_millis(&now) != 0) return -1;
+    if (state->observed && now < state->last_now) {
+        errno = ERANGE;
+        return -1;
+    }
+    state->observed = true;
+    state->last_now = now;
+    if (now >= state->deadline) {
+        if (remaining_millis) *remaining_millis = 0;
+        errno = ETIMEDOUT;
+        return 1;
+    }
+    if (remaining_millis) {
+        int64_t remaining = state->deadline - now;
+        *remaining_millis =
+            remaining > INT_MAX ? INT_MAX : (int)remaining;
+    }
+    return 0;
+}
+
+static void run_deadline_set_error(int deadline_rc, const char *phase,
+                                   run_result_t *result) {
+    int primary_errno = errno;
+    if (deadline_rc > 0) {
+        primary_errno = ETIMEDOUT;
+        if (result) result->timed_out = true;
+        errno = primary_errno;
+        set_system_error(ERR_SYSTEM_CALL,
+                         "run_argv: deadline expired %s", phase);
+    } else {
+        if (primary_errno == 0) primary_errno = EIO;
+        errno = primary_errno;
+        if (primary_errno == ERANGE) {
+            set_system_error(
+                ERR_SYSTEM_CALL,
+                "run_argv: monotonic clock moved backwards %s", phase);
+        } else {
+            set_system_error(
+                ERR_SYSTEM_CALL,
+                "run_argv: cannot observe monotonic deadline %s", phase);
+        }
+    }
+    errno = primary_errno;
 }
 
 #define RUNNER_POLL_SLICE_MS 50
 #define RUNNER_CAPTURE_GRACE_MS 250
 #define RUNNER_DRAIN_CHUNKS_PER_POLL 16
+#define RUNNER_SILENT_SETUP_RETRIES 1U
 
-int run_argv_real(const char *const argv[], const run_opts_t *opts, run_result_t *result) {
+static int run_argv_real_impl(
+    const char *const argv[], const run_opts_t *opts,
+    const run_launch_witness_t *expected, run_result_t *result,
+    unsigned int silent_setup_retries_remaining) {
     run_opts_t no_opts;
     run_result_t local;
     memset(&no_opts, 0, sizeof(no_opts));
@@ -3523,8 +4539,10 @@ int run_argv_real(const char *const argv[], const run_opts_t *opts, run_result_t
     result->exit_code = -1;
     result->term_signal = 0;
     result->spawned = false;
+    result->timed_out = false;
     result->out_len = 0;
     result->out_truncated = false;
+    memset(&result->launch_witness, 0, sizeof(result->launch_witness));
     /* AR-12 L12 (defense in depth): terminate the caller's capture buffer
      * before any early-return validation path, so a pre-spawn failure never
      * leaves callers formatting uninitialized bytes. */
@@ -3535,6 +4553,20 @@ int run_argv_real(const char *const argv[], const run_opts_t *opts, run_result_t
 
     if (!argv || !argv[0]) {
         set_error(ERR_INVALID_ARGS, "run_argv: empty argv");
+        return -1;
+    }
+    if (expected && !run_launch_witness_is_well_formed(expected)) {
+        set_error(ERR_INVALID_ARGS,
+                  "run_argv: invalid expected launch witness");
+        return -1;
+    }
+    if (expected &&
+        strcmp(argv[0], expected->executable_path) != 0) {
+        errno = ESTALE;
+        set_system_error(
+            ERR_PERMISSION_DENIED,
+            "run_argv: executable invocation does not match the expected launch");
+        errno = ESTALE;
         return -1;
     }
 
@@ -3575,6 +4607,26 @@ int run_argv_real(const char *const argv[], const run_opts_t *opts, run_result_t
             !S_ISDIR(cwd_st.st_mode)) {
             set_error(ERR_INVALID_ARGS,
                       "run_argv: cwd_fd is not an open directory");
+            return -1;
+        }
+    }
+
+    run_deadline_state_t deadline = {
+        .enabled = opts->use_deadline,
+        .deadline = opts->deadline_millis
+    };
+    if (deadline.enabled && deadline.deadline < 0) {
+        errno = EINVAL;
+        set_system_error(
+            ERR_INVALID_ARGS,
+            "run_argv: monotonic deadline must be nonnegative");
+        errno = EINVAL;
+        return -1;
+    }
+    if (deadline.enabled) {
+        int deadline_rc = run_deadline_observe(&deadline, NULL);
+        if (deadline_rc != 0) {
+            run_deadline_set_error(deadline_rc, "before launch", result);
             return -1;
         }
     }
@@ -3655,6 +4707,42 @@ int run_argv_real(const char *const argv[], const run_opts_t *opts, run_result_t
     }
     if (g_test_exec_resolved_hook) g_test_exec_resolved_hook(exec_path);
 
+    run_launch_witness_t opened_witness;
+    if (run_launch_witness_from_opened(
+            exec_path, exec_fd, &exec_identity, &script_launch,
+            &opened_witness) != 0) {
+        int witness_errno = errno ? errno : ESTALE;
+
+        close(exec_fd);
+        trusted_script_launch_cleanup(&script_launch);
+        errno = witness_errno;
+        if (witness_errno == ESTALE || witness_errno == EACCES) {
+            set_system_error(
+                ERR_PERMISSION_DENIED,
+                "run_argv: executable or interpreter changed before launch for '%s'",
+                exec_path);
+        } else {
+            set_system_error(
+                ERR_SYSTEM_CALL,
+                "run_argv: cannot certify the opened launch generation for '%s'",
+                exec_path);
+        }
+        errno = witness_errno;
+        return -1;
+    }
+    if (expected &&
+        !run_launch_witness_matches(expected, &opened_witness)) {
+        close(exec_fd);
+        trusted_script_launch_cleanup(&script_launch);
+        errno = ESTALE;
+        set_system_error(
+            ERR_PERMISSION_DENIED,
+            "run_argv: executable generation or invocation changed before launch for '%s'",
+            exec_path);
+        errno = ESTALE;
+        return -1;
+    }
+
     bool pipe_input = opts->input != NULL;
     bool fd_input = opts->use_stdin_fd;
     bool want_in = pipe_input || fd_input;
@@ -3716,6 +4804,9 @@ int run_argv_real(const char *const argv[], const run_opts_t *opts, run_result_t
     int in_pipe[2] = {-1, -1};
     int out_pipe[2] = {-1, -1};
     int status_pipe[2] = {-1, -1};
+    int group_ready_pipe[2] = {-1, -1};
+    int group_release_pipe[2] = {-1, -1};
+    int signal_relay_pipe[2] = {-1, -1};
     if (need_devnull && (devnull = open_internal_devnull()) < 0) {
         set_system_error(ERR_SYSTEM_CALL,
                          "run_argv: cannot acquire /dev/null for child stdio");
@@ -3754,6 +4845,29 @@ int run_argv_real(const char *const argv[], const run_opts_t *opts, run_result_t
         trusted_script_launch_cleanup(&script_launch);
         return -1;
     }
+    if (make_internal_pipe(group_ready_pipe) != 0 ||
+        make_internal_pipe(group_release_pipe) != 0 ||
+        make_internal_pipe(signal_relay_pipe) != 0) {
+        int pipe_errno = errno;
+        set_system_error(ERR_SYSTEM_CALL,
+                         "run_argv: cannot create process-group gate");
+        if (devnull >= 0) close(devnull);
+        if (pipe_input) { close(in_pipe[0]); close(in_pipe[1]); }
+        if (want_out) { close(out_pipe[0]); close(out_pipe[1]); }
+        close(status_pipe[0]);
+        close(status_pipe[1]);
+        if (group_ready_pipe[0] >= 0) close(group_ready_pipe[0]);
+        if (group_ready_pipe[1] >= 0) close(group_ready_pipe[1]);
+        if (group_release_pipe[0] >= 0) close(group_release_pipe[0]);
+        if (group_release_pipe[1] >= 0) close(group_release_pipe[1]);
+        if (signal_relay_pipe[0] >= 0) close(signal_relay_pipe[0]);
+        if (signal_relay_pipe[1] >= 0) close(signal_relay_pipe[1]);
+        free(fd_snapshot.fds);
+        close(exec_fd);
+        trusted_script_launch_cleanup(&script_launch);
+        errno = pipe_errno;
+        return -1;
+    }
 
     /* Own SIGCHLD before fork so an inherited auto-reap policy or foreign
      * signal handler can never consume a helper after it has side effects.
@@ -3766,6 +4880,12 @@ int run_argv_real(const char *const argv[], const run_opts_t *opts, run_result_t
         if (want_out) { close(out_pipe[0]); close(out_pipe[1]); }
         close(status_pipe[0]);
         close(status_pipe[1]);
+        close(group_ready_pipe[0]);
+        close(group_ready_pipe[1]);
+        close(group_release_pipe[0]);
+        close(group_release_pipe[1]);
+        close(signal_relay_pipe[0]);
+        close(signal_relay_pipe[1]);
         free(fd_snapshot.fds);
         close(exec_fd);
         trusted_script_launch_cleanup(&script_launch);
@@ -3774,6 +4894,8 @@ int run_argv_real(const char *const argv[], const run_opts_t *opts, run_result_t
     }
 
     sigset_t pre_spawn_mask;
+    sigset_t guarded_spawn_mask;
+    sigset_t relay_block_set;
     if (signals_block_for_child_spawn(&pre_spawn_mask) != 0) {
         int block_errno = errno;
         int ownership_restore_errno = 0;
@@ -3785,6 +4907,12 @@ int run_argv_real(const char *const argv[], const run_opts_t *opts, run_result_t
         if (want_out) { close(out_pipe[0]); close(out_pipe[1]); }
         close(status_pipe[0]);
         close(status_pipe[1]);
+        close(group_ready_pipe[0]);
+        close(group_ready_pipe[1]);
+        close(group_release_pipe[0]);
+        close(group_release_pipe[1]);
+        close(signal_relay_pipe[0]);
+        close(signal_relay_pipe[1]);
         free(fd_snapshot.fds);
         close(exec_fd);
         trusted_script_launch_cleanup(&script_launch);
@@ -3801,9 +4929,51 @@ int run_argv_real(const char *const argv[], const run_opts_t *opts, run_result_t
         errno = block_errno;
         return -1;
     }
+    if (runner_build_group_relay_set(&relay_block_set) != 0 ||
+        sigprocmask(SIG_BLOCK, &relay_block_set, &guarded_spawn_mask) != 0) {
+        int block_errno = errno;
+        int mask_restore_errno = 0;
+        int wait_mask_restore_errno = 0;
+        if (signals_restore_after_child_spawn(&pre_spawn_mask) != 0) {
+            mask_restore_errno = errno;
+        }
+        if (signals_child_wait_end(&pre_wait_mask) != 0) {
+            wait_mask_restore_errno = errno;
+        }
+        if (devnull >= 0) close(devnull);
+        if (pipe_input) { close(in_pipe[0]); close(in_pipe[1]); }
+        if (want_out) { close(out_pipe[0]); close(out_pipe[1]); }
+        close(status_pipe[0]);
+        close(status_pipe[1]);
+        close(group_ready_pipe[0]);
+        close(group_ready_pipe[1]);
+        close(group_release_pipe[0]);
+        close(group_release_pipe[1]);
+        close(signal_relay_pipe[0]);
+        close(signal_relay_pipe[1]);
+        free(fd_snapshot.fds);
+        close(exec_fd);
+        trusted_script_launch_cleanup(&script_launch);
+        errno = block_errno;
+        if (mask_restore_errno != 0 || wait_mask_restore_errno != 0) {
+            set_system_error(
+                ERR_SYSTEM_CALL,
+                "run_argv: cannot block process-group relay signals before fork; also failed to restore parent signal state (spawn restore errno=%d, wait restore errno=%d)",
+                mask_restore_errno, wait_mask_restore_errno);
+        } else {
+            set_system_error(
+                ERR_SYSTEM_CALL,
+                "run_argv: cannot block process-group relay signals before fork");
+        }
+        errno = block_errno;
+        return -1;
+    }
 
     pid_t pid;
-    if (g_test_fork_failure_errno != 0) {
+    int pre_fork_deadline_rc = run_deadline_observe(&deadline, NULL);
+    if (pre_fork_deadline_rc != 0) {
+        pid = -1;
+    } else if (g_test_fork_failure_errno != 0) {
         int injected_errno = g_test_fork_failure_errno;
         g_test_fork_failure_errno = 0;
         errno = injected_errno;
@@ -3826,11 +4996,26 @@ int run_argv_real(const char *const argv[], const run_opts_t *opts, run_result_t
         if (want_out) { close(out_pipe[0]); close(out_pipe[1]); }
         close(status_pipe[0]);
         close(status_pipe[1]);
+        close(group_ready_pipe[0]);
+        close(group_ready_pipe[1]);
+        close(group_release_pipe[0]);
+        close(group_release_pipe[1]);
+        close(signal_relay_pipe[0]);
+        close(signal_relay_pipe[1]);
         free(fd_snapshot.fds);
         close(exec_fd);
         trusted_script_launch_cleanup(&script_launch);
         errno = fork_errno;
-        if (mask_restore_errno != 0 || wait_mask_restore_errno != 0) {
+        if (pre_fork_deadline_rc != 0) {
+            run_deadline_set_error(
+                pre_fork_deadline_rc, "before child creation", result);
+            report_secondary_runner_cleanup_failure(
+                "while restoring the guarded spawn mask",
+                mask_restore_errno);
+            report_secondary_runner_cleanup_failure(
+                "while restoring SIGCHLD wait ownership",
+                wait_mask_restore_errno);
+        } else if (mask_restore_errno != 0 || wait_mask_restore_errno != 0) {
             set_system_error(
                 ERR_SYSTEM_CALL,
                 "fork() failed; also failed to restore parent signal mask (spawn restore errno=%d, wait restore errno=%d)",
@@ -3844,15 +5029,258 @@ int run_argv_real(const char *const argv[], const run_opts_t *opts, run_result_t
 
     if (pid == 0) {
         /* ---- child ---- */
+        int child_status_fd = status_pipe[1];
+        sigset_t installed_relay_set;
+
+#ifdef GITSWITCH_TESTING
+        int injected_signal = g_test_supervisor_pending_signal;
+        g_test_supervisor_pending_signal = 0;
+        /* Model the process-directed delivery produced by killpg(2). Darwin's
+         * raise(3) is thread-directed, which is not the supervisor state this
+         * seam is intended to exercise and can behave differently across the
+         * following fork. */
+        if (injected_signal != 0 &&
+            kill(getpid(), injected_signal) != 0) {
+            child_report_failure(child_status_fd,
+                                 CHILD_STAGE_PROCESS_GROUP, errno, 126);
+        }
+#endif
+        close(group_ready_pipe[0]);
+        close(group_release_pipe[1]);
+        close(signal_relay_pipe[0]);
+#ifdef GITSWITCH_TESTING
+        if (g_test_child_process_group_failure_errno != 0) {
+            int injected_errno =
+                g_test_child_process_group_failure_errno;
+            g_test_child_process_group_failure_errno = 0;
+            child_report_failure(child_status_fd,
+                                 CHILD_STAGE_PROCESS_GROUP,
+                                 injected_errno, 126);
+        }
+#endif
+        if (setpgid(0, 0) != 0) {
+            child_report_failure(child_status_fd,
+                                 CHILD_STAGE_PROCESS_GROUP, errno, 126);
+        }
+        if (runner_install_group_relay(
+                signal_relay_pipe[1], &installed_relay_set) != 0) {
+            child_report_failure(child_status_fd,
+                                 CHILD_STAGE_PROCESS_GROUP, errno, 126);
+        }
+        if (runner_write_byte(group_ready_pipe[1], 0x47U) != 0 ||
+            runner_read_byte(group_release_pipe[0], 0x52U) != 0) {
+            child_report_failure(child_status_fd,
+                                 CHILD_STAGE_PROCESS_GROUP, errno, 126);
+        }
+        close(group_ready_pipe[1]);
+        close(group_release_pipe[0]);
+
+        int worker_release_pipe[2] = {-1, -1};
+#ifdef GITSWITCH_TESTING
+        if (g_test_supervisor_failure_stage ==
+            RUN_TEST_SUPERVISOR_FAILURE_WORKER_RELEASE_PIPE) {
+            int injected_errno = g_test_supervisor_failure_errno;
+            g_test_supervisor_failure_stage =
+                RUN_TEST_SUPERVISOR_FAILURE_NONE;
+            g_test_supervisor_failure_errno = 0;
+            child_report_failure(child_status_fd,
+                                 CHILD_STAGE_PROCESS_GROUP,
+                                 injected_errno, 126);
+        }
+#endif
+        if (make_internal_pipe(worker_release_pipe) != 0) {
+            child_report_failure(child_status_fd,
+                                 CHILD_STAGE_PROCESS_GROUP, errno, 126);
+        }
+
+        pid_t exec_child;
+#ifdef GITSWITCH_TESTING
+        if (g_test_supervisor_failure_stage ==
+            RUN_TEST_SUPERVISOR_FAILURE_INNER_FORK) {
+            int injected_errno = g_test_supervisor_failure_errno;
+            g_test_supervisor_failure_stage =
+                RUN_TEST_SUPERVISOR_FAILURE_NONE;
+            g_test_supervisor_failure_errno = 0;
+            errno = injected_errno;
+            exec_child = -1;
+        } else
+#endif
+        {
+            exec_child = fork();
+        }
+        if (exec_child < 0) {
+            int fork_errno = errno;
+            close(worker_release_pipe[0]);
+            close(worker_release_pipe[1]);
+            child_report_failure(child_status_fd,
+                                 CHILD_STAGE_PROCESS_GROUP,
+                                 fork_errno, 126);
+        }
+        if (exec_child > 0) {
+            int exec_status = 0;
+            pid_t waited;
+            run_test_fd_close_observation_t supervisor_close_observation;
+            int supervisor_relay_fd = STDERR_FILENO + 1;
+            bool worker_killed = false;
+
+            close(worker_release_pipe[0]);
+            close(status_pipe[0]);
+            if (in_pipe[0] >= 0) close(in_pipe[0]);
+            if (in_pipe[1] >= 0) close(in_pipe[1]);
+            if (out_pipe[0] >= 0) close(out_pipe[0]);
+            if (out_pipe[1] >= 0) close(out_pipe[1]);
+            if (devnull >= 0) close(devnull);
+            close(exec_fd);
+            if (script_launch.interpreter_fd >= 0) {
+                close(script_launch.interpreter_fd);
+            }
+            if (signal_relay_pipe[1] != supervisor_relay_fd) {
+                if (dup2(signal_relay_pipe[1], supervisor_relay_fd) < 0) {
+                    int setup_errno = errno;
+                    close(worker_release_pipe[1]);
+                    runner_kill_and_reap_worker(
+                        exec_child, &relay_block_set);
+                    child_report_failure(
+                        child_status_fd, CHILD_STAGE_PROCESS_GROUP,
+                        setup_errno, 126);
+                }
+                close(signal_relay_pipe[1]);
+            }
+            g_runner_relay_fd = (sig_atomic_t)supervisor_relay_fd;
+#ifdef GITSWITCH_TESTING
+            if (g_test_supervisor_failure_stage ==
+                RUN_TEST_SUPERVISOR_FAILURE_REPLAY) {
+                int injected_errno = g_test_supervisor_failure_errno;
+                g_test_supervisor_failure_stage =
+                    RUN_TEST_SUPERVISOR_FAILURE_NONE;
+                g_test_supervisor_failure_errno = 0;
+                close(worker_release_pipe[1]);
+                runner_kill_and_reap_worker(
+                    exec_child, &relay_block_set);
+                child_report_failure(
+                    child_status_fd, CHILD_STAGE_PROCESS_GROUP,
+                    injected_errno, 126);
+            }
+#endif
+            if (runner_replay_pending_group_signals(
+                    exec_child, supervisor_relay_fd,
+                    &installed_relay_set, &pre_wait_mask,
+                    &worker_killed) != 0) {
+                int setup_errno = errno;
+                close(worker_release_pipe[1]);
+                runner_kill_and_reap_worker(
+                    exec_child, &relay_block_set);
+                child_report_failure(
+                    child_status_fd, CHILD_STAGE_PROCESS_GROUP,
+                    setup_errno, 126);
+            }
+#ifdef GITSWITCH_TESTING
+            if (g_test_supervisor_failure_stage ==
+                RUN_TEST_SUPERVISOR_FAILURE_RELEASE_WRITE) {
+                int injected_errno = g_test_supervisor_failure_errno;
+                g_test_supervisor_failure_stage =
+                    RUN_TEST_SUPERVISOR_FAILURE_NONE;
+                g_test_supervisor_failure_errno = 0;
+                close(worker_release_pipe[1]);
+                runner_kill_and_reap_worker(
+                    exec_child, &relay_block_set);
+                child_report_failure(
+                    child_status_fd, CHILD_STAGE_PROCESS_GROUP,
+                    injected_errno, 126);
+            }
+#endif
+            if (!worker_killed &&
+                runner_write_byte(worker_release_pipe[1], 0x45U) != 0) {
+                int setup_errno = errno;
+                close(worker_release_pipe[1]);
+                runner_kill_and_reap_worker(
+                    exec_child, &relay_block_set);
+                child_report_failure(
+                    child_status_fd, CHILD_STAGE_PROCESS_GROUP,
+                    setup_errno, 126);
+            }
+            close(worker_release_pipe[1]);
+#ifdef GITSWITCH_TESTING
+            int post_replay_signal =
+                g_test_post_replay_signal;
+            g_test_post_replay_signal = 0;
+            if (post_replay_signal != 0 &&
+                (post_replay_signal == SIGTSTP
+                     ? raise(post_replay_signal)
+                     : kill(0, post_replay_signal)) != 0) {
+                int setup_errno = errno;
+                runner_kill_and_reap_worker(
+                    exec_child, &relay_block_set);
+                child_report_failure(
+                    child_status_fd, CHILD_STAGE_PROCESS_GROUP,
+                    setup_errno, 126);
+            }
+#endif
+            if (sigprocmask(SIG_SETMASK, &pre_wait_mask, NULL) != 0) {
+                int setup_errno = errno;
+                runner_kill_and_reap_worker(
+                    exec_child, &relay_block_set);
+                child_report_failure(
+                    child_status_fd, CHILD_STAGE_PROCESS_GROUP,
+                    setup_errno, 126);
+            }
+            close(status_pipe[1]);
+            close(STDIN_FILENO);
+            close(STDOUT_FILENO);
+            close(STDERR_FILENO);
+            /* The worker inherited its own copy of every test fault before
+             * this supervisor-only reset. Do not let a worker close-strategy
+             * injection strand the waitable group leader with inherited
+             * locks; use the fastest real primitive, then the parent snapshot
+             * or numeric fallback. */
+            g_test_bulk_close_failure_errno = 0;
+            if (child_close_fds_from(
+                    supervisor_relay_fd + 1, use_bulk_close, false,
+                    &fd_snapshot,
+                    &supervisor_close_observation) != 0) {
+                runner_kill_and_reap_worker(
+                    exec_child, &relay_block_set);
+                _exit(127);
+            }
+            /* run_argv publishes only the independently proven process group,
+             * never this private worker PID. Once the worker exists, normal
+             * cancellation and terminal signals target that group, so the
+             * kernel delivers them to both members. The supervisor must not
+             * re-forward them or one group signal could reach the worker
+             * twice after it resets its disposition. */
+            do {
+                waited = waitpid(exec_child, &exec_status, 0);
+            } while (waited < 0 && errno == EINTR);
+            if (waited != exec_child) _exit(127);
+            runner_supervisor_exit_for_status(exec_child, exec_status);
+        }
+        close(worker_release_pipe[1]);
+        if (runner_read_byte(worker_release_pipe[0], 0x45U) != 0) {
+            child_report_failure(child_status_fd,
+                                 CHILD_STAGE_PROCESS_GROUP, errno, 126);
+        }
+        close(worker_release_pipe[0]);
+        close(signal_relay_pipe[1]);
+        runner_reset_group_relay_for_exec();
+
         /* Drop the parent's guard handler first (AR-06 F76): until exec resets
          * it, a signal delivered to this child would run guard_handler (which
          * only records and returns), swallowing it and leaving the helper
          * "pre-interrupted" instead of terminating normally. */
         signals_reset_for_child(&pre_wait_mask);
 
-        int child_status_fd = status_pipe[1];
         close(status_pipe[0]);
         int child_cwd_fd = -1;
+#ifdef GITSWITCH_TESTING
+        if (g_test_child_setup_delay_millis > 0) {
+            struct timespec delay = {
+                .tv_sec = (time_t)(g_test_child_setup_delay_millis / 1000),
+                .tv_nsec = (long)(g_test_child_setup_delay_millis % 1000) *
+                           1000000L
+            };
+            while (nanosleep(&delay, &delay) != 0 && errno == EINTR) {}
+        }
+#endif
 
         /* Preserve a pinned working-directory descriptor before touching
          * stdio.  If the parent began with fd 0/1/2 closed, cwd_fd can occupy
@@ -4024,19 +5452,23 @@ int run_argv_real(const char *const argv[], const run_opts_t *opts, run_result_t
             for (size_t i = 0; opts->extra_env[i]; i++) {
                 const char *e = opts->extra_env[i];
                 const char *eq = strchr(e, '=');
-                if (eq) {
-                    char key[256];
-                    size_t klen = (size_t)(eq - e);
-                    if (klen == 0 || klen >= sizeof(key)) {
-                        child_report_failure(child_status_fd,
-                                             CHILD_STAGE_ENV, EINVAL, 126);
-                    }
-                    memcpy(key, e, klen);
-                    key[klen] = '\0';
-                    if (setenv(key, eq + 1, 1) != 0) {
-                        child_report_failure(child_status_fd,
-                                             CHILD_STAGE_ENV, errno, 126);
-                    }
+                char key[256];
+                size_t klen;
+
+                if (!eq) {
+                    child_report_failure(child_status_fd,
+                                         CHILD_STAGE_ENV, EINVAL, 126);
+                }
+                klen = (size_t)(eq - e);
+                if (klen == 0 || klen >= sizeof(key)) {
+                    child_report_failure(child_status_fd,
+                                         CHILD_STAGE_ENV, EINVAL, 126);
+                }
+                memcpy(key, e, klen);
+                key[klen] = '\0';
+                if (setenv(key, eq + 1, 1) != 0) {
+                    child_report_failure(child_status_fd,
+                                         CHILD_STAGE_ENV, errno, 126);
                 }
             }
         }
@@ -4132,20 +5564,27 @@ int run_argv_real(const char *const argv[], const run_opts_t *opts, run_result_t
 
     /* ---- parent ---- */
     result->spawned = true;
-    if (g_test_post_fork_pre_publish_hook) {
-        g_test_post_fork_pre_publish_hook();
-    }
-    /* AR-03 L8: publish the in-flight child while guarded signals are still
-     * blocked, so a pending rollback signal can observe it when the exact
-     * parent mask is restored below. */
-    signals_child_spawned(pid);
-    if (signals_restore_after_child_spawn(&pre_spawn_mask) != 0) {
+#ifdef GITSWITCH_TESTING
+    g_test_child_process_group_failure_errno = 0;
+    g_test_supervisor_pending_signal = 0;
+    g_test_post_replay_signal = 0;
+    g_test_supervisor_failure_stage =
+        RUN_TEST_SUPERVISOR_FAILURE_NONE;
+    g_test_supervisor_failure_errno = 0;
+#endif
+    if (signals_restore_after_child_spawn(&guarded_spawn_mask) != 0) {
         int restore_errno = errno;
         int cleanup_wait_errno = 0;
         int wait_mask_restore_errno = 0;
         signals_child_wait_result_t wait_result;
 
-        (void)kill(pid, SIGKILL);
+        close(group_ready_pipe[0]);
+        close(group_ready_pipe[1]);
+        close(group_release_pipe[0]);
+        close(group_release_pipe[1]);
+        close(signal_relay_pipe[0]);
+        close(signal_relay_pipe[1]);
+        runner_signal_child(pid, false, SIGKILL);
         do {
             wait_result = signals_wait_child(pid, NULL, 0);
         } while (wait_result.waited < 0 &&
@@ -4172,32 +5611,346 @@ int run_argv_real(const char *const argv[], const run_opts_t *opts, run_result_t
             wait_mask_restore_errno != 0) {
             set_system_error(
                 ERR_SYSTEM_CALL,
-                "run_argv: cannot restore parent signal mask after fork; child cleanup also failed (reap errno=%d, wait-mask errno=%d, final-mask errno=%d)",
+                "run_argv: cannot restore guarded parent signal mask after fork; child cleanup also failed (reap errno=%d, wait-mask errno=%d, final-mask errno=%d)",
                 cleanup_wait_errno, wait_result.mask_errno,
                 wait_mask_restore_errno);
         } else {
-            set_system_error(ERR_SYSTEM_CALL,
-                             "run_argv: cannot restore parent signal mask after fork");
+            set_system_error(
+                ERR_SYSTEM_CALL,
+                "run_argv: cannot restore guarded parent signal mask after fork");
         }
         errno = restore_errno;
         return -1;
     }
+    /* The parent never publishes setup status. Drop its writer before any
+     * child handshake so a supervisor that exits without reporting still
+     * produces observable EOF instead of a self-sustaining pipe wait. */
+    close(status_pipe[1]);
+    status_pipe[1] = -1;
+    bool group_proven = false;
+    runner_tty_state_t tty_state;
+    memset(&tty_state, 0, sizeof(tty_state));
+    tty_state.fd = -1;
+    close(group_ready_pipe[1]);
+    close(group_release_pipe[0]);
+    close(signal_relay_pipe[1]);
+    if (g_test_post_fork_pre_publish_hook) {
+        g_test_post_fork_pre_publish_hook();
+    }
+    int group_ready_rc = 0;
+    if (deadline.enabled) {
+        for (;;) {
+            int remaining = 0;
+            int deadline_rc = run_deadline_observe(&deadline, &remaining);
+            struct pollfd ready_poll = {
+                .fd = group_ready_pipe[0],
+                .events = POLLIN
+            };
+            int poll_rc;
+
+            if (deadline_rc != 0) {
+                group_ready_rc = -1;
+                errno = deadline_rc > 0 ? ETIMEDOUT : errno;
+                break;
+            }
+            poll_rc = poll(&ready_poll, 1, remaining);
+            if (poll_rc > 0) break;
+            if (poll_rc < 0 && errno == EINTR) continue;
+            group_ready_rc = -1;
+            if (poll_rc == 0) errno = ETIMEDOUT;
+            break;
+        }
+    }
+    if (group_ready_rc == 0) {
+        group_ready_rc =
+            runner_read_byte(group_ready_pipe[0], 0x47U);
+    }
+    int group_ready_errno = group_ready_rc == 0 ? 0 : errno;
+    child_status_t early_group_failure = {0};
+    int early_group_failure_rc = 0;
+    if (group_ready_rc != 0 && group_ready_errno == EPIPE) {
+        run_test_fd_close_observation_t ignored_observation = {0};
+        bool ignored_observation_valid = false;
+        early_group_failure_rc = read_child_status(
+            status_pipe[0], &early_group_failure, &ignored_observation,
+            &ignored_observation_valid, &deadline);
+    }
+    if (group_ready_rc == 0 &&
+        (setpgid(pid, pid) == 0 || errno == EACCES) &&
+        getpgid(pid) == pid) {
+        group_proven = true;
+    }
+    close(group_ready_pipe[0]);
+    if (!group_proven || runner_tty_prepare(&tty_state) != 0 ||
+        runner_tty_transfer(&tty_state, pid) != 0) {
+        bool silent_pre_ready_failure =
+            group_ready_rc != 0 && group_ready_errno == EPIPE &&
+            early_group_failure_rc == 0;
+        int group_errno =
+            early_group_failure_rc > 0 &&
+                    early_group_failure.stage ==
+                        CHILD_STAGE_PROCESS_GROUP
+                ? early_group_failure.system_errno
+                : (group_ready_errno != 0
+                       ? group_ready_errno
+                       : (errno != 0 ? errno : EIO));
+        int cleanup_wait_errno = 0;
+        int tty_cleanup_errno = 0;
+        int spawn_mask_restore_errno = 0;
+        int wait_mask_restore_errno = 0;
+        int group_status = 0;
+        signals_child_wait_result_t wait_result;
+
+        close(group_release_pipe[1]);
+        close(signal_relay_pipe[0]);
+        runner_signal_child(pid, group_proven, SIGKILL);
+        if (runner_tty_restore(&tty_state) != 0) {
+            tty_cleanup_errno = errno;
+        }
+        do {
+            wait_result = signals_wait_child(pid, &group_status, 0);
+        } while (wait_result.waited < 0 &&
+                 wait_result.wait_errno == EINTR &&
+                 wait_result.mask_errno == 0);
+        if (wait_result.waited != pid) {
+            cleanup_wait_errno = wait_result.wait_errno != 0
+                                     ? wait_result.wait_errno : ECHILD;
+        }
+        if (wait_result.waited == pid && WIFEXITED(group_status)) {
+            result->exit_code = WEXITSTATUS(group_status);
+        } else if (wait_result.waited == pid &&
+                   WIFSIGNALED(group_status)) {
+            result->term_signal = WTERMSIG(group_status);
+        }
+        if (signals_restore_after_child_spawn(&pre_spawn_mask) != 0) {
+            spawn_mask_restore_errno = errno;
+        }
+        if (signals_child_wait_end(&pre_wait_mask) != 0) {
+            wait_mask_restore_errno = errno;
+        }
+        if (devnull >= 0) close(devnull);
+        if (pipe_input) { close(in_pipe[0]); close(in_pipe[1]); }
+        if (want_out) { close(out_pipe[0]); close(out_pipe[1]); }
+        close(status_pipe[0]);
+        free(fd_snapshot.fds);
+        close(exec_fd);
+        trusted_script_launch_cleanup(&script_launch);
+        /* Before GROUP_READY the supervisor has not created or released the
+         * worker, so the requested command cannot have executed. A platform
+         * or runtime may nevertheless terminate this short-lived fork child
+         * without a setup record.
+         * Retry that side-effect-free window once, but never retry an explicit
+         * setup report or continue after incomplete signal/reap cleanup. */
+        if (silent_pre_ready_failure &&
+            silent_setup_retries_remaining > 0U &&
+            wait_result.waited == pid &&
+            (WIFEXITED(group_status) || WIFSIGNALED(group_status)) &&
+            cleanup_wait_errno == 0 && wait_result.mask_errno == 0 &&
+            tty_cleanup_errno == 0 && spawn_mask_restore_errno == 0 &&
+            wait_mask_restore_errno == 0) {
+            return run_argv_real_impl(
+                argv, opts, expected, result,
+                silent_setup_retries_remaining - 1U);
+        }
+        errno = group_errno;
+        if (early_group_failure_rc > 0 &&
+            early_group_failure.stage == CHILD_STAGE_PROCESS_GROUP) {
+            set_system_error(
+                ERR_SYSTEM_CALL,
+                "run_argv: child process-group supervisor setup failed");
+        } else if (group_errno == ETIMEDOUT) {
+            run_deadline_set_error(
+                1, "while establishing child process group", result);
+        } else {
+            set_system_error(
+                ERR_SYSTEM_CALL,
+                "run_argv: cannot establish and verify isolated child process group");
+        }
+        report_secondary_runner_cleanup_failure(
+            "while reaping failed process-group setup", cleanup_wait_errno);
+        report_secondary_runner_cleanup_failure(
+            "while restoring terminal ownership after failed process-group setup",
+            tty_cleanup_errno);
+        report_secondary_runner_cleanup_failure(
+            "while restoring the guarded spawn mask after failed process-group setup",
+            spawn_mask_restore_errno);
+        report_secondary_runner_cleanup_failure(
+            "while restoring SIGCHLD ownership after failed process-group setup",
+            wait_mask_restore_errno);
+        errno = group_errno;
+        return -1;
+    }
+    /* Publish only the independently proven group, then release the
+     * supervisor to fork/exec descendants. */
+    signals_child_group_spawned(pid, pid);
+    run_sigpipe_state_t release_sigpipe_state;
+    sigset_t pre_release_mask = pre_spawn_mask;
+    memset(&release_sigpipe_state, 0, sizeof(release_sigpipe_state));
+    if (sigaddset(&pre_release_mask, SIGPIPE) != 0 ||
+        run_sigpipe_begin(&release_sigpipe_state) != 0) {
+        int sigpipe_errno = errno;
+
+        close(group_release_pipe[1]);
+        runner_signal_child(pid, true, SIGKILL);
+        (void)runner_tty_restore(&tty_state);
+        (void)signals_restore_after_child_spawn(&pre_spawn_mask);
+        (void)signals_wait_child(pid, NULL, 0);
+        (void)signals_child_wait_end(&pre_wait_mask);
+        close(signal_relay_pipe[0]);
+        if (devnull >= 0) close(devnull);
+        if (pipe_input) { close(in_pipe[0]); close(in_pipe[1]); }
+        if (want_out) { close(out_pipe[0]); close(out_pipe[1]); }
+        close(status_pipe[0]);
+        free(fd_snapshot.fds);
+        close(exec_fd);
+        trusted_script_launch_cleanup(&script_launch);
+        errno = sigpipe_errno;
+        set_system_error(
+            ERR_SYSTEM_CALL,
+            "run_argv: cannot protect child process-group gate release");
+        errno = sigpipe_errno;
+        return -1;
+    }
+    /* run_sigpipe_begin() captured the guarded spawn mask. The release
+     * window instead ends at the exact pre-spawn mask, so keep SIGPIPE
+     * blocked while guarded signals are delivered and have the scoped
+     * finalizer restore that exact destination. */
+    release_sigpipe_state.saved_mask = pre_spawn_mask;
+    if (signals_restore_after_child_spawn(&pre_release_mask) != 0) {
+        int restore_errno = errno;
+        int cleanup_wait_errno = 0;
+        int sigpipe_cleanup_errno = 0;
+        int wait_mask_restore_errno = 0;
+        signals_child_wait_result_t wait_result;
+
+        close(group_release_pipe[1]);
+        runner_signal_child(pid, true, SIGKILL);
+        (void)runner_tty_restore(&tty_state);
+        if (run_sigpipe_end(&release_sigpipe_state) != 0) {
+            sigpipe_cleanup_errno = errno;
+        }
+        do {
+            wait_result = signals_wait_child(pid, NULL, 0);
+        } while (wait_result.waited < 0 &&
+                 wait_result.wait_errno == EINTR &&
+                 wait_result.mask_errno == 0);
+        if (wait_result.waited != pid) {
+            cleanup_wait_errno = wait_result.wait_errno != 0
+                                     ? wait_result.wait_errno
+                                     : ECHILD;
+        }
+        if (signals_child_wait_end(&pre_wait_mask) != 0) {
+            wait_mask_restore_errno = errno;
+        }
+        if (devnull >= 0) close(devnull);
+        if (pipe_input) { close(in_pipe[0]); close(in_pipe[1]); }
+        if (want_out) { close(out_pipe[0]); close(out_pipe[1]); }
+        close(status_pipe[0]);
+        close(signal_relay_pipe[0]);
+        free(fd_snapshot.fds);
+        close(exec_fd);
+        trusted_script_launch_cleanup(&script_launch);
+        errno = restore_errno;
+        if (cleanup_wait_errno != 0 || sigpipe_cleanup_errno != 0 ||
+            wait_result.mask_errno != 0 ||
+            wait_mask_restore_errno != 0) {
+            set_system_error(
+                ERR_SYSTEM_CALL,
+                "run_argv: cannot restore parent signal mask before releasing child group; child cleanup also failed (reap errno=%d, SIGPIPE-mask errno=%d, wait-mask errno=%d, final-mask errno=%d)",
+                cleanup_wait_errno, sigpipe_cleanup_errno,
+                wait_result.mask_errno,
+                wait_mask_restore_errno);
+        } else {
+            set_system_error(
+                ERR_SYSTEM_CALL,
+                "run_argv: cannot restore parent signal mask before releasing child group");
+        }
+        errno = restore_errno;
+        return -1;
+    }
+#ifdef GITSWITCH_TESTING
+    if (g_test_pre_group_release_hook) {
+        run_test_pre_group_release_hook_fn hook =
+            g_test_pre_group_release_hook;
+        g_test_pre_group_release_hook = NULL;
+        hook(pid);
+    }
+#endif
+    int release_rc = runner_write_byte(group_release_pipe[1], 0x52U);
+    int release_errno = release_rc == 0 ? 0 : errno;
+    if (release_errno == EPIPE) {
+        release_sigpipe_state.saw_epipe = true;
+    }
+    int release_sigpipe_errno = 0;
+    if (run_sigpipe_end(&release_sigpipe_state) != 0) {
+        release_sigpipe_errno = errno;
+    }
+    if (release_rc != 0 || release_sigpipe_errno != 0) {
+        int primary_errno =
+            release_rc != 0 ? release_errno : release_sigpipe_errno;
+
+        close(group_release_pipe[1]);
+        runner_signal_child(pid, true, SIGKILL);
+        (void)runner_tty_restore(&tty_state);
+        (void)signals_wait_child(pid, NULL, 0);
+        (void)signals_child_wait_end(&pre_wait_mask);
+        close(signal_relay_pipe[0]);
+        if (devnull >= 0) close(devnull);
+        if (pipe_input) { close(in_pipe[0]); close(in_pipe[1]); }
+        if (want_out) { close(out_pipe[0]); close(out_pipe[1]); }
+        close(status_pipe[0]);
+        free(fd_snapshot.fds);
+        close(exec_fd);
+        trusted_script_launch_cleanup(&script_launch);
+        errno = primary_errno;
+        if (release_rc != 0 && release_sigpipe_errno != 0) {
+            set_system_error(
+                ERR_SYSTEM_CALL,
+                "run_argv: cannot release child process-group gate; also failed to restore SIGPIPE state (restore errno=%d)",
+                release_sigpipe_errno);
+        } else if (release_rc != 0) {
+            set_system_error(
+                ERR_SYSTEM_CALL,
+                "run_argv: cannot release child process-group gate");
+        } else {
+            set_system_error(
+                ERR_SYSTEM_CALL,
+                "run_argv: cannot restore SIGPIPE state after releasing child process-group gate");
+        }
+        errno = primary_errno;
+        return -1;
+    }
+    close(group_release_pipe[1]);
     free(fd_snapshot.fds);
     close(exec_fd);
     trusted_script_launch_cleanup(&script_launch);
     if (devnull >= 0) close(devnull);
     if (pipe_input) close(in_pipe[0]);
     if (want_out) close(out_pipe[1]);
-    close(status_pipe[1]);
 
     child_status_t child_status = {0};
     run_test_fd_close_observation_t child_fd_close_observation = {0};
     bool child_fd_close_observation_valid = false;
+    bool deadline_expired = false;
+    bool deadline_clock_failed = false;
+    int deadline_errno = 0;
     int child_status_rc = read_child_status(
         status_pipe[0], &child_status, &child_fd_close_observation,
-        &child_fd_close_observation_valid);
+        &child_fd_close_observation_valid, &deadline);
     int child_status_errno = errno;
     close(status_pipe[0]);
+    if (child_status_rc == -2) {
+        deadline_expired = true;
+        deadline_errno = ETIMEDOUT;
+        result->timed_out = true;
+        runner_signal_child(pid, group_proven, SIGKILL);
+    } else if (child_status_rc == -3) {
+        deadline_clock_failed = true;
+        deadline_errno = child_status_errno != 0 ? child_status_errno : EIO;
+        runner_signal_child(pid, group_proven, SIGKILL);
+    } else if (child_status_rc < 0) {
+        runner_signal_child(pid, group_proven, SIGKILL);
+    }
     if (g_test_fd_close_observation_enabled &&
         child_fd_close_observation_valid) {
         g_test_fd_close_observation = child_fd_close_observation;
@@ -4206,7 +5959,8 @@ int run_argv_real(const char *const argv[], const run_opts_t *opts, run_result_t
 
     run_sigpipe_state_t sigpipe_state;
     memset(&sigpipe_state, 0, sizeof(sigpipe_state));
-    if (pipe_input && run_sigpipe_begin(&sigpipe_state) != 0) {
+    if (pipe_input && !deadline_expired && !deadline_clock_failed &&
+        run_sigpipe_begin(&sigpipe_state) != 0) {
         int block_errno = errno;
         int cleanup_wait_errno = 0;
         int cleanup_wait_mask_errno = 0;
@@ -4215,7 +5969,9 @@ int run_argv_real(const char *const argv[], const run_opts_t *opts, run_result_t
 
         close(in_pipe[1]);
         if (want_out) close(out_pipe[0]);
-        (void)kill(pid, SIGKILL);
+        runner_signal_child(pid, group_proven, SIGKILL);
+        close(signal_relay_pipe[0]);
+        (void)runner_tty_restore(&tty_state);
         do {
             wait_result = signals_wait_child(pid, NULL, 0);
         } while (wait_result.waited < 0 &&
@@ -4276,7 +6032,7 @@ int run_argv_real(const char *const argv[], const run_opts_t *opts, run_result_t
          * use the normal wait/reap path before reporting the setup failure. */
         if (infd >= 0) { close(infd); infd = -1; }
         if (outfd >= 0) { close(outfd); outfd = -1; }
-        (void)kill(pid, SIGKILL);
+        runner_signal_child(pid, group_proven, SIGKILL);
     }
 
     /* A child-side report means no helper was successfully exec'd.  Close the
@@ -4297,15 +6053,53 @@ int run_argv_real(const char *const argv[], const run_opts_t *opts, run_result_t
 
     int status = 0;
     bool child_reaped = false;
+    bool child_exited_unreaped = false;
     bool wait_failed = false;
     int wait_errno = 0;
     int64_t capture_deadline = -1;
 
-    while (infd >= 0 || outfd >= 0) {
+    int relayfd = signal_relay_pipe[0];
+    if (set_nonblock(relayfd) != 0) {
+        io_failed = true;
+        nonblock_setup_failed = true;
+        io_errno = errno;
+        runner_signal_child(pid, group_proven, SIGKILL);
+    }
+
+    while (infd >= 0 || outfd >= 0 || !child_exited_unreaped) {
         int timeout_ms = RUNNER_POLL_SLICE_MS;
-        if (child_reaped && outfd >= 0) {
-            int64_t now = monotonic_millis();
-            if (now < 0) {
+        if (!deadline_expired && !deadline_clock_failed &&
+            deadline.enabled) {
+            int remaining = 0;
+            int deadline_rc = run_deadline_observe(
+                &deadline, &remaining);
+            if (deadline_rc != 0) {
+                deadline_expired = deadline_rc > 0;
+                deadline_clock_failed = deadline_rc < 0;
+                deadline_errno = deadline_expired
+                                     ? ETIMEDOUT
+                                     : (errno != 0 ? errno : EIO);
+                result->timed_out = deadline_expired;
+                if (infd >= 0) {
+                    close(infd);
+                    infd = -1;
+                }
+                if (outfd >= 0) {
+                    close(outfd);
+                    outfd = -1;
+                }
+                runner_signal_child(pid, group_proven, SIGKILL);
+                break;
+            }
+            if (remaining < timeout_ms) timeout_ms = remaining;
+        } else if (deadline_expired || deadline_clock_failed) {
+            break;
+        }
+        if (child_exited_unreaped && outfd >= 0) {
+            int64_t now;
+            if (deadline.enabled) {
+                now = deadline.last_now;
+            } else if (monotonic_millis(&now) != 0) {
                 io_failed = true;
                 io_errno = errno;
                 close(outfd);
@@ -4313,11 +6107,13 @@ int run_argv_real(const char *const argv[], const run_opts_t *opts, run_result_t
                 continue;
             }
             if (capture_deadline < 0) {
-                capture_deadline = now + RUNNER_CAPTURE_GRACE_MS;
+                capture_deadline = monotonic_millis_add_saturating(
+                    now, RUNNER_CAPTURE_GRACE_MS);
             }
             int64_t remaining = capture_deadline - now;
             if (remaining <= 0) {
                 output_stalled = true;
+                runner_signal_child(pid, group_proven, SIGKILL);
                 close(outfd);
                 outfd = -1;
                 continue;
@@ -4325,12 +6121,17 @@ int run_argv_real(const char *const argv[], const run_opts_t *opts, run_result_t
             if (remaining < timeout_ms) timeout_ms = (int)remaining;
         }
 
-        struct pollfd pfds[2];
-        int n = 0, in_idx = -1, out_idx = -1;
+        struct pollfd pfds[3];
+        int n = 0, in_idx = -1, out_idx = -1, relay_idx = -1;
         if (infd >= 0) { pfds[n].fd = infd; pfds[n].events = POLLOUT; in_idx = n++; }
         if (outfd >= 0) { pfds[n].fd = outfd; pfds[n].events = POLLIN; out_idx = n++; }
+        if (relayfd >= 0) {
+            pfds[n].fd = relayfd;
+            pfds[n].events = POLLIN;
+            relay_idx = n++;
+        }
 
-        int poll_rc = poll(pfds, (nfds_t)n, timeout_ms);
+        int poll_rc = runner_poll(pfds, (nfds_t)n, timeout_ms);
         if (poll_rc < 0) {
             if (errno == EINTR) {
                 /* Still execute the child-state/deadline maintenance below. */
@@ -4343,6 +6144,27 @@ int run_argv_real(const char *const argv[], const run_opts_t *opts, run_result_t
                 if (outfd >= 0) { close(outfd); outfd = -1; }
                 io_failed = true;
                 io_errno = errno;
+                runner_signal_child(pid, group_proven, SIGKILL);
+                break;
+            }
+        }
+
+        if (poll_rc > 0 && relay_idx >= 0 &&
+            (pfds[relay_idx].revents &
+             (POLLIN | POLLERR | POLLHUP | POLLNVAL))) {
+            for (;;) {
+                unsigned char relayed = 0U;
+                ssize_t got = read(relayfd, &relayed, 1U);
+                if (got == 1) {
+                    runner_accept_group_relay(
+                        pid, group_proven, (int)relayed);
+                    continue;
+                }
+                if (got == 0 ||
+                    (got < 0 && errno != EAGAIN && errno != EINTR)) {
+                    close(relayfd);
+                    relayfd = -1;
+                }
                 break;
             }
         }
@@ -4413,60 +6235,91 @@ int run_argv_real(const char *const argv[], const run_opts_t *opts, run_result_t
              * so waitpid(WNOHANG) and the post-exit deadline run every cycle. */
         }
 
-        /* Finite polling lets us observe the direct child independently of
-         * capture EOF.  A background descendant may retain stdout forever;
-         * once the direct child is reaped, only a short drain grace remains. */
-        if (!child_reaped) {
-            signals_child_wait_result_t wait_result;
-            do {
-                wait_result = signals_wait_child(pid, &status, WNOHANG);
-            } while (wait_result.waited < 0 &&
-                     wait_result.wait_errno == EINTR &&
-                     wait_result.mask_errno == 0);
-
-            /* AR-12 U4: process a successful reap FIRST even when a
-             * mask-restore failure is reported alongside it — the PID is
-             * consumed and the exit status is valid; discarding the reap
-             * left child_reaped false and re-waited a released PID. The
-             * mask failure still fails the call afterwards. */
-            if (wait_result.waited == pid) {
-                child_reaped = true;
+        /* Observe without releasing the group leader PID. This pins the PGID
+         * until descendant-held capture either reaches EOF or the bounded
+         * grace expires and the proven group is killed. */
+        if (!child_exited_unreaped) {
+            siginfo_t observed;
+            memset(&observed, 0, sizeof(observed));
+            if (waitid(P_PID, (id_t)pid, &observed,
+                       WEXITED | WNOWAIT | WNOHANG) != 0) {
+                if (errno != EINTR) {
+                    wait_failed = true;
+                    wait_errno = errno;
+                    if (infd >= 0) { close(infd); infd = -1; }
+                    if (outfd >= 0) { close(outfd); outfd = -1; }
+                    runner_signal_child(pid, group_proven, SIGKILL);
+                    break;
+                }
+            } else if (observed.si_pid == pid) {
+                child_exited_unreaped = true;
                 if (infd >= 0) {
                     if (in_off < opts->input_len) input_failed = true;
                     close(infd);
                     infd = -1;
                 }
+                if (observed.si_code != CLD_EXITED ||
+                    observed.si_status != 0) {
+                    runner_signal_child(pid, group_proven, SIGKILL);
+                }
                 if (outfd >= 0) {
-                    int64_t now = monotonic_millis();
-                    if (now < 0) {
+                    int64_t now;
+                    int deadline_rc = deadline.enabled
+                                          ? run_deadline_observe(
+                                                &deadline, NULL)
+                                          : 0;
+                    if (deadline_rc != 0) {
+                        deadline_expired = deadline_rc > 0;
+                        deadline_clock_failed = deadline_rc < 0;
+                        deadline_errno = deadline_expired
+                                             ? ETIMEDOUT
+                                             : (errno != 0 ? errno : EIO);
+                        result->timed_out = deadline_expired;
+                        close(outfd);
+                        outfd = -1;
+                    } else if (deadline.enabled) {
+                        now = deadline.last_now;
+                        capture_deadline =
+                            monotonic_millis_add_saturating(
+                                now, RUNNER_CAPTURE_GRACE_MS);
+                    } else if (monotonic_millis(&now) != 0) {
                         io_failed = true;
                         io_errno = errno;
                         close(outfd);
                         outfd = -1;
                     } else {
-                        capture_deadline = now + RUNNER_CAPTURE_GRACE_MS;
+                        capture_deadline =
+                            monotonic_millis_add_saturating(
+                                now, RUNNER_CAPTURE_GRACE_MS);
                     }
                 }
-                if (wait_result.mask_errno != 0) {
-                    wait_failed = true;
-                    wait_errno = wait_result.mask_errno;
-                    if (infd >= 0) { close(infd); infd = -1; }
-                    if (outfd >= 0) { close(outfd); outfd = -1; }
-                    break;
-                }
-            } else if (wait_result.mask_errno != 0) {
-                wait_failed = true;
-                wait_errno = wait_result.mask_errno;
-                if (infd >= 0) { close(infd); infd = -1; }
-                if (outfd >= 0) { close(outfd); outfd = -1; }
-                break;
-            } else if (wait_result.waited < 0) {
-                wait_failed = true;
-                wait_errno = wait_result.wait_errno;
-                if (infd >= 0) { close(infd); infd = -1; }
-                if (outfd >= 0) { close(outfd); outfd = -1; }
-                break;
             }
+        }
+    }
+    if (relayfd >= 0) {
+        for (;;) {
+            unsigned char relayed = 0U;
+            ssize_t got = read(relayfd, &relayed, 1U);
+            if (got == 1) {
+                runner_accept_group_relay(
+                    pid, group_proven, (int)relayed);
+                continue;
+            }
+            break;
+        }
+        close(relayfd);
+    }
+    if (deadline.enabled && !deadline_expired && !deadline_clock_failed &&
+        child_status_rc >= 0 && !io_failed && !wait_failed) {
+        int deadline_rc = run_deadline_observe(&deadline, NULL);
+        if (deadline_rc != 0) {
+            deadline_expired = deadline_rc > 0;
+            deadline_clock_failed = deadline_rc < 0;
+            deadline_errno = deadline_expired
+                                 ? ETIMEDOUT
+                                 : (errno != 0 ? errno : EIO);
+            result->timed_out = deadline_expired;
+            runner_signal_child(pid, group_proven, SIGKILL);
         }
     }
     if (want_out) {
@@ -4475,6 +6328,16 @@ int run_argv_real(const char *const argv[], const run_opts_t *opts, run_result_t
         secure_zero_memory(rdbuf, sizeof(rdbuf));
     }
     result->out_len = out_off;
+
+    if (deadline_expired || deadline_clock_failed || child_status_rc != 0 ||
+        io_failed || input_failed || output_stalled || wait_failed) {
+        runner_signal_child(pid, group_proven, SIGKILL);
+    }
+
+    int tty_cleanup_errno = 0;
+    if (runner_tty_restore(&tty_state) != 0) {
+        tty_cleanup_errno = errno;
+    }
 
     if (!child_reaped && !wait_failed) {
         signals_child_wait_result_t wait_result;
@@ -4518,10 +6381,28 @@ int run_argv_real(const char *const argv[], const run_opts_t *opts, run_result_t
         result->exit_code = -1;
     }
 
+    if (deadline_expired || deadline_clock_failed) {
+        errno = deadline_errno;
+        run_deadline_set_error(
+            deadline_expired ? 1 : -1,
+            result->spawned ? "while running child" : "before launch",
+            result);
+        report_secondary_signal_cleanup_failures(
+            sigpipe_cleanup_errno, wait_ownership_cleanup_errno);
+        report_secondary_runner_cleanup_failure(
+            "while restoring terminal foreground ownership",
+            tty_cleanup_errno);
+        return -1;
+    }
     if (child_status_rc > 0) {
         int primary_errno = child_status.system_errno;
         errno = primary_errno;
         switch ((child_stage_t)child_status.stage) {
+            case CHILD_STAGE_PROCESS_GROUP:
+                set_system_error(
+                    ERR_SYSTEM_CALL,
+                    "run_argv: child process-group supervisor setup failed");
+                break;
             case CHILD_STAGE_STDIO:
                 set_system_error(ERR_SYSTEM_CALL,
                                  "run_argv: child stdio setup failed");
@@ -4551,6 +6432,9 @@ int run_argv_real(const char *const argv[], const run_opts_t *opts, run_result_t
         errno = primary_errno;
         report_secondary_signal_cleanup_failures(
             sigpipe_cleanup_errno, wait_ownership_cleanup_errno);
+        report_secondary_runner_cleanup_failure(
+            "while restoring terminal foreground ownership",
+            tty_cleanup_errno);
         return -1;
     }
     if (child_status_rc < 0) {
@@ -4626,7 +6510,22 @@ int run_argv_real(const char *const argv[], const run_opts_t *opts, run_result_t
         }
         return -1;
     }
+    if (tty_cleanup_errno != 0) {
+        errno = tty_cleanup_errno;
+        set_system_error(
+            ERR_SYSTEM_CALL,
+            "run_argv: cannot restore terminal foreground ownership");
+        errno = tty_cleanup_errno;
+        return -1;
+    }
+    result->launch_witness = opened_witness;
     return 0;
+}
+
+int run_argv_real(const char *const argv[], const run_opts_t *opts,
+                  run_result_t *result) {
+    return run_argv_real_impl(argv, opts, NULL, result,
+                              RUNNER_SILENT_SETUP_RETRIES);
 }
 
 static command_runner_fn g_runner = run_argv_real;
@@ -4643,6 +6542,51 @@ bool run_uses_default_runner(void) {
 
 int run_argv(const char *const argv[], const run_opts_t *opts, run_result_t *result) {
     return g_runner(argv, opts, result);
+}
+
+int run_argv_with_expected_launch(
+    const char *const argv[], const run_opts_t *opts,
+    const run_launch_witness_t *expected, run_result_t *result) {
+    run_result_t local_result;
+    run_result_t *observed = result ? result : &local_result;
+    int rc;
+
+    memset(observed, 0, sizeof(*observed));
+    observed->exit_code = -1;
+    if (opts && opts->out && opts->out_size > 0) opts->out[0] = '\0';
+    if (!expected || !run_launch_witness_is_well_formed(expected)) {
+        set_error(ERR_INVALID_ARGS,
+                  "run_argv: invalid expected launch witness");
+        return -1;
+    }
+    if (!argv || !argv[0]) {
+        set_error(ERR_INVALID_ARGS, "run_argv: empty argv");
+        return -1;
+    }
+    if (strcmp(argv[0], expected->executable_path) != 0) {
+        errno = ESTALE;
+        set_system_error(
+            ERR_PERMISSION_DENIED,
+            "run_argv: executable invocation does not match the expected launch");
+        errno = ESTALE;
+        return -1;
+    }
+    if (g_runner == run_argv_real) {
+        return run_argv_real_impl(argv, opts, expected, result,
+                                  RUNNER_SILENT_SETUP_RETRIES);
+    }
+    rc = g_runner(argv, opts, observed);
+    if (rc != 0) return rc;
+    if (!run_launch_witness_matches(
+            expected, &observed->launch_witness)) {
+        errno = ESTALE;
+        set_system_error(
+            ERR_PERMISSION_DENIED,
+            "run_argv: injected runner did not certify the expected launch");
+        errno = ESTALE;
+        return -1;
+    }
+    return 0;
 }
 
 /* AR-07 M28/M29 executable trust.  A helper is trusted only when every
@@ -4966,7 +6910,7 @@ static int exec_open_directory_at(int parent_fd, const char *component,
     }
     if (!exec_stat_identity_matches(opened, &sealed)) {
         close(fd);
-        errno = EACCES;
+        errno = ESTALE;
         return -1;
     }
 #ifndef O_CLOEXEC
@@ -5204,7 +7148,7 @@ static int exec_open_canonical(const char *canonical,
             close(fd);
             close(metadata_fd);
             close(dir_fd);
-            errno = EACCES;
+            errno = ESTALE;
             return -1;
         }
         if (!exec_command_acl_is_trusted(fd, EXEC_ACL_TARGET_LEAF)) {
@@ -5247,7 +7191,7 @@ static int exec_open_canonical(const char *canonical,
             close(fd);
             close(metadata_fd);
             close(dir_fd);
-            errno = EACCES;
+            errno = ESTALE;
             return -1;
         }
         close(metadata_fd);
@@ -5397,6 +7341,69 @@ int find_command_path(const char *name, char *buf, size_t size) {
     trusted_script_launch_cleanup(&launch);
     close(fd);
     return 0;
+}
+
+bool run_launch_witness_capture(
+    const char *program_path, run_launch_witness_t *out) {
+    const char *probe_argv[] = {program_path, NULL};
+    char resolved[MAX_PATH_LEN];
+    struct stat executable_identity;
+    trusted_script_launch_t launch;
+    int fd;
+
+    if (out) memset(out, 0, sizeof(*out));
+    if (!program_path || program_path[0] != '/' || !out) {
+        errno = EINVAL;
+        return false;
+    }
+    memset(&launch, 0, sizeof(launch));
+    launch.interpreter_fd = -1;
+    fd = open_trusted_command(program_path, resolved, sizeof(resolved),
+                              &executable_identity);
+    if (fd < 0) return false;
+    if (strcmp(resolved, program_path) != 0) {
+        close(fd);
+        errno = ESTALE;
+        return false;
+    }
+    if (prepare_trusted_script_launch(fd, probe_argv, &launch) != 0) {
+        int saved_errno = errno ? errno : ESTALE;
+
+        close(fd);
+        trusted_script_launch_cleanup(&launch);
+        errno = saved_errno;
+        return false;
+    }
+    if (run_launch_witness_from_opened(
+            resolved, fd, &executable_identity, &launch, out) != 0) {
+        int saved_errno = errno ? errno : ESTALE;
+
+        close(fd);
+        trusted_script_launch_cleanup(&launch);
+        memset(out, 0, sizeof(*out));
+        errno = saved_errno;
+        return false;
+    }
+    close(fd);
+    trusted_script_launch_cleanup(&launch);
+    return true;
+}
+
+bool run_launch_witness_revalidate(
+    const char *program_path, const run_launch_witness_t *witness) {
+    run_launch_witness_t current;
+
+    if (!program_path || program_path[0] != '/' ||
+        !run_launch_witness_is_well_formed(witness)) {
+        errno = EINVAL;
+        return false;
+    }
+    if (!run_launch_witness_capture(program_path, &current)) return false;
+    if (!run_launch_witness_matches(witness, &current)) {
+        errno = ESTALE;
+        return false;
+    }
+    return true;
 }
 
 bool command_exists(const char *command) {
@@ -5574,25 +7581,12 @@ bool validate_name(const char *name) {
     return false;
 }
 
-/* ssh-1 (shared; moved from git_ops.c for AR-02 #10): the account SSH key
- * path ends up in two security-sensitive sinks, and EACH sink must apply this
- * check itself rather than assume the other (or the TOML-load sanitizer)
- * already did:
- *
- *  1. core.sshCommand — the ONE git config value git hands to /bin/sh. The
- *     path is wrapped in single quotes; inside '...' the shell treats every
- *     byte literally EXCEPT a single quote, which ends the quote and lets a
- *     crafted path smuggle extra ssh options (-oProxyCommand=..., i.e.
- *     arbitrary code on the next fetch). Guarded in git_configure_ssh.
- *  2. ~/.ssh/config — the same path is emitted as an "IdentityFile <path>"
- *     line by the host-alias support. There, a \n or \r starts a new line,
- *     i.e. injects an arbitrary ssh_config keyword (ProxyCommand again), and
- *     a quote breaks the directive's tokenization. Guarded in
- *     ssh_configure_host_alias.
- *
- * So reject both quote characters and every control byte (\n and \r included)
- * up front, before the path is probed or written anywhere. A real SSH key
- * path never needs any of these. */
+/* Conservative path admission for the shell-interpreted core.sshCommand
+ * value. Its word serializer also applies POSIX shell quoting, but retaining
+ * this quote/control gate is an independent defense and stable contract for
+ * that sink. ~/.ssh/config IdentityFile values use a separate
+ * OpenSSH-grammar-aware serializer: apostrophes are literal there, while
+ * controls, double quotes, and expansion tokens need different handling. */
 bool is_safe_ssh_key_path(const char *path) {
     for (const char *p = path; *p; p++) {
         unsigned char c = (unsigned char)*p;
@@ -6214,12 +8208,12 @@ void *safe_memcpy(void *dest, const void *src, size_t size) {
 }
 
 int safe_mlock(void *ptr, size_t size) {
-#if defined(__linux__)
     if (!ptr || size == 0) {
         set_error(ERR_INVALID_ARGS, "Invalid arguments to safe_mlock");
         return -1;
     }
-    
+
+#if defined(__linux__) || defined(__APPLE__) || defined(__FreeBSD__)
     if (mlock(ptr, size) != 0) {
         set_system_error(ERR_SYSTEM_CALL, "Failed to lock memory");
         return -1;
@@ -6227,20 +8221,20 @@ int safe_mlock(void *ptr, size_t size) {
     
     return 0;
 #else
-    /* Not supported on this platform */
-    (void)ptr;
-    (void)size;
-    return 0;
+    errno = ENOTSUP;
+    set_system_error(ERR_SYSTEM_CALL,
+                     "Memory locking is not supported on this platform");
+    return -1;
 #endif
 }
 
 int safe_munlock(void *ptr, size_t size) {
-#if defined(__linux__)
     if (!ptr || size == 0) {
         set_error(ERR_INVALID_ARGS, "Invalid arguments to safe_munlock");
         return -1;
     }
-    
+
+#if defined(__linux__) || defined(__APPLE__) || defined(__FreeBSD__)
     if (munlock(ptr, size) != 0) {
         set_system_error(ERR_SYSTEM_CALL, "Failed to unlock memory");
         return -1;
@@ -6248,10 +8242,10 @@ int safe_munlock(void *ptr, size_t size) {
     
     return 0;
 #else
-    /* Not supported on this platform */
-    (void)ptr;
-    (void)size;
-    return 0;
+    errno = ENOTSUP;
+    set_system_error(ERR_SYSTEM_CALL,
+                     "Memory unlocking is not supported on this platform");
+    return -1;
 #endif
 }
 

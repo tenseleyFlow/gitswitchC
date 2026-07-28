@@ -1,11 +1,14 @@
 /* AR-11 M8-M10: durable Git-publication provenance is an exact, versioned
  * ownership record. These tests stay on the public record/ledger/config APIs
  * so persistence layout can evolve without weakening the causal contract. */
+#define GITSWITCH_PUBLICATION_SERIALIZER_TEST_API
+#include "publication.h"
+#undef GITSWITCH_PUBLICATION_SERIALIZER_TEST_API
+
 #include "test.h"
 #include "accounts.h"
 #include "config.h"
 #include "error.h"
-#include "publication.h"
 #include "toml_parser.h"
 #include "utils.h"
 
@@ -20,9 +23,11 @@
     "0123456789ABCDEF0123456789ABCDEF0123456789ABCDEF0123456789ABCDEF"
 #define SSH_PROGRAM_A "/usr/bin/ssh"
 #define SSH_PROGRAM_B "/usr/bin/scp"
+#define SSH_COMMAND_OPTIONS \
+    "-F none -o IdentitiesOnly=yes -o StrictHostKeyChecking=accept-new " \
+    "-o LogLevel=ERROR"
 #define SSH_COMMAND_A \
-    "'/usr/bin/ssh' -i '/tmp/ar11 publication key' -F '/dev/null' " \
-    "-o IdentitiesOnly=yes"
+    "'/usr/bin/ssh' -i '/tmp/ar11 publication key' " SSH_COMMAND_OPTIONS
 #define INCARNATION_A \
     "1111111111111111111111111111111111111111111111111111111111111111"
 #define INCARNATION_B \
@@ -614,6 +619,46 @@ static int create_complete_global_publication(
     return publication_record_validate(record);
 }
 
+static int bind_live_local_destination(publication_record_t *record,
+                                       const char *repository_path,
+                                       const char *config_parent_path,
+                                       const char *config_path) {
+    struct stat st;
+
+    if (!record || !repository_path || !config_parent_path || !config_path ||
+        snprintf(record->repository_path, sizeof(record->repository_path),
+                 "%s", repository_path) >=
+            (int)sizeof(record->repository_path) ||
+        snprintf(record->config_path, sizeof(record->config_path), "%s",
+                 config_path) >= (int)sizeof(record->config_path) ||
+        stat(repository_path, &st) != 0) {
+        return -1;
+    }
+    publication_identity_from_stat(&record->repository, &st);
+    if (stat(config_parent_path, &st) != 0) return -1;
+    publication_identity_from_stat(&record->config_parent, &st);
+    if (stat(config_path, &st) != 0) return -1;
+    publication_identity_from_stat(&record->post_config, &st);
+    return publication_record_validate(record);
+}
+
+static int encode_upper_hex(const char *value, char *out, size_t out_size) {
+    static const char digits[] = "0123456789ABCDEF";
+    size_t length;
+
+    if (!value || !out ||
+        (length = strlen(value)) > (out_size - 1U) / 2U) {
+        return -1;
+    }
+    for (size_t i = 0U; i < length; i++) {
+        unsigned char byte = (unsigned char)value[i];
+        out[i * 2U] = digits[byte >> 4U];
+        out[i * 2U + 1U] = digits[byte & 0x0fU];
+    }
+    out[length * 2U] = '\0';
+    return 0;
+}
+
 static void check_record_identity(const publication_record_t *record,
                                   const char *repository_path,
                                   const char *fingerprint) {
@@ -804,9 +849,41 @@ TEST(gpg_selector_record_validation_requires_complete_canonical_tuple) {
 
 TEST(ssh_program_extraction_accepts_only_the_managed_first_word) {
     static const char escaped_command[] =
-        "'/opt/ssh'\\''helper' -i '/tmp/key' -F '/dev/null'";
+        "'/opt/ssh'\\''helper' -i '/tmp/key' " SSH_COMMAND_OPTIONS;
+    static const char alias_command[] =
+        "'/usr/bin/ssh' -i '/tmp/key' " SSH_COMMAND_OPTIONS
+        " -o HostName='2001:db8::1'";
+    static const char *const malformed[] = {
+        "/usr/bin/ssh -i '/tmp/key' " SSH_COMMAND_OPTIONS,
+        "'ssh' -i '/tmp/key' " SSH_COMMAND_OPTIONS,
+        "'/usr/bin/ssh' -i 'relative-key' " SSH_COMMAND_OPTIONS,
+        "'/usr/bin/ssh' -i '' " SSH_COMMAND_OPTIONS,
+        "'/usr/bin/ssh' -i '/tmp/key " SSH_COMMAND_OPTIONS,
+        "'/usr/bin/ssh' -i '/tmp/key'\\x " SSH_COMMAND_OPTIONS,
+        "'/usr/bin/ssh' -i '/tmp/key' "
+            "-o IdentitiesOnly=yes -o StrictHostKeyChecking=accept-new "
+            "-o LogLevel=ERROR",
+        "'/usr/bin/ssh' -i '/tmp/key' "
+            "-F none -o StrictHostKeyChecking=accept-new -o LogLevel=ERROR",
+        "'/usr/bin/ssh' -i '/tmp/key' "
+            "-F none -o IdentitiesOnly=yes -o LogLevel=ERROR",
+        "'/usr/bin/ssh' -i '/tmp/key' "
+            "-F none -o IdentitiesOnly=yes "
+            "-o StrictHostKeyChecking=accept-new",
+        "'/usr/bin/ssh' -i '/tmp/key' " SSH_COMMAND_OPTIONS
+            " -o BatchMode=yes",
+        "'/usr/bin/ssh' -i '/tmp/key' " SSH_COMMAND_OPTIONS " trailing",
+        "'/usr/bin/ssh' -i '/tmp/key' " SSH_COMMAND_OPTIONS "\n",
+        "'/usr/bin/ssh' -i '/tmp/key' " SSH_COMMAND_OPTIONS
+            " -o HostName=github.com",
+        "'/usr/bin/ssh' -i '/tmp/key' " SSH_COMMAND_OPTIONS
+            " -o HostName='github.com' trailing",
+        "'/usr/bin/ssh -i '/tmp/key' " SSH_COMMAND_OPTIONS,
+        "'/usr/bin/ssh\n' -i '/tmp/key' " SSH_COMMAND_OPTIONS,
+    };
     char program[MAX_PATH_LEN];
     char tiny[4];
+    size_t i;
 
     CHECK_EQ_INT(publication_extract_ssh_program(
                      SSH_COMMAND_A, program, sizeof(program)), 0);
@@ -814,22 +891,14 @@ TEST(ssh_program_extraction_accepts_only_the_managed_first_word) {
     CHECK_EQ_INT(publication_extract_ssh_program(
                      escaped_command, program, sizeof(program)), 0);
     CHECK_STR_EQ(program, "/opt/ssh'helper");
-
     CHECK_EQ_INT(publication_extract_ssh_program(
-                     "/usr/bin/ssh -i '/tmp/key'", program,
-                     sizeof(program)), -1);
-    CHECK_EQ_INT(publication_extract_ssh_program(
-                     "'ssh' -i '/tmp/key'", program,
-                     sizeof(program)), -1);
-    CHECK_EQ_INT(publication_extract_ssh_program(
-                     "'/usr/bin/ssh' -F '/dev/null'", program,
-                     sizeof(program)), -1);
-    CHECK_EQ_INT(publication_extract_ssh_program(
-                     "'/usr/bin/ssh -i '/tmp/key'", program,
-                     sizeof(program)), -1);
-    CHECK_EQ_INT(publication_extract_ssh_program(
-                     "'/usr/bin/ssh\n' -i '/tmp/key'", program,
-                     sizeof(program)), -1);
+                     alias_command, program, sizeof(program)), 0);
+    CHECK_STR_EQ(program, SSH_PROGRAM_A);
+    for (i = 0U; i < sizeof(malformed) / sizeof(malformed[0]); i++) {
+        CHECK_EQ_INT(publication_extract_ssh_program(
+                         malformed[i], program, sizeof(program)), -1);
+        CHECK_EQ_INT(program[0], '\0');
+    }
     CHECK_EQ_INT(publication_extract_ssh_program(
                      SSH_COMMAND_A, tiny, sizeof(tiny)), -1);
     CHECK_EQ_INT(publication_extract_ssh_program(
@@ -845,6 +914,13 @@ TEST(ssh_record_validation_requires_complete_matching_provenance) {
     };
     publication_record_t record;
     publication_record_t candidate;
+    static const char *const malformed_commands[] = {
+        "'/usr/bin/ssh' -i '/tmp/key'",
+        "'/usr/bin/ssh' -i '/tmp/key' " SSH_COMMAND_OPTIONS " trailing",
+        "'/usr/bin/ssh' -i '/tmp/key' "
+            "-F none -o IdentitiesOnly=yes -o LogLevel=ERROR",
+        "'/usr/bin/ssh' -i '/tmp/key " SSH_COMMAND_OPTIONS,
+    };
 
     fill_ssh_record(&record);
     CHECK_EQ_INT(publication_record_validate(&record), 0);
@@ -884,6 +960,15 @@ TEST(ssh_record_validation_requires_complete_matching_provenance) {
                               "/usr/bin/ssh -i '/tmp/key'",
                               sizeof(candidate.ssh_command)), 0);
     CHECK_EQ_INT(publication_record_validate(&candidate), -1);
+    for (size_t i = 0U;
+         i < sizeof(malformed_commands) / sizeof(malformed_commands[0]);
+         i++) {
+        candidate = record;
+        CHECK_EQ_INT(safe_strncpy(
+                         candidate.ssh_command, malformed_commands[i],
+                         sizeof(candidate.ssh_command)), 0);
+        CHECK_EQ_INT(publication_record_validate(&candidate), -1);
+    }
 
     candidate = record;
     candidate.capabilities &= ~(PUBLICATION_CAP_SSH_COMMAND |
@@ -1773,6 +1858,514 @@ TEST(upsert_replaces_only_the_exact_publication_destination) {
     check_record_identity(found, "/tmp/ar11-publication/other-repository",
                           FINGERPRINT_A);
     publication_ledger_clear(&ledger);
+}
+
+TEST(destination_aliases_share_one_canonical_upsert_lookup_and_live_key) {
+    char root[MAX_PATH_LEN] = "/tmp/gsw-ar14-publication-alias.XXXXXX";
+    char repository[MAX_PATH_LEN];
+    char config_parent[MAX_PATH_LEN];
+    char config_path[MAX_PATH_LEN];
+    char repository_alias[MAX_PATH_LEN];
+    char alias_config[MAX_PATH_LEN];
+    char alias_repository[MAX_PATH_LEN];
+    publication_record_t canonical;
+    publication_record_t alias;
+    publication_record_t replacement;
+    publication_ledger_t ledger;
+    const publication_record_t *found = NULL;
+    const publication_record_t *generation_records[1];
+    int fd = -1;
+    static const char contents[] = "[alias]\n";
+
+    publication_ledger_init(&ledger);
+    CHECK(ts_mkdtemp(root) != NULL);
+    if (!root[0] || ts_canonicalize_dir_path(root, sizeof(root)) != 0 ||
+        snprintf(repository, sizeof(repository), "%s/repository", root) >=
+            (int)sizeof(repository) ||
+        snprintf(config_parent, sizeof(config_parent), "%s/.git",
+                 repository) >= (int)sizeof(config_parent) ||
+        snprintf(config_path, sizeof(config_path), "%s/config",
+                 config_parent) >= (int)sizeof(config_path) ||
+        snprintf(repository_alias, sizeof(repository_alias), "%s/repo-link",
+                 root) >= (int)sizeof(repository_alias) ||
+        mkdir(repository, 0700) != 0 ||
+        mkdir(config_parent, 0700) != 0) {
+        CHECK(false);
+        goto cleanup;
+    }
+    fd = open(config_path, O_WRONLY | O_CREAT | O_EXCL | O_CLOEXEC, 0600);
+    if (fd < 0 ||
+        write(fd, contents, sizeof(contents) - 1U) !=
+            (ssize_t)(sizeof(contents) - 1U) ||
+        close(fd) != 0 ||
+        symlink(repository, repository_alias) != 0) {
+        CHECK(false);
+        fd = -1;
+        goto cleanup;
+    }
+    fd = -1;
+    if (snprintf(alias_config, sizeof(alias_config),
+                 "%s//.git/./config", repository_alias) >=
+            (int)sizeof(alias_config) ||
+        snprintf(alias_repository, sizeof(alias_repository), "%s//.",
+                 repository_alias) >= (int)sizeof(alias_repository)) {
+        CHECK(false);
+        goto cleanup;
+    }
+
+    fill_gpg_record(&canonical, repository, FINGERPRINT_A);
+    CHECK_EQ_INT(bind_live_local_destination(
+                     &canonical, repository, config_parent, config_path), 0);
+    alias = canonical;
+    CHECK_EQ_INT(safe_strncpy(alias.config_path, alias_config,
+                              sizeof(alias.config_path)), 0);
+    CHECK_EQ_INT(safe_strncpy(alias.repository_path, alias_repository,
+                              sizeof(alias.repository_path)), 0);
+
+    errno = E2BIG;
+    CHECK(publication_record_same_config_destination(&canonical, &alias));
+    CHECK(publication_record_same_destination(&canonical, &alias));
+    CHECK_EQ_INT(errno, E2BIG);
+
+    CHECK_EQ_INT(publication_ledger_upsert(&ledger, &alias), 0);
+    CHECK_EQ_INT((long)ledger.count, 1);
+    CHECK_STR_EQ(ledger.records[0].config_path, config_path);
+    CHECK_STR_EQ(ledger.records[0].repository_path, repository);
+
+    CHECK_LOOKUP_STATUS(publication_ledger_find(
+                     &ledger, canonical.account_id,
+                     canonical.account_incarnation, canonical.scope,
+                     alias_config, alias_repository, &found),
+                 PUBLICATION_LOOKUP_FOUND);
+    CHECK(found == &ledger.records[0]);
+    CHECK_LOOKUP_STATUS(publication_ledger_find(
+                     &ledger, canonical.account_id,
+                     canonical.account_incarnation, canonical.scope,
+                     config_path, repository, &found),
+                 PUBLICATION_LOOKUP_FOUND);
+    CHECK(found == &ledger.records[0]);
+
+    replacement = alias;
+    snprintf(replacement.gpg_fingerprint,
+             sizeof(replacement.gpg_fingerprint), "%s", FINGERPRINT_B);
+    CHECK_EQ_INT(publication_ledger_upsert(&ledger, &replacement), 0);
+    CHECK_EQ_INT((long)ledger.count, 1);
+    CHECK_STR_EQ(ledger.records[0].config_path, config_path);
+    CHECK_STR_EQ(ledger.records[0].repository_path, repository);
+    CHECK_STR_EQ(ledger.records[0].gpg_fingerprint, FINGERPRINT_B);
+
+    generation_records[0] = &ledger.records[0];
+    CHECK_EQ_INT(publication_record_verify_live_destination(
+                     &ledger.records[0], generation_records, 1U, &found), 0);
+    CHECK(found == &ledger.records[0]);
+
+cleanup:
+    if (fd >= 0) close(fd);
+    publication_ledger_clear(&ledger);
+    ts_rm_rf(root);
+}
+
+TEST(absent_config_leaf_uses_anchored_parent_but_conflicts_stay_unresolved) {
+    char root[MAX_PATH_LEN] = "/tmp/gsw-ar14-publication-absent.XXXXXX";
+    char repository[MAX_PATH_LEN];
+    char config_parent[MAX_PATH_LEN];
+    char config_path[MAX_PATH_LEN];
+    char repository_alias[MAX_PATH_LEN];
+    char missing_alias[MAX_PATH_LEN];
+    char expected_missing[MAX_PATH_LEN];
+    char dangling_path[MAX_PATH_LEN];
+    char dangling_alias[MAX_PATH_LEN];
+    char conflicting_alias[MAX_PATH_LEN];
+    publication_record_t live;
+    publication_record_t absent;
+    publication_record_t dangling;
+    publication_record_t conflicting;
+    publication_ledger_t ledger;
+    int fd = -1;
+    static const char contents[] = "[anchor]\n";
+
+    publication_ledger_init(&ledger);
+    CHECK(ts_mkdtemp(root) != NULL);
+    if (!root[0] || ts_canonicalize_dir_path(root, sizeof(root)) != 0 ||
+        snprintf(repository, sizeof(repository), "%s/repository", root) >=
+            (int)sizeof(repository) ||
+        snprintf(config_parent, sizeof(config_parent), "%s/.git",
+                 repository) >= (int)sizeof(config_parent) ||
+        snprintf(config_path, sizeof(config_path), "%s/config",
+                 config_parent) >= (int)sizeof(config_path) ||
+        snprintf(repository_alias, sizeof(repository_alias), "%s/repo-link",
+                 root) >= (int)sizeof(repository_alias) ||
+        mkdir(repository, 0700) != 0 ||
+        mkdir(config_parent, 0700) != 0) {
+        CHECK(false);
+        goto cleanup;
+    }
+    fd = open(config_path, O_WRONLY | O_CREAT | O_EXCL | O_CLOEXEC, 0600);
+    if (fd < 0 ||
+        write(fd, contents, sizeof(contents) - 1U) !=
+            (ssize_t)(sizeof(contents) - 1U) ||
+        close(fd) != 0 ||
+        symlink(repository, repository_alias) != 0) {
+        CHECK(false);
+        fd = -1;
+        goto cleanup;
+    }
+    fd = -1;
+    if (snprintf(missing_alias, sizeof(missing_alias),
+                 "%s//.git/./future-config", repository_alias) >=
+            (int)sizeof(missing_alias) ||
+        snprintf(expected_missing, sizeof(expected_missing),
+                 "%s/future-config", config_parent) >=
+            (int)sizeof(expected_missing) ||
+        snprintf(dangling_path, sizeof(dangling_path), "%s/dangling",
+                 config_parent) >= (int)sizeof(dangling_path) ||
+        snprintf(dangling_alias, sizeof(dangling_alias), "%s/.git/dangling",
+                 repository_alias) >= (int)sizeof(dangling_alias) ||
+        snprintf(conflicting_alias, sizeof(conflicting_alias),
+                 "%s/.git/config", repository_alias) >=
+            (int)sizeof(conflicting_alias) ||
+        symlink("/definitely/missing/ar14-target", dangling_path) != 0) {
+        CHECK(false);
+        goto cleanup;
+    }
+
+    fill_gpg_record(&live, repository, FINGERPRINT_A);
+    CHECK_EQ_INT(bind_live_local_destination(
+                     &live, repository, config_parent, config_path), 0);
+
+    absent = live;
+    CHECK_EQ_INT(safe_strncpy(absent.config_path, missing_alias,
+                              sizeof(absent.config_path)), 0);
+    CHECK_EQ_INT(publication_ledger_upsert(&ledger, &absent), 0);
+    CHECK_STR_EQ(ledger.records[0].config_path, expected_missing);
+    CHECK_STR_EQ(ledger.records[0].repository_path, repository);
+
+    publication_ledger_clear(&ledger);
+    dangling = live;
+    CHECK_EQ_INT(safe_strncpy(dangling.config_path, dangling_alias,
+                              sizeof(dangling.config_path)), 0);
+    CHECK_EQ_INT(publication_ledger_upsert(&ledger, &dangling), 0);
+    CHECK_STR_EQ(ledger.records[0].config_path, dangling_alias);
+    CHECK_STR_EQ(ledger.records[0].repository_path, repository);
+
+    publication_ledger_clear(&ledger);
+    conflicting = live;
+    conflicting.config_parent.inode++;
+    CHECK_EQ_INT(safe_strncpy(conflicting.config_path, conflicting_alias,
+                              sizeof(conflicting.config_path)), 0);
+    CHECK_EQ_INT(publication_ledger_upsert(&ledger, &conflicting), 0);
+    CHECK_STR_EQ(ledger.records[0].config_path, conflicting_alias);
+    CHECK_STR_EQ(ledger.records[0].repository_path, repository);
+    CHECK(!publication_record_same_config_destination(&live, &conflicting));
+
+cleanup:
+    if (fd >= 0) close(fd);
+    publication_ledger_clear(&ledger);
+    ts_rm_rf(root);
+}
+
+TEST(offline_destination_spellings_round_trip_without_ancestry_rewrite) {
+    publication_record_t record;
+    publication_ledger_t source;
+    publication_ledger_t loaded;
+    publication_ledger_t ancestry;
+    const publication_record_t *found = NULL;
+    unsigned char *serialized = NULL;
+    unsigned char *reserialized = NULL;
+    size_t serialized_length = 0U;
+    size_t reserialized_length = 0U;
+    static const char config_alias[] =
+        "/offline-ar14//repository/./.git/config";
+    static const char repository_alias[] =
+        "/offline-ar14//repository/.";
+    static const char ancestry_config[] =
+        "/offline-ar14/base/../repository/.git/config";
+    static const char ancestry_repository[] =
+        "/offline-ar14/base/../repository";
+
+    publication_ledger_init(&source);
+    publication_ledger_init(&loaded);
+    publication_ledger_init(&ancestry);
+    fill_gpg_record(&record, repository_alias, FINGERPRINT_A);
+    CHECK_EQ_INT(safe_strncpy(record.config_path, config_alias,
+                              sizeof(record.config_path)), 0);
+    source.present = true;
+    source.version = PUBLICATION_LEDGER_VERSION;
+    source.records = &record;
+    source.count = 1U;
+
+    CHECK_EQ_INT(publication_ledger_serialize(
+                     &source, &serialized, &serialized_length), 0);
+    CHECK_EQ_INT(publication_ledger_parse(
+                     serialized, serialized_length, &loaded), 0);
+    CHECK_STR_EQ(loaded.records[0].config_path, config_alias);
+    CHECK_STR_EQ(loaded.records[0].repository_path, repository_alias);
+    CHECK_LOOKUP_STATUS(publication_ledger_find(
+                     &loaded, record.account_id, record.account_incarnation,
+                     record.scope,
+                     "/offline-ar14/repository/.git/config",
+                     "/offline-ar14/repository", &found),
+                 PUBLICATION_LOOKUP_FOUND);
+    CHECK(found == &loaded.records[0]);
+    CHECK_EQ_INT(publication_ledger_serialize(
+                     &loaded, &reserialized, &reserialized_length), 0);
+    CHECK_EQ_INT((long)reserialized_length, (long)serialized_length);
+    if (serialized && reserialized &&
+        serialized_length == reserialized_length) {
+        CHECK(memcmp(serialized, reserialized, serialized_length) == 0);
+    }
+
+    CHECK_EQ_INT(safe_strncpy(record.config_path, ancestry_config,
+                              sizeof(record.config_path)), 0);
+    CHECK_EQ_INT(safe_strncpy(record.repository_path, ancestry_repository,
+                              sizeof(record.repository_path)), 0);
+    CHECK_EQ_INT(publication_ledger_upsert(&ancestry, &record), 0);
+    CHECK_STR_EQ(ancestry.records[0].config_path, ancestry_config);
+    CHECK_STR_EQ(ancestry.records[0].repository_path, ancestry_repository);
+    CHECK_LOOKUP_STATUS(publication_ledger_find(
+                     &ancestry, record.account_id,
+                     record.account_incarnation, record.scope,
+                     "/offline-ar14/repository/.git/config",
+                     "/offline-ar14/repository", &found),
+                 PUBLICATION_LOOKUP_ABSENT);
+
+    free(reserialized);
+    free(serialized);
+    publication_ledger_clear(&ancestry);
+    publication_ledger_clear(&loaded);
+}
+
+TEST(alias_duplicate_destinations_fail_closed_in_serializer_and_parser) {
+    char root[MAX_PATH_LEN] = "/tmp/gsw-ar14-publication-duplicate.XXXXXX";
+    char repository[MAX_PATH_LEN];
+    char config_parent[MAX_PATH_LEN];
+    char config_path[MAX_PATH_LEN];
+    char repository_alias[MAX_PATH_LEN];
+    char alias_config[MAX_PATH_LEN];
+    char distinct_config[MAX_PATH_LEN];
+    char distinct_repository[MAX_PATH_LEN];
+    char config_hex[MAX_PATH_LEN * 2U + 1U];
+    char repository_hex[MAX_PATH_LEN * 2U + 1U];
+    publication_record_t records[2];
+    publication_ledger_t ledger;
+    publication_ledger_t parsed;
+    unsigned char *serialized = NULL;
+    unsigned char *config_replaced = NULL;
+    unsigned char *alias_bytes = NULL;
+    size_t serialized_length = 0U;
+    size_t config_replaced_length = 0U;
+    size_t alias_length = 0U;
+    int fd = -1;
+    static const char contents[] = "[duplicate]\n";
+
+    publication_ledger_init(&ledger);
+    publication_ledger_init(&parsed);
+    CHECK(ts_mkdtemp(root) != NULL);
+    if (!root[0] || ts_canonicalize_dir_path(root, sizeof(root)) != 0 ||
+        snprintf(repository, sizeof(repository), "%s/repository", root) >=
+            (int)sizeof(repository) ||
+        snprintf(config_parent, sizeof(config_parent), "%s/.git",
+                 repository) >= (int)sizeof(config_parent) ||
+        snprintf(config_path, sizeof(config_path), "%s/config",
+                 config_parent) >= (int)sizeof(config_path) ||
+        snprintf(repository_alias, sizeof(repository_alias), "%s/repo-link",
+                 root) >= (int)sizeof(repository_alias) ||
+        mkdir(repository, 0700) != 0 ||
+        mkdir(config_parent, 0700) != 0) {
+        CHECK(false);
+        goto cleanup;
+    }
+    fd = open(config_path, O_WRONLY | O_CREAT | O_EXCL | O_CLOEXEC, 0600);
+    if (fd < 0 ||
+        write(fd, contents, sizeof(contents) - 1U) !=
+            (ssize_t)(sizeof(contents) - 1U) ||
+        close(fd) != 0 ||
+        symlink(repository, repository_alias) != 0) {
+        CHECK(false);
+        fd = -1;
+        goto cleanup;
+    }
+    fd = -1;
+    if (snprintf(alias_config, sizeof(alias_config),
+                 "%s//.git/./config", repository_alias) >=
+            (int)sizeof(alias_config) ||
+        snprintf(distinct_config, sizeof(distinct_config),
+                 "%s/offline/.git/config", root) >=
+            (int)sizeof(distinct_config) ||
+        snprintf(distinct_repository, sizeof(distinct_repository),
+                 "%s/offline", root) >= (int)sizeof(distinct_repository) ||
+        encode_upper_hex(alias_config, config_hex, sizeof(config_hex)) != 0 ||
+        encode_upper_hex(repository_alias, repository_hex,
+                         sizeof(repository_hex)) != 0) {
+        CHECK(false);
+        goto cleanup;
+    }
+
+    fill_gpg_record(&records[0], repository, FINGERPRINT_A);
+    CHECK_EQ_INT(bind_live_local_destination(
+                     &records[0], repository, config_parent, config_path), 0);
+    records[1] = records[0];
+    records[1].account_id++;
+    CHECK_EQ_INT(safe_strncpy(records[1].config_path, alias_config,
+                              sizeof(records[1].config_path)), 0);
+    CHECK_EQ_INT(safe_strncpy(records[1].repository_path, repository_alias,
+                              sizeof(records[1].repository_path)), 0);
+    ledger.present = true;
+    ledger.version = PUBLICATION_LEDGER_VERSION;
+    ledger.records = records;
+    ledger.count = 2U;
+    clear_error();
+    CHECK_EQ_INT(publication_ledger_serialize(
+                     &ledger, &serialized, &serialized_length), -1);
+    CHECK(serialized == NULL);
+    CHECK(strstr(get_last_error()->message, "duplicate destinations") != NULL);
+
+    CHECK_EQ_INT(safe_strncpy(records[1].config_path, distinct_config,
+                              sizeof(records[1].config_path)), 0);
+    CHECK_EQ_INT(safe_strncpy(records[1].repository_path,
+                              distinct_repository,
+                              sizeof(records[1].repository_path)), 0);
+    CHECK_EQ_INT(publication_ledger_serialize(
+                     &ledger, &serialized, &serialized_length), 0);
+    config_replaced = replace_serialized_field_value(
+        serialized, serialized_length, "p.1.config=", config_hex,
+        &config_replaced_length);
+    CHECK(config_replaced != NULL);
+    if (config_replaced) {
+        alias_bytes = replace_serialized_field_value(
+            config_replaced, config_replaced_length, "p.1.repository=",
+            repository_hex, &alias_length);
+    }
+    CHECK(alias_bytes != NULL);
+    clear_error();
+    if (alias_bytes) {
+        CHECK_EQ_INT(publication_ledger_parse(
+                         alias_bytes, alias_length, &parsed), -1);
+    }
+    CHECK(!parsed.present);
+    CHECK(strstr(get_last_error()->message, "duplicate destinations") != NULL);
+
+cleanup:
+    if (fd >= 0) close(fd);
+    free(alias_bytes);
+    free(config_replaced);
+    free(serialized);
+    publication_ledger_clear(&parsed);
+    ts_rm_rf(root);
+}
+
+TEST(upsert_rejects_offline_aliases_that_converge_without_model_mutation) {
+    char root[MAX_PATH_LEN] = "/tmp/gsw-ar14-publication-converge.XXXXXX";
+    char repository[MAX_PATH_LEN];
+    char config_parent[MAX_PATH_LEN];
+    char config_path[MAX_PATH_LEN];
+    char alias_a[MAX_PATH_LEN];
+    char alias_b[MAX_PATH_LEN];
+    char config_a[MAX_PATH_LEN];
+    char config_b[MAX_PATH_LEN];
+    publication_record_t incoming;
+    publication_record_t records[2];
+    publication_record_t before[2];
+    publication_record_t *records_before;
+    publication_ledger_t source;
+    publication_ledger_t parsed;
+    unsigned char *serialized = NULL;
+    size_t serialized_length = 0U;
+    size_t count_before;
+    unsigned int version_before;
+    bool present_before;
+    int fd = -1;
+    static const char contents[] = "[converge]\n";
+
+    publication_ledger_init(&source);
+    publication_ledger_init(&parsed);
+    CHECK(ts_mkdtemp(root) != NULL);
+    if (!root[0] || ts_canonicalize_dir_path(root, sizeof(root)) != 0 ||
+        snprintf(repository, sizeof(repository), "%s/repository", root) >=
+            (int)sizeof(repository) ||
+        snprintf(config_parent, sizeof(config_parent), "%s/.git",
+                 repository) >= (int)sizeof(config_parent) ||
+        snprintf(config_path, sizeof(config_path), "%s/config",
+                 config_parent) >= (int)sizeof(config_path) ||
+        snprintf(alias_a, sizeof(alias_a), "%s/offline-a", root) >=
+            (int)sizeof(alias_a) ||
+        snprintf(alias_b, sizeof(alias_b), "%s/offline-b", root) >=
+            (int)sizeof(alias_b) ||
+        snprintf(config_a, sizeof(config_a), "%s/.git/config", alias_a) >=
+            (int)sizeof(config_a) ||
+        snprintf(config_b, sizeof(config_b), "%s/.git/config", alias_b) >=
+            (int)sizeof(config_b) ||
+        mkdir(repository, 0700) != 0 ||
+        mkdir(config_parent, 0700) != 0) {
+        CHECK(false);
+        goto cleanup;
+    }
+    fd = open(config_path, O_WRONLY | O_CREAT | O_EXCL | O_CLOEXEC, 0600);
+    if (fd < 0 ||
+        write(fd, contents, sizeof(contents) - 1U) !=
+            (ssize_t)(sizeof(contents) - 1U) ||
+        close(fd) != 0) {
+        CHECK(false);
+        fd = -1;
+        goto cleanup;
+    }
+    fd = -1;
+
+    fill_gpg_record(&incoming, repository, FINGERPRINT_A);
+    CHECK_EQ_INT(bind_live_local_destination(
+                     &incoming, repository, config_parent, config_path), 0);
+    records[0] = incoming;
+    records[1] = incoming;
+    records[1].account_id++;
+    CHECK_EQ_INT(safe_strncpy(records[0].config_path, config_a,
+                              sizeof(records[0].config_path)), 0);
+    CHECK_EQ_INT(safe_strncpy(records[0].repository_path, alias_a,
+                              sizeof(records[0].repository_path)), 0);
+    CHECK_EQ_INT(safe_strncpy(records[1].config_path, config_b,
+                              sizeof(records[1].config_path)), 0);
+    CHECK_EQ_INT(safe_strncpy(records[1].repository_path, alias_b,
+                              sizeof(records[1].repository_path)), 0);
+
+    /* Step 1/2: while both aliases are offline, their byte-distinct spellings
+     * are a valid legacy ledger and survive serialization plus parsing. */
+    source.present = true;
+    source.version = PUBLICATION_LEDGER_VERSION;
+    source.records = records;
+    source.count = 2U;
+    CHECK_EQ_INT(publication_ledger_serialize(
+                     &source, &serialized, &serialized_length), 0);
+    CHECK_EQ_INT(publication_ledger_parse(
+                     serialized, serialized_length, &parsed), 0);
+    CHECK_EQ_INT((long)parsed.count, 2);
+
+    records_before = parsed.records;
+    count_before = parsed.count;
+    version_before = parsed.version;
+    present_before = parsed.present;
+    memcpy(before, parsed.records, sizeof(before));
+
+    /* Step 3: both previously unresolved names now resolve to the exact same
+     * anchored repository and config parent. */
+    CHECK_EQ_INT(symlink(repository, alias_a), 0);
+    CHECK_EQ_INT(symlink(repository, alias_b), 0);
+
+    /* Step 4: upsert must classify every existing match before mutation.
+     * Replacing only the first would leave a second live alias and an
+     * ambiguous ownership model. */
+    clear_error();
+    CHECK_EQ_INT(publication_ledger_upsert(&parsed, &incoming), -1);
+    CHECK(strstr(get_last_error()->message, "ambiguous") != NULL);
+    CHECK(parsed.records == records_before);
+    CHECK_EQ_INT((long)parsed.count, (long)count_before);
+    CHECK_EQ_INT((int)parsed.version, (int)version_before);
+    CHECK(parsed.present == present_before);
+    CHECK(memcmp(parsed.records, before, sizeof(before)) == 0);
+
+cleanup:
+    if (fd >= 0) close(fd);
+    free(serialized);
+    publication_ledger_clear(&parsed);
+    ts_rm_rf(root);
 }
 
 TEST(guarded_publication_clears_install_state_before_input_validation) {
@@ -2752,169 +3345,231 @@ TEST(removed_account_publication_reserves_recycled_id_without_git_mutation) {
     ts_rm_rf(home);
 }
 
-/* AR-12 H2: only PUBLISHED records with provably dead destinations (ENOENT
- * or changed object identity on the recorded anchor) are reclaimable.
- * RETIRING residue and indeterminate probes must survive reclamation. */
-TEST(reclaim_absent_drops_only_provably_dead_published_records) {
+TEST(present_empty_ledger_serializes_canonically_with_tiny_allocation) {
+    static const unsigned char expected[] =
+        "publications=v1\n"
+        "count=0\n"
+        "end=v1\n";
+    publication_ledger_t ledger;
+    publication_ledger_t parsed;
+    unsigned char *serialized = NULL;
+    size_t serialized_length = 0U;
+
+    publication_ledger_init(&ledger);
+    publication_ledger_init(&parsed);
+    ledger.present = true;
+    ledger.version = PUBLICATION_LEDGER_VERSION;
+    CHECK_EQ_INT(publication_ledger_serialize(
+                     &ledger, &serialized, &serialized_length), 0);
+    CHECK_EQ_INT((long)serialized_length, (long)(sizeof(expected) - 1U));
+    CHECK(serialized &&
+          memcmp(serialized, expected, sizeof(expected) - 1U) == 0);
+    CHECK(publication_test_last_serializer_peak_capacity() <= 64U);
+    CHECK(publication_test_last_serializer_peak_capacity() <
+          PUBLICATION_LEDGER_MAX_BYTES);
+    CHECK_EQ_INT(publication_ledger_parse(
+                     serialized, serialized_length, &parsed), 0);
+    CHECK(parsed.present);
+    CHECK_EQ_INT(parsed.version, PUBLICATION_LEDGER_VERSION);
+    CHECK_EQ_INT((long)parsed.count, 0);
+
+    free(serialized);
+    publication_ledger_clear(&parsed);
+    publication_ledger_clear(&ledger);
+}
+
+TEST(reclaim_keeps_the_single_final_v1_record_canonical) {
+    publication_ledger_t ledger;
+    publication_ledger_t parsed;
+    publication_record_t record;
+    publication_record_t before_record;
+    const publication_record_t *found = NULL;
+    unsigned char *before = NULL;
+    unsigned char *after = NULL;
+    size_t before_length = 0U;
+    size_t after_length = 0U;
+
+    fill_ssh_record(&record);
+    publication_ledger_init(&ledger);
+    publication_ledger_init(&parsed);
+    CHECK_EQ_INT(publication_ledger_upsert(&ledger, &record), 0);
+    before_record = ledger.records[0];
+    CHECK_EQ_INT(publication_ledger_serialize(
+                     &ledger, &before, &before_length), 0);
+
+    CHECK_EQ_INT((long)publication_ledger_reclaim_absent(&ledger), 0);
+    CHECK(ledger.present);
+    CHECK_EQ_INT(ledger.version, PUBLICATION_LEDGER_VERSION);
+    CHECK_EQ_INT((long)ledger.count, 1);
+    CHECK(memcmp(&ledger.records[0], &before_record,
+                 sizeof(before_record)) == 0);
+    CHECK_LOOKUP_STATUS(
+        publication_ledger_find(
+            &ledger, record.account_id, record.account_incarnation,
+            record.scope, record.config_path, record.repository_path, &found),
+        PUBLICATION_LOOKUP_FOUND);
+    CHECK(found == &ledger.records[0]);
+    CHECK_EQ_INT(publication_ledger_serialize(
+                     &ledger, &after, &after_length), 0);
+    CHECK_EQ_INT((long)after_length, (long)before_length);
+    CHECK(before && after && memcmp(before, after, before_length) == 0);
+    CHECK_EQ_INT(publication_ledger_parse(after, after_length, &parsed), 0);
+    found = NULL;
+    CHECK_LOOKUP_STATUS(
+        publication_ledger_find(
+            &parsed, record.account_id, record.account_incarnation,
+            record.scope, record.config_path, record.repository_path, &found),
+        PUBLICATION_LOOKUP_FOUND);
+    CHECK(found != NULL);
+    if (found) CHECK_EQ_INT(publication_record_validate(found), 0);
+
+    free(after);
+    free(before);
+    publication_ledger_clear(&parsed);
+    publication_ledger_clear(&ledger);
+}
+
+/* AR-14 M13: a v1 filesystem probe cannot distinguish permanent deletion
+ * from rename-away/restore. Exercise each anchor independently under one
+ * same-filesystem root and prove both PUBLISHED authority and a RETIRING
+ * settlement obligation remain byte-exact. */
+TEST(reclamation_keeps_renamed_published_and_retiring_destinations) {
     publication_ledger_t ledger;
     publication_record_t record;
-    publication_record_t dead_probe;
-    char dead_repo[] = "/tmp/ar12-h2-dead-XXXXXX";
-    char live_repo[] = "/tmp/ar12-h2-live-XXXXXX";
-    char mismatch_repo[] = "/tmp/ar12-h2-mismatch-XXXXXX";
-    char unmount_repo[] = "/tmp/ar12-h2-unmount-XXXXXX";
-    char retiring_repo[] = "/tmp/ar12-h2-retiring-XXXXXX";
+    publication_record_t probes[4];
+    unsigned char *before = NULL;
+    unsigned char *after = NULL;
+    size_t before_length = 0U;
+    size_t after_length = 0U;
+    char root[] = "/tmp/ar14-m13-rename-XXXXXX";
+    char shared_parent[MAX_PATH_LEN];
+    char repo_anchor[MAX_PATH_LEN];
+    char repo_away[MAX_PATH_LEN];
+    char live_repo[MAX_PATH_LEN];
+    char local_parent[MAX_PATH_LEN];
+    char local_parent_away[MAX_PATH_LEN];
+    char global_parent[MAX_PATH_LEN];
+    char global_parent_away[MAX_PATH_LEN];
+    char global_config[MAX_PATH_LEN];
+    char retiring_parent[MAX_PATH_LEN];
+    char retiring_parent_away[MAX_PATH_LEN];
+    char retiring_config[MAX_PATH_LEN];
     struct stat st;
 
-    CHECK(ts_mkdtemp(dead_repo) != NULL);
-    CHECK(ts_mkdtemp(live_repo) != NULL);
-    CHECK(ts_mkdtemp(mismatch_repo) != NULL);
-    CHECK(ts_mkdtemp(unmount_repo) != NULL);
-    CHECK(ts_mkdtemp(retiring_repo) != NULL);
+    CHECK(ts_mkdtemp(root) != NULL);
+    CHECK_EQ_INT(join_path(shared_parent, sizeof(shared_parent), root,
+                           "shared-parent"), 0);
+    CHECK_EQ_INT(join_path(repo_anchor, sizeof(repo_anchor), root,
+                           "repository-anchor"), 0);
+    CHECK_EQ_INT(join_path(repo_away, sizeof(repo_away), root,
+                           "repository-away"), 0);
+    CHECK_EQ_INT(join_path(live_repo, sizeof(live_repo), root,
+                           "live-repository"), 0);
+    CHECK_EQ_INT(join_path(local_parent, sizeof(local_parent), root,
+                           "local-parent"), 0);
+    CHECK_EQ_INT(join_path(local_parent_away,
+                           sizeof(local_parent_away), root,
+                           "local-parent-away"), 0);
+    CHECK_EQ_INT(join_path(global_parent, sizeof(global_parent), root,
+                           "global-parent"), 0);
+    CHECK_EQ_INT(join_path(global_parent_away,
+                           sizeof(global_parent_away), root,
+                           "global-parent-away"), 0);
+    CHECK_EQ_INT(join_path(retiring_parent, sizeof(retiring_parent), root,
+                           "retiring-parent"), 0);
+    CHECK_EQ_INT(join_path(retiring_parent_away,
+                           sizeof(retiring_parent_away), root,
+                           "retiring-parent-away"), 0);
+    CHECK_EQ_INT(mkdir(shared_parent, 0700), 0);
+    CHECK_EQ_INT(mkdir(repo_anchor, 0700), 0);
+    CHECK_EQ_INT(mkdir(live_repo, 0700), 0);
+    CHECK_EQ_INT(mkdir(local_parent, 0700), 0);
+    CHECK_EQ_INT(mkdir(global_parent, 0700), 0);
+    CHECK_EQ_INT(mkdir(retiring_parent, 0700), 0);
     publication_ledger_init(&ledger);
 
-    /* Dead destination: real identity captured, directory then removed. */
-    fill_gpg_record(&record, dead_repo, FINGERPRINT_A);
-    snprintf(record.config_path, sizeof(record.config_path),
-             "%s/.git/config", dead_repo);
-    CHECK_EQ_INT(stat(dead_repo, &st), 0);
+    /* Local repository anchor moves while its independently anchored config
+     * parent stays live. */
+    fill_gpg_record(&record, repo_anchor, FINGERPRINT_A);
+    CHECK_EQ_INT(safe_snprintf(record.config_path,
+                               sizeof(record.config_path),
+                               "%s/repository.gitconfig", shared_parent), 0);
+    CHECK_EQ_INT(stat(shared_parent, &st), 0);
+    publication_identity_from_stat(&record.config_parent, &st);
+    CHECK_EQ_INT(stat(repo_anchor, &st), 0);
     publication_identity_from_stat(&record.repository, &st);
     CHECK_EQ_INT(publication_ledger_upsert(&ledger, &record), 0);
-    dead_probe = record;
+    probes[0] = ledger.records[ledger.count - 1U];
 
-    /* Live destination with the real identity: must be kept. */
+    /* Local config parent moves while its repository anchor stays live. */
     fill_gpg_record(&record, live_repo, FINGERPRINT_A);
-    snprintf(record.config_path, sizeof(record.config_path),
-             "%s/.git/config", live_repo);
+    CHECK_EQ_INT(safe_snprintf(record.config_path,
+                               sizeof(record.config_path),
+                               "%s/config", local_parent), 0);
+    CHECK_EQ_INT(stat(local_parent, &st), 0);
+    publication_identity_from_stat(&record.config_parent, &st);
     CHECK_EQ_INT(stat(live_repo, &st), 0);
     publication_identity_from_stat(&record.repository, &st);
     CHECK_EQ_INT(publication_ledger_upsert(&ledger, &record), 0);
+    probes[1] = ledger.records[ledger.count - 1U];
 
-    /* AR-13 R1: live path whose recorded identity changed ON THE SAME
-     * filesystem (same st_dev, different inode) is an in-place replacement —
-     * provably non-matchable, so reclaimable. */
-    fill_gpg_record(&record, mismatch_repo, FINGERPRINT_A);
-    snprintf(record.config_path, sizeof(record.config_path),
-             "%s/.git/config", mismatch_repo);
-    CHECK_EQ_INT(stat(mismatch_repo, &st), 0);
-    publication_identity_from_stat(&record.repository, &st);
-    record.repository.inode ^= UINTMAX_C(1); /* same device, wrong inode */
+    /* Global publication: only the config-parent anchor exists. */
+    CHECK_EQ_INT(safe_snprintf(global_config, sizeof(global_config),
+                               "%s/config", global_parent), 0);
+    fill_global_gpg_record(&record, UINT32_C(41), global_config,
+                           FINGERPRINT_A);
+    CHECK_EQ_INT(stat(global_parent, &st), 0);
+    publication_identity_from_stat(&record.config_parent, &st);
     CHECK_EQ_INT(publication_ledger_upsert(&ledger, &record), 0);
+    probes[2] = ledger.records[ledger.count - 1U];
 
-    /* AR-13 R1: live path whose recorded identity differs on a DIFFERENT
-     * device is indeterminate — an unmounted volume presents its mountpoint
-     * with the parent filesystem's device — so it must be KEPT (fail closed),
-     * not silently reclaimed with its PUBLISHED provenance. */
-    fill_gpg_record(&record, unmount_repo, FINGERPRINT_A);
-    snprintf(record.config_path, sizeof(record.config_path),
-             "%s/.git/config", unmount_repo);
-    CHECK_EQ_INT(stat(unmount_repo, &st), 0);
-    publication_identity_from_stat(&record.repository, &st);
-    record.repository.device += UINTMAX_C(1); /* different device */
-    record.repository.inode ^= UINTMAX_C(1);
-    CHECK_EQ_INT(publication_ledger_upsert(&ledger, &record), 0);
-
-    /* Dead destination in RETIRING state: retirement recovery owns it. */
-    fill_gpg_record(&record, retiring_repo, FINGERPRINT_A);
-    snprintf(record.config_path, sizeof(record.config_path),
-             "%s/.git/config", retiring_repo);
-    CHECK_EQ_INT(stat(retiring_repo, &st), 0);
-    publication_identity_from_stat(&record.repository, &st);
+    /* A RETIRING global record is an explicit settlement obligation and must
+     * survive the same ambiguous observation. */
+    CHECK_EQ_INT(safe_snprintf(retiring_config, sizeof(retiring_config),
+                               "%s/config", retiring_parent), 0);
+    fill_global_gpg_record(&record, UINT32_C(41), retiring_config,
+                           FINGERPRINT_A);
+    CHECK_EQ_INT(stat(retiring_parent, &st), 0);
+    publication_identity_from_stat(&record.config_parent, &st);
     record.state = PUBLICATION_STATE_RETIRING;
     CHECK_EQ_INT(publication_ledger_upsert(&ledger, &record), 0);
+    probes[3] = ledger.records[ledger.count - 1U];
 
-    CHECK_EQ_INT(rmdir(dead_repo), 0);
-    CHECK_EQ_INT(rmdir(retiring_repo), 0);
+    CHECK_EQ_INT(publication_ledger_serialize(
+                     &ledger, &before, &before_length), 0);
+    CHECK_EQ_INT(rename(repo_anchor, repo_away), 0);
+    CHECK_EQ_INT(rename(local_parent, local_parent_away), 0);
+    CHECK_EQ_INT(rename(global_parent, global_parent_away), 0);
+    CHECK_EQ_INT(rename(retiring_parent, retiring_parent_away), 0);
+
     CHECK(!publication_record_destination_provably_absent(NULL));
-    CHECK(publication_record_destination_provably_absent(&dead_probe));
+    for (size_t i = 0U; i < ledger.count; i++) {
+        CHECK(!publication_record_destination_provably_absent(
+            &ledger.records[i]));
+    }
+    CHECK_EQ_INT((long)publication_ledger_reclaim_absent(&ledger), 0);
+    CHECK_EQ_INT((long)ledger.count, 4);
+    CHECK_EQ_INT(ledger.records[3].state, PUBLICATION_STATE_RETIRING);
+    CHECK_EQ_INT(publication_ledger_serialize(
+                     &ledger, &after, &after_length), 0);
+    CHECK_EQ_INT((long)after_length, (long)before_length);
+    CHECK(before && after &&
+          memcmp(before, after, before_length) == 0);
 
-    /* Reclaimed: dead (deleted on the recorded fs) + same-device mismatch.
-     * Kept: live, the different-device "unmount" mismatch, and RETIRING. */
-    CHECK_EQ_INT((long)publication_ledger_reclaim_absent(&ledger), 2);
-    CHECK_EQ_INT((long)ledger.count, 3);
-    CHECK(!publication_ledger_destination_present(&ledger, &dead_probe));
-    {
-        bool saw_unmount = false;
-        for (size_t i = 0U; i < ledger.count; i++) {
-            CHECK(strstr(ledger.records[i].repository_path,
-                         "ar12-h2-mismatch") == NULL);
-            if (strstr(ledger.records[i].repository_path,
-                       "ar12-h2-unmount") != NULL) {
-                saw_unmount = true;
-            }
-        }
-        CHECK(saw_unmount); /* different-device change failed closed */
+    CHECK_EQ_INT(rename(repo_away, repo_anchor), 0);
+    CHECK_EQ_INT(rename(local_parent_away, local_parent), 0);
+    CHECK_EQ_INT(rename(global_parent_away, global_parent), 0);
+    CHECK_EQ_INT(rename(retiring_parent_away, retiring_parent), 0);
+    for (size_t i = 0U; i < sizeof(probes) / sizeof(probes[0]); i++) {
+        CHECK(publication_ledger_destination_present(&ledger, &probes[i]));
     }
 
+    free(after);
+    free(before);
     publication_ledger_clear(&ledger);
-    (void)rmdir(live_repo);
-    (void)rmdir(mismatch_repo);
-    (void)rmdir(unmount_repo);
+    ts_rm_rf(root);
 }
 
-/* AR-13 L42: R1/R2 made the oracle probe the config_parent anchor too, but the
- * reclaim test above drives only the repository anchor (config_parent left
- * synthetic device=17), so the config_parent ENOENT walk-up had no real
- * coverage. Prove both directions with real captured identities on a
- * config-parent-only (global) record: a parent removed above a surviving
- * same-device ancestor directory is provably DEAD, while an ancestor replaced
- * by a regular file makes the leaf probe fail with ENOTDIR — indeterminate, so
- * the record must be KEPT (fail closed). ENOTDIR is not privilege-bypassable,
- * so this is deterministic on every CI platform including the root FreeBSD VM,
- * unlike a chmod/EACCES construction. */
-TEST(config_parent_anchor_is_dead_on_dir_ancestor_but_fails_closed_on_nondir) {
-    char root[] = "/tmp/ar13-l42-XXXXXX";
-    publication_record_t record;
-    char sub[MAX_PATH_LEN];
-    char leafdir[MAX_PATH_LEN];
-    struct stat st;
-    int fd;
-
-    CHECK(ts_mkdtemp(root) != NULL);
-    CHECK((size_t)snprintf(sub, sizeof(sub), "%s/sub", root) < sizeof(sub));
-    CHECK((size_t)snprintf(leafdir, sizeof(leafdir), "%s/leaf", sub) <
-          sizeof(leafdir));
-    CHECK_EQ_INT(mkdir(sub, 0700), 0);
-    CHECK_EQ_INT(mkdir(leafdir, 0700), 0);
-
-    /* Config-parent-only record: repository anchor cleared so the oracle's
-     * verdict is driven solely by the config_parent walk-up. */
-    fill_gpg_record(&record, "/unused", FINGERPRINT_A);
-    record.scope = PUBLICATION_SCOPE_GLOBAL;
-    record.repository_path[0] = '\0';
-    memset(&record.repository, 0, sizeof(record.repository));
-    CHECK((size_t)snprintf(record.config_path, sizeof(record.config_path),
-                           "%s/config", leafdir) < sizeof(record.config_path));
-    CHECK_EQ_INT(stat(leafdir, &st), 0);
-    publication_identity_from_stat(&record.config_parent, &st);
-
-    /* Parent gone, same-device ancestor directory survives: provably DEAD. */
-    CHECK_EQ_INT(rmdir(leafdir), 0);
-    CHECK(publication_record_destination_provably_absent(&record));
-
-    /* Recreate and re-capture, then replace the <root>/sub ancestor with a
-     * regular file: the leaf lstat now returns ENOTDIR (not ENOENT), which is
-     * indeterminate and must fail closed. */
-    CHECK_EQ_INT(mkdir(leafdir, 0700), 0);
-    CHECK_EQ_INT(stat(leafdir, &st), 0);
-    publication_identity_from_stat(&record.config_parent, &st);
-    CHECK_EQ_INT(rmdir(leafdir), 0);
-    CHECK_EQ_INT(rmdir(sub), 0);
-    fd = open(sub, O_WRONLY | O_CREAT | O_EXCL, 0600);
-    CHECK(fd >= 0);
-    if (fd >= 0) CHECK_EQ_INT(close(fd), 0);
-    CHECK(!publication_record_destination_provably_absent(&record));
-
-    (void)unlink(sub);
-    (void)rmdir(root);
-}
-
-/* AR-13 R2: an in-place .git rebuild (rm -rf .git && git init) changes the
- * .git directory's inode while the worktree root is untouched. The config
- * parent is one of the identities same_destination() compares, so the record
- * can never match again and must be reclaimable. The old oracle probed only
- * the repository anchor for local records, kept such records forever, and
- * would eventually exhaust the 128-slot ledger. */
 /* AR-13 L44: the AR-12 L16/L17 ledger-parse tightenings (named errors for the
  * capability-mask length and the count line; '-' as the ONLY canonical empty
  * spelling for gpg_fingerprint/gpg_selector) had zero coverage. Serialize a
@@ -2986,65 +3641,108 @@ TEST(ledger_parse_rejects_l16_l17_grammar_tightenings) {
     publication_ledger_clear(&source);
 }
 
-TEST(reclaim_absent_drops_local_record_after_in_place_git_rebuild) {
-    publication_ledger_t ledger;
+TEST(ledger_parse_distinguishes_bad_end_marker_from_trailing_bytes) {
+    static const unsigned char end_marker[] = "end=v1\n";
+    static const char malformed_end_message[] =
+        "Malformed or missing publication ledger end marker";
+    publication_ledger_t source;
+    publication_ledger_t parsed;
     publication_record_t record;
-    char repo[] = "/tmp/ar13-r2-repo-XXXXXX";
-    char gitdir[sizeof(repo) + 8];
-    struct stat st;
+    unsigned char *serialized = NULL;
+    unsigned char *bad = NULL;
+    size_t serialized_length = 0U;
+    size_t marker_length = sizeof(end_marker) - 1U;
 
-    CHECK(ts_mkdtemp(repo) != NULL);
-    snprintf(gitdir, sizeof(gitdir), "%s/.git", repo);
-    CHECK_EQ_INT(mkdir(gitdir, 0700), 0);
-    publication_ledger_init(&ledger);
+    fill_gpg_record(&record, "/tmp/ar14-l9-repo", FINGERPRINT_A);
+    publication_ledger_init(&source);
+    CHECK_EQ_INT(publication_ledger_upsert(&source, &record), 0);
+    CHECK_EQ_INT(publication_ledger_serialize(
+                     &source, &serialized, &serialized_length), 0);
+    CHECK(serialized != NULL);
+    CHECK(serialized_length >= marker_length);
+    if (!serialized || serialized_length < marker_length) goto cleanup;
+    CHECK(memcmp(serialized + serialized_length - marker_length,
+                 end_marker, marker_length) == 0);
 
-    fill_gpg_record(&record, repo, FINGERPRINT_A);
-    snprintf(record.config_path, sizeof(record.config_path), "%s/.git/config",
-             repo);
-    CHECK_EQ_INT(stat(gitdir, &st), 0);
-    publication_identity_from_stat(&record.config_parent, &st);
-    CHECK_EQ_INT(stat(repo, &st), 0);
-    publication_identity_from_stat(&record.repository, &st);
-    CHECK_EQ_INT(publication_ledger_upsert(&ledger, &record), 0);
+    bad = malloc(serialized_length);
+    CHECK(bad != NULL);
+    if (bad) {
+        memcpy(bad, serialized, serialized_length);
+        bad[serialized_length - marker_length] = 'X';
+        publication_ledger_init(&parsed);
+        clear_error();
+        CHECK_EQ_INT(publication_ledger_parse(
+                         bad, serialized_length, &parsed), -1);
+        CHECK(strstr(get_last_error()->message,
+                     malformed_end_message) != NULL);
+        CHECK(!parsed.present);
+        CHECK_EQ_INT((long)parsed.count, 0);
+        CHECK(parsed.records == NULL);
+        publication_ledger_clear(&parsed);
+        free(bad);
+        bad = NULL;
+    }
 
-    /* All anchors live and matching: not reclaimable. */
-    CHECK(!publication_record_destination_provably_absent(&ledger.records[0]));
+    publication_ledger_init(&parsed);
+    clear_error();
+    CHECK_EQ_INT(publication_ledger_parse(
+                     serialized, serialized_length - marker_length,
+                     &parsed), -1);
+    CHECK(strstr(get_last_error()->message, malformed_end_message) != NULL);
+    CHECK(!parsed.present);
+    CHECK_EQ_INT((long)parsed.count, 0);
+    CHECK(parsed.records == NULL);
+    publication_ledger_clear(&parsed);
 
-    /* An in-place `rm -rf .git && git init` leaves the worktree root untouched
-     * but gives .git a new inode on the SAME filesystem. Simulate that exact
-     * state deterministically by staling only the recorded config_parent inode
-     * (a real rmdir+mkdir can reuse the freed inode on ext4/UFS, leaving the
-     * identity unchanged). The live .git still exists, so the config-parent
-     * anchor reads present-but-different-object on the same device -> provably
-     * dead, while the repository anchor stays live. */
-    ledger.records[0].config_parent.inode ^= UINTMAX_C(1);
+    bad = malloc(serialized_length + 1U);
+    CHECK(bad != NULL);
+    if (bad) {
+        memcpy(bad, serialized, serialized_length);
+        bad[serialized_length] = 'X';
+        publication_ledger_init(&parsed);
+        clear_error();
+        CHECK_EQ_INT(publication_ledger_parse(
+                         bad, serialized_length + 1U, &parsed), -1);
+        CHECK(strstr(get_last_error()->message,
+                     "Trailing publication ledger bytes") != NULL);
+        CHECK(!parsed.present);
+        CHECK_EQ_INT((long)parsed.count, 0);
+        CHECK(parsed.records == NULL);
+        publication_ledger_clear(&parsed);
+    }
 
-    CHECK(publication_record_destination_provably_absent(&ledger.records[0]));
-    CHECK_EQ_INT((long)publication_ledger_reclaim_absent(&ledger), 1);
-    CHECK_EQ_INT((long)ledger.count, 0);
-
-    publication_ledger_clear(&ledger);
-    (void)rmdir(gitdir);
-    (void)rmdir(repo);
+cleanup:
+    free(bad);
+    free(serialized);
+    publication_ledger_clear(&source);
 }
 
-/* AR-12 H2: a full 128-record ledger must still admit a switch whose
- * destination already has a record (in-place replacement), and must reclaim
- * provably dead destinations rather than deterministically blocking every
- * new destination for the config's lifetime. */
-TEST(at_capacity_ledger_admits_replacement_and_reclaims_dead_destinations) {
+/* A full ledger still admits an exact destination replacement, but a
+ * genuinely new destination fails before active-state mutation even while a
+ * recorded repository is renamed away and later restored. */
+TEST(at_capacity_ledger_admits_replacement_and_rejects_renamed_reuse) {
     char home[MAX_PATH_LEN];
     char config_path[MAX_PATH_LEN];
     char state_path[MAX_PATH_LEN];
     char git_config_path[MAX_PATH_LEN];
-    char dead_repo[MAX_PATH_LEN];
+    char recorded_repo[MAX_PATH_LEN];
+    char recorded_repo_away[MAX_PATH_LEN];
     char *saved_home = NULL;
     const char *home_before = getenv("HOME");
     gitswitch_ctx_t ctx;
     publication_record_t record;
+    publication_record_t recorded_probe;
     publication_record_t probe;
     publication_ledger_t ledger;
     config_resume_hint_snapshot_t snapshot = {0};
+    unsigned char *before = NULL;
+    unsigned char *after = NULL;
+    unsigned char *model_before = NULL;
+    unsigned char *model_after = NULL;
+    size_t before_length = 0U;
+    size_t after_length = 0U;
+    size_t model_before_length = 0U;
+    size_t model_after_length = 0U;
     struct stat home_stat;
     struct stat repo_stat;
     bool installed = false;
@@ -3060,18 +3758,22 @@ TEST(at_capacity_ledger_admits_replacement_and_reclaims_dead_destinations) {
     fill_active_context(&ctx);
     CHECK_EQ_INT(config_save(&ctx, config_path), 0);
     CHECK_EQ_INT(stat(home, &home_stat), 0);
-    CHECK_EQ_INT(join_path(dead_repo, sizeof(dead_repo), home,
-                           "doomed-repository"), 0);
-    CHECK_EQ_INT(mkdir(dead_repo, 0700), 0);
-    CHECK_EQ_INT(stat(dead_repo, &repo_stat), 0);
+    CHECK_EQ_INT(join_path(recorded_repo, sizeof(recorded_repo), home,
+                           "recorded-repository"), 0);
+    CHECK_EQ_INT(join_path(recorded_repo_away,
+                           sizeof(recorded_repo_away), home,
+                           "recorded-repository-away"), 0);
+    CHECK_EQ_INT(mkdir(recorded_repo, 0700), 0);
+    CHECK_EQ_INT(stat(recorded_repo, &repo_stat), 0);
 
-    /* Record 0 is a local destination in a repository that will later be
-     * deleted; records 1..127 are live global destinations under HOME. */
-    fill_gpg_record(&record, dead_repo, FINGERPRINT_A);
+    /* Record 0 is a local destination whose repository will be renamed;
+     * records 1..127 are global destinations under HOME. */
+    fill_gpg_record(&record, recorded_repo, FINGERPRINT_A);
     CHECK_EQ_INT(safe_snprintf(record.config_path,
                                sizeof(record.config_path),
-                               "%s/.git/config", dead_repo), 0);
+                               "%s/.git/config", recorded_repo), 0);
     publication_identity_from_stat(&record.repository, &repo_stat);
+    recorded_probe = record;
     CHECK_EQ_INT(config_resume_hint_snapshot_capture(&snapshot), 0);
     installed = false;
     CHECK_EQ_INT(
@@ -3107,30 +3809,13 @@ TEST(at_capacity_ledger_admits_replacement_and_reclaims_dead_destinations) {
     CHECK_EQ_INT(config_publication_preflight(config_path), -1);
     CHECK_EQ_INT(errno, ENOSPC);
 
-    /* A destination that already has a record is a replacement. */
+    /* A destination that already has a record remains capacity-neutral through
+     * both preflight and durable save. */
     CHECK_EQ_INT(join_path(git_config_path, sizeof(git_config_path), home,
                            "global-005.gitconfig"), 0);
     fill_global_gpg_record(&probe, UINT32_C(41), git_config_path,
-                           FINGERPRINT_A);
+                           FINGERPRINT_B);
     publication_identity_from_stat(&probe.config_parent, &home_stat);
-    CHECK_EQ_INT(config_publication_preflight_destination(
-                     config_path, &probe), 0);
-
-    /* A genuinely new destination is still refused while every recorded
-     * destination remains alive... */
-    CHECK_EQ_INT(join_path(git_config_path, sizeof(git_config_path), home,
-                           "global-new.gitconfig"), 0);
-    fill_global_gpg_record(&probe, UINT32_C(41), git_config_path,
-                           FINGERPRINT_A);
-    publication_identity_from_stat(&probe.config_parent, &home_stat);
-    errno = 0;
-    CHECK_EQ_INT(config_publication_preflight_destination(
-                     config_path, &probe), -1);
-    CHECK_EQ_INT(errno, ENOSPC);
-
-    /* ...but once a recorded repository is provably gone, both the
-     * preflight and the durable save reclaim it. */
-    CHECK_EQ_INT(rmdir(dead_repo), 0);
     CHECK_EQ_INT(config_publication_preflight_destination(
                      config_path, &probe), 0);
     record = probe;
@@ -3145,12 +3830,67 @@ TEST(at_capacity_ledger_admits_replacement_and_reclaims_dead_destinations) {
     CHECK_EQ_INT(config_load_publication_ledger(config_path, &ledger), 0);
     CHECK_EQ_INT((long)ledger.count,
                  (long)PUBLICATION_LEDGER_MAX_RECORDS);
-    CHECK(publication_ledger_destination_present(&ledger, &probe));
-    for (size_t i = 0U; i < ledger.count; i++) {
-        CHECK(strstr(ledger.records[i].repository_path,
-                     "doomed-repository") == NULL);
-    }
     publication_ledger_clear(&ledger);
+
+    /* A genuinely new destination is still refused while every recorded
+     * destination remains alive... */
+    CHECK_EQ_INT(join_path(git_config_path, sizeof(git_config_path), home,
+                           "global-new.gitconfig"), 0);
+    fill_global_gpg_record(&probe, UINT32_C(41), git_config_path,
+                           FINGERPRINT_A);
+    publication_identity_from_stat(&probe.config_parent, &home_stat);
+    errno = 0;
+    CHECK_EQ_INT(config_publication_preflight_destination(
+                     config_path, &probe), -1);
+    CHECK_EQ_INT(errno, ENOSPC);
+
+    /* Rename-away is observationally identical to deletion. Capacity remains
+     * exhausted, and the durable save must preserve the exact state bytes. */
+    CHECK_EQ_INT(read_file_alloc(state_path, &before, &before_length), 0);
+    CHECK_EQ_INT(rename(recorded_repo, recorded_repo_away), 0);
+    errno = 0;
+    CHECK_EQ_INT(config_publication_preflight_destination(
+                     config_path, &probe), -1);
+    CHECK_EQ_INT(errno, ENOSPC);
+    record = probe;
+    CHECK_EQ_INT(config_resume_hint_snapshot_capture(&snapshot), 0);
+    installed = true;
+    errno = 0;
+    CHECK_EQ_INT(
+        config_save_active_account_publication_transactional_guarded(
+            &ctx, config_path, &record, &installed, &snapshot), -1);
+    CHECK(!installed);
+    CHECK_EQ_INT(errno, ENOSPC);
+    config_resume_hint_snapshot_clear(&snapshot);
+    CHECK_EQ_INT(read_file_alloc(state_path, &after, &after_length), 0);
+    CHECK_EQ_INT((long)after_length, (long)before_length);
+    CHECK(before && after &&
+          memcmp(before, after, before_length) == 0);
+    publication_ledger_init(&ledger);
+    CHECK_EQ_INT(config_load_publication_ledger(config_path, &ledger), 0);
+    CHECK_EQ_INT((long)ledger.count,
+                 (long)PUBLICATION_LEDGER_MAX_RECORDS);
+    CHECK(publication_ledger_destination_present(&ledger, &recorded_probe));
+    CHECK(!publication_ledger_destination_present(&ledger, &probe));
+    CHECK_EQ_INT(publication_ledger_serialize(
+                     &ledger, &model_before, &model_before_length), 0);
+    errno = 0;
+    CHECK_EQ_INT(publication_ledger_upsert(&ledger, &probe), -1);
+    CHECK_EQ_INT(errno, ENOSPC);
+    CHECK_EQ_INT((long)ledger.count,
+                 (long)PUBLICATION_LEDGER_MAX_RECORDS);
+    CHECK_EQ_INT(publication_ledger_serialize(
+                     &ledger, &model_after, &model_after_length), 0);
+    CHECK_EQ_INT((long)model_after_length, (long)model_before_length);
+    CHECK(model_before && model_after &&
+          memcmp(model_before, model_after, model_before_length) == 0);
+    publication_ledger_clear(&ledger);
+    CHECK_EQ_INT(rename(recorded_repo_away, recorded_repo), 0);
+
+    free(model_after);
+    free(model_before);
+    free(after);
+    free(before);
 
     if (saved_home) {
         CHECK_EQ_INT(setenv("HOME", saved_home, 1), 0);
@@ -3182,6 +3922,11 @@ TEST_MAIN_BEGIN()
     RUN_TEST(identity_parser_rejects_malformed_overflow_and_noncanonical_numbers);
     RUN_TEST(serializer_rejects_duplicate_publication_destinations);
     RUN_TEST(upsert_replaces_only_the_exact_publication_destination);
+    RUN_TEST(destination_aliases_share_one_canonical_upsert_lookup_and_live_key);
+    RUN_TEST(absent_config_leaf_uses_anchored_parent_but_conflicts_stay_unresolved);
+    RUN_TEST(offline_destination_spellings_round_trip_without_ancestry_rewrite);
+    RUN_TEST(alias_duplicate_destinations_fail_closed_in_serializer_and_parser);
+    RUN_TEST(upsert_rejects_offline_aliases_that_converge_without_model_mutation);
     RUN_TEST(guarded_publication_clears_install_state_before_input_validation);
     RUN_TEST(guarded_publication_requires_the_exact_live_active_incarnation);
     RUN_TEST(guarded_publication_preserves_intervening_writer_generation);
@@ -3192,9 +3937,10 @@ TEST_MAIN_BEGIN()
     RUN_TEST(malformed_publication_never_falls_back_to_legacy_ssh_retirement);
     RUN_TEST(same_numeric_id_different_incarnation_is_never_live_publication_owner);
     RUN_TEST(removed_account_publication_reserves_recycled_id_without_git_mutation);
-    RUN_TEST(reclaim_absent_drops_only_provably_dead_published_records);
-    RUN_TEST(config_parent_anchor_is_dead_on_dir_ancestor_but_fails_closed_on_nondir);
+    RUN_TEST(present_empty_ledger_serializes_canonically_with_tiny_allocation);
+    RUN_TEST(reclaim_keeps_the_single_final_v1_record_canonical);
+    RUN_TEST(reclamation_keeps_renamed_published_and_retiring_destinations);
     RUN_TEST(ledger_parse_rejects_l16_l17_grammar_tightenings);
-    RUN_TEST(reclaim_absent_drops_local_record_after_in_place_git_rebuild);
-    RUN_TEST(at_capacity_ledger_admits_replacement_and_reclaims_dead_destinations);
+    RUN_TEST(ledger_parse_distinguishes_bad_end_marker_from_trailing_bytes);
+    RUN_TEST(at_capacity_ledger_admits_replacement_and_rejects_renamed_reuse);
 TEST_MAIN_END()
