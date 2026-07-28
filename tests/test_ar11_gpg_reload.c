@@ -153,6 +153,10 @@ static bool g_text_publisher_open;
 static int g_text_postclose_mutation_limit;
 static int g_text_postclose_mutation_applications;
 static bool g_text_postclose_observed_closed;
+static char g_hosted_tools_dir[MAX_PATH_LEN];
+static m20_saved_env_t g_hosted_tools_path;
+static bool g_hosted_tools_path_saved;
+static bool g_hosted_tools_active;
 
 static m20_saved_env_t m20_save_env(const char *name) {
     const char *value = getenv(name);
@@ -176,6 +180,174 @@ static int m20_restore_env(const char *name, m20_saved_env_t *saved) {
     saved->value = NULL;
     saved->present = false;
     return rc;
+}
+
+/* Production deliberately rejects package-manager executables below a
+ * group/world-writable ancestor. Hosted Darwin installs GnuPG below such a
+ * Homebrew prefix, so relocate the already-provisioned suite into the same
+ * private trusted fixture class used by the other real-runtime tests. The
+ * original paths are byte sources only and are never launched here. */
+static int m20_find_provisioned_tool(const char *name, char *output,
+                                     size_t output_size) {
+    const char *path = getenv("PATH");
+    const char *cursor;
+    size_t name_len;
+
+    if (!name || !*name || !output || output_size == 0U) {
+        errno = EINVAL;
+        return -1;
+    }
+    if (!path) {
+        errno = ENOENT;
+        return -1;
+    }
+    name_len = strlen(name);
+    cursor = path;
+    while (true) {
+        const char *separator = strchr(cursor, ':');
+        size_t directory_len = separator
+                                   ? (size_t)(separator - cursor)
+                                   : strlen(cursor);
+
+        if (directory_len > 0U &&
+            directory_len <= SIZE_MAX - name_len - 2U &&
+            directory_len + name_len + 2U <= MAX_PATH_LEN) {
+            char candidate[MAX_PATH_LEN];
+            char resolved[MAX_PATH_LEN];
+            struct stat st;
+
+            memcpy(candidate, cursor, directory_len);
+            candidate[directory_len] = '/';
+            memcpy(candidate + directory_len + 1U, name, name_len + 1U);
+            if (realpath(candidate, resolved) &&
+                stat(resolved, &st) == 0 && S_ISREG(st.st_mode) &&
+                (st.st_mode & (S_IXUSR | S_IXGRP | S_IXOTH)) != 0 &&
+                access(resolved, X_OK) == 0 &&
+                safe_strncpy(output, resolved, output_size) == 0) {
+                return 0;
+            }
+        }
+        if (!separator) break;
+        cursor = separator + 1;
+    }
+    errno = ENOENT;
+    return -1;
+}
+
+static int m20_restore_hosted_tools(void) {
+    int saved_errno = 0;
+
+    if (g_hosted_tools_path_saved &&
+        m20_restore_env("PATH", &g_hosted_tools_path) != 0) {
+        saved_errno = errno ? errno : EIO;
+    }
+    g_hosted_tools_path_saved = false;
+    g_hosted_tools_active = false;
+    if (g_hosted_tools_dir[0] != '\0') {
+        if (ts_cleanup_tracked_tmpdir(g_hosted_tools_dir) != 0 &&
+            errno != ENOENT && saved_errno == 0) {
+            saved_errno = errno ? errno : EIO;
+        }
+        g_hosted_tools_dir[0] = '\0';
+    }
+    if (saved_errno != 0) {
+        errno = saved_errno;
+        return -1;
+    }
+    return 0;
+}
+
+static int m20_prepend_hosted_tools_path(void) {
+    const char *path = getenv("PATH");
+    size_t directory_len = strlen(g_hosted_tools_dir);
+    size_t path_len = path ? strlen(path) : 0U;
+    size_t combined_size;
+    char *combined;
+    int rc;
+
+    if (directory_len == 0U ||
+        path_len > SIZE_MAX - directory_len - 2U) {
+        errno = directory_len == 0U ? EINVAL : EOVERFLOW;
+        return -1;
+    }
+    combined_size =
+        directory_len + (path_len > 0U ? path_len + 1U : 0U) + 1U;
+    combined = malloc(combined_size);
+    if (!combined) return -1;
+    memcpy(combined, g_hosted_tools_dir, directory_len);
+    if (path_len > 0U) {
+        combined[directory_len] = ':';
+        memcpy(combined + directory_len + 1U, path, path_len + 1U);
+    } else {
+        combined[directory_len] = '\0';
+    }
+    rc = setenv("PATH", combined, 1);
+    free(combined);
+    return rc;
+}
+
+/* Return 0 when trusted tools are ready, 1 when no provisioned suite exists,
+ * and -1 for a fixture failure. A relocated suite remains active for this
+ * process so every deterministic transaction observes one stable generation. */
+static int m20_prepare_hosted_tools(void) {
+    static const char *const names[] = {
+        "gpg", "gpgconf", "gpg-connect-agent"
+    };
+    char sources[3][MAX_PATH_LEN];
+    char destination[MAX_PATH_LEN];
+    char resolved[MAX_PATH_LEN];
+
+    if (find_command_path(names[0], resolved, sizeof(resolved)) == 0 &&
+        find_command_path(names[1], resolved, sizeof(resolved)) == 0 &&
+        find_command_path(names[2], resolved, sizeof(resolved)) == 0) {
+        return 0;
+    }
+    for (size_t i = 0; i < 3U; i++) {
+        if (m20_find_provisioned_tool(
+                names[i], sources[i], sizeof(sources[i])) != 0) {
+            return errno == ENOENT ? 1 : -1;
+        }
+    }
+    g_hosted_tools_path = m20_save_env("PATH");
+    if (g_hosted_tools_path.present && !g_hosted_tools_path.value) {
+        errno = ENOMEM;
+        return -1;
+    }
+    g_hosted_tools_path_saved = true;
+    if (!ts_mkdtemp_trusted(
+            g_hosted_tools_dir, sizeof(g_hosted_tools_dir),
+            "gitswitch-ar11-reload-tools")) {
+        goto fail;
+    }
+    for (size_t i = 0; i < 3U; i++) {
+        if (safe_snprintf(destination, sizeof(destination), "%s/%s",
+                          g_hosted_tools_dir, names[i]) != 0 ||
+            copy_file(sources[i], destination) != 0 ||
+            chmod(destination, 0700) != 0) {
+            goto fail;
+        }
+    }
+    if (m20_prepend_hosted_tools_path() != 0) goto fail;
+    g_hosted_tools_active = true;
+    for (size_t i = 0; i < 3U; i++) {
+        if (safe_snprintf(destination, sizeof(destination), "%s/%s",
+                          g_hosted_tools_dir, names[i]) != 0 ||
+            find_command_path(names[i], resolved, sizeof(resolved)) != 0 ||
+            strcmp(resolved, destination) != 0) {
+            errno = errno ? errno : ENOEXEC;
+            goto fail;
+        }
+    }
+    return 0;
+
+fail:
+    {
+        int saved_errno = errno ? errno : EIO;
+
+        (void)m20_restore_hosted_tools();
+        errno = saved_errno;
+        return -1;
+    }
 }
 
 static const char *m20_extra_env(const run_opts_t *opts,
@@ -573,6 +745,7 @@ static int m20_private_text_postclose_hook(const char *path, int proof_fd) {
 
 static int m20_capture_private_text(const char *path, const char *expected,
                                     struct stat *identity) {
+    enum { M20_PRIVATE_TEXT_MAX = 96 * 1024 };
     char parent[MAX_PATH_LEN];
     const char *leaf;
     struct stat named_before;
@@ -582,7 +755,7 @@ static int m20_capture_private_text(const char *path, const char *expected,
     struct stat named_after;
     size_t expected_length;
     size_t used = 0;
-    char buffer[512];
+    char *buffer = NULL;
     unsigned char extra;
     int parent_fd = -1;
     int fd = -1;
@@ -594,13 +767,18 @@ static int m20_capture_private_text(const char *path, const char *expected,
         return -1;
     }
     expected_length = strlen(expected);
-    if (expected_length > sizeof(buffer) ||
+    if (expected_length > M20_PRIVATE_TEXT_MAX ||
         m20_split_private_path(path, parent, sizeof(parent), &leaf) != 0) {
-        if (expected_length > sizeof(buffer)) errno = EOVERFLOW;
+        if (expected_length > M20_PRIVATE_TEXT_MAX) errno = EOVERFLOW;
         return -1;
     }
+    buffer = malloc(expected_length > 0U ? expected_length : 1U);
+    if (!buffer) return -1;
     parent_fd = m20_open_private_directory(parent);
-    if (parent_fd < 0) return -1;
+    if (parent_fd < 0) {
+        saved_errno = errno;
+        goto out;
+    }
     if (fstatat(parent_fd, leaf, &named_before,
                 AT_SYMLINK_NOFOLLOW) != 0) {
         saved_errno = errno;
@@ -700,10 +878,12 @@ out:
         saved_errno = errno;
     }
     if (saved_errno != 0) {
+        free(buffer);
         errno = saved_errno;
         return -1;
     }
     *identity = named_after;
+    free(buffer);
     return 0;
 }
 
@@ -1541,6 +1721,15 @@ static int m20_observe_external_reload(const m20_fixture_t *fixture,
 static int m20_real_recording_runner(const char *const argv[],
                                      const run_opts_t *opts,
                                      run_result_t *result) {
+    if (g_hosted_tools_active && argv && argv[0] && argv[1] &&
+        !argv[2] && strcmp(argv[0], g_expected_gpgconf) == 0 &&
+        strcmp(argv[1], "--list-components") == 0) {
+        /* The relocated gpgconf retains its package-prefix metadata. The
+         * deterministic cases already validate parsing and suite matching;
+         * this live case substitutes only the relocated sibling spelling,
+         * then executes the real copied gpgconf for the reload itself. */
+        return m20_runner(argv, opts, result);
+    }
     if (m20_reload_shape_is_exact(argv)) g_live_reload_calls++;
     return run_argv_real(argv, opts, result);
 }
@@ -5431,7 +5620,30 @@ TEST(private_text_publication_continuous_drift_is_bounded) {
     ts_rm_rf(directory);
 }
 
+TEST(private_text_publication_accepts_clean_state_sized_records) {
+    char directory[MAX_PATH_LEN];
+    char path[MAX_PATH_LEN];
+    char text[1025];
+    struct stat identity;
+
+    memset(text, 'x', sizeof(text) - 1U);
+    text[sizeof(text) - 1U] = '\0';
+    CHECK(ts_mkdtemp_trusted(directory, sizeof(directory),
+                            "gitswitch-ar11-private-text"));
+    CHECK_EQ_INT(chmod(directory, 0700), 0);
+    CHECK_EQ_INT(safe_snprintf(path, sizeof(path), "%s/config",
+                               directory), 0);
+    m20_reset_text_settle_seam(0);
+    CHECK_EQ_INT(m20_publish_private_text(path, text), 0);
+    CHECK_EQ_INT(m20_capture_private_text(path, text, &identity), 0);
+    CHECK_EQ_INT(identity.st_size, (off_t)(sizeof(text) - 1U));
+    ts_rm_rf(directory);
+}
+
 int main(int argc, char **argv) {
+    int tools_rc;
+    int result;
+
     (void)argv;
     (void)unsetenv("GNUPGHOME");
     if (argc != 1) {
@@ -5440,9 +5652,16 @@ int main(int argc, char **argv) {
         return 2;
     }
     error_init(LOG_LEVEL_ERROR, NULL);
+    tools_rc = m20_prepare_hosted_tools();
+    if (tools_rc != 0) {
+        fprintf(stderr,
+                "test_ar11_gpg_reload: cannot prepare trusted GnuPG suite\n");
+        return 2;
+    }
     RUN_TEST(private_text_publication_settles_four_closed_successors);
     RUN_TEST(private_text_publication_binds_postclose_successor);
     RUN_TEST(private_text_publication_continuous_drift_is_bounded);
+    RUN_TEST(private_text_publication_accepts_clean_state_sized_records);
     RUN_TEST(changed_and_unchanged_config_reload_is_exactly_once);
     RUN_TEST(reload_failure_prevents_activation_and_identity_publication);
     RUN_TEST(config_write_failure_prevents_activation_and_identity_publication);
@@ -5510,5 +5729,11 @@ int main(int argc, char **argv) {
     RUN_TEST(clean_state_is_invalidated_by_transaction_gpg_generation_change);
     RUN_TEST(toolchain_epoch_change_after_reload_is_rejected_before_publication);
     RUN_TEST(changed_config_is_observed_by_the_retained_live_agent);
-    return ts_test_finish();
+    result = ts_test_finish();
+    if (m20_restore_hosted_tools() != 0) {
+        fprintf(stderr,
+                "test_ar11_gpg_reload: cannot restore hosted GnuPG fixture\n");
+        return 2;
+    }
+    return result;
 }
