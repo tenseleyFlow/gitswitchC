@@ -74,6 +74,7 @@ typedef struct {
     saved_env_t ssh_command_env;
     saved_env_t ssh_env;
     saved_env_t trace_env;
+    pid_t creator_pid;
     bool initialized;
 } git_fixture_t;
 
@@ -167,6 +168,7 @@ static int run_git(const char *const argv[]) {
 
 static bool fixture_init(git_fixture_t *fixture) {
     memset(fixture, 0, sizeof(*fixture));
+    fixture->creator_pid = getpid();
     fixture->home_env = save_env("HOME");
     fixture->xdg_env = save_env("XDG_CONFIG_HOME");
     fixture->global_env = save_env("GIT_CONFIG_GLOBAL");
@@ -218,6 +220,9 @@ static bool fixture_init(git_fixture_t *fixture) {
 }
 
 static void fixture_cleanup(git_fixture_t *fixture) {
+    bool require_tracked_release =
+        fixture->initialized && fixture->creator_pid == getpid();
+
     git_ops_test_reset_caches();
     if (fixture->saved_cwd[0] != '\0' && chdir(fixture->saved_cwd) != 0) {
         perror("restore test working directory");
@@ -233,6 +238,10 @@ static void fixture_cleanup(git_fixture_t *fixture) {
     restore_env("GIT_CONFIG_GLOBAL", &fixture->global_env);
     restore_env("XDG_CONFIG_HOME", &fixture->xdg_env);
     restore_env("HOME", &fixture->home_env);
+    if (fixture->creator_pid == getpid() && fixture->base[0] != '\0') {
+        int cleanup_rc = ts_cleanup_tracked_tmpdir(fixture->base);
+        if (require_tracked_release) CHECK_EQ_INT(cleanup_rc, 0);
+    }
     fixture->initialized = false;
 }
 
