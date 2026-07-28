@@ -12,7 +12,9 @@
  *
  * External commands are intercepted with the recording-runner pattern from
  * test_security.c; the runtime symlinks live under a private fake
- * XDG_RUNTIME_DIR so no real agents are involved. */
+ * XDG_RUNTIME_DIR. Darwin's launch fixture uses a minimal protocol-capable
+ * child because its peer-credential proof intentionally requires a valid
+ * SSH-agent identity exchange; all key and Git commands remain intercepted. */
 
 /* Enable POSIX extensions for mkdtemp/symlink/fork. glibc-only: on macOS and
  * the BSDs the strict macros hide default-namespace declarations (mkdtemp,
@@ -38,6 +40,7 @@
 #include <dirent.h>
 #include <signal.h>
 #include <fcntl.h>
+#include <poll.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -46,7 +49,13 @@
 #include <sys/types.h>
 #include <sys/un.h>
 #include <sys/wait.h>
+#include <time.h>
 #include <unistd.h>
+
+#if defined(__APPLE__) || \
+    defined(GITSWITCH_TEST_FORCE_PROTOCOL_AGENT_FIXTURE)
+#define USE_PROTOCOL_AGENT_FIXTURE 1
+#endif
 
 /* ---- fake runtime dir ---------------------------------------------------- */
 
@@ -60,6 +69,11 @@ static bool g_gpg_saved_path_present;
 static bool g_gpg_command_fixture_active;
 static bool g_host_gpg_available;
 static int g_fake_agent_listener = -1;
+#ifdef USE_PROTOCOL_AGENT_FIXTURE
+static int g_fake_agent_control_fd = -1;
+static pid_t g_fake_agent_server_pid = -1;
+static pid_t g_fake_agent_server_owner = -1;
+#endif
 static gitswitch_ctx_t *g_finalizing_observer_ctx;
 static bool g_finalizing_phase_observed;
 
@@ -85,6 +99,35 @@ static void close_fake_agent_listener(void) {
         close(g_fake_agent_listener);
         g_fake_agent_listener = -1;
     }
+#ifdef USE_PROTOCOL_AGENT_FIXTURE
+    if (g_fake_agent_control_fd >= 0) {
+        close(g_fake_agent_control_fd);
+        g_fake_agent_control_fd = -1;
+    }
+    if (g_fake_agent_server_pid > 0 &&
+        g_fake_agent_server_owner == getpid()) {
+        static const struct timespec pause = {
+            .tv_sec = 0, .tv_nsec = 1000000L
+        };
+        int status;
+        pid_t waited = 0;
+
+        for (int attempt = 0; attempt < 500 && waited == 0; attempt++) {
+            do {
+                waited = waitpid(g_fake_agent_server_pid, &status, WNOHANG);
+            } while (waited < 0 && errno == EINTR);
+            if (waited == 0) (void)nanosleep(&pause, NULL);
+        }
+        if (waited == 0 || (waited < 0 && errno != ECHILD)) {
+            (void)kill(g_fake_agent_server_pid, SIGKILL);
+            do {
+                waited = waitpid(g_fake_agent_server_pid, &status, 0);
+            } while (waited < 0 && errno == EINTR);
+        }
+    }
+    g_fake_agent_server_pid = -1;
+    g_fake_agent_server_owner = -1;
+#endif
 }
 
 /* Create a fresh fake XDG_RUNTIME_DIR holding the pre-switch runtime state of
@@ -939,6 +982,7 @@ static int certify_agent_launch(const char *path, run_result_t *result) {
 
 /* Bind and retain a real listening 0600 unix socket so both inode validation
  * and the kernel-authenticated peer probe see a live fake agent endpoint. */
+#ifndef USE_PROTOCOL_AGENT_FIXTURE
 static int bind_fake_agent_socket(const char *path) {
     struct sockaddr_un addr;
     int fd = socket(AF_UNIX, SOCK_STREAM, 0);
@@ -962,9 +1006,231 @@ static int bind_fake_agent_socket(const char *path) {
     g_fake_agent_listener = fd;
     return 0;
 }
+#else
+static int fixture_set_cloexec(int fd) {
+    int flags = fcntl(fd, F_GETFD);
+
+    return flags >= 0 && fcntl(fd, F_SETFD, flags | FD_CLOEXEC) == 0 ? 0 : -1;
+}
+
+static int fixture_pipe(int descriptors[2]) {
+    if (pipe(descriptors) != 0) return -1;
+    if (fixture_set_cloexec(descriptors[0]) != 0 ||
+        fixture_set_cloexec(descriptors[1]) != 0) {
+        int saved_errno = errno;
+
+        close(descriptors[0]);
+        close(descriptors[1]);
+        descriptors[0] = -1;
+        descriptors[1] = -1;
+        errno = saved_errno;
+        return -1;
+    }
+    return 0;
+}
+
+/* Return 1 for a complete read, 0 when the owner/control connection closes,
+ * and -1 for a client I/O failure. */
+static int fixture_agent_read_exact(int client_fd, int control_fd,
+                                    unsigned char *buffer, size_t length) {
+    size_t offset = 0;
+
+    while (offset < length) {
+        struct pollfd descriptors[2] = {
+            {.fd = client_fd, .events = POLLIN},
+            {.fd = control_fd, .events = POLLIN}
+        };
+        int poll_rc;
+
+        do {
+            poll_rc = poll(descriptors, 2, -1);
+        } while (poll_rc < 0 && errno == EINTR);
+        if (poll_rc < 0) return -1;
+        if (descriptors[1].revents != 0) return 0;
+        if ((descriptors[0].revents & (POLLERR | POLLNVAL)) != 0) return -1;
+        if ((descriptors[0].revents & POLLIN) != 0) {
+            ssize_t count;
+
+            do {
+                count = read(client_fd, buffer + offset, length - offset);
+            } while (count < 0 && errno == EINTR);
+            if (count <= 0) return count == 0 ? 0 : -1;
+            offset += (size_t)count;
+        } else if ((descriptors[0].revents & POLLHUP) != 0) {
+            return 0;
+        }
+    }
+    return 1;
+}
+
+static int fixture_agent_write_all(int fd, const unsigned char *buffer,
+                                   size_t length) {
+    size_t offset = 0;
+
+    while (offset < length) {
+        ssize_t count;
+
+        do {
+            count = write(fd, buffer + offset, length - offset);
+        } while (count < 0 && errno == EINTR);
+        if (count <= 0) return -1;
+        offset += (size_t)count;
+    }
+    return 0;
+}
+
+static int fixture_agent_serve_client(int client_fd, int control_fd) {
+    static const unsigned char identities_answer[] = {
+        0, 0, 0, 5, 12, 0, 0, 0, 0
+    };
+    static const unsigned char success_answer[] = {0, 0, 0, 1, 6};
+    static const unsigned char failure_answer[] = {0, 0, 0, 1, 5};
+    unsigned char header[4];
+    unsigned char request[256];
+
+    for (;;) {
+        uint32_t length;
+        int read_rc =
+            fixture_agent_read_exact(client_fd, control_fd, header,
+                                     sizeof(header));
+        if (read_rc <= 0) return read_rc;
+        length = ((uint32_t)header[0] << 24) |
+                 ((uint32_t)header[1] << 16) |
+                 ((uint32_t)header[2] << 8) |
+                 (uint32_t)header[3];
+        if (length == 0U || length > sizeof(request)) return -1;
+        read_rc = fixture_agent_read_exact(client_fd, control_fd, request,
+                                           (size_t)length);
+        if (read_rc <= 0) return read_rc;
+        if (length == 1U && request[0] == 11U) {
+            if (fixture_agent_write_all(
+                    client_fd, identities_answer,
+                    sizeof(identities_answer)) != 0) {
+                return -1;
+            }
+        } else if (length == 1U && request[0] == 19U) {
+            if (fixture_agent_write_all(
+                    client_fd, success_answer,
+                    sizeof(success_answer)) != 0) {
+                return -1;
+            }
+        } else if (fixture_agent_write_all(
+                       client_fd, failure_answer,
+                       sizeof(failure_answer)) != 0) {
+            return -1;
+        }
+    }
+}
+
+static void fixture_agent_server_main(const char *path, int cwd_fd,
+                                      int ready_fd, int control_fd) {
+    struct sockaddr_un addr;
+    int listener = -1;
+    char ready = 'E';
+
+    (void)signal(SIGPIPE, SIG_IGN);
+    if (cwd_fd >= 0 && fchdir(cwd_fd) != 0) goto ready;
+    listener = socket(AF_UNIX, SOCK_STREAM, 0);
+    if (listener < 0 || fixture_set_cloexec(listener) != 0 ||
+        strlen(path) >= sizeof(addr.sun_path)) {
+        goto ready;
+    }
+    memset(&addr, 0, sizeof(addr));
+    addr.sun_family = AF_UNIX;
+    strcpy(addr.sun_path, path);
+    if (bind(listener, (struct sockaddr *)&addr, sizeof(addr)) != 0 ||
+        listen(listener, 8) != 0 || chmod(path, 0600) != 0) {
+        goto ready;
+    }
+    ready = 'R';
+ready:
+    if (write(ready_fd, &ready, 1) != 1 || close(ready_fd) != 0 ||
+        ready != 'R') {
+        if (listener >= 0) close(listener);
+        close(control_fd);
+        _exit(1);
+    }
+    for (;;) {
+        struct pollfd descriptors[2] = {
+            {.fd = listener, .events = POLLIN},
+            {.fd = control_fd, .events = POLLIN}
+        };
+        int poll_rc;
+
+        do {
+            poll_rc = poll(descriptors, 2, -1);
+        } while (poll_rc < 0 && errno == EINTR);
+        if (poll_rc < 0 || descriptors[1].revents != 0) break;
+        if ((descriptors[0].revents & POLLIN) != 0) {
+            int client_fd;
+
+            do {
+                client_fd = accept(listener, NULL, NULL);
+            } while (client_fd < 0 && errno == EINTR);
+            if (client_fd >= 0) {
+                (void)fixture_set_cloexec(client_fd);
+                (void)fixture_agent_serve_client(client_fd, control_fd);
+                close(client_fd);
+            }
+        }
+    }
+    close(listener);
+    close(control_fd);
+    _exit(0);
+}
+#endif
 
 static int bind_fake_agent_socket_for_runner(const char *path,
                                              const run_opts_t *opts) {
+#ifdef USE_PROTOCOL_AGENT_FIXTURE
+    int ready_pipe[2] = {-1, -1};
+    int control_pipe[2] = {-1, -1};
+    int cwd_fd = opts && opts->use_cwd_fd ? opts->cwd_fd : -1;
+    pid_t server_pid;
+    char ready = '\0';
+    ssize_t count;
+
+    close_fake_agent_listener();
+    if (fixture_pipe(ready_pipe) != 0 ||
+        fixture_pipe(control_pipe) != 0) {
+        if (ready_pipe[0] >= 0) close(ready_pipe[0]);
+        if (ready_pipe[1] >= 0) close(ready_pipe[1]);
+        return -1;
+    }
+    server_pid = fork();
+    if (server_pid < 0) {
+        close(ready_pipe[0]);
+        close(ready_pipe[1]);
+        close(control_pipe[0]);
+        close(control_pipe[1]);
+        return -1;
+    }
+    if (server_pid == 0) {
+        close(ready_pipe[0]);
+        close(control_pipe[1]);
+        fixture_agent_server_main(path, cwd_fd, ready_pipe[1],
+                                  control_pipe[0]);
+    }
+    close(ready_pipe[1]);
+    close(control_pipe[0]);
+    do {
+        count = read(ready_pipe[0], &ready, 1);
+    } while (count < 0 && errno == EINTR);
+    close(ready_pipe[0]);
+    if (count != 1 || ready != 'R') {
+        int status;
+
+        close(control_pipe[1]);
+        do {
+            count = waitpid(server_pid, &status, 0);
+        } while (count < 0 && errno == EINTR);
+        return -1;
+    }
+    g_fake_agent_control_fd = control_pipe[1];
+    g_fake_agent_server_pid = server_pid;
+    g_fake_agent_server_owner = getpid();
+    return 0;
+#else
     int saved_cwd;
     int rc;
 
@@ -980,6 +1246,7 @@ static int bind_fake_agent_socket_for_runner(const char *path,
     if (fchdir(saved_cwd) != 0) rc = -1;
     close(saved_cwd);
     return rc;
+#endif
 }
 
 /* Extends fake_runner with a working fake ssh-agent (binds the -a socket), a
@@ -1010,7 +1277,7 @@ static int capture_rollback_process_generation(
     return ssh_manager_test_capture_process_generation(pid, generation);
 }
 
-static int retire_fake_agent_pidfd_open(pid_t pid) {
+static int retire_fixture_agent_pidfd_open(pid_t pid) {
     if (pid == (pid_t)FAKE_AGENT_PID) {
         close_fake_agent_listener();
         errno = ESRCH;
@@ -6437,7 +6704,7 @@ TEST(sigint_mid_git_config_rolls_back_then_reraises) {
 TEST_MAIN_BEGIN()
     const ssh_reap_test_ops_t generation_ops = {
         .generation = capture_rollback_process_generation,
-        .pidfd_open = retire_fake_agent_pidfd_open,
+        .pidfd_open = retire_fixture_agent_pidfd_open,
     };
     ssh_reap_test_ops_t previous_reap_ops =
         ssh_manager_set_reap_test_ops(&generation_ops);
