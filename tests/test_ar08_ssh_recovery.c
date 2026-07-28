@@ -374,6 +374,17 @@ static int test_agent_write_exact(int fd, const void *buffer, size_t size) {
     return 0;
 }
 
+static void test_agent_wait_for_peer_close(int fd) {
+    unsigned char discarded[64];
+
+    for (;;) {
+        ssize_t n = read(fd, discarded, sizeof(discarded));
+        if (n > 0) continue;
+        if (n < 0 && errno == EINTR) continue;
+        return;
+    }
+}
+
 static int test_agent_read_request(int fd, unsigned char *type) {
     unsigned char frame[5];
 
@@ -423,7 +434,14 @@ static void test_agent_serve_connection(int fd, int trace_fd,
     switch (mode) {
         case TEST_AGENT_IDENTITIES_ONE:
             if (type == TEST_AGENT_REQUEST_IDENTITIES) {
-                (void)test_agent_write_identities(fd, true);
+                if (test_agent_write_identities(fd, true) == 0) {
+                    /* Darwin authenticates the socket peer again after the
+                     * protocol response. A real ssh-agent keeps this
+                     * connection open until its client closes it; doing the
+                     * same here prevents the post-response LOCAL_PEERPID
+                     * proof from racing a synthetic server exit. */
+                    test_agent_wait_for_peer_close(fd);
+                }
             }
             return;
         case TEST_AGENT_WRONG_TYPE: {
