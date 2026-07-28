@@ -58,7 +58,24 @@ static const ssh_process_generation_t g_test_generation = {
     .start_hi = 0,
     .start_lo = UINT64_C(0x2122232425262728)
 };
-static int g_runner_listener = -1;
+static pid_t g_runner_server_pid = -1;
+static int g_runner_server_trace_fd = -1;
+
+static void stop_runner_server(void) {
+    if (g_runner_server_pid > 1) {
+        int status;
+
+        (void)kill(g_runner_server_pid, SIGKILL);
+        while (waitpid(g_runner_server_pid, &status, 0) < 0 &&
+               errno == EINTR) {
+        }
+    }
+    if (g_runner_server_trace_fd >= 0) {
+        close(g_runner_server_trace_fd);
+    }
+    g_runner_server_pid = -1;
+    g_runner_server_trace_fd = -1;
+}
 
 static bool is_ssh_agent_command(const char *path) {
     const char *base;
@@ -198,10 +215,7 @@ static ssh_process_outcome_t reap_gone(const ssh_agent_record_t *record,
     (void)record;
     (void)socket_arg;
     (void)runtime_dir_fd;
-    if (g_runner_listener >= 0) {
-        close(g_runner_listener);
-        g_runner_listener = -1;
-    }
+    stop_runner_server();
     return SSH_PROCESS_GONE;
 }
 
@@ -2582,7 +2596,15 @@ TEST(stop_owned_bsd_endpoint_cleanup_failure_preserves_observable_retry_state) {
     CHECK_EQ_INT((int)trace_size, (int)sizeof(expected));
     CHECK(trace_size != sizeof(expected) ||
           memcmp(trace, expected, sizeof(expected)) == 0);
+    /* Darwin pins filesystem sockets with a private hard link because it has
+     * no O_PATH equivalent. The injected sidecar-unlink sync fails first;
+     * releasing that pin then performs its own successful directory sync.
+     * Descriptor-pin platforms have no namespace entry to retire. */
+#ifdef __APPLE__
+    CHECK_EQ_INT(g_stop_dirsync_calls, 2);
+#else
     CHECK_EQ_INT(g_stop_dirsync_calls, 1);
+#endif
     CHECK_EQ_INT(g_signal_calls, 0);
     CHECK_EQ_INT(g_term_calls, 0);
     CHECK_EQ_INT(g_kill_calls, 0);
@@ -3390,36 +3412,32 @@ static const char *runner_socket_arg(const char *const argv[]) {
 
 static int bind_runner_socket(const char *path, mode_t mode,
                               const run_opts_t *opts) {
-    struct sockaddr_un address;
+    test_agent_server_t server = {.pid = -1, .trace_fd = -1};
     int saved_cwd = -1;
-    int socket_fd = -1;
     int rc = -1;
 
-    if (!path || strlen(path) >= sizeof(address.sun_path)) return -1;
+    if (!path ||
+        strlen(path) >= sizeof(((struct sockaddr_un *)0)->sun_path)) {
+        return -1;
+    }
     if (opts && opts->use_cwd_fd) {
         saved_cwd = open(".", O_RDONLY | O_CLOEXEC);
         if (saved_cwd < 0 || fchdir(opts->cwd_fd) != 0) goto done;
     }
-    socket_fd = socket(AF_UNIX, SOCK_STREAM, 0);
-    if (socket_fd < 0) goto done;
-    if (g_runner_listener >= 0) {
-        close(g_runner_listener);
-        g_runner_listener = -1;
-    }
-    memset(&address, 0, sizeof(address));
-    address.sun_family = AF_UNIX;
-    memcpy(address.sun_path, path, strlen(path) + 1U);
-    if (bind(socket_fd, (struct sockaddr *)&address, sizeof(address)) != 0 ||
-        listen(socket_fd, 8) != 0 ||
-        chmod(path, mode) != 0) {
+    stop_runner_server();
+    if (start_test_agent_server(
+            path, TEST_AGENT_IDENTITIES_ONE, &server) != 0) {
         goto done;
     }
-    g_runner_listener = socket_fd;
-    socket_fd = -1;
+    g_runner_server_pid = server.pid;
+    g_runner_server_trace_fd = server.trace_fd;
+    if (chmod(path, mode) != 0) {
+        stop_runner_server();
+        goto done;
+    }
     rc = 0;
 
 done:
-    if (socket_fd >= 0) close(socket_fd);
     if (saved_cwd >= 0) {
         if (fchdir(saved_cwd) != 0) rc = -1;
         close(saved_cwd);
@@ -3428,10 +3446,7 @@ done:
 }
 
 static void make_runner_socket_stale(void) {
-    if (g_runner_listener >= 0) {
-        close(g_runner_listener);
-        g_runner_listener = -1;
-    }
+    stop_runner_server();
 }
 
 static bool is_key_fingerprint_command(const char *const argv[]) {
