@@ -55,7 +55,9 @@ typedef enum {
     GIT_RETIREMENT_TEST_AFTER_FREEBSD_AUTHORITY_PUBLISH,
     GIT_RETIREMENT_TEST_AFTER_FREEBSD_AUTHORITY_DIRECTORY_SYNC,
     GIT_RETIREMENT_TEST_AFTER_PRELOCK_WITNESS,
-    GIT_RETIREMENT_TEST_AFTER_STABLE_WITNESS_CLOSE
+    GIT_RETIREMENT_TEST_AFTER_STABLE_WITNESS_CLOSE,
+    GIT_RETIREMENT_TEST_AFTER_RESTORED_WITNESS_READ,
+    GIT_RETIREMENT_TEST_AFTER_FINAL_RESTORED_WITNESS_READ
 } git_retirement_test_stage_t;
 typedef bool (*git_retirement_test_hook_fn)(
     git_retirement_test_stage_t stage, const char *path,
@@ -173,7 +175,13 @@ typedef enum {
     AT_HOOK_PRELOCK_SAME_SIZE_REWRITE,
     AT_HOOK_STABLE_CLOSE_CTIME_ONCE,
     AT_HOOK_STABLE_CLOSE_CTIME_REPEATED,
-    AT_HOOK_STABLE_CLOSE_SAME_SIZE_REWRITE
+    AT_HOOK_STABLE_CLOSE_SAME_SIZE_REWRITE,
+    AT_HOOK_POST_READ_CTIME_ONCE,
+    AT_HOOK_POST_READ_CTIME_REPEATED,
+    AT_HOOK_POST_READ_SAME_SIZE_REWRITE,
+    AT_HOOK_FINAL_READ_CTIME_ONCE,
+    AT_HOOK_FINAL_READ_CTIME_REPEATED,
+    AT_HOOK_FINAL_READ_SAME_SIZE_REWRITE
 } at_hook_mode_t;
 
 static at_hook_mode_t at_hook_mode;
@@ -1467,9 +1475,44 @@ static bool at_retirement_hook(git_retirement_test_stage_t stage,
         at_hook_observed = mutation_result == 0;
         return mutation_result != 0;
     }
+    if ((at_hook_mode == AT_HOOK_POST_READ_CTIME_ONCE ||
+         at_hook_mode == AT_HOOK_POST_READ_CTIME_REPEATED ||
+         at_hook_mode == AT_HOOK_POST_READ_SAME_SIZE_REWRITE) &&
+        stage == GIT_RETIREMENT_TEST_AFTER_RESTORED_WITNESS_READ &&
+        path &&
+        (at_hook_attempts == 0U ||
+         (at_hook_mode == AT_HOOK_POST_READ_CTIME_REPEATED &&
+          at_hook_attempts < 3U))) {
+        int mutation_result = at_mutate_prelock_source(
+            path,
+            at_hook_mode ==
+                AT_HOOK_POST_READ_SAME_SIZE_REWRITE);
+
+        at_hook_attempts++;
+        at_hook_observed = mutation_result == 0;
+        return mutation_result != 0;
+    }
+    if ((at_hook_mode == AT_HOOK_FINAL_READ_CTIME_ONCE ||
+         at_hook_mode == AT_HOOK_FINAL_READ_CTIME_REPEATED ||
+         at_hook_mode == AT_HOOK_FINAL_READ_SAME_SIZE_REWRITE) &&
+        stage ==
+            GIT_RETIREMENT_TEST_AFTER_FINAL_RESTORED_WITNESS_READ &&
+        path &&
+        (at_hook_attempts == 0U ||
+         (at_hook_mode == AT_HOOK_FINAL_READ_CTIME_REPEATED &&
+          at_hook_attempts < 3U))) {
+        int mutation_result = at_mutate_prelock_source(
+            path,
+            at_hook_mode ==
+                AT_HOOK_FINAL_READ_SAME_SIZE_REWRITE);
+
+        at_hook_attempts++;
+        at_hook_observed = mutation_result == 0;
+        return mutation_result != 0;
+    }
     if ((at_hook_mode == AT_HOOK_STABLE_CLOSE_CTIME_ONCE ||
          at_hook_mode == AT_HOOK_STABLE_CLOSE_CTIME_REPEATED ||
-        at_hook_mode == AT_HOOK_STABLE_CLOSE_SAME_SIZE_REWRITE) &&
+         at_hook_mode == AT_HOOK_STABLE_CLOSE_SAME_SIZE_REWRITE) &&
         stage == GIT_RETIREMENT_TEST_AFTER_STABLE_WITNESS_CLOSE &&
         path &&
         (at_hook_attempts == 0U ||
@@ -1936,7 +1979,7 @@ TEST(prelock_same_size_rewrite_with_restored_mtime_is_rejected) {
     at_bytes_clear(&original);
 }
 
-static void at_run_stable_close_ctime_convergence(
+static void at_run_restored_witness_ctime_convergence(
     at_hook_mode_t mode, unsigned expected_mutations) {
     at_fixture_t fixture;
     const account_t *accounts[1];
@@ -1971,16 +2014,37 @@ static void at_run_stable_close_ctime_convergence(
 }
 
 TEST(restored_witness_reproves_one_delayed_ctime_step) {
-    at_run_stable_close_ctime_convergence(
+    at_run_restored_witness_ctime_convergence(
         AT_HOOK_STABLE_CLOSE_CTIME_ONCE, 1U);
 }
 
 TEST(restored_witness_reproves_repeated_delayed_ctime_steps) {
-    at_run_stable_close_ctime_convergence(
+    at_run_restored_witness_ctime_convergence(
         AT_HOOK_STABLE_CLOSE_CTIME_REPEATED, 3U);
 }
 
-TEST(restored_witness_rejects_same_size_rewrite_with_restored_mtime) {
+TEST(restored_witness_flushes_one_post_read_ctime_step) {
+    at_run_restored_witness_ctime_convergence(
+        AT_HOOK_POST_READ_CTIME_ONCE, 1U);
+}
+
+TEST(restored_witness_flushes_repeated_post_read_ctime_steps) {
+    at_run_restored_witness_ctime_convergence(
+        AT_HOOK_POST_READ_CTIME_REPEATED, 3U);
+}
+
+TEST(restored_witness_flushes_one_final_read_ctime_step) {
+    at_run_restored_witness_ctime_convergence(
+        AT_HOOK_FINAL_READ_CTIME_ONCE, 1U);
+}
+
+TEST(restored_witness_flushes_repeated_final_read_ctime_steps) {
+    at_run_restored_witness_ctime_convergence(
+        AT_HOOK_FINAL_READ_CTIME_REPEATED, 3U);
+}
+
+static void at_run_restored_witness_rewrite_rejection(
+    at_hook_mode_t mode) {
     at_fixture_t fixture;
     at_bytes_t original = {0};
     const account_t *accounts[1];
@@ -2006,8 +2070,7 @@ TEST(restored_witness_rejects_same_size_rewrite_with_restored_mtime) {
                      transaction, &cleared), 0);
     CHECK_EQ_INT((long)cleared, (long)AT_KEY_COUNT);
     CHECK_EQ_INT(git_retirement_transaction_abort(transaction), 0);
-    at_install_hook(
-        &fixture, AT_HOOK_STABLE_CLOSE_SAME_SIZE_REWRITE, NULL);
+    at_install_hook(&fixture, mode, NULL);
     CHECK_EQ_INT(git_retirement_transaction_rollback_destination(
                      transaction, 0U, restored_path,
                      sizeof(restored_path), &restored_identity), -1);
@@ -2018,6 +2081,21 @@ TEST(restored_witness_rejects_same_size_rewrite_with_restored_mtime) {
     CHECK_EQ_INT(git_retirement_transaction_commit(&transaction), 0);
     CHECK(transaction == NULL);
     at_bytes_clear(&original);
+}
+
+TEST(restored_witness_rejects_same_size_rewrite_with_restored_mtime) {
+    at_run_restored_witness_rewrite_rejection(
+        AT_HOOK_STABLE_CLOSE_SAME_SIZE_REWRITE);
+}
+
+TEST(restored_witness_rejects_post_read_same_size_rewrite) {
+    at_run_restored_witness_rewrite_rejection(
+        AT_HOOK_POST_READ_SAME_SIZE_REWRITE);
+}
+
+TEST(restored_witness_rejects_final_read_same_size_rewrite) {
+    at_run_restored_witness_rewrite_rejection(
+        AT_HOOK_FINAL_READ_SAME_SIZE_REWRITE);
 }
 
 TEST(prelock_witness_aggregate_budget_fails_before_lock_mutation) {
@@ -4811,7 +4889,13 @@ TEST_MAIN_BEGIN()
     RUN_TEST(prelock_same_size_rewrite_with_restored_mtime_is_rejected);
     RUN_TEST(restored_witness_reproves_one_delayed_ctime_step);
     RUN_TEST(restored_witness_reproves_repeated_delayed_ctime_steps);
+    RUN_TEST(restored_witness_flushes_one_post_read_ctime_step);
+    RUN_TEST(restored_witness_flushes_repeated_post_read_ctime_steps);
+    RUN_TEST(restored_witness_flushes_one_final_read_ctime_step);
+    RUN_TEST(restored_witness_flushes_repeated_final_read_ctime_steps);
     RUN_TEST(restored_witness_rejects_same_size_rewrite_with_restored_mtime);
+    RUN_TEST(restored_witness_rejects_post_read_same_size_rewrite);
+    RUN_TEST(restored_witness_rejects_final_read_same_size_rewrite);
     RUN_TEST(prelock_witness_aggregate_budget_fails_before_lock_mutation);
     RUN_TEST(early_prelock_failure_preserves_standard_input_descriptor);
     RUN_TEST(absent_first_later_witness_budget_failure_has_no_namespace_mutation);
