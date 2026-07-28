@@ -16,6 +16,7 @@
 #include "utils.h"
 
 #include <limits.h>
+#include <sys/resource.h>
 #include <sys/wait.h>
 #include <time.h>
 
@@ -31,6 +32,7 @@ typedef bool (*git_metadata_test_hook_fn)(git_metadata_test_stage_t stage);
 git_metadata_test_hook_fn git_ops_test_set_metadata_hook(
     git_metadata_test_hook_fn fn);
 size_t git_ops_test_set_cleanup_arena_capacity(size_t capacity);
+static int count_open_descriptors(void);
 
 static git_metadata_test_stage_t g_metadata_mismatch_stage;
 static int g_metadata_mismatch_calls;
@@ -162,8 +164,46 @@ static int run_command(const char *const argv[], char *output,
 }
 
 static int run_git(const char *const argv[]) {
+    char output[4096];
+    char cwd[MAX_PATH_LEN];
     run_result_t result;
-    return run_command(argv, NULL, 0, false, &result);
+    struct rlimit nofile = {0};
+    int rc = run_command(argv, output, sizeof(output), true, &result);
+    int command_errno = errno;
+
+    if (rc != 0) {
+        const error_context_t *error = get_last_error();
+        int descriptor_count = count_open_descriptors();
+        const char *observed_cwd =
+            getcwd(cwd, sizeof(cwd)) ? cwd : "<unavailable>";
+        int limit_rc = getrlimit(RLIMIT_NOFILE, &nofile);
+
+        fprintf(
+            stderr,
+            "real Git command failed: %s %s %s "
+            "(spawned=%d exit=%d signal=%d timeout=%d errno=%d "
+            "open-fds=%d nofile-soft=%llu nofile-hard=%llu cwd=%s): "
+            "runner=%s; output=%s\n",
+            argv && argv[0] ? argv[0] : "<null>",
+            argv && argv[1] ? argv[1] : "",
+            argv && argv[2] ? argv[2] : "",
+            result.spawned ? 1 : 0, result.exit_code,
+            result.term_signal, result.timed_out ? 1 : 0,
+            command_errno, descriptor_count,
+            limit_rc == 0
+                ? (unsigned long long)nofile.rlim_cur
+                : 0ULL,
+            limit_rc == 0
+                ? (unsigned long long)nofile.rlim_max
+                : 0ULL,
+            observed_cwd,
+            error && error->message[0] != '\0'
+                ? error->message
+                : "<none>",
+            output[0] != '\0' ? output : "<none>");
+    }
+    errno = command_errno;
+    return rc;
 }
 
 static bool fixture_init(git_fixture_t *fixture) {

@@ -688,6 +688,7 @@ static inline int ts_test_finish(void) {
         ts_tests_passed++;                                                   \
         printf("[ ok ] %s\n", #fn);                                         \
     }                                                                       \
+    (void)fflush(stdout);                                                    \
 } while (0)
 
 /* AR-10: suites sandbox HOME themselves but inherited GNUPGHOME leaked
