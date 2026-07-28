@@ -1194,7 +1194,23 @@ TEST(post_spawn_runner_failure_reaps_runtime_and_allows_retry) {
         }
         pid_gone = g_post_spawn_agent_pid > 1 &&
                    kill(g_post_spawn_agent_pid, 0) != 0 && errno == ESRCH;
+#if defined(__APPLE__) || defined(__FreeBSD__)
+        /*
+         * Native BSD process generations authenticate protocol retirement,
+         * but do not provide a race-free signaling handle. A successful
+         * rollback therefore proves that every identity was removed and the
+         * exact socket/sidecar names were detached; the daemon itself may
+         * remain alive until this fixture terminates it below.
+         */
+        CHECK_EQ_INT(launch_error.code, ERR_SSH_AGENT_START_FAILED);
+        CHECK_EQ_INT(launch_error.system_errno, 0);
+        CHECK_STR_EQ(
+            launch_error.message,
+            "SSH agent runner failed after an ambiguous launch; "
+            "spawned runtime removed");
+#else
         CHECK(pid_gone);
+#endif
         CHECK(!entry_exists(sock));
         CHECK(!entry_exists(pidfile));
         CHECK(!entry_exists(current));

@@ -139,6 +139,12 @@ static int retire_recorded_agent_endpoint(
     const char *socket_path, const char *pid_name,
     ssh_runtime_pin_t *socket_pin,
     ssh_runtime_pin_t *pid_pin,
+    const ssh_agent_record_t *record,
+    bool allow_detached_namespace);
+static int protocol_retire_failed_agent_at(
+    int dir_fd, const char *socket_dir, const char *socket_name,
+    const char *socket_path, const char *pid_name, const char *pid_path,
+    ssh_runtime_pin_t *socket_pin, ssh_runtime_pin_t *pid_pin,
     const ssh_agent_record_t *record);
 
 /* A malformed sidecar is materially different from an unsafe or unstable
@@ -244,6 +250,9 @@ static int unlink_ssh_reset_path_at(int dir_fd, const char *name,
                                     ssh_runtime_pin_t *pin,
                                     bool expected_present);
 static int wait_for_ssh_probe(int fd, int timeout_ms);
+static int probe_ssh_agent_socket_at(int dir_fd, const char *path,
+                                     const char *display_path,
+                                     bool *reachable);
 static int probe_ssh_agent_socket(const char *path, bool *reachable);
 static int reconcile_current_socket_quarantines(int dir_fd,
                                                 const char *socket_dir);
@@ -1098,12 +1107,15 @@ static int open_socket_peer(const char *socket_arg, int runtime_dir_fd,
                             ssh_agent_connection_t *connection) {
     struct sockaddr_un address;
     struct stat held_dir;
+#if !defined(__FreeBSD__)
     char anchored_path[MAX_PATH_LEN];
     char pinned_dir_path[MAX_PATH_LEN];
+#endif
     const char *connect_path = socket_arg;
     bool anchored = false;
     int fd = -1;
     int flags;
+    int connect_rc;
     int rc = -1;
 
     if (connection) {
@@ -1117,8 +1129,10 @@ static int open_socket_peer(const char *socket_arg, int runtime_dir_fd,
     }
     if (runtime_dir_fd >= 0) {
         const char *leaf = strrchr(socket_arg, '/');
+#if !defined(__FreeBSD__)
         struct stat named_dir;
         int written;
+#endif
 
         leaf = leaf ? leaf + 1 : socket_arg;
         if (!*leaf || strchr(leaf, '/') ||
@@ -1138,22 +1152,17 @@ static int open_socket_peer(const char *socket_arg, int runtime_dir_fd,
         if (fcntl(runtime_dir_fd, F_GETPATH, pinned_dir_path) != 0) {
             return -1;
         }
-#elif defined(__FreeBSD__) && defined(F_KINFO)
-        {
-            struct kinfo_file info;
-            memset(&info, 0, sizeof(info));
-            info.kf_structsize = sizeof(info);
-            if (fcntl(runtime_dir_fd, F_KINFO, &info) != 0 ||
-                info.kf_path[0] == '\0' ||
-                safe_strncpy(pinned_dir_path, info.kf_path,
-                             sizeof(pinned_dir_path)) != 0) {
-                return -1;
-            }
-        }
+#elif defined(__FreeBSD__)
+        /* FreeBSD exposes connectat(2), so keep lookup bound directly to the
+         * held directory descriptor. F_KINFO is unsuitable here because its
+         * pathname can retain the pre-rename spelling of this same vnode. */
+        connect_path = leaf;
+        anchored = true;
 #else
         errno = ENOTSUP;
         return -1;
 #endif
+#if !defined(__FreeBSD__)
         if (stat(pinned_dir_path, &named_dir) != 0 ||
             !same_runtime_identity(&held_dir, &named_dir)) {
             errno = ESTALE;
@@ -1167,6 +1176,7 @@ static int open_socket_peer(const char *socket_arg, int runtime_dir_fd,
         }
         connect_path = anchored_path;
         anchored = true;
+#endif
     } else if (socket_arg[0] != '/') {
         errno = EINVAL;
         return -1;
@@ -1197,8 +1207,18 @@ static int open_socket_peer(const char *socket_arg, int runtime_dir_fd,
                      sizeof(address.sun_path)) != 0) {
         goto out;
     }
-    if (connect(fd, (struct sockaddr *)(void *)&address,
-                sizeof(address)) != 0) {
+#ifdef __FreeBSD__
+    connect_rc = anchored
+                     ? connectat(runtime_dir_fd, fd,
+                                 (struct sockaddr *)(void *)&address,
+                                 sizeof(address))
+                     : connect(fd, (struct sockaddr *)(void *)&address,
+                               sizeof(address));
+#else
+    connect_rc = connect(fd, (struct sockaddr *)(void *)&address,
+                         sizeof(address));
+#endif
+    if (connect_rc != 0) {
         if (errno != EINPROGRESS && errno != EAGAIN &&
             errno != EWOULDBLOCK) {
             goto out;
@@ -1210,11 +1230,17 @@ static int open_socket_peer(const char *socket_arg, int runtime_dir_fd,
     }
     if (anchored) {
         struct stat held_after;
+#if !defined(__FreeBSD__)
         struct stat named_after;
+#endif
         if (fstat(runtime_dir_fd, &held_after) != 0 ||
+#if defined(__FreeBSD__)
+            !same_runtime_identity(&held_dir, &held_after)) {
+#else
             stat(pinned_dir_path, &named_after) != 0 ||
             !same_runtime_identity(&held_dir, &held_after) ||
             !same_runtime_identity(&held_dir, &named_after)) {
+#endif
             errno = ESTALE;
             goto out;
         }
@@ -2550,6 +2576,48 @@ static ssh_unrecorded_result_t reap_unrecorded_agent(
     if (retry_record.pid > 1 &&
         ssh_process_generation_valid(&retry_record.generation)) {
         if (write_ssh_agent_pid_at(dir_fd, pid_name, &retry_record) == 0) {
+            ssh_runtime_pin_t pid_pin;
+            bool protocol_retired = false;
+            bool runtime_cleaned = false;
+
+            ssh_runtime_pin_init(&pid_pin);
+            if (socket_present &&
+                protocol_retire_failed_agent_at(
+                    dir_fd, socket_dir, socket_name, socket_path,
+                    pid_name, pid_path, &socket_pin, &pid_pin,
+                    &retry_record) == 0) {
+                protocol_retired = true;
+                if ((!g_unrecorded_cleanup_hook ||
+                     g_unrecorded_cleanup_hook(
+                         dir_fd, socket_name) == 0) &&
+                    unlink_ssh_reset_path_at(
+                        dir_fd, pid_name, pid_path,
+                        "protocol-retired unrecorded-agent PID sidecar",
+                        &pid_pin, true) == 0 &&
+                    unlink_ssh_reset_path_at(
+                        dir_fd, socket_name, socket_path,
+                        "protocol-retired unrecorded-agent socket",
+                        &socket_pin, true) == 0) {
+                    runtime_cleaned = true;
+                }
+            }
+            if (release_ssh_runtime_pin(dir_fd, &pid_pin) != 0) {
+                runtime_cleaned = false;
+            }
+            if (protocol_retired) {
+                if (release_ssh_runtime_pin(
+                        dir_fd, &socket_pin) != 0) {
+                    runtime_cleaned = false;
+                }
+                if (runtime_cleaned) {
+                    warn_recorded_endpoint_retirement(socket_path, true);
+                    return SSH_UNRECORDED_CLEANED;
+                }
+                log_warning(
+                    "Protocol-retired failed-launch SSH endpoint left an "
+                    "inert runtime artifact for later reconciliation");
+                return SSH_UNRECORDED_ARTIFACT_RETAINED;
+            }
             log_warning("SSH agent reap outcome %s; retained PID %ld and socket for retry",
                         ssh_process_outcome_name(outcome),
                         (long)retry_record.pid);
@@ -4749,9 +4817,50 @@ fresh_commit_failed:
             .generation = ssh_config->agent_generation,
             .image = ssh_config->agent_image
         };
+        ssh_runtime_pin_t rollback_socket_pin;
+        ssh_runtime_pin_t rollback_pid_pin;
+        bool protocol_retired = false;
         ssh_process_outcome_t reap_outcome = g_ssh_reap(
             &record, socket_path, dir_fd);
-        if (ssh_reap_allows_cleanup(reap_outcome)) {
+
+        ssh_runtime_pin_init(&rollback_socket_pin);
+        ssh_runtime_pin_init(&rollback_pid_pin);
+        if (reap_outcome == SSH_PROCESS_INDETERMINATE &&
+            pid_recorded &&
+            pin_ssh_runtime_entry_at(
+                dir_fd, socket_name, socket_path,
+                &rollback_socket_pin) == 0 &&
+            protocol_retire_failed_agent_at(
+                dir_fd, socket_dir, socket_name, socket_path,
+                pid_name, pid_path, &rollback_socket_pin,
+                &rollback_pid_pin, &record) == 0) {
+            protocol_retired = true;
+            /* The still-live BSD process is now keyless. Retire its exact
+             * durable targeting record before detaching the socket name. */
+            if (unlink_ssh_reset_path_at(
+                    dir_fd, pid_name, pid_path,
+                    "protocol-retired failed-launch PID sidecar",
+                    &rollback_pid_pin, true) != 0 ||
+                unlink_ssh_reset_path_at(
+                    dir_fd, socket_name, socket_path,
+                    "protocol-retired failed-launch socket",
+                    &rollback_socket_pin, true) != 0) {
+                agent_retained = true;
+            } else {
+                warn_recorded_endpoint_retirement(socket_path, true);
+            }
+        }
+        if (release_ssh_runtime_pin(
+                dir_fd, &rollback_pid_pin) != 0) {
+            agent_retained = true;
+        }
+        if (release_ssh_runtime_pin(
+                dir_fd, &rollback_socket_pin) != 0) {
+            agent_retained = true;
+        }
+
+        if (!protocol_retired &&
+            ssh_reap_allows_cleanup(reap_outcome)) {
             /* This rollback can be entered because the public directory was
              * replaced after current.sock committed. Exact process reaping
              * plus the held directory/socket identities authorize retiring
@@ -4767,7 +4876,7 @@ fresh_commit_failed:
                     "PID sidecar cleanup after failed publication") != 0) {
                 agent_retained = true;
             }
-        } else {
+        } else if (!protocol_retired) {
             /* Preserve the sidecar/socket whenever reap is inconclusive:
              * deleting its targeting information would make a future retry
              * impossible and could leak a key-holding agent until reboot. */
@@ -4956,7 +5065,7 @@ static int cleanup_stopped_agent_runtime(ssh_config_t *ssh_config) {
             if (retire_recorded_agent_endpoint(
                     dir_fd, runtime_dir, socket_name,
                     ssh_config->agent_socket_path, pid_name,
-                    &socket_pin, &pid_pin, &recorded) == 0) {
+                    &socket_pin, &pid_pin, &recorded, false) == 0) {
                 recorded_endpoint_retired = true;
             }
         }
@@ -9084,6 +9193,32 @@ static int verify_socket_dir_namespace(int dir_fd, const char *socket_dir) {
     return 0;
 }
 
+/* Ordinary operations require the exported pathname to keep naming the held
+ * runtime directory. Failed-publication rollback is the one exception: its
+ * transaction already owns the descriptor and lock, and must operate on that
+ * exact now-detached directory rather than a replacement at the public name. */
+static int verify_socket_dir_authority(int dir_fd, const char *socket_dir,
+                                       bool allow_detached_namespace) {
+    struct stat held;
+
+    if (!allow_detached_namespace) {
+        return verify_socket_dir_namespace(dir_fd, socket_dir);
+    }
+    if (fstat(dir_fd, &held) != 0) {
+        set_system_error(ERR_FILE_IO,
+                         "Cannot inspect detached SSH agent directory");
+        return -1;
+    }
+    if (!S_ISDIR(held.st_mode) || held.st_uid != getuid() ||
+        (held.st_mode & 0777) != 0700) {
+        set_error(ERR_FILE_IO,
+                  "Detached SSH agent directory is no longer private");
+        errno = ESTALE;
+        return -1;
+    }
+    return 0;
+}
+
 /* Capture one symlink's inode and exact target through a stable read. Metadata
  * alone is not an identity proof: an equal-length replacement (or inode reuse)
  * must never inherit cleanup authority from the link it displaced. */
@@ -9790,35 +9925,72 @@ static int wait_for_ssh_probe(int fd, int timeout_ms) {
     }
 }
 
-static int probe_ssh_agent_socket(const char *path, bool *reachable) {
+static int probe_ssh_agent_socket_at(int dir_fd, const char *path,
+                                     const char *display_path,
+                                     bool *reachable) {
     struct stat st;
     struct sockaddr_un addr;
+    const char *connect_path = path;
+    const char *shown_path =
+        display_path && *display_path ? display_path : path;
     socklen_t err_len;
+    int connect_rc;
     int fd;
     int flags;
     int socket_error = 0;
 
+    if (!path || !*path || !reachable) {
+        errno = EINVAL;
+        return -1;
+    }
     *reachable = false;
-    if (lstat(path, &st) != 0) {
+    if (dir_fd >= 0) {
+#ifdef __FreeBSD__
+        const char *leaf = strrchr(path, '/');
+
+        leaf = leaf ? leaf + 1 : path;
+        if (!*leaf || strchr(leaf, '/') ||
+            fstatat(dir_fd, leaf, &st, AT_SYMLINK_NOFOLLOW) != 0) {
+            if (errno == ENOENT) return 0;
+            set_system_error(
+                ERR_FILE_IO,
+                "Cannot inspect descriptor-anchored SSH socket: %s",
+                shown_path);
+            return -1;
+        }
+        connect_path = leaf;
+#else
+        errno = ENOTSUP;
+        set_system_error(
+            ERR_FILE_IO,
+            "Descriptor-relative SSH socket probing is unavailable: %s",
+            shown_path);
+        return -1;
+#endif
+    } else if (lstat(path, &st) != 0) {
         if (errno == ENOENT) {
             return 0;
         }
-        set_system_error(ERR_FILE_IO, "Cannot inspect sidecar-less SSH socket: %s", path);
+        set_system_error(ERR_FILE_IO,
+                         "Cannot inspect sidecar-less SSH socket: %s",
+                         shown_path);
         return -1;
     }
     if (!S_ISSOCK(st.st_mode)) {
         return 0; /* provably not a live UNIX-domain socket */
     }
-    if (strlen(path) >= sizeof(addr.sun_path)) {
+    if (strlen(connect_path) >= sizeof(addr.sun_path)) {
         set_error(ERR_INVALID_PATH,
-                  "Cannot probe overlong sidecar-less SSH socket: %s", path);
+                  "Cannot probe overlong sidecar-less SSH socket: %s",
+                  shown_path);
         return -1;
     }
 
     fd = socket(AF_UNIX, SOCK_STREAM, 0);
     if (fd < 0) {
         set_system_error(ERR_SYSTEM_CALL,
-                         "Cannot create probe for sidecar-less SSH socket: %s", path);
+                         "Cannot create probe for sidecar-less SSH socket: %s",
+                         shown_path);
         return -1;
     }
     if (fcntl(fd, F_SETFD, FD_CLOEXEC) != 0 ||
@@ -9826,17 +9998,29 @@ static int probe_ssh_agent_socket(const char *path, bool *reachable) {
         fcntl(fd, F_SETFL, flags | O_NONBLOCK) != 0) {
         close(fd);
         set_system_error(ERR_SYSTEM_CALL,
-                         "Cannot configure probe for sidecar-less SSH socket: %s", path);
+                         "Cannot configure probe for sidecar-less SSH socket: %s",
+                         shown_path);
         return -1;
     }
 
     memset(&addr, 0, sizeof(addr));
     addr.sun_family = AF_UNIX;
-    safe_strncpy(addr.sun_path, path, sizeof(addr.sun_path));
+    safe_strncpy(addr.sun_path, connect_path, sizeof(addr.sun_path));
     /* Cast through void*: the direct sockaddr_un->sockaddr cast trips
      * -Wstrict-aliasing=2 on gcc 13 at -O2 (the CI release toolchain), which
      * WERROR promotes to an error. Same idiom as the test suites. */
-    if (connect(fd, (struct sockaddr *)(void *)&addr, sizeof(addr)) == 0) {
+#ifdef __FreeBSD__
+    connect_rc = dir_fd >= 0
+                     ? connectat(dir_fd, fd,
+                                 (struct sockaddr *)(void *)&addr,
+                                 sizeof(addr))
+                     : connect(fd, (struct sockaddr *)(void *)&addr,
+                               sizeof(addr));
+#else
+    connect_rc =
+        connect(fd, (struct sockaddr *)(void *)&addr, sizeof(addr));
+#endif
+    if (connect_rc == 0) {
         *reachable = true;
         close(fd);
         return 0;
@@ -9850,7 +10034,8 @@ static int probe_ssh_agent_socket(const char *path, bool *reachable) {
         close(fd);
         errno = saved_errno;
         set_system_error(ERR_SSH_AGENT_FAILED,
-                         "Cannot prove sidecar-less SSH socket is unreachable: %s", path);
+                         "Cannot prove sidecar-less SSH socket is unreachable: %s",
+                         shown_path);
         return -1;
     }
 
@@ -9860,7 +10045,8 @@ static int probe_ssh_agent_socket(const char *path, bool *reachable) {
         close(fd);
         errno = saved_errno;
         set_system_error(ERR_SSH_AGENT_FAILED,
-                         "Timed out probing sidecar-less SSH socket: %s", path);
+                         "Timed out probing sidecar-less SSH socket: %s",
+                         shown_path);
         return -1;
     }
 
@@ -9870,7 +10056,8 @@ static int probe_ssh_agent_socket(const char *path, bool *reachable) {
         close(fd);
         errno = saved_errno;
         set_system_error(ERR_SSH_AGENT_FAILED,
-                         "Cannot finish probing sidecar-less SSH socket: %s", path);
+                         "Cannot finish probing sidecar-less SSH socket: %s",
+                         shown_path);
         return -1;
     }
     close(fd);
@@ -9883,8 +10070,13 @@ static int probe_ssh_agent_socket(const char *path, bool *reachable) {
     }
     errno = socket_error;
     set_system_error(ERR_SSH_AGENT_FAILED,
-                     "Cannot prove sidecar-less SSH socket is unreachable: %s", path);
+                     "Cannot prove sidecar-less SSH socket is unreachable: %s",
+                     shown_path);
     return -1;
+}
+
+static int probe_ssh_agent_socket(const char *path, bool *reachable) {
+    return probe_ssh_agent_socket_at(-1, path, path, reachable);
 }
 
 int ssh_manager_test_probe_socket(const char *path, bool *reachable) {
@@ -10370,29 +10562,13 @@ static int prove_malformed_pid_socket_dead_at(
             g_socket_probe(anchored_path, &reachable) != 0) {
             return -1;
         }
-#elif defined(__APPLE__) || defined(__FreeBSD__)
+#elif defined(__APPLE__)
         char pinned_dir_path[MAX_PATH_LEN];
         char anchored_path[MAX_PATH_LEN];
         struct stat held_dir;
         struct stat named_dir;
         int written;
-#if defined(__APPLE__)
         if (fcntl(dir_fd, F_GETPATH, pinned_dir_path) != 0) return -1;
-#elif defined(F_KINFO)
-        {
-            struct kinfo_file info;
-            memset(&info, 0, sizeof(info));
-            info.kf_structsize = sizeof(info);
-            if (fcntl(dir_fd, F_KINFO, &info) != 0 ||
-                info.kf_path[0] == '\0' ||
-                safe_strncpy(pinned_dir_path, info.kf_path,
-                             sizeof(pinned_dir_path)) != 0) {
-                return -1;
-            }
-        }
-#else
-        return -1;
-#endif
         if (fstat(dir_fd, &held_dir) != 0 ||
             stat(pinned_dir_path, &named_dir) != 0 ||
             !same_runtime_identity(&held_dir, &named_dir)) {
@@ -10404,6 +10580,16 @@ static int prove_malformed_pid_socket_dead_at(
             g_socket_probe(anchored_path, &reachable) != 0 ||
             stat(pinned_dir_path, &named_dir) != 0 ||
             !same_runtime_identity(&held_dir, &named_dir)) {
+            return -1;
+        }
+#elif defined(__FreeBSD__)
+        /* F_KINFO may retain the directory's pre-rename spelling, which is
+         * precisely the namespace that is no longer authoritative here.
+         * connectat(2) resolves the socket leaf from the held directory
+         * descriptor and therefore keeps this post-reap liveness proof bound
+         * to the transaction's original runtime inode. */
+        if (probe_ssh_agent_socket_at(
+                dir_fd, socket_name, socket_path, &reachable) != 0) {
             return -1;
         }
 #else
@@ -10459,7 +10645,8 @@ static int retire_recorded_agent_endpoint(
     const char *socket_path, const char *pid_name,
     ssh_runtime_pin_t *socket_pin,
     ssh_runtime_pin_t *pid_pin,
-    const ssh_agent_record_t *record) {
+    const ssh_agent_record_t *record,
+    bool allow_detached_namespace) {
     ssh_agent_connection_t connection;
     ssh_process_outcome_t process_outcome;
     uint32_t identity_count;
@@ -10476,7 +10663,8 @@ static int retire_recorded_agent_endpoint(
         !S_ISSOCK(socket_pin->identity.st_mode) ||
         socket_pin->identity.st_uid != getuid() ||
         (socket_pin->identity.st_mode & 0777) != 0600 ||
-        verify_socket_dir_namespace(dir_fd, socket_dir) != 0 ||
+        verify_socket_dir_authority(
+            dir_fd, socket_dir, allow_detached_namespace) != 0 ||
         verify_ssh_runtime_pin_at(
             dir_fd, socket_name, socket_path, socket_pin) != 0 ||
         verify_ssh_runtime_pin_at(
@@ -10551,7 +10739,8 @@ static int retire_recorded_agent_endpoint(
     /* Mutation authority is established only immediately before REMOVE_ALL.
      * Every proof remains anchored to the original connected descriptor and
      * the exact pinned sidecar/socket generations. */
-    if (verify_socket_dir_namespace(dir_fd, socket_dir) != 0 ||
+    if (verify_socket_dir_authority(
+            dir_fd, socket_dir, allow_detached_namespace) != 0 ||
         verify_ssh_runtime_pin_at(
             dir_fd, socket_name, socket_path, socket_pin) != 0 ||
         verify_ssh_runtime_pin_at(
@@ -10599,7 +10788,8 @@ static int retire_recorded_agent_endpoint(
     if (ssh_agent_request_identities(
             connection.fd, deadline, &identity_count) != 0 ||
         identity_count != 0 ||
-        verify_socket_dir_namespace(dir_fd, socket_dir) != 0 ||
+        verify_socket_dir_authority(
+            dir_fd, socket_dir, allow_detached_namespace) != 0 ||
         verify_ssh_runtime_pin_at(
             dir_fd, socket_name, socket_path, socket_pin) != 0 ||
         verify_ssh_runtime_pin_at(
@@ -10623,6 +10813,42 @@ out:
         if (rc != 0) errno = operation_errno;
     }
     return rc;
+}
+
+/* Convert a failed fresh launch into the same authenticated BSD fallback used
+ * by reset/stop: bind the exact durable sidecar and socket generations, clear
+ * every identity through the connected agent protocol, and leave both pins
+ * held so the caller can retire their names in sidecar-before-socket order. */
+static int protocol_retire_failed_agent_at(
+    int dir_fd, const char *socket_dir, const char *socket_name,
+    const char *socket_path, const char *pid_name, const char *pid_path,
+    ssh_runtime_pin_t *socket_pin, ssh_runtime_pin_t *pid_pin,
+    const ssh_agent_record_t *record) {
+    ssh_agent_record_t recorded;
+    ssh_pid_sidecar_result_t pid_rc;
+
+    if (!socket_pin || !pid_pin || !record) {
+        errno = EINVAL;
+        return -1;
+    }
+    memset(&recorded, 0, sizeof(recorded));
+    pid_rc = read_ssh_agent_pid_at(
+        dir_fd, pid_name, pid_path, &recorded, pid_pin);
+    if (pid_rc != SSH_PID_SIDECAR_VALID ||
+        recorded.pid != record->pid ||
+        !ssh_process_generation_equal(
+            &recorded.generation, &record->generation) ||
+        !ssh_process_image_equal(&recorded.image, &record->image) ||
+        !pinned_pid_sidecar_matches_record(pid_pin, record)) {
+        set_error(
+            ERR_FILE_IO,
+            "Failed-launch SSH process sidecar is not the exact recorded "
+            "generation; runtime retained for retry");
+        return -1;
+    }
+    return retire_recorded_agent_endpoint(
+        dir_fd, socket_dir, socket_name, socket_path, pid_name,
+        socket_pin, pid_pin, record, true);
 }
 
 static void warn_recorded_endpoint_retirement(const char *socket_path,
@@ -12306,7 +12532,7 @@ int ssh_manager_reset(const char *account) {
             retirement_attempted = true;
             if (retire_recorded_agent_endpoint(
                     dir_fd, socket_dir, sock_name, sock_path, pid_name,
-                    &socket_pin, &pid_pin, &record) == 0) {
+                    &socket_pin, &pid_pin, &record, false) == 0) {
                 recorded_endpoint_retired = true;
             }
         }
@@ -12665,7 +12891,7 @@ static int kill_orphaned_gitswitch_agents(int dir_fd, const char *socket_dir,
             retirement_attempted = true;
             if (retire_recorded_agent_endpoint(
                     dir_fd, socket_dir, sock_name, sock_full, name,
-                    &socket_pin, &pid_pin, &record) == 0) {
+                    &socket_pin, &pid_pin, &record, false) == 0) {
                 recorded_endpoint_retired = true;
             }
         }
