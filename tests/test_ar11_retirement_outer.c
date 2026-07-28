@@ -84,7 +84,9 @@ typedef enum {
     GIT_RETIREMENT_TEST_AFTER_FREEBSD_AUTHORITY_PUBLISH,
     GIT_RETIREMENT_TEST_AFTER_FREEBSD_AUTHORITY_DIRECTORY_SYNC,
     GIT_RETIREMENT_TEST_AFTER_PRELOCK_WITNESS,
-    GIT_RETIREMENT_TEST_AFTER_STABLE_WITNESS_CLOSE
+    GIT_RETIREMENT_TEST_AFTER_STABLE_WITNESS_CLOSE,
+    GIT_RETIREMENT_TEST_AFTER_RESTORED_WITNESS_READ,
+    GIT_RETIREMENT_TEST_AFTER_FINAL_RESTORED_WITNESS_READ
 } git_retirement_test_stage_t;
 typedef bool (*git_retirement_test_hook_fn)(
     git_retirement_test_stage_t stage, const char *path,
@@ -203,6 +205,8 @@ static size_t m18_faults_remaining;
 static size_t m18_fault_matches_to_skip;
 static size_t m18_witness_ctime_drifts_remaining;
 static int m18_witness_ctime_drift_error;
+static git_retirement_test_stage_t m18_witness_ctime_drift_stage =
+    GIT_RETIREMENT_TEST_RESTORED_WITNESS_AFTER_CLOSE;
 static bool m18_clear_after_stage_write_fault;
 static bool m18_clear_after_stage_write_observed;
 static bool m18_prepare_ctime_drift_requested;
@@ -688,7 +692,7 @@ static bool m18_retirement_witness_hook(
         }
         return false;
     }
-    if (stage != GIT_RETIREMENT_TEST_RESTORED_WITNESS_AFTER_CLOSE ||
+    if (stage != m18_witness_ctime_drift_stage ||
         m18_witness_ctime_drifts_remaining == 0U) {
         return false;
     }
@@ -2384,10 +2388,46 @@ static int m18_run_cli_with_witness_ctime_drifts(
     size_t witness_ctime_drifts, bool *fault_observed) {
     int status;
 
+    m18_witness_ctime_drift_stage =
+        GIT_RETIREMENT_TEST_RESTORED_WITNESS_AFTER_CLOSE;
     m18_witness_ctime_drifts_remaining = witness_ctime_drifts;
     status = m18_run_cli(fixture, command, fault_limit, boundary,
                          fault_observed);
     m18_witness_ctime_drifts_remaining = 0U;
+    return status;
+}
+
+static int m18_run_cli_with_post_read_ctime_drifts(
+    const m18_fixture_t *fixture, m18_command_t command,
+    size_t fault_limit, config_io_boundary_t boundary,
+    size_t witness_ctime_drifts, bool *fault_observed) {
+    int status;
+
+    m18_witness_ctime_drift_stage =
+        GIT_RETIREMENT_TEST_AFTER_RESTORED_WITNESS_READ;
+    m18_witness_ctime_drifts_remaining = witness_ctime_drifts;
+    status = m18_run_cli(fixture, command, fault_limit, boundary,
+                         fault_observed);
+    m18_witness_ctime_drifts_remaining = 0U;
+    m18_witness_ctime_drift_stage =
+        GIT_RETIREMENT_TEST_RESTORED_WITNESS_AFTER_CLOSE;
+    return status;
+}
+
+static int m18_run_cli_with_final_read_ctime_drifts(
+    const m18_fixture_t *fixture, m18_command_t command,
+    size_t fault_limit, config_io_boundary_t boundary,
+    size_t witness_ctime_drifts, bool *fault_observed) {
+    int status;
+
+    m18_witness_ctime_drift_stage =
+        GIT_RETIREMENT_TEST_AFTER_FINAL_RESTORED_WITNESS_READ;
+    m18_witness_ctime_drifts_remaining = witness_ctime_drifts;
+    status = m18_run_cli(fixture, command, fault_limit, boundary,
+                         fault_observed);
+    m18_witness_ctime_drifts_remaining = 0U;
+    m18_witness_ctime_drift_stage =
+        GIT_RETIREMENT_TEST_RESTORED_WITNESS_AFTER_CLOSE;
     return status;
 }
 
@@ -5071,6 +5111,82 @@ TEST(restored_witness_retries_multiple_delayed_ctime_steps) {
     m18_fixture_cleanup(&fixture);
 }
 
+TEST(restored_witness_flushes_post_read_ctime_before_reset_ledger_seal) {
+    m18_fixture_t fixture;
+    m18_bytes_t accounts_before = {0};
+    m18_bytes_t git_before = {0};
+    m18_bytes_t output = {0};
+    bool observed = false;
+    int status;
+
+    CHECK_EQ_INT(m18_fixture_setup(&fixture), 0);
+    CHECK_EQ_INT(m18_read_bytes(fixture.accounts_path,
+                                &accounts_before), 0);
+    CHECK_EQ_INT(m18_read_bytes(fixture.git_path, &git_before), 0);
+
+    /* Reproduce the hosted reset failure at its causal seam: the first exact
+     * restored-byte read materializes a ctime-only successor that must be
+     * flushed and re-proved before its identity reaches the durable ledger. */
+    status = m18_run_cli_with_post_read_ctime_drifts(
+        &fixture, M18_COMMAND_RESET, M18_FAULT_ONCE,
+        CONFIG_IO_STATE_BEFORE_RENAME, 1U, &observed);
+    CHECK(WIFEXITED(status));
+    if (WIFEXITED(status)) CHECK_EQ_INT(WEXITSTATUS(status), EXIT_FAILURE);
+    CHECK(observed);
+    CHECK(m18_file_equals(fixture.accounts_path, &accounts_before));
+    CHECK(m18_file_equals(fixture.git_path, &git_before));
+    CHECK(m18_git_has_command(&fixture));
+    CHECK(m18_state_has_active_work_header(&fixture));
+    CHECK(m18_ledger_matches_live_restored_git(&fixture));
+    CHECK(m18_guard_is_unblocked_and_bounded(&fixture));
+    CHECK_EQ_INT(m18_read_bytes(fixture.output_path, &output), 0);
+    CHECK(!m18_output_contains(
+        &output, "destination changed after abort"));
+
+    m18_bytes_clear(&accounts_before);
+    m18_bytes_clear(&git_before);
+    m18_bytes_clear(&output);
+    m18_fixture_cleanup(&fixture);
+}
+
+TEST(restored_witness_flushes_final_read_ctime_before_reset_ledger_seal) {
+    m18_fixture_t fixture;
+    m18_bytes_t accounts_before = {0};
+    m18_bytes_t git_before = {0};
+    m18_bytes_t output = {0};
+    bool observed = false;
+    int status;
+
+    CHECK_EQ_INT(m18_fixture_setup(&fixture), 0);
+    CHECK_EQ_INT(m18_read_bytes(fixture.accounts_path,
+                                &accounts_before), 0);
+    CHECK_EQ_INT(m18_read_bytes(fixture.git_path, &git_before), 0);
+
+    /* Exercise the final byte-read seam that precedes descriptor close.
+     * Its ctime successor must be flushed and re-proved before the ledger
+     * seal; later terminal marker directory syncs must not advance it. */
+    status = m18_run_cli_with_final_read_ctime_drifts(
+        &fixture, M18_COMMAND_RESET, M18_FAULT_ONCE,
+        CONFIG_IO_STATE_BEFORE_RENAME, 1U, &observed);
+    CHECK(WIFEXITED(status));
+    if (WIFEXITED(status)) CHECK_EQ_INT(WEXITSTATUS(status), EXIT_FAILURE);
+    CHECK(observed);
+    CHECK(m18_file_equals(fixture.accounts_path, &accounts_before));
+    CHECK(m18_file_equals(fixture.git_path, &git_before));
+    CHECK(m18_git_has_command(&fixture));
+    CHECK(m18_state_has_active_work_header(&fixture));
+    CHECK(m18_ledger_matches_live_restored_git(&fixture));
+    CHECK(m18_guard_is_unblocked_and_bounded(&fixture));
+    CHECK_EQ_INT(m18_read_bytes(fixture.output_path, &output), 0);
+    CHECK(!m18_output_contains(
+        &output, "destination changed after abort"));
+
+    m18_bytes_clear(&accounts_before);
+    m18_bytes_clear(&git_before);
+    m18_bytes_clear(&output);
+    m18_fixture_cleanup(&fixture);
+}
+
 TEST(prepared_guard_flush_precedes_restored_ledger_seal) {
     m18_fixture_t fixture;
     m18_bytes_t accounts_before = {0};
@@ -6794,6 +6910,8 @@ TEST_MAIN_BEGIN()
     RUN_TEST(same_filesystem_repository_move_retains_guard_and_retry_authority);
     RUN_TEST(remove_backup_verification_fault_restores_exact_outer_state);
     RUN_TEST(restored_witness_retries_multiple_delayed_ctime_steps);
+    RUN_TEST(restored_witness_flushes_post_read_ctime_before_reset_ledger_seal);
+    RUN_TEST(restored_witness_flushes_final_read_ctime_before_reset_ledger_seal);
     RUN_TEST(prepared_guard_flush_precedes_restored_ledger_seal);
     RUN_TEST(rollback_prepublish_ctime_drift_reseals_then_clears);
     RUN_TEST(rollback_prepublish_same_size_rewrite_is_rejected_exactly);

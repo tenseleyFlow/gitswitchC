@@ -319,7 +319,9 @@ typedef enum {
     GIT_RETIREMENT_TEST_AFTER_FREEBSD_AUTHORITY_PUBLISH,
     GIT_RETIREMENT_TEST_AFTER_FREEBSD_AUTHORITY_DIRECTORY_SYNC,
     GIT_RETIREMENT_TEST_AFTER_PRELOCK_WITNESS,
-    GIT_RETIREMENT_TEST_AFTER_STABLE_WITNESS_CLOSE
+    GIT_RETIREMENT_TEST_AFTER_STABLE_WITNESS_CLOSE,
+    GIT_RETIREMENT_TEST_AFTER_RESTORED_WITNESS_READ,
+    GIT_RETIREMENT_TEST_AFTER_FINAL_RESTORED_WITNESS_READ
 } git_retirement_test_stage_t;
 typedef bool (*git_retirement_test_hook_fn)(
     git_retirement_test_stage_t stage, const char *path,
@@ -12246,6 +12248,7 @@ static bool git_file_at_matches_witness_after_close(
          attempt < GIT_RESTORED_WITNESS_STABILIZATION_ATTEMPTS;
          attempt++) {
         struct stat opened;
+        struct stat flushed;
         struct stat named_after;
         struct stat named_after_hook;
         int fd = openat(parent_fd, leaf,
@@ -12274,6 +12277,62 @@ static bool git_file_at_matches_witness_after_close(
             errno = saved_errno;
             return false;
         }
+        /* The exact read above can be the operation that makes a delayed UFS
+         * inode update visible. Flush after that read, then repeat the exact
+         * descriptor/name/byte proof before allowing the descriptor to close.
+         * A pre-read fsync alone can leave that successor pending until after
+         * the durable publication identity has already been sealed. */
+        if (g_retirement_test_hook &&
+            g_retirement_test_hook(
+                GIT_RETIREMENT_TEST_AFTER_RESTORED_WITNESS_READ,
+                path, NULL, NULL)) {
+            (void)close(fd);
+            errno = EIO;
+            return false;
+        }
+        g_terminal_namespace_sync_count++;
+        if (fsync(fd) != 0) {
+            int saved_errno = errno ? errno : EIO;
+
+            (void)close(fd);
+            errno = saved_errno;
+            return false;
+        }
+        errno = 0;
+        if (!git_file_at_matches_witness(
+                parent_fd, leaf, fd, &opened, data, length, &flushed)) {
+            int saved_errno = errno ? errno : EAGAIN;
+
+            if (close(fd) != 0) return false;
+            if (saved_errno == EAGAIN &&
+                attempt + 1U <
+                    GIT_RESTORED_WITNESS_STABILIZATION_ATTEMPTS) {
+                continue;
+            }
+            errno = saved_errno;
+            return false;
+        }
+        /* The repeated exact proof is itself a read. UFS can leave the ctime
+         * successor exposed by that final read pending until a later sibling
+         * directory sync. Flush once more after the last byte proof; any
+         * ctime it materializes is observed after close and forces another
+         * complete byte-proof iteration before acceptance. */
+        if (g_retirement_test_hook &&
+            g_retirement_test_hook(
+                GIT_RETIREMENT_TEST_AFTER_FINAL_RESTORED_WITNESS_READ,
+                path, NULL, NULL)) {
+            (void)close(fd);
+            errno = EIO;
+            return false;
+        }
+        g_terminal_namespace_sync_count++;
+        if (fsync(fd) != 0) {
+            int saved_errno = errno ? errno : EIO;
+
+            (void)close(fd);
+            errno = saved_errno;
+            return false;
+        }
         if (close(fd) != 0) return false;
         /* FreeBSD may not expose the last funlinkat/link/rename ctime until
          * the retained descriptor closes. Sync the containing namespace only
@@ -12295,8 +12354,8 @@ static bool git_file_at_matches_witness_after_close(
             errno = EAGAIN;
             return false;
         }
-        if (!git_same_file_observation(&opened, &named_after) &&
-            !git_metadata_ctime_only_change(&opened, &named_after)) {
+        if (!git_same_file_observation(&flushed, &named_after) &&
+            !git_metadata_ctime_only_change(&flushed, &named_after)) {
             errno = EAGAIN;
             return false;
         }
