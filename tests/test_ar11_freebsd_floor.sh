@@ -30,17 +30,17 @@ grep -F '#include "../src/freebsd_compat.h"' \
     "$root/tools/release_publish.c" >/dev/null ||
     fail "release publisher does not consume the FreeBSD floor contract"
 
-# F_KINFO is an in/out ABI: FreeBSD requires callers to publish the structure
-# size before fcntl(2). Keep every ssh_manager use paired with that
-# initialization so zero-filled probes cannot silently fail on the floor.
-kinfo_decl_count=$(grep -F -c 'struct kinfo_file info;' \
-    "$root/src/ssh_manager.c" || true)
-kinfo_size_count=$(grep -F -c 'info.kf_structsize = sizeof(info);' \
-    "$root/src/ssh_manager.c" || true)
-[ "$kinfo_decl_count" -gt 0 ] ||
-    fail "ssh_manager has no F_KINFO structure contract"
-[ "$kinfo_size_count" -eq "$kinfo_decl_count" ] ||
-    fail "every F_KINFO structure must initialize kf_structsize"
+# A descriptor may retain the pre-rename spelling reported by F_KINFO even
+# after that pathname selects a replacement directory. SSH socket operations
+# therefore have to stay relative to the already-held runtime directory with
+# connectat(2); falling back to an F_KINFO-derived pathname would discard the
+# transaction's namespace authority.
+connectat_count=$(grep -F -c 'connectat(' "$root/src/ssh_manager.c" || true)
+[ "$connectat_count" -ge 2 ] ||
+    fail "ssh_manager lacks descriptor-relative FreeBSD socket operations"
+if grep -F ', F_KINFO,' "$root/src/ssh_manager.c" >/dev/null; then
+    fail "ssh_manager must not derive socket paths through F_KINFO"
+fi
 
 min_version=$(sed -n \
     's/^#define GITSWITCH_FREEBSD_MIN_VERSION \([0-9][0-9]*\)$/\1/p' \
