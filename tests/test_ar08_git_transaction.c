@@ -26,7 +26,8 @@ void git_ops_test_set_restore_locked_hook(void (*fn)(git_scope_t scope));
 void git_ops_test_set_restore_postpublish_hook(void (*fn)(git_scope_t scope));
 typedef enum {
     GIT_METADATA_TEST_SOURCE_PIN = 1,
-    GIT_METADATA_TEST_STAGE_REVALIDATE
+    GIT_METADATA_TEST_STAGE_REVALIDATE,
+    GIT_METADATA_TEST_POST_CONFIG_PIN
 } git_metadata_test_stage_t;
 typedef bool (*git_metadata_test_hook_fn)(git_metadata_test_stage_t stage);
 git_metadata_test_hook_fn git_ops_test_set_metadata_hook(
@@ -39,6 +40,10 @@ static int g_metadata_mismatch_calls;
 static git_metadata_test_stage_t g_metadata_trace[2];
 static int g_metadata_trace_count;
 static bool g_fork_coverage_child;
+static char g_post_config_pin_path[MAX_PATH_LEN];
+static char g_post_config_pin_alias[MAX_PATH_LEN];
+static int g_post_config_pin_churn_calls;
+static int g_post_config_pin_churn_errno;
 
 static bool force_git_metadata_mismatch(git_metadata_test_stage_t stage) {
     if (g_metadata_trace_count <
@@ -50,6 +55,17 @@ static bool force_git_metadata_mismatch(git_metadata_test_stage_t stage) {
     if (stage != g_metadata_mismatch_stage) return false;
     g_metadata_mismatch_calls++;
     return true;
+}
+
+static bool churn_post_config_pin_ctime(git_metadata_test_stage_t stage) {
+    if (stage != GIT_METADATA_TEST_POST_CONFIG_PIN) return false;
+    g_post_config_pin_churn_calls++;
+    if (link(g_post_config_pin_path, g_post_config_pin_alias) != 0) {
+        g_post_config_pin_churn_errno = errno;
+    } else if (unlink(g_post_config_pin_alias) != 0) {
+        g_post_config_pin_churn_errno = errno;
+    }
+    return false;
 }
 
 typedef struct {
@@ -2059,6 +2075,50 @@ TEST(git_list_config_never_returns_a_successful_prefix) {
     fixture_cleanup(&fixture);
 }
 
+TEST(postimage_pin_reproves_ctime_only_successor_by_exact_bytes) {
+    git_fixture_t fixture;
+    git_metadata_test_hook_fn previous = NULL;
+    char actual[256];
+    int seal_rc;
+
+    if (!fixture_init(&fixture)) {
+        CHECK(false);
+        fixture_cleanup(&fixture);
+        return;
+    }
+    CHECK((size_t)snprintf(g_post_config_pin_path,
+                           sizeof(g_post_config_pin_path),
+                           "%s/.git/config", fixture.repo) <
+          sizeof(g_post_config_pin_path));
+    CHECK((size_t)snprintf(g_post_config_pin_alias,
+                           sizeof(g_post_config_pin_alias),
+                           "%s/.git/config.ctime-alias", fixture.repo) <
+          sizeof(g_post_config_pin_alias));
+    CHECK_EQ_INT(git_set("--local", "user.name", "before-pin-churn"), 0);
+    CHECK_EQ_INT(git_config_snapshot(GIT_SCOPE_LOCAL), 0);
+    CHECK_EQ_INT(git_set_config_value(GIT_CONFIG_USER_NAME,
+                                      "owned-pin-churn",
+                                      GIT_SCOPE_LOCAL), 0);
+
+    g_post_config_pin_churn_calls = 0;
+    g_post_config_pin_churn_errno = 0;
+    previous = git_ops_test_set_metadata_hook(churn_post_config_pin_ctime);
+    seal_rc = git_config_seal();
+    (void)git_ops_test_set_metadata_hook(previous);
+
+    CHECK_EQ_INT(g_post_config_pin_churn_calls, 1);
+    CHECK_EQ_INT(g_post_config_pin_churn_errno, 0);
+    CHECK_EQ_INT(seal_rc, 0);
+    if (seal_rc == 0) {
+        CHECK_EQ_INT(git_config_restore(), 0);
+        CHECK_EQ_INT(git_get_all("--local", "user.name", actual,
+                                 sizeof(actual)), 0);
+        CHECK_STR_EQ(actual, "before-pin-churn\n");
+    }
+
+    fixture_cleanup(&fixture);
+}
+
 TEST(replaced_repository_with_identical_managed_vectors_is_never_rolled_back) {
     git_fixture_t fixture;
     char original_repo[MAX_PATH_LEN];
@@ -3535,6 +3595,7 @@ TEST_MAIN_BEGIN()
     RUN_TEST(committed_git_transaction_discards_rollback_ownership);
     RUN_TEST(worktree_probe_has_a_truthful_hard_bound_before_mutation);
     RUN_TEST(git_list_config_never_returns_a_successful_prefix);
+    RUN_TEST(postimage_pin_reproves_ctime_only_successor_by_exact_bytes);
     RUN_TEST(replaced_repository_with_identical_managed_vectors_is_never_rolled_back);
     RUN_TEST(replaced_config_namespace_with_identical_vectors_is_never_rolled_back);
     RUN_TEST(replaced_config_file_with_identical_vectors_is_never_rolled_back);

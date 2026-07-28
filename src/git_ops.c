@@ -287,7 +287,8 @@ static git_restore_test_hook_fn g_restore_postpublish_hook;
 
 typedef enum {
     GIT_METADATA_TEST_SOURCE_PIN = 1,
-    GIT_METADATA_TEST_STAGE_REVALIDATE
+    GIT_METADATA_TEST_STAGE_REVALIDATE,
+    GIT_METADATA_TEST_POST_CONFIG_PIN
 } git_metadata_test_stage_t;
 typedef bool (*git_metadata_test_hook_fn)(git_metadata_test_stage_t stage);
 static git_metadata_test_hook_fn g_metadata_test_hook;
@@ -2362,7 +2363,7 @@ static int git_scope_generation_pin_post_config_pinned(
     struct stat named;
     struct stat opened;
     struct stat captured;
-    struct stat named_after;
+    struct stat verified;
     unsigned char *post_config_data = NULL;
     size_t post_config_length = 0;
     int config_fd = -1;
@@ -2381,14 +2382,12 @@ static int git_scope_generation_pin_post_config_pinned(
         config_fd = openat(generation->parent_fd, generation->leaf,
                            O_RDONLY | O_CLOEXEC | O_NOFOLLOW);
         if (config_fd < 0 || fstat(config_fd, &opened) != 0 ||
-            !git_same_file_observation(&named, &opened) ||
+            (!git_same_file_observation(&named, &opened) &&
+             !git_metadata_ctime_only_change(&named, &opened)) ||
             git_capture_fd_bytes_exact(config_fd, &post_config_data,
                                        &post_config_length, &captured) != 0 ||
             (!git_same_file_observation(&opened, &captured) &&
-             !git_metadata_ctime_only_change(&opened, &captured)) ||
-            fstatat(generation->parent_fd, generation->leaf, &named_after,
-                    AT_SYMLINK_NOFOLLOW) != 0 ||
-            !git_same_file_observation(&captured, &named_after)) {
+             !git_metadata_ctime_only_change(&opened, &captured))) {
             if (config_fd >= 0) (void)close(config_fd);
             if (post_config_data) {
                 secure_zero_memory(post_config_data, post_config_length);
@@ -2399,7 +2398,29 @@ static int git_scope_generation_pin_post_config_pinned(
                       git_scope_diagnostic_label(generation->scope));
             return -1;
         }
-        opened = captured;
+        errno = ESTALE;
+        if ((g_metadata_test_hook &&
+             g_metadata_test_hook(GIT_METADATA_TEST_POST_CONFIG_PIN)) ||
+            !git_file_at_matches_witness(
+                generation->parent_fd, generation->leaf, config_fd,
+                &captured, post_config_data, post_config_length,
+                &verified)) {
+            if (config_fd >= 0) (void)close(config_fd);
+            if (post_config_data) {
+                secure_zero_memory(post_config_data, post_config_length);
+                free(post_config_data);
+            }
+            errno = errno ? errno : ESTALE;
+            set_error(ERR_GIT_CONFIG_FAILED,
+                      "Git post-image changed while it was being re-proved for %s",
+                      git_scope_diagnostic_label(generation->scope));
+            return -1;
+        }
+        /* Git publishes config via lockfile replacement. Darwin and FreeBSD
+         * may materialize that inode's final ctime after the first read-side
+         * observation. Retain only the bounded successor proved through the
+         * same descriptor, canonical name, and exact byte witness. */
+        opened = verified;
     } else if (errno == ENOENT) {
         present = false;
         memset(&opened, 0, sizeof(opened));
