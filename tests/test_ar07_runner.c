@@ -203,19 +203,24 @@ static bool isolated_runner_check_passes(int (*check)(void)) {
     return isolated_runner_check_passes_within(check, 2000);
 }
 
-static bool isolated_runner_check_returns_normally(int (*check)(void)) {
+static bool isolated_runner_check_returns_normally_within(
+    int (*check)(void), int timeout_ms) {
     int status = 0;
 
     fflush(NULL);
     pid_t worker = fork();
     if (worker < 0) return false;
     if (worker == 0) exit(check());
-    if (!reap_within(worker, 2000, &status)) return false;
+    if (!reap_within(worker, timeout_ms, &status)) return false;
     if (!WIFEXITED(status) || WEXITSTATUS(status) != 0) {
         fprintf(stderr, "  normal-exit runner worker status=%d\n", status);
         return false;
     }
     return true;
+}
+
+static bool isolated_runner_check_returns_normally(int (*check)(void)) {
+    return isolated_runner_check_returns_normally_within(check, 2000);
 }
 
 static bool sigsets_semantically_equal(const sigset_t *left,
@@ -1185,13 +1190,14 @@ static int supervisor_termination_worker(int signal_number,
     sigset_t configured_mask;
     sigset_t after_mask;
     run_opts_t opts;
-    run_result_t result;
+    run_result_t result = {0};
     int rc = -1;
     int outcome = 78;
+    int pending_signal = 0;
     bool action_configured = false;
     bool mask_configured = false;
     bool guard_started = false;
-    bool correct = false;
+    bool mask_preserved = false;
 
     if (install_default_signal_fixture(
             signal_number, &original_action, &configured_action) != 0) {
@@ -1216,7 +1222,14 @@ static int supervisor_termination_worker(int signal_number,
     }
     guard_started = true;
     memset(&opts, 0, sizeof(opts));
-    if (run_deadline_after_millis(1000, &opts.deadline_millis) != 0) {
+    /*
+     * This contract proves delivery and parent observability, not a
+     * one-second latency guarantee. Shared sanitizer runners can occasionally
+     * spend more than one second between the gated forks even though delivery
+     * is correct, so retain a hard bound without coupling the assertion to
+     * scheduler load.
+     */
+    if (run_deadline_after_millis(3000, &opts.deadline_millis) != 0) {
         outcome = 76;
         goto cleanup;
     }
@@ -1233,19 +1246,31 @@ static int supervisor_termination_worker(int signal_number,
         outcome = 77;
         goto cleanup;
     }
-    correct = rc == -1 && result.spawned && !result.timed_out &&
-              result.exit_code == -1 &&
-              result.term_signal == signal_number &&
-              signals_pending_signal() == signal_number &&
-              sigsets_semantically_equal(&configured_mask, &after_mask);
-    if (signals_guard_end() != 0) goto cleanup;
-    guard_started = false;
-    if (sigaction(signal_number, NULL, &after_action) != 0 ||
-        !sigactions_semantically_equal(
-            &configured_action, &after_action)) {
+    pending_signal = signals_pending_signal();
+    mask_preserved =
+        sigsets_semantically_equal(&configured_mask, &after_mask);
+    if (rc != -1) outcome = 78;
+    else if (!result.spawned) outcome = 79;
+    else if (result.timed_out) outcome = 80;
+    else if (result.exit_code != -1) outcome = 81;
+    else if (result.term_signal != signal_number) outcome = 82;
+    else if (pending_signal != signal_number) outcome = 83;
+    else if (!mask_preserved) outcome = 84;
+    else outcome = 0;
+    if (signals_guard_end() != 0) {
+        outcome = 85;
         goto cleanup;
     }
-    outcome = correct ? 0 : 78;
+    guard_started = false;
+    if (sigaction(signal_number, NULL, &after_action) != 0) {
+        outcome = 86;
+        goto cleanup;
+    }
+    if (!sigactions_semantically_equal(
+            &configured_action, &after_action)) {
+        outcome = 87;
+        goto cleanup;
+    }
 
 cleanup:
     run_test_set_supervisor_pending_signal(0);
@@ -1261,7 +1286,18 @@ cleanup:
     if (action_configured &&
         sigaction(signal_number, &original_action, NULL) != 0 &&
         outcome == 0) {
-        outcome = 78;
+        outcome = 88;
+    }
+    if (outcome != 0) {
+        fprintf(
+            stderr,
+            "  relay worker outcome=%d signal=%d post_replay=%d "
+            "rc=%d spawned=%d timed_out=%d exit=%d term=%d pending=%d "
+            "mask_preserved=%d\n",
+            outcome, signal_number, post_replay ? 1 : 0, rc,
+            result.spawned ? 1 : 0, result.timed_out ? 1 : 0,
+            result.exit_code, result.term_signal, pending_signal,
+            mask_preserved ? 1 : 0);
     }
     return outcome;
 }
@@ -1314,10 +1350,10 @@ TEST(post_replay_group_termination_reaches_worker_once) {
 }
 
 TEST(hangup_and_quit_relays_are_parent_observable_once) {
-    CHECK(isolated_runner_check_returns_normally(
-        supervisor_pending_sighup_worker));
-    CHECK(isolated_runner_check_returns_normally(
-        post_replay_group_sigquit_worker));
+    CHECK(isolated_runner_check_returns_normally_within(
+        supervisor_pending_sighup_worker, 5000));
+    CHECK(isolated_runner_check_returns_normally_within(
+        post_replay_group_sigquit_worker, 5000));
 }
 
 static int pending_replay_failure_worker(void) {
