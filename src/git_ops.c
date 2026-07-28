@@ -8420,13 +8420,13 @@ void git_config_commit(void) {
 /* Initialize git operations */
 int git_ops_init(void) {
     log_debug("Initializing git operations");
-    
+
     /* Validate git installation */
     if (validate_git_installation() != 0) {
         set_error(ERR_SYSTEM_REQUIREMENT, "Git validation failed");
         return -1;
     }
-    
+
     log_info("Git operations initialized successfully");
     return 0;
 }
@@ -8563,23 +8563,23 @@ static int git_verify_effective_account(const account_t *account,
 static int git_set_config_impl(const account_t *account, git_scope_t scope) {
     const char *scope_flag;
     bool manage_worktree = false;
-    
+
     if (!account) {
         set_error(ERR_INVALID_ARGS, "NULL account to git_set_config");
         return -1;
     }
-    
+
     /* Validate account data */
     if (!validate_name(account->name)) {
         set_error(ERR_ACCOUNT_INVALID, "Invalid account name for git config");
         return -1;
     }
-    
+
     if (!validate_email(account->email)) {
         set_error(ERR_ACCOUNT_INVALID, "Invalid account email for git config");
         return -1;
     }
-    
+
     /* Get scope flag */
     scope_flag = git_scope_to_flag(scope);
     if (!scope_flag) {
@@ -8588,7 +8588,7 @@ static int git_set_config_impl(const account_t *account, git_scope_t scope) {
     }
     if (git_reject_ssh_command_override() != 0) return -1;
     if (git_reject_managed_command_overrides() != 0) return -1;
-    
+
     /* If local scope, ensure we're in a git repository */
     if (scope == GIT_SCOPE_LOCAL && !git_is_repository()) {
         set_error(ERR_GIT_NOT_REPOSITORY, "Not in a git repository, cannot set local config");
@@ -8628,13 +8628,13 @@ static int git_set_config_impl(const account_t *account, git_scope_t scope) {
         set_error(ERR_GIT_CONFIG_FAILED, "Failed to set user.name");
         return -1;
     }
-    
+
     /* Set user.email */
     if (git_set_config_value(GIT_CONFIG_USER_EMAIL, account->email, scope) != 0) {
         set_error(ERR_GIT_CONFIG_FAILED, "Failed to set user.email");
         return -1;
     }
-    
+
     /* Configure GPG if enabled */
     if (account->gpg_enabled) {
         if (git_configure_gpg(account, scope) != 0) {
@@ -8683,7 +8683,7 @@ static int git_set_config_impl(const account_t *account, git_scope_t scope) {
         set_error(ERR_GIT_CONFIG_FAILED, "Failed to set gpg.format=openpgp");
         return -1;
     }
-    
+
     /* Configure SSH if enabled. AR-05 M5: SSH identity is NOT optional for
      * an account that declares ssh_enabled. core.sshCommand carries
      * IdentitiesOnly=yes, so the configured key bypasses the isolated agent
@@ -8704,7 +8704,7 @@ static int git_set_config_impl(const account_t *account, git_scope_t scope) {
             return -1;
         }
     }
-    
+
     /* Verify configuration was set correctly - check the same scope we just
      * wrote to. A failed read-back of a key we just wrote is itself a
      * verification failure: we cannot confirm the identity was applied, which
@@ -8713,7 +8713,7 @@ static int git_set_config_impl(const account_t *account, git_scope_t scope) {
     if (git_verify_effective_account(account, scope, manage_worktree) != 0) {
         return -1;
     }
-    
+
     log_info("Git configuration set successfully for %s", account->name);
     return 0;
 }
@@ -9287,7 +9287,7 @@ int git_clear_config(git_scope_t scope) {
     const char *scope_flag;
     char first_error[sizeof(g_last_error.message)] = "";
     int failures = 0;
-    
+
     if (git_snapshot_require_current_owner("clear through") != 0) {
         return -1;
     }
@@ -9296,9 +9296,9 @@ int git_clear_config(git_scope_t scope) {
         set_error(ERR_INVALID_ARGS, "Invalid git scope");
         return -1;
     }
-    
+
     log_info("Clearing git configuration (%s scope)", scope_flag);
-    
+
     /* Attempt every managed unset so one failure cannot hide additional stale
      * identity state. Preserve the first useful diagnostic after the loop. */
     for (size_t i = 0; i < GIT_MANAGED_KEY_COUNT; i++) {
@@ -9318,7 +9318,7 @@ int git_clear_config(git_scope_t scope) {
                   first_error[0] ? first_error : "unknown Git error");
         return -1;
     }
-    
+
     log_info("Git configuration cleared");
     return 0;
 }
