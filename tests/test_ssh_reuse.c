@@ -5,10 +5,10 @@
  * a stale key after `gitswitch edit` changed the account's key path — the
  * wrong identity would keep authenticating silently.
  *
- * All ssh-keygen/ssh-add/ssh-agent invocations are intercepted with a fake
- * runner; the "agent" is a real (bound but unserved) unix socket under a
- * private fake XDG_RUNTIME_DIR so validate_ssh_agent_socket sees a genuine
- * 0600 socket. */
+ * ssh-keygen/ssh-add invocations are intercepted with deterministic answers.
+ * Reuse fixtures use a real 0600 socket inode under a private
+ * XDG_RUNTIME_DIR; fresh-start fixtures launch a real protocol-capable
+ * ssh-agent so Darwin's credential binding is exercised truthfully. */
 
 /* glibc-only: on macOS and the BSDs the strict macros hide default-namespace
  * declarations (mkdtemp, sockets) — the trap documented in ssh_manager.c. */
@@ -58,7 +58,6 @@ static const char *g_generation_loaded_fp;
 static char g_generation_key_path[MAX_PATH_LEN];
 static char g_generation_replacement[MAX_PATH_LEN];
 static bool g_keygen_used_admitted_bytes;
-static int g_fake_agent_listener = -1;
 
 static bool is_ssh_agent_command(const char *path) {
     const char *base;
@@ -140,54 +139,6 @@ static int fail_namespace_commit(int dir_fd) {
     (void)dir_fd;
     errno = EIO;
     return -1;
-}
-
-static int with_runner_cwd(const run_opts_t *opts,
-                           int (*operation)(const char *),
-                           const char *path) {
-    int saved_cwd = -1;
-    int rc;
-
-    if (!opts || !opts->use_cwd_fd) {
-        return operation(path);
-    }
-    saved_cwd = open(".", O_RDONLY | O_CLOEXEC);
-    if (saved_cwd < 0 || fchdir(opts->cwd_fd) != 0) {
-        if (saved_cwd >= 0) close(saved_cwd);
-        return -1;
-    }
-    rc = operation(path);
-    if (fchdir(saved_cwd) != 0) rc = -1;
-    close(saved_cwd);
-    return rc;
-}
-
-static int bind_and_chmod_socket(const char *path) {
-    struct sockaddr_un addr;
-    int fd = socket(AF_UNIX, SOCK_STREAM, 0);
-
-    if (fd < 0 || strlen(path) >= sizeof(addr.sun_path)) {
-        if (fd >= 0) close(fd);
-        return -1;
-    }
-    memset(&addr, 0, sizeof(addr));
-    addr.sun_family = AF_UNIX;
-    strcpy(addr.sun_path, path);
-    if (g_fake_agent_listener >= 0) {
-        close(g_fake_agent_listener);
-        g_fake_agent_listener = -1;
-    }
-    if (bind(fd, (struct sockaddr *)&addr, sizeof(addr)) != 0 ||
-        listen(fd, 8) != 0) {
-        close(fd);
-        return -1;
-    }
-    if (chmod(path, 0600) != 0) {
-        close(fd);
-        return -1;
-    }
-    g_fake_agent_listener = fd;
-    return 0;
 }
 
 static ssh_process_outcome_t refuse_agent_reap(
@@ -305,48 +256,6 @@ static ssh_agent_record_t synthetic_agent_record(pid_t pid, uint64_t nonce) {
         record.image.socket_peer_uid = geteuid();
     }
     return record;
-}
-
-static int capture_synthetic_agent_generation(
-    pid_t pid, ssh_process_generation_t *generation) {
-    ssh_agent_record_t record;
-
-    if (pid != (pid_t)12345 || !generation) {
-        errno = ESRCH;
-        return -1;
-    }
-    record = synthetic_agent_record(
-        pid, UINT64_C(0x3132333435363738));
-    *generation = record.generation;
-    return 0;
-}
-
-static ssh_reap_test_ops_t install_synthetic_generation_capture(void) {
-    const ssh_reap_test_ops_t ops = {
-        .generation = capture_synthetic_agent_generation,
-    };
-    return ssh_manager_set_reap_test_ops(&ops);
-}
-
-static int synthetic_agent_is_gone_pidfd_open(pid_t pid) {
-    if (pid != (pid_t)12345) {
-        errno = EINVAL;
-        return -1;
-    }
-    if (g_fake_agent_listener >= 0) {
-        close(g_fake_agent_listener);
-        g_fake_agent_listener = -1;
-    }
-    errno = ESRCH;
-    return -1;
-}
-
-static ssh_reap_test_ops_t install_synthetic_gone_generation(void) {
-    const ssh_reap_test_ops_t ops = {
-        .generation = capture_synthetic_agent_generation,
-        .pidfd_open = synthetic_agent_is_gone_pidfd_open,
-    };
-    return ssh_manager_set_reap_test_ops(&ops);
 }
 
 static int write_agent_sidecar(const char *account,
@@ -733,26 +642,27 @@ TEST(ssh_fingerprint_reuse_rejects_same_fingerprint_certificate) {
     CHECK(!path_exists(sock));
 }
 
-/* T1 (AR-01-T1): parse_ssh_agent_output must unwrap a quoted
- * SSH_AUTH_SOCK="..." value, the way some ssh-agent builds and wrappers
- * report paths containing spaces/parens. Locks the T1 quoted-socket fix. */
+/* T1 (AR-01-T1): a quoted SSH_AUTH_SOCK="..." assignment from ssh-agent
+ * must not leak quotes into the descriptor-derived public socket path. */
 
-/* Runner variant whose fake ssh-agent SUCCEEDS: it binds a real socket at the
- * requested -a path and reports it QUOTED, the way some ssh-agent builds and
- * wrappers do. Only a parser that strips the quotes can then validate it. */
+/* Runner variant whose ssh-agent SUCCEEDS: use the real daemon so Darwin's
+ * protocol-qualified peer inspection exercises the same boundary as
+ * production, while retaining deterministic fake ssh-add/ssh-keygen answers
+ * and the namespace-race hooks below. Rewrite only the successful daemon's
+ * output to the quoted form this parser regression is meant to cover. */
 static int fake_quoting_agent_runner(const char *const argv[],
                                      const run_opts_t *opts,
                                      run_result_t *result) {
-    if (result) {
-        memset(result, 0, sizeof(*result));
-        result->spawned = true;
-    }
-    if (opts && opts->out && opts->out_size > 0) opts->out[0] = '\0';
-
     if (is_ssh_agent_command(argv[0])) {
+        const char *sock = NULL;
+        const char *pid_text;
+        char *pid_end = NULL;
+        long agent_pid;
+        int written;
+        int rc;
+
         /* Find "-a <path>" wherever it sits: the AR-03 H1 fix passes an
          * explicit -s ahead of it, so the socket is no longer argv[2]. */
-        const char *sock = NULL;
         for (size_t i = 1; argv[i]; i++) {
             if (strcmp(argv[i], "-a") == 0 && argv[i + 1]) {
                 sock = argv[i + 1];
@@ -760,26 +670,43 @@ static int fake_quoting_agent_runner(const char *const argv[],
             }
         }
         if (!sock) return -1;
-        if (certify_agent_launch(argv[0], result) != 0) return -1;
         if (g_replace_dir_on_agent_start) {
             g_replace_dir_on_agent_start = false;
             if (replace_agent_dir_namespace() != 0) return -1;
         }
-        if (with_runner_cwd(opts, bind_and_chmod_socket, sock) != 0) return -1;
-        if (g_pid_link_to_plant && g_pid_link_target &&
-            symlink(g_pid_link_target, g_pid_link_to_plant) != 0) {
-            (void)unlink(sock);
+        rc = run_argv_real(argv, opts, result);
+        if (rc != 0 || !result || !opts || !opts->out ||
+            result->out_truncated) {
+            return rc != 0 ? rc : -1;
+        }
+        pid_text = strstr(opts->out, "SSH_AGENT_PID=");
+        if (!pid_text) return -1;
+        pid_text += strlen("SSH_AGENT_PID=");
+        errno = 0;
+        agent_pid = strtol(pid_text, &pid_end, 10);
+        if (errno != 0 || pid_end == pid_text || agent_pid <= 1 ||
+            (long)(pid_t)agent_pid != agent_pid) {
             return -1;
         }
-        if (opts && opts->out) {
-            snprintf(opts->out, opts->out_size,
-                     "SSH_AUTH_SOCK=\"%s\"; export SSH_AUTH_SOCK;\n"
-                     "SSH_AGENT_PID=12345; export SSH_AGENT_PID;\n"
-                     "echo Agent pid 12345;\n", sock);
-            if (result) result->out_len = strlen(opts->out);
+        written = snprintf(
+            opts->out, opts->out_size,
+            "SSH_AUTH_SOCK=\"%s\"; export SSH_AUTH_SOCK;\n"
+            "SSH_AGENT_PID=%ld; export SSH_AGENT_PID;\n"
+            "echo Agent pid %ld;\n",
+            sock, agent_pid, agent_pid);
+        if (written < 0 || (size_t)written >= opts->out_size) return -1;
+        result->out_len = (size_t)written;
+        if (g_pid_link_to_plant && g_pid_link_target &&
+            symlink(g_pid_link_target, g_pid_link_to_plant) != 0) {
+            return -1;
         }
         return 0;
     }
+    if (result) {
+        memset(result, 0, sizeof(*result));
+        result->spawned = true;
+    }
+    if (opts && opts->out && opts->out_size > 0) opts->out[0] = '\0';
     if (strcmp(argv[0], "ssh-add") == 0 && argv[1] &&
         strcmp(argv[1], "-l") == 0) {
         if (opts && opts->out && opts->out_size > 0) {
@@ -835,12 +762,11 @@ static int fake_quoting_agent_runner(const char *const argv[],
     return 0;
 }
 
-TEST(agent_output_quoted_auth_sock_is_unwrapped) {
+TEST(agent_output_quoted_auth_sock_preserves_pinned_path) {
     char sock[256];
     ssh_config_t cfg;
     account_t acct;
     command_runner_fn prev;
-    ssh_reap_test_ops_t previous_reap_ops;
     int rc;
 
     /* Runtime dir only — deliberately NO pre-existing per-account socket, so
@@ -857,17 +783,16 @@ TEST(agent_output_quoted_auth_sock_is_unwrapped) {
      * marker retained in a caller-reused configuration object. */
     cfg.reused_existing_agent = true;
 
-    previous_reap_ops = install_synthetic_generation_capture();
     prev = run_set_runner(fake_quoting_agent_runner);
     rc = ssh_start_isolated_agent(&cfg, &acct);
     run_set_runner(prev);
-    ssh_manager_set_reap_test_ops(&previous_reap_ops);
 
     CHECK_EQ_INT(rc, 0);
     CHECK(strchr(cfg.agent_socket_path, '"') == NULL); /* quotes stripped */
     CHECK_STR_EQ(cfg.agent_socket_path, sock);
     CHECK(g_key_load_used_pinned_socket);
     CHECK(!cfg.reused_existing_agent);
+    CHECK_EQ_INT(ssh_manager_cleanup(&cfg), 0);
 }
 
 /* A stale agent forces a fingerprint-before-fresh-load sequence inside the
@@ -890,7 +815,6 @@ TEST(isolated_activation_retains_generation_between_fingerprint_and_load) {
     ssh_config_t cfg;
     account_t acct;
     command_runner_fn previous;
-    ssh_reap_test_ops_t previous_reap_ops;
 
     CHECK_EQ_INT(setup_agent_socket("work", sock, sizeof(sock)), 0);
     CHECK_EQ_INT(make_account(&acct, "keyA"), 0);
@@ -911,7 +835,6 @@ TEST(isolated_activation_retains_generation_between_fingerprint_and_load) {
     g_generation_loaded_fp = FP_B; /* stale agent: refuse reuse */
     g_generation_loads = 0;
     g_swap_key_after_fingerprint = true;
-    previous_reap_ops = install_synthetic_gone_generation();
     previous = run_set_runner(fake_quoting_agent_runner);
     CHECK_EQ_INT(ssh_start_isolated_agent(&cfg, &acct), 0);
     run_set_runner(previous);
@@ -922,7 +845,6 @@ TEST(isolated_activation_retains_generation_between_fingerprint_and_load) {
     g_generation_runner_mode = false;
     g_generation_loaded_fp = NULL;
     CHECK_EQ_INT(ssh_manager_cleanup(&cfg), 0);
-    ssh_manager_set_reap_test_ops(&previous_reap_ops);
     unsetenv("SSH_AUTH_SOCK");
     unsetenv("SSH_AGENT_PID");
     unsetenv("XDG_RUNTIME_DIR");
@@ -1047,7 +969,7 @@ TEST(fresh_agent_sidecar_atomically_replaces_planted_symlink) {
     ssh_config_t cfg;
     account_t acct;
     command_runner_fn prev;
-    ssh_reap_test_ops_t previous_reap_ops;
+    char expected_prefix[64];
 
     CHECK_EQ_INT(make_xdg_runtime_dir(), 0);
     CHECK_EQ_INT(setenv("XDG_RUNTIME_DIR", g_xdg, 1), 0);
@@ -1063,11 +985,9 @@ TEST(fresh_agent_sidecar_atomically_replaces_planted_symlink) {
 
     g_pid_link_to_plant = pid_path;
     g_pid_link_target = victim;
-    previous_reap_ops = install_synthetic_generation_capture();
     prev = run_set_runner(fake_quoting_agent_runner);
     CHECK_EQ_INT(ssh_start_isolated_agent(&cfg, &acct), 0);
     run_set_runner(prev);
-    ssh_manager_set_reap_test_ops(&previous_reap_ops);
     g_pid_link_to_plant = NULL;
     g_pid_link_target = NULL;
 
@@ -1077,7 +997,10 @@ TEST(fresh_agent_sidecar_atomically_replaces_planted_symlink) {
     CHECK(S_ISREG(st.st_mode));
     CHECK_EQ_INT(st.st_mode & 0777, 0600);
     CHECK(read_file_to_string(pid_path, content, sizeof(content)) > 0);
-    CHECK(strncmp(content, "v2 12345 ", strlen("v2 12345 ")) == 0);
+    CHECK(snprintf(expected_prefix, sizeof(expected_prefix), "v2 %ld ",
+                   (long)cfg.agent_pid) > 0);
+    CHECK(strncmp(content, expected_prefix, strlen(expected_prefix)) == 0);
+    CHECK_EQ_INT(ssh_manager_cleanup(&cfg), 0);
 }
 
 /* Reuse must stay inside the directory inode it pinned. Replacing the public
@@ -1118,9 +1041,8 @@ TEST(reuse_aborts_on_agent_directory_namespace_replacement) {
 /* A fresh agent is started with a relative -a argument and a pinned cwd.
  * Even when the public directory pathname is replaced inside the runner, no
  * sidecar/link may be split across namespaces and success may not be reported
- * through a public path that names the replacement. Linux and FreeBSD can
- * probe and retire the descriptor-anchored old socket; fallback platforms
- * preserve that inert residue while clearing every ownership claim. */
+ * through a public path that names the replacement. Every supported platform
+ * can now protocol-probe and retire the descriptor-anchored old socket. */
 TEST(fresh_start_aborts_without_claiming_replaced_namespace) {
     char public_dir[256];
     char public_sock[384];
@@ -1130,7 +1052,6 @@ TEST(fresh_start_aborts_without_claiming_replaced_namespace) {
     ssh_config_t cfg;
     account_t acct;
     command_runner_fn prev;
-    ssh_reap_test_ops_t previous_reap_ops;
 
     CHECK_EQ_INT(make_xdg_runtime_dir(), 0);
     CHECK_EQ_INT(setenv("XDG_RUNTIME_DIR", g_xdg, 1), 0);
@@ -1144,11 +1065,9 @@ TEST(fresh_start_aborts_without_claiming_replaced_namespace) {
     cfg.agent_pid = -1;
 
     g_replace_dir_on_agent_start = true;
-    previous_reap_ops = install_synthetic_gone_generation();
     prev = run_set_runner(fake_quoting_agent_runner);
     CHECK_EQ_INT(ssh_start_isolated_agent(&cfg, &acct), -1);
     run_set_runner(prev);
-    ssh_manager_set_reap_test_ops(&previous_reap_ops);
     g_replace_dir_on_agent_start = false;
 
     snprintf(moved_sock, sizeof(moved_sock),
@@ -1158,11 +1077,7 @@ TEST(fresh_start_aborts_without_claiming_replaced_namespace) {
     snprintf(moved_current, sizeof(moved_current),
              "%s/current.sock", g_moved_agent_dir);
     CHECK(!path_exists(public_sock));
-#if defined(__linux__) || defined(__FreeBSD__)
     CHECK(!path_exists(moved_sock));
-#else
-    CHECK(path_exists(moved_sock));
-#endif
     CHECK(!path_exists(moved_pid));
     CHECK(!path_exists(moved_current));
     CHECK(!cfg.agent_owned);
@@ -1181,7 +1096,6 @@ TEST(pid_sidecar_rejects_temp_path_inode_swap) {
     account_t acct;
     command_runner_fn prev_runner;
     ssh_pid_commit_hook_fn prev_hook;
-    ssh_reap_test_ops_t previous_reap_ops;
 
     CHECK_EQ_INT(make_xdg_runtime_dir(), 0);
     CHECK_EQ_INT(setenv("XDG_RUNTIME_DIR", g_xdg, 1), 0);
@@ -1196,11 +1110,9 @@ TEST(pid_sidecar_rejects_temp_path_inode_swap) {
     cfg.agent_pid = -1;
 
     prev_hook = ssh_manager_set_pid_commit_hook_fn(swap_pid_temp_path);
-    previous_reap_ops = install_synthetic_gone_generation();
     prev_runner = run_set_runner(fake_quoting_agent_runner);
     CHECK_EQ_INT(ssh_start_isolated_agent(&cfg, &acct), -1);
     run_set_runner(prev_runner);
-    ssh_manager_set_reap_test_ops(&previous_reap_ops);
     ssh_manager_set_pid_commit_hook_fn(prev_hook);
 
     CHECK(!path_exists(pid_path));
@@ -1858,7 +1770,7 @@ TEST_MAIN_BEGIN()
     RUN_TEST(reuse_failure_preserves_only_reproven_target_key_truth);
     RUN_TEST(ssh_fingerprint_reuse_rejects_different_key);
     RUN_TEST(ssh_fingerprint_reuse_rejects_same_fingerprint_certificate);
-    RUN_TEST(agent_output_quoted_auth_sock_is_unwrapped);
+    RUN_TEST(agent_output_quoted_auth_sock_preserves_pinned_path);
     RUN_TEST(
         isolated_activation_retains_generation_between_fingerprint_and_load);
     RUN_TEST(fresh_commit_revalidates_public_agent_directory);

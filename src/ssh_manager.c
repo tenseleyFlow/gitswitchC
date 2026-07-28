@@ -198,7 +198,8 @@ static int prove_malformed_pid_socket_dead_at(
     const char *record_description);
 static int retire_reaped_socket_if_dead(
     int dir_fd, const char *socket_dir, const char *socket_name,
-    const char *socket_path, const char *description);
+    const char *socket_path, bool allow_detached_namespace,
+    const char *description);
 static int release_ssh_runtime_pin(int dir_fd, ssh_runtime_pin_t *pin);
 static int reconcile_ssh_runtime_pins(int dir_fd, const char *socket_dir);
 static void warn_recorded_endpoint_retirement(const char *socket_path,
@@ -4633,6 +4634,7 @@ static int ssh_start_isolated_agent_with_key(
                 ssh_reap_allows_cleanup(reap_outcome) &&
                 retire_reaped_socket_if_dead(
                     dir_fd, socket_dir, socket_name, socket_path,
+                    false,
                     "agent socket cleanup after sidecar failure") == 0;
             ssh_config->agent_pid = -1;
             ssh_process_generation_clear(&ssh_config->agent_generation);
@@ -4750,8 +4752,13 @@ fresh_commit_failed:
         ssh_process_outcome_t reap_outcome = g_ssh_reap(
             &record, socket_path, dir_fd);
         if (ssh_reap_allows_cleanup(reap_outcome)) {
+            /* This rollback can be entered because the public directory was
+             * replaced after current.sock committed. Exact process reaping
+             * plus the held directory/socket identities authorize retiring
+             * only that detached runtime. */
             if (retire_reaped_socket_if_dead(
                     dir_fd, socket_dir, socket_name, socket_path,
+                    true,
                     "agent socket cleanup after failed publication") != 0) {
                 agent_retained = true;
             } else if (pid_recorded &&
@@ -10637,7 +10644,8 @@ static void warn_recorded_endpoint_retirement(const char *socket_path,
 
 static int retire_reaped_socket_if_dead(
     int dir_fd, const char *socket_dir, const char *socket_name,
-    const char *socket_path, const char *description) {
+    const char *socket_path, bool allow_detached_namespace,
+    const char *description) {
     ssh_runtime_pin_t socket_pin;
     bool socket_present;
     int pin_rc;
@@ -10650,7 +10658,8 @@ static int retire_reaped_socket_if_dead(
     socket_present = pin_rc == 0;
     if (prove_malformed_pid_socket_dead_at(
             dir_fd, socket_dir, socket_name, socket_path, &socket_pin,
-            socket_present, false, "a valid SSH process record") != 0) {
+            socket_present, allow_detached_namespace,
+            "a valid SSH process record") != 0) {
         goto done;
     }
     if (unlink_ssh_reset_path_at(
@@ -12694,6 +12703,7 @@ static int kill_orphaned_gitswitch_agents(int dir_fd, const char *socket_dir,
         if ((!recorded_endpoint_retired &&
              retire_reaped_socket_if_dead(
                  dir_fd, socket_dir, sock_name, sock_full,
+                 false,
                  "orphaned SSH agent socket cleanup") != 0) ||
             (recorded_endpoint_retired &&
              unlink_ssh_reset_path_at(
