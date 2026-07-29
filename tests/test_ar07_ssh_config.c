@@ -2189,7 +2189,13 @@ TEST(absent_alias_obligation_rejects_later_ssh_directory_without_mutation) {
     check_unchanged(config, original, sizeof(original) - 1U, &before);
 }
 
-TEST(alias_obligation_rejects_replaced_ssh_directory_without_mutation) {
+/* AR-15 M7: replacing ~/.ssh with a fresh, self-owned safe directory is a
+ * benign namespace change (delete+recreate). The replacement is now the live
+ * namespace, so its managed alias block is retired goal-based rather than the
+ * obligation wedging permanently on the inode change. The moved-aside directory
+ * is outside the managed namespace and left untouched. Pre-fix this returned -1
+ * ("generation") and mutated nothing. */
+TEST(alias_obligation_settles_safe_replaced_ssh_directory) {
     static const char original[] =
         "Host preserved\n  User alice\n"
         BEGIN_MARK "\n"
@@ -2198,12 +2204,12 @@ TEST(alias_obligation_rejects_replaced_ssh_directory_without_mutation) {
         "  IdentityFile \"/stale/key\"\n"
         "  IdentitiesOnly yes\n"
         END_MARK "\n";
+    static const char expected[] = "Host preserved\n  User alice\n";
     char home[96], config[MAX_PATH_LEN], ssh_dir[MAX_PATH_LEN];
     char moved_ssh[MAX_PATH_LEN], moved_config[MAX_PATH_LEN];
-    struct stat before;
     config_retirement_ssh_alias_obligation_t obligation;
     ssh_config_publication_state_t publication =
-        SSH_CONFIG_PUBLICATION_COMMITTED;
+        SSH_CONFIG_PUBLICATION_PREINSTALL_FAILED;
 
     CHECK_EQ_INT(setup_home(home, config), 0);
     CHECK((size_t)snprintf(ssh_dir, sizeof(ssh_dir), "%s/.ssh", home) <
@@ -2219,15 +2225,113 @@ TEST(alias_obligation_rejects_replaced_ssh_directory_without_mutation) {
     CHECK_EQ_INT(rename(ssh_dir, moved_ssh), 0);
     CHECK_EQ_INT(mkdir(ssh_dir, 0700), 0);
     CHECK_EQ_INT(write_bytes(config, original, sizeof(original) - 1U), 0);
+    clear_error();
+    CHECK_EQ_INT(ssh_remove_host_alias_obligation_result(
+                     &obligation, &publication), 0);
+
+    CHECK_EQ_INT(publication, SSH_CONFIG_PUBLICATION_COMMITTED);
+    check_exact_file_bytes(config, expected, sizeof(expected) - 1U);
+    check_exact_file_bytes(moved_config, original, sizeof(original) - 1U);
+}
+
+/* AR-15 M7 safety complement: the relaxation is bounded to self-owned safe
+ * directories. A replacement ~/.ssh that is group/other-writable is still a
+ * suspicious namespace and must fail closed without mutation. */
+TEST(alias_obligation_rejects_unsafe_replaced_ssh_directory) {
+    static const char original[] =
+        "Host preserved\n  User alice\n"
+        BEGIN_MARK "\n"
+        "Host " TEST_ALIAS "\n"
+        "  HostName github.com\n"
+        "  IdentityFile \"/stale/key\"\n"
+        "  IdentitiesOnly yes\n"
+        END_MARK "\n";
+    char home[96], config[MAX_PATH_LEN], ssh_dir[MAX_PATH_LEN];
+    struct stat before;
+    config_retirement_ssh_alias_obligation_t obligation;
+    ssh_config_publication_state_t publication =
+        SSH_CONFIG_PUBLICATION_COMMITTED;
+
+    CHECK_EQ_INT(setup_home(home, config), 0);
+    CHECK((size_t)snprintf(ssh_dir, sizeof(ssh_dir), "%s/.ssh", home) <
+          sizeof(ssh_dir));
+    CHECK_EQ_INT(write_bytes(config, original, sizeof(original) - 1U), 0);
+    CHECK_EQ_INT(ssh_capture_host_alias_obligation(
+                     TEST_ALIAS, &obligation), 0);
+
+    CHECK_EQ_INT(chmod(ssh_dir, 0770), 0);
     CHECK_EQ_INT(stat(config, &before), 0);
     clear_error();
     CHECK_EQ_INT(ssh_remove_host_alias_obligation_result(
                      &obligation, &publication), -1);
-
     CHECK_EQ_INT(publication, SSH_CONFIG_PUBLICATION_PREINSTALL_FAILED);
-    CHECK(strstr(get_last_error()->message, "generation") != NULL);
     check_unchanged(config, original, sizeof(original) - 1U, &before);
-    check_exact_file_bytes(moved_config, original, sizeof(original) - 1U);
+    CHECK_EQ_INT(chmod(ssh_dir, 0700), 0);
+}
+
+/* AR-15 M7: a benign chmod of ~/.ssh (same inode, still safe) must not wedge
+ * the retirement -- the managed block is still removed. Pre-fix the exact-mode
+ * binding failed with "generation". */
+TEST(alias_obligation_tolerates_benign_ssh_directory_chmod) {
+    static const char original[] =
+        "Host preserved\n  User alice\n"
+        BEGIN_MARK "\n"
+        "Host " TEST_ALIAS "\n"
+        "  HostName github.com\n"
+        "  IdentityFile \"/stale/key\"\n"
+        "  IdentitiesOnly yes\n"
+        END_MARK "\n";
+    static const char expected[] = "Host preserved\n  User alice\n";
+    char home[96], config[MAX_PATH_LEN], ssh_dir[MAX_PATH_LEN];
+    config_retirement_ssh_alias_obligation_t obligation;
+    ssh_config_publication_state_t publication =
+        SSH_CONFIG_PUBLICATION_PREINSTALL_FAILED;
+
+    CHECK_EQ_INT(setup_home(home, config), 0);
+    CHECK((size_t)snprintf(ssh_dir, sizeof(ssh_dir), "%s/.ssh", home) <
+          sizeof(ssh_dir));
+    CHECK_EQ_INT(write_bytes(config, original, sizeof(original) - 1U), 0);
+    CHECK_EQ_INT(ssh_capture_host_alias_obligation(
+                     TEST_ALIAS, &obligation), 0);
+
+    CHECK_EQ_INT(chmod(ssh_dir, 0750), 0);
+    clear_error();
+    CHECK_EQ_INT(ssh_remove_host_alias_obligation_result(
+                     &obligation, &publication), 0);
+    CHECK_EQ_INT(publication, SSH_CONFIG_PUBLICATION_COMMITTED);
+    check_exact_file_bytes(config, expected, sizeof(expected) - 1U);
+}
+
+/* AR-15 M7: deleting ~/.ssh entirely means the managed alias is necessarily
+ * gone, so obligation recovery settles the goal instead of wedging with EAGAIN
+ * ("Required SSH directory is absent"). */
+TEST(alias_obligation_settles_when_ssh_directory_removed) {
+    static const char original[] =
+        "Host preserved\n  User alice\n"
+        BEGIN_MARK "\n"
+        "Host " TEST_ALIAS "\n"
+        "  HostName github.com\n"
+        "  IdentityFile \"/stale/key\"\n"
+        "  IdentitiesOnly yes\n"
+        END_MARK "\n";
+    char home[96], config[MAX_PATH_LEN], ssh_dir[MAX_PATH_LEN];
+    config_retirement_ssh_alias_obligation_t obligation;
+    ssh_config_publication_state_t publication =
+        SSH_CONFIG_PUBLICATION_PREINSTALL_FAILED;
+
+    CHECK_EQ_INT(setup_home(home, config), 0);
+    CHECK((size_t)snprintf(ssh_dir, sizeof(ssh_dir), "%s/.ssh", home) <
+          sizeof(ssh_dir));
+    CHECK_EQ_INT(write_bytes(config, original, sizeof(original) - 1U), 0);
+    CHECK_EQ_INT(ssh_capture_host_alias_obligation(
+                     TEST_ALIAS, &obligation), 0);
+
+    CHECK_EQ_INT(unlink(config), 0);
+    CHECK_EQ_INT(rmdir(ssh_dir), 0);
+    clear_error();
+    CHECK_EQ_INT(ssh_remove_host_alias_obligation_result(
+                     &obligation, &publication), 0);
+    CHECK_EQ_INT(publication, SSH_CONFIG_PUBLICATION_UNCHANGED);
 }
 
 TEST(alias_obligation_rejects_retargeted_home_without_mutation) {
@@ -2290,7 +2394,12 @@ TEST(alias_obligation_rejects_retargeted_home_without_mutation) {
                            sizeof(original) - 1U);
 }
 
-TEST(alias_obligation_success_revalidates_until_directory_replacement) {
+/* AR-15 M7: revalidation binds to the present-time namespace. A successful
+ * removal still revalidates, and replacing ~/.ssh with a fresh self-owned safe
+ * directory revalidates too (the namespace is safe and consumable) instead of
+ * wedging. An unsafe replacement still fails closed. Pre-fix the safe
+ * replacement returned -1 ("no longer matches"). */
+TEST(alias_obligation_revalidates_across_safe_directory_replacement) {
     static const char original[] =
         "Host before\n  User alice\n"
         BEGIN_MARK "\n"
@@ -2327,8 +2436,11 @@ TEST(alias_obligation_success_revalidates_until_directory_replacement) {
     CHECK_EQ_INT(rename(ssh_dir, moved_ssh), 0);
     CHECK_EQ_INT(mkdir(ssh_dir, 0700), 0);
     clear_error();
+    CHECK_EQ_INT(ssh_revalidate_host_alias_obligation(&obligation), 0);
+    CHECK_EQ_INT(chmod(ssh_dir, 0770), 0);
+    clear_error();
     CHECK_EQ_INT(ssh_revalidate_host_alias_obligation(&obligation), -1);
-    CHECK(strstr(get_last_error()->message, "no longer matches") != NULL);
+    CHECK_EQ_INT(chmod(ssh_dir, 0700), 0);
     {
         char moved_config[MAX_PATH_LEN];
 
@@ -3983,9 +4095,12 @@ TEST_MAIN_BEGIN()
     RUN_TEST(legacy_remove_preserves_empty_alias_noop_compatibility);
     RUN_TEST(alias_obligation_capture_binds_canonical_home_and_stable_directories);
     RUN_TEST(absent_alias_obligation_rejects_later_ssh_directory_without_mutation);
-    RUN_TEST(alias_obligation_rejects_replaced_ssh_directory_without_mutation);
+    RUN_TEST(alias_obligation_settles_safe_replaced_ssh_directory);
+    RUN_TEST(alias_obligation_rejects_unsafe_replaced_ssh_directory);
+    RUN_TEST(alias_obligation_tolerates_benign_ssh_directory_chmod);
+    RUN_TEST(alias_obligation_settles_when_ssh_directory_removed);
     RUN_TEST(alias_obligation_rejects_retargeted_home_without_mutation);
-    RUN_TEST(alias_obligation_success_revalidates_until_directory_replacement);
+    RUN_TEST(alias_obligation_revalidates_across_safe_directory_replacement);
     RUN_TEST(alias_obligation_capture_failure_clears_output);
     RUN_TEST(byte_identical_config_skips_all_write_and_sync_work);
     RUN_TEST(byte_identical_safe_config_rechecks_mode_before_noop);

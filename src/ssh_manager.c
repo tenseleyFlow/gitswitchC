@@ -5822,6 +5822,15 @@ static bool ssh_config_directory_is_safe(const struct stat *identity) {
            (identity->st_mode & (S_IWGRP | S_IWOTH)) == 0;
 }
 
+/* AR-15 M7: publication_identity_t form of ssh_config_directory_is_safe, used to
+ * revalidate a re-captured alias obligation against the present-time namespace
+ * (self-owned safe directory) rather than an exact captured generation. */
+static bool ssh_directory_publication_safe(const publication_identity_t *id) {
+    return id && id->present && S_ISDIR((mode_t)id->mode) &&
+           id->uid == (uintmax_t)getuid() &&
+           ((mode_t)id->mode & (S_IWGRP | S_IWOTH)) == 0;
+}
+
 static bool ssh_config_file_is_safe_unchanged(const struct stat *identity) {
     return S_ISREG(identity->st_mode) && identity->st_uid == getuid() &&
            (identity->st_mode & (S_IWGRP | S_IWOTH)) == 0;
@@ -5836,9 +5845,6 @@ typedef struct {
     bool absent;
     bool home_entry_synced;
 } ssh_config_directory_t;
-
-static bool ssh_directory_publication_matches(
-    const publication_identity_t *expected, const struct stat *observed);
 
 static int recheck_ssh_home_directory(
     const char *home, const ssh_config_directory_t *directory) {
@@ -5920,13 +5926,11 @@ static int prove_absent_ssh_config_directory_durable(
             "HOME changed while proving absent SSH config directory");
         goto done;
     }
-    if (obligation &&
-        !ssh_directory_publication_matches(
-            &obligation->home_identity, &pinned_before)) {
+    if (obligation && !ssh_config_directory_is_safe(&pinned_before)) {
         errno = EAGAIN;
         set_system_error(
             ERR_FILE_IO,
-            "HOME generation does not match SSH alias obligation");
+            "HOME is no longer a safe directory for the SSH alias obligation");
         goto done;
     }
 
@@ -5962,8 +5966,7 @@ static int prove_absent_ssh_config_directory_durable(
         goto done;
     }
     if (obligation &&
-        (!ssh_directory_publication_matches(
-             &obligation->home_identity, &pinned_before) ||
+        (!ssh_config_directory_is_safe(&pinned_before) ||
          realpath(home, canonical_home) == NULL ||
          strcmp(canonical_home, obligation->home_path) != 0)) {
         errno = EAGAIN;
@@ -6032,8 +6035,7 @@ static int prove_absent_ssh_config_directory_durable(
         goto done;
     }
     if (obligation &&
-        (!ssh_directory_publication_matches(
-             &obligation->home_identity, &pinned_after) ||
+        (!ssh_config_directory_is_safe(&pinned_after) ||
          realpath(home, canonical_home) == NULL ||
          strcmp(canonical_home, obligation->home_path) != 0)) {
         errno = EAGAIN;
@@ -6294,28 +6296,6 @@ static bool ssh_publication_identity_is_zero(
     return memcmp(identity, &zero, sizeof(zero)) == 0;
 }
 
-static bool ssh_directory_publication_matches(
-    const publication_identity_t *expected, const struct stat *observed) {
-    return expected && observed && expected->present &&
-           expected->device == (uintmax_t)observed->st_dev &&
-           expected->inode == (uintmax_t)observed->st_ino &&
-           expected->mode == (uintmax_t)observed->st_mode &&
-           expected->uid == (uintmax_t)observed->st_uid &&
-           expected->gid == (uintmax_t)observed->st_gid &&
-           S_ISDIR(observed->st_mode);
-}
-
-static bool ssh_directory_publication_equal_stable(
-    const publication_identity_t *left,
-    const publication_identity_t *right) {
-    return left && right && left->present == right->present &&
-           (!left->present ||
-            (left->device == right->device &&
-             left->inode == right->inode &&
-             left->mode == right->mode &&
-             left->uid == right->uid &&
-             left->gid == right->gid));
-}
 
 static bool ssh_alias_obligation_is_valid(
     const config_retirement_ssh_alias_obligation_t *obligation) {
@@ -6543,26 +6523,21 @@ static int ssh_recheck_open_alias_obligation(
             "Failed to inspect HOME for SSH alias obligation");
         return -1;
     }
-    if (!ssh_directory_publication_matches(
-            &obligation->home_identity, &pinned_home) ||
+    /* AR-15 M7: bind consumption to the present-time namespace, not the exact
+     * captured generation. The safety that matters for a marker-delimited
+     * removal under the ~/.ssh/config lock is the matching HOME path (above)
+     * and a self-owned safe directory -- not the mode/mtime/inode recorded at
+     * capture, whose exact match permanently wedged recovery (and therefore
+     * every account mutation) on a benign chmod, delete, or recreate of HOME or
+     * ~/.ssh. A foreign-owned or group/other-writable directory still fails
+     * closed, and the open ~/.ssh fd is proved consistent with its name. */
+    if (!ssh_config_directory_is_safe(&pinned_home) ||
         !same_ssh_config_directory(&pinned_home, &named_home)) {
         errno = EAGAIN;
         set_system_error(
             ERR_FILE_IO,
-            "HOME generation does not match SSH alias obligation");
+            "HOME is no longer a safe directory for the SSH alias obligation");
         return -1;
-    }
-    if (!obligation->ssh_directory_identity.present) {
-        if (fstatat(directory->home_fd, ".ssh", &named_ssh,
-                    AT_SYMLINK_NOFOLLOW) == 0 ||
-            errno != ENOENT) {
-            errno = EAGAIN;
-            set_system_error(
-                ERR_FILE_IO,
-                "SSH directory appeared after alias obligation capture");
-            return -1;
-        }
-        return 0;
     }
     if (fstat(directory->dir_fd, &pinned_ssh) != 0 ||
         fstatat(directory->home_fd, ".ssh", &named_ssh,
@@ -6573,13 +6548,11 @@ static int ssh_recheck_open_alias_obligation(
         return -1;
     }
     if (!ssh_config_directory_is_safe(&pinned_ssh) ||
-        !ssh_directory_publication_matches(
-            &obligation->ssh_directory_identity, &pinned_ssh) ||
         !same_ssh_config_directory(&pinned_ssh, &named_ssh)) {
         errno = EAGAIN;
         set_system_error(
             ERR_FILE_IO,
-            "SSH directory generation does not match alias obligation");
+            "SSH directory is no longer safe for the alias obligation");
         return -1;
     }
     return 0;
@@ -6598,16 +6571,20 @@ int ssh_revalidate_host_alias_obligation(
             obligation->ssh_host_alias, &observed) != 0) {
         return -1;
     }
+    /* AR-15 M7: revalidate against the present-time namespace, not the captured
+     * generation. The retirement's safety comes from the matching HOME path and
+     * a self-owned safe HOME/~/.ssh (the removal is a marker-delimited edit
+     * under the ~/.ssh/config lock), so a benign chmod/delete/recreate must not
+     * wedge recovery. An absent ~/.ssh is admissible here: the managed alias is
+     * necessarily gone, and consumption settles it as goal-met. */
     if (strcmp(observed.home_path, obligation->home_path) != 0 ||
-        !ssh_directory_publication_equal_stable(
-            &observed.home_identity, &obligation->home_identity) ||
-        !ssh_directory_publication_equal_stable(
-            &observed.ssh_directory_identity,
-            &obligation->ssh_directory_identity)) {
+        !ssh_directory_publication_safe(&observed.home_identity) ||
+        (observed.ssh_directory_identity.present &&
+         !ssh_directory_publication_safe(&observed.ssh_directory_identity))) {
         errno = EAGAIN;
         set_system_error(
             ERR_FILE_IO,
-            "SSH alias retirement namespace no longer matches obligation");
+            "SSH alias retirement namespace is no longer safe");
         return -1;
     }
     return 0;
@@ -8284,15 +8261,13 @@ static int ssh_remove_host_alias_result_internal(
     }
     if (open_ssh_config_directory(home, false, &directory) != 0) {
         if (directory.absent) {
-            if (obligation) {
-                errno = EAGAIN;
-                set_system_error(
-                    ERR_FILE_IO,
-                    "Required SSH directory is absent for alias obligation");
-                return -1;
-            }
+            /* AR-15 M7: an absent ~/.ssh means the managed alias is necessarily
+             * gone, so the retirement goal is already met even during
+             * obligation recovery. Prove the absence durable under the matching
+             * HOME (bound to present-time safety, not the captured generation)
+             * and settle, instead of wedging with EAGAIN on a benign delete. */
             if (prove_absent_ssh_config_directory_durable(
-                    home, NULL, publication) != 0) {
+                    home, obligation, publication) != 0) {
                 return -1;
             }
             if (publication) {
