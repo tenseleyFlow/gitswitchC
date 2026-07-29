@@ -614,6 +614,33 @@ static int config_select_settled_name_at(
     errno = ENOSPC;
     return -1;
 }
+
+/* Reclaim one arena slot this process just created and proved while the
+ * exclusive directory publication lock is held. Platforms without funlinkat(2)
+ * cannot delete the retired inode by identity in a single step, so
+ * config_retire_exact_name_at relocates the exact proven inode into a private
+ * slot and then calls this to delete it — leaving the arena transient rather
+ * than accumulating one file per successful switch clear or backup prune
+ * (AR-15 H1). The slot is re-pinned through an O_NOFOLLOW descriptor and
+ * unlinked only while its live identity still equals the proven generation, so
+ * a raced replacement is never removed. Deletion failure is deliberately
+ * non-fatal: the canonical retirement already committed and a rare straggler
+ * slot is bounded. */
+static void config_reclaim_settled_slot_at(int dir_fd, const char *slot,
+                                           const struct stat *proven) {
+    struct stat now;
+    int fd;
+
+    if (dir_fd < 0 || !slot || !proven) return;
+    fd = openat(dir_fd, slot, O_RDONLY | O_CLOEXEC | O_NOFOLLOW | O_NONBLOCK);
+    if (fd < 0) return;
+    if (fstat(fd, &now) == 0 &&
+        config_metadata_same_file(proven, &now) &&
+        config_metadata_file_is_safe(&now, false)) {
+        (void)unlinkat(dir_fd, slot, 0);
+    }
+    (void)close(fd);
+}
 #endif
 
 /* Retire one exact pathname generation without ever deleting a later
@@ -693,6 +720,7 @@ static int config_retire_exact_name_at(
                       expected_length, &moved);
 
         if (proof_result == 0) {
+            config_reclaim_settled_slot_at(dir_fd, settled, &moved);
             return 0;
         }
     } else if (config_metadata_same_file(expected, &moved) &&
@@ -703,6 +731,7 @@ static int config_retire_exact_name_at(
                  config_alias_metadata_is_safe(&moved) &&
                  (config_metadata_snapshot_same(expected, &moved) ||
                   config_metadata_ctime_only_change(expected, &moved))))) {
+        config_reclaim_settled_slot_at(dir_fd, settled, &moved);
         return 0;
     }
     {

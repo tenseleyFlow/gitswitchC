@@ -727,6 +727,37 @@ TEST(backups_are_durable_monotonic_and_bounded) {
     for (int i = 2; i < 7; i++) CHECK(seen[i]);
 }
 
+/* AR-15 H1: the retirement proof path (config_retire_exact_name_at) has no
+ * funlinkat(2) on Linux/macOS, so it relocates each retired inode into a
+ * private "settled" arena slot. Before the fix nothing ever reclaimed those
+ * slots, so every pruned backup — and, through the same primitive, every
+ * cleared switch guard — leaked one permanent file; past ~4096 entries the
+ * config directory-scan bound bricked the write lock for all mutating commands.
+ * The arena must be transient: a slot is deleted by identity once the move is
+ * reproved. Pruning many generations must therefore leave zero settled slots,
+ * and this assertion fails (7 leaked slots) if the reclaim step is reverted. */
+TEST(retired_backup_slots_are_reclaimed_not_leaked) {
+    char dir[128], path[256], body[512];
+
+    CHECK_EQ_INT(private_dir(dir, sizeof(dir)), 0);
+    snprintf(path, sizeof(path), "%s/accounts.toml", dir);
+    config_set_backup_clock_fn(fixed_clock);
+    for (int i = 0; i < 12; i++) {
+        snprintf(body, sizeof(body),
+                 "[settings]\ndefault_scope=\"local\"\n"
+                 "[accounts.1]\nname=\"alice\"\nemail=\"a@b.com\"\n"
+                 "description=\"v%d\"\n", i);
+        CHECK_EQ_INT(write_private(path, body), 0);
+        CHECK_EQ_INT(config_backup(path), 0);
+    }
+    config_set_backup_clock_fn(NULL);
+
+    /* 12 generations, window of 5 => 7 retired through the settled arena. */
+    CHECK_EQ_INT(count_prefix(dir, ".gitswitch-backup-settled-"), 0);
+    /* Rotation itself still keeps exactly the window, unchanged by reclamation. */
+    CHECK_EQ_INT(count_prefix(dir, "accounts.toml.backup."), 5);
+}
+
 TEST(backup_prunes_recognized_legacy_names_in_generation_order) {
     static const char *const names[] = {
         "accounts.toml.backup.20240101_000000",
@@ -2178,6 +2209,7 @@ TEST_MAIN_BEGIN()
     RUN_TEST(default_create_fault_matrix_is_atomic_and_closes_fds);
     RUN_TEST(default_create_signal_death_is_truthful_at_every_boundary);
     RUN_TEST(backups_are_durable_monotonic_and_bounded);
+    RUN_TEST(retired_backup_slots_are_reclaimed_not_leaked);
     RUN_TEST(backup_prunes_recognized_legacy_names_in_generation_order);
     RUN_TEST(backup_retains_malformed_legacy_near_misses_while_pruning_valid_names);
     RUN_TEST(backup_pruning_requires_complete_directory_enumeration);
