@@ -11537,7 +11537,13 @@ static int git_retirement_transaction_prepare_internal(
             clear_error();
             continue;
         }
-        if (!transaction->recovery_proof_only) {
+        /* AR-15 M4: detect an absence candidate in recovery too. AR-14 H3/H4
+         * gave the forward transaction this arm; restart recovery
+         * (recovery_proof_only) must compose with it so an installed-but-
+         * uncertain remove whose recorded destination is now absent can settle
+         * rather than permanently wedging the retirement guard. Grouping and the
+         * under-lock absence reproof below still gate any settlement authority. */
+        {
             namespace_error = *get_last_error();
             namespace_errno = errno ? errno : ESTALE;
             errno = 0;
@@ -11588,8 +11594,10 @@ static int git_retirement_transaction_prepare_internal(
             }
         }
         if (representative == SIZE_MAX) {
-            if (transaction->recovery_proof_only ||
-                absent_representative == SIZE_MAX) {
+            /* AR-15 M4: recovery may also form a zero-mutation absent group.
+             * The under-lock absence proof (prepare_absent_group_atomic) and
+             * the recovery reprove arm re-establish and re-verify ENOENT. */
+            if (absent_representative == SIZE_MAX) {
                 continue;
             }
             representative = absent_representative;
@@ -13644,6 +13652,25 @@ static int git_retirement_recovery_reprove_transaction(
         }
         representative =
             transaction->publication_refs[group->representative];
+        if (group->absent_destination) {
+            /* AR-15 M4: an absent destination has no present config file to
+             * re-witness (git_file_at_matches_witness / git_capture_file_snapshot
+             * below both assume a live file). This reprove runs at the verify
+             * stage, before terminal completion settles the group, so the group
+             * is prepared+lock_ready but not yet settled and absent_witness_ready
+             * is not set. Re-prove its ENOENT with the non-settled revalidator,
+             * mirroring the forward terminal-completion pre-settle proof at
+             * git_retirement_transaction_finish_terminal_commit. */
+            if (git_retirement_revalidate_absent_group(
+                    representative, group, false) != 0) {
+                errno = errno ? errno : ESTALE;
+                set_error(
+                    ERR_GIT_CONFIG_FAILED,
+                    "Retirement recovery could not re-prove its absent Git destination");
+                group_valid = false;
+            }
+            goto group_done;
+        }
         if (!git_file_at_matches_witness(
                 group->lock.dir_fd, group->lock.leaf,
                 group->lock.original_fd, &group->lock.original_stat,
