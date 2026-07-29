@@ -4296,8 +4296,7 @@ static int ssh_start_isolated_agent_with_key(
                         launch_socket_arg,
                         sizeof(adopted.agent_socket_arg));
                 }
-            } else if (pid_rc == SSH_PID_SIDECAR_MALFORMED ||
-                       pid_rc == SSH_PID_SIDECAR_LEGACY) {
+            } else if (pid_rc == SSH_PID_SIDECAR_MALFORMED) {
                 set_error(
                     ERR_FILE_IO,
                     "Invalid SSH agent PID sidecar; retained for retry: %s",
@@ -4305,8 +4304,16 @@ static int ssh_start_isolated_agent_with_key(
                 goto done;
             } else if (pid_rc == SSH_PID_SIDECAR_ERROR) {
                 goto done;
-            } else if (pid_rc == SSH_PID_SIDECAR_ABSENT) {
-                /* Fingerprint-qualified reuse remains explicitly unowned. */
+            } else if (pid_rc == SSH_PID_SIDECAR_ABSENT ||
+                       pid_rc == SSH_PID_SIDECAR_LEGACY) {
+                /* Fingerprint-qualified reuse remains explicitly unowned. The
+                 * socket was already proven to hold exactly this account's key,
+                 * so a legacy (pre-AR-14 bare-PID) sidecar -- which cannot
+                 * authorize signaling -- must NOT block the reuse that proof
+                 * already justifies (AR-15 H2). Treat it exactly like an absent
+                 * record: reuse proceeds unowned, and the stale legacy record is
+                 * migrated or reaped by kill_orphaned/reset on switch-away or an
+                 * explicit reset. */
             } else {
                 set_error(ERR_FILE_IO,
                           "Unexpected SSH agent PID sidecar classification");
@@ -10629,6 +10636,57 @@ static int prove_malformed_pid_socket_dead_at(
     return 0;
 }
 
+/* AR-15 H2: a legacy (pre-AR-14 bare-decimal) PID sidecar names a real,
+ * still-running managed agent after an in-place upgrade. Its bare PID cannot
+ * authorize signaling, and because a managed agent deliberately outlives the
+ * process the reachable socket makes the dead-socket proof above impossible, so
+ * orphan cleanup and reset would be permanently blocked with a misleading
+ * "retained for retry". When the managed socket is live, reconstruct a full
+ * agent record from the kernel socket peer -- never from the untrusted decimal
+ * -- and run the standard reap. The reap's own generation + argv
+ * (-a <this exact managed socket>) + executable-image proof is the sole
+ * authority to signal, identical to a v2 record: a genuine managed agent
+ * classifies OWNED and is reaped; any other live process classifies UNRELATED
+ * and is never signaled, leaving the reachable socket in place so the caller's
+ * UNCHANGED dead-socket proof still fails closed. The helper writes and unlinks
+ * nothing. It mirrors the valid-record path's post-reap presence refresh: a
+ * cleanly terminated agent removes its own socket, so *socket_present flips to
+ * false only on a proven ENOENT, and any other outcome conservatively keeps the
+ * presence bit so the caller re-proves it. */
+static void migrate_legacy_pid_socket_peer_at(
+    int dir_fd, const char *socket_dir, const char *socket_name,
+    const char *socket_path, bool *socket_present) {
+    ssh_agent_record_t adopt;
+    pid_t peer_pid = -1;
+    uid_t peer_uid = (uid_t)-1;
+    struct stat after_reap;
+
+    if (!socket_present || !*socket_present) return;
+    if (verify_socket_dir_namespace(dir_fd, socket_dir) != 0) return;
+    if (inspect_socket_peer(socket_path, dir_fd, &peer_pid, &peer_uid) != 0 ||
+        peer_pid <= 1 || peer_uid != getuid()) {
+        return;
+    }
+    memset(&adopt, 0, sizeof(adopt));
+    adopt.pid = peer_pid;
+    if (g_reap_ops.generation(peer_pid, &adopt.generation) != 0 ||
+        g_reap_ops.image(peer_pid, &adopt.image) != 0 ||
+        !ssh_process_generation_valid(&adopt.generation) ||
+        !adopt.image.valid) {
+        return;
+    }
+    adopt.image.socket_peer_pid = peer_pid;
+    adopt.image.socket_peer_uid = peer_uid;
+    if (!ssh_reap_allows_cleanup(g_ssh_reap(&adopt, socket_path, dir_fd))) {
+        return;
+    }
+    if (verify_socket_dir_namespace(dir_fd, socket_dir) != 0) return;
+    if (fstatat(dir_fd, socket_name, &after_reap, AT_SYMLINK_NOFOLLOW) != 0 &&
+        errno == ENOENT) {
+        *socket_present = false;
+    }
+}
+
 static ssh_process_outcome_t prove_recorded_agent_identity(
     const ssh_agent_record_t *record, const char *socket_path, int dir_fd) {
     ssh_process_outcome_t outcome =
@@ -12636,11 +12694,18 @@ int ssh_manager_reset(const char *account) {
     if (can_remove_runtime &&
         (pid_rc == SSH_PID_SIDECAR_MALFORMED ||
          pid_rc == SSH_PID_SIDECAR_LEGACY)) {
+            if (pid_rc == SSH_PID_SIDECAR_LEGACY) {
+                migrate_legacy_pid_socket_peer_at(
+                    dir_fd, socket_dir, sock_name, sock_path,
+                    &socket_present);
+            }
             if (prove_malformed_pid_socket_dead_at(
                     dir_fd, socket_dir, sock_name, sock_path, &socket_pin,
                     socket_present, false,
                     pid_rc == SSH_PID_SIDECAR_LEGACY
-                        ? "a legacy PID-only record"
+                        ? "a legacy pre-upgrade PID-only record; kill the "
+                          "pre-upgrade ssh-agent or log out and back in to "
+                          "clear it"
                         : "a malformed PID sidecar") != 0) {
             failed = true;
             can_remove_runtime = false;
@@ -12835,12 +12900,19 @@ static int kill_orphaned_gitswitch_agents(int dir_fd, const char *socket_dir,
             } else if (socket_rc < 0) {
                 entry_failed = true;
             }
+            if (!entry_failed && pid_rc == SSH_PID_SIDECAR_LEGACY) {
+                migrate_legacy_pid_socket_peer_at(
+                    dir_fd, socket_dir, sock_name, sock_full,
+                    &socket_present);
+            }
             if (!entry_failed &&
                 prove_malformed_pid_socket_dead_at(
                     dir_fd, socket_dir, sock_name, sock_full, &socket_pin,
                     socket_present, false,
                     pid_rc == SSH_PID_SIDECAR_LEGACY
-                        ? "a legacy PID-only record"
+                        ? "a legacy pre-upgrade PID-only record; kill the "
+                          "pre-upgrade ssh-agent or log out and back in to "
+                          "clear it"
                         : "a malformed PID sidecar") != 0) {
                 entry_failed = true;
             }
