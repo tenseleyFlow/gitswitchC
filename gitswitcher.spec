@@ -1,5 +1,5 @@
 Name:           gitswitcher
-Version:        1.8.0
+Version:        1.9.0
 Release:        1%{?dist}
 Summary:        Secure Git identity and SSH/GPG key management tool for seamless account switching
 
@@ -84,6 +84,24 @@ make test BUILD_TYPE=release READLINE=1 VERSION=%{version} COMMIT=rpm
 %{_datadir}/fish/vendor_completions.d/gitswitch.fish
 
 %changelog
+* Wed Jul 29 2026 mfw <espadonne@outlook.com> - 1.9.0-1
+- First release since 1.8.0; ships the full audit-remediation backlog (AR-01..AR-15). Every switch/remove/reset/resume is transactional and fail-closed.
+- AR-15: settled-arena files no longer accumulate and brick mutating commands (0659967); upgrades with a live pre-upgrade ssh-agent no longer wedge switch/reset (dd3a45c); interrupted retirement-guard install no longer leaves a blocking stage (d87bd2a); SSH alias-retirement recovery survives a benign chmod/delete/recreate of ~/.ssh (c3586ad); orphaned GPG recovery residue is retired on Linux/macOS (5ed994d).
+- AR-14: durable-state rollback/recovery-ownership highs + mediums/lows (d80c5e6).
+- AR-13: provably-absent retirement cluster + coverage tail (01fdcff).
+- AR-12: release-gate hardening — SSH hostname validation, snapshot restore, GPG reset (f5eb1dc).
+- AR-11: durable Git-publication provenance ledger (6c44004).
+- AR-10: thin-coverage adversarial pass (dfe57da).
+- AR-09: status/runner-stdin/ssh-listing fixes (b98a67e).
+- AR-08: SSH recovery, git transaction, prompt, remove-signal (dae3af1).
+- AR-07: exec-trust and runner hardening (93e015b).
+- AR-06: shell-init quoting, format-string checks, SPDX (3b85c2a, 388fbe6).
+- AR-05: 25 audit findings (aeb9033).
+- AR-04: lifecycle/QA gates, credential runtime pinning, lock/config namespaces (8c1baad).
+- AR-03: config symlink/id/tty hardening, SSH key-path validation, all-or-nothing switch (0631abd).
+- AR-02: SSH kill-path & IdentityFile sink, PATH memoization, runtime-dir locking, resume boot-only (4c0dd44).
+- AR-01/foundational: SSH command-injection fix, TOML charset gate, GPG export truncation, signal-safe rollback (bd2697b).
+
 * Thu Jul 09 2026 mfw <espadonne@outlook.com> - 1.8.0-1
 - Security/correctness: fixes from a full adversarial audit (46 findings), incl. a core.sshCommand injection, unescaped TOML writes that could brick the config, silent account loss on save, and SSH/GPG teardown and concurrency races.
 - Feature: `gitswitch edit <account>` to edit an account interactively.
