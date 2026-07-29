@@ -2894,7 +2894,7 @@ TEST(freebsd_reverse_absent_canonical_retries_from_exact_original) {
  * via the portable atomic renameat(2), instead of failing closed with ENOTSUP. */
 TEST(portable_fallback_reverse_restores_exact_original) {
 #if defined(__FreeBSD__)
-    TS_SKIP("native-exchange",
+    TS_SKIP("persistent-fs",
             "portable renameat fallback path is exercised off FreeBSD");
 #else
     at_fixture_t fixture;
@@ -2936,7 +2936,7 @@ TEST(portable_fallback_reverse_restores_exact_original) {
  * performed — the original stays canonical and no owned artifact leaks. */
 TEST(portable_fallback_link_failure_preserves_original) {
 #if defined(__FreeBSD__)
-    TS_SKIP("native-exchange",
+    TS_SKIP("persistent-fs",
             "portable renameat fallback path is exercised off FreeBSD");
 #else
     at_fixture_t fixture;
