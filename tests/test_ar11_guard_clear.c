@@ -37,7 +37,8 @@ typedef enum {
     RETIREMENT_GUARD_CLEAR_AFTER_SETTLED_SLOT_MOVE,
     RETIREMENT_GUARD_CLEAR_AFTER_NAMESPACE_COMMIT,
     RETIREMENT_GUARD_CLEAR_AFTER_PREPARED_PUBLISH,
-    RETIREMENT_GUARD_INSTALL_BEFORE_PRIOR_RETIRE
+    RETIREMENT_GUARD_INSTALL_BEFORE_PRIOR_RETIRE,
+    RETIREMENT_GUARD_INSTALL_AFTER_STAGE_WRITE
 } retirement_guard_clear_test_stage_t;
 typedef int (*retirement_guard_clear_test_hook_fn)(
     retirement_guard_clear_test_stage_t stage, int descriptor,
@@ -3402,6 +3403,56 @@ TEST(foreign_staged_generation_remains_fail_closed_and_untouched) {
     guard_fixture_cleanup(&fixture);
 }
 
+/* AR-15 M2: a fresh install that fails after writing the .retirement-transition
+ * stage but before publishing the marker must retire that owned stage. The only
+ * reconciler removes a stage whose bytes equal a present marker, so a leaked
+ * fresh-token stage (no marker) would permanently block every remove/reset/
+ * resume. Prove the stage is gone and retirement is not wedged: probe reports
+ * unblocked and a subsequent install succeeds. Fails (stage leaked, install
+ * wedged) if the install-path cleanup is reverted. */
+TEST(failed_install_after_stage_write_retires_the_owned_stage) {
+    static const char incarnation[] =
+        "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA";
+    guard_fixture_t fixture;
+    config_retirement_guard_t *guard = NULL;
+    bool blocked = true;
+
+    memset(&fixture, 0, sizeof(fixture));
+    fixture.owner.account_id = UINT32_C(1);
+    memcpy(fixture.owner.account_incarnation, incarnation,
+           sizeof(incarnation));
+    CHECK((size_t)snprintf(fixture.directory, sizeof(fixture.directory),
+                           "/tmp/gswm2install.XXXXXX") <
+          sizeof(fixture.directory));
+    CHECK(ts_mkdtemp(fixture.directory) != NULL);
+    CHECK((size_t)snprintf(fixture.config_path, sizeof(fixture.config_path),
+                           "%s/accounts.toml", fixture.directory) <
+          sizeof(fixture.config_path));
+    CHECK((size_t)snprintf(fixture.stage_path, sizeof(fixture.stage_path),
+                           "%s/%s", fixture.directory, STAGE_NAME) <
+          sizeof(fixture.stage_path));
+
+    guard_arm_hook(RETIREMENT_GUARD_INSTALL_AFTER_STAGE_WRITE, HOOK_FAIL);
+    errno = 0;
+    CHECK_EQ_INT(config_retirement_guard_install_or_adopt(
+                     fixture.config_path, CONFIG_RETIREMENT_RESET,
+                     &fixture.owner, 1U, &guard), -1);
+    CHECK(guard == NULL);
+    (void)gitswitch_test_set_retirement_guard_clear_hook(NULL);
+
+    errno = 0;
+    CHECK(access(fixture.stage_path, F_OK) != 0 && errno == ENOENT);
+    CHECK_EQ_INT(config_retirement_guard_probe(
+                     fixture.config_path, &blocked), 0);
+    CHECK(!blocked);
+    CHECK_EQ_INT(config_retirement_guard_install_or_adopt(
+                     fixture.config_path, CONFIG_RETIREMENT_RESET,
+                     &fixture.owner, 1U, &guard), 0);
+    CHECK(guard != NULL);
+    config_retirement_guard_abandon(&guard);
+    guard_fixture_cleanup(&fixture);
+}
+
 TEST_MAIN_BEGIN()
     error_init(LOG_LEVEL_ERROR, NULL);
     RUN_TEST(
@@ -3498,4 +3549,5 @@ TEST_MAIN_BEGIN()
     RUN_TEST(exact_stage_cleanup_reproves_one_ctime_only_reader_race);
     RUN_TEST(exact_stage_cleanup_rejects_changed_bytes_after_reader_race);
     RUN_TEST(foreign_staged_generation_remains_fail_closed_and_untouched);
+    RUN_TEST(failed_install_after_stage_write_retires_the_owned_stage);
 TEST_MAIN_END()

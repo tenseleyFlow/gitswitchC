@@ -2724,27 +2724,66 @@ TEST(generation_inspection_error_never_terminates_or_consumes_tuple) {
     close(fixture.dir_fd);
 }
 
-TEST(legacy_live_sidecar_is_retained_without_reap) {
+/* AR-15 H2: after an in-place upgrade from a release that wrote bare-PID
+ * sidecars, a legacy record names a still-running managed agent. The reachable
+ * socket used to make retirement impossible, permanently locking switch and
+ * reset. The fix reconstructs a record from the kernel socket peer and runs the
+ * standard reap; when it proves OWNED and terminates the agent, the socket goes
+ * dead and reset converges with no manual kill. reap_gone models that proven
+ * termination by stopping the live agent server exactly when the migration
+ * reaps. With the migration reverted, the still-live socket keeps reset at -1,
+ * so this test fails closed on the old behavior. */
+TEST(legacy_live_owned_sidecar_is_migrated_and_reset_converges) {
     static const char legacy[] = "1073741824\n";
     ssh_fixture_t fixture;
+    test_agent_server_t server = {.pid = -1, .trace_fd = -1};
     ssh_reap_fn previous;
-    int listener;
 
-    CHECK_EQ_INT(make_fixture(&fixture, "gsar14legacylive"), 0);
+    CHECK_EQ_INT(make_fixture(&fixture, "gsar15legacymig"), 0);
     if (fixture.dir_fd < 0) return;
     CHECK_EQ_INT(write_sidecar_bytes(&fixture, legacy,
                                      sizeof(legacy) - 1U, 0600), 0);
-    listener = bind_live_socket(fixture.socket);
-    CHECK(listener >= 0);
-    g_malformed_reap_calls = 0;
-    previous = ssh_manager_set_reap_fn(malformed_reap_must_not_run);
+    CHECK_EQ_INT(start_test_agent_server(
+                     fixture.socket, TEST_AGENT_IDENTITIES_ONE, &server), 0);
+    g_runner_server_pid = server.pid;
+    g_runner_server_trace_fd = server.trace_fd;
+
+    previous = ssh_manager_set_reap_fn(reap_gone);
+    CHECK_EQ_INT(ssh_manager_reset("work"), 0);
+    ssh_manager_set_reap_fn(previous);
+    stop_runner_server();
+
+    CHECK(!entry_exists(fixture.sidecar));
+    CHECK(!entry_exists(fixture.socket));
+    cleanup_retained_fixture(&fixture);
+    close(fixture.dir_fd);
+}
+
+/* Safety complement: a legacy record whose live socket peer cannot be proven to
+ * be our agent (the reap returns a non-cleanup outcome) must NOT be signaled,
+ * and the reachable socket must keep reset fail-closed. */
+TEST(legacy_live_unprovable_sidecar_stays_fail_closed) {
+    static const char legacy[] = "1073741824\n";
+    ssh_fixture_t fixture;
+    test_agent_server_t server = {.pid = -1, .trace_fd = -1};
+    ssh_reap_fn previous;
+
+    CHECK_EQ_INT(make_fixture(&fixture, "gsar15legacyfc"), 0);
+    if (fixture.dir_fd < 0) return;
+    CHECK_EQ_INT(write_sidecar_bytes(&fixture, legacy,
+                                     sizeof(legacy) - 1U, 0600), 0);
+    CHECK_EQ_INT(start_test_agent_server(
+                     fixture.socket, TEST_AGENT_IDENTITIES_ONE, &server), 0);
+    g_runner_server_pid = server.pid;
+    g_runner_server_trace_fd = server.trace_fd;
+
+    previous = ssh_manager_set_reap_fn(reap_replaced);
     CHECK_EQ_INT(ssh_manager_reset("work"), -1);
     ssh_manager_set_reap_fn(previous);
+    stop_runner_server();
 
-    CHECK_EQ_INT(g_malformed_reap_calls, 0);
     CHECK(entry_exists(fixture.sidecar));
     CHECK(entry_exists(fixture.socket));
-    if (listener >= 0) close(listener);
     cleanup_retained_fixture(&fixture);
     close(fixture.dir_fd);
 }
@@ -4340,7 +4379,8 @@ TEST_MAIN_BEGIN()
     RUN_TEST(linux_pidfd_unavailable_never_uses_agent_protocol);
     RUN_TEST(pidfd_open_esrch_cleans_exact_tuple_without_numeric_termination);
     RUN_TEST(generation_inspection_error_never_terminates_or_consumes_tuple);
-    RUN_TEST(legacy_live_sidecar_is_retained_without_reap);
+    RUN_TEST(legacy_live_owned_sidecar_is_migrated_and_reset_converges);
+    RUN_TEST(legacy_live_unprovable_sidecar_stays_fail_closed);
     RUN_TEST(legacy_dead_sidecar_is_cleaned_without_reap);
     RUN_TEST(stopped_session_preserves_same_pid_replacement_generation);
     RUN_TEST(gone_record_with_live_replacement_preserves_complete_tuple);

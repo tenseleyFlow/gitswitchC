@@ -908,7 +908,14 @@ TEST(full_reset_preserves_postvalidated_retirement_replacement) {
 }
 
 #if !defined(__FreeBSD__)
-TEST(full_reset_fails_closed_without_descriptor_unlink) {
+/* AR-15 M8: on Linux/macOS production installs no g_identity_unlink seam and
+ * there is no funlinkat(2), yet an orphaned GPG recovery residue must still be
+ * retired -- before the fix reset failed closed with "lacks descriptor-bound",
+ * permanently blocking every GPG mutation via the stale-quarantine gate. The
+ * retirement now performs an identity-bound unlink (re-proving inode metadata
+ * and symlink target under the base lock). Fails (reset -1, residue retained)
+ * when the fix is reverted. */
+TEST(full_reset_retires_residue_without_descriptor_unlink) {
     char xdg[128], base[256], home[320], marker[384], legacy[416];
     gpg_identity_unlink_fn old_unlink;
     command_runner_fn previous;
@@ -923,16 +930,11 @@ TEST(full_reset_fails_closed_without_descriptor_unlink) {
     CHECK_EQ_INT(symlink(home, legacy), 0);
     old_unlink = gpg_manager_set_identity_unlink_fn(NULL);
     previous = run_set_runner(recording_null_runner);
-    CHECK_EQ_INT(gpg_manager_reset(NULL), -1);
-    run_set_runner(previous);
-    gpg_manager_set_identity_unlink_fn(old_unlink);
-    CHECK(strstr(get_last_error()->message,
-                 "lacks descriptor-bound") != NULL);
-    CHECK(lstat(legacy, &(struct stat){0}) == 0);
-    CHECK(path_exists(marker));
-    previous = run_set_runner(recording_null_runner);
     CHECK_EQ_INT(gpg_manager_reset(NULL), 0);
     run_set_runner(previous);
+    gpg_manager_set_identity_unlink_fn(old_unlink);
+    errno = 0;
+    CHECK(lstat(legacy, &(struct stat){0}) != 0 && errno == ENOENT);
 }
 #endif
 
@@ -1846,7 +1848,7 @@ TEST_MAIN_BEGIN()
     RUN_TEST(full_reset_generation_capture_failure_is_fail_closed);
     RUN_TEST(full_reset_preserves_postvalidated_retirement_replacement);
 #if !defined(__FreeBSD__)
-    RUN_TEST(full_reset_fails_closed_without_descriptor_unlink);
+    RUN_TEST(full_reset_retires_residue_without_descriptor_unlink);
 #endif
     RUN_TEST(full_reset_preserves_replaced_retirement_quarantine);
     RUN_TEST(full_reset_preflight_preserves_every_planned_entry_on_home_blocker);

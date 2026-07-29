@@ -5919,27 +5919,46 @@ static int gpg_retire_planned_reset_residue_locked(
     } else if (funlinkat(base_fd, quarantine, pinned_fd, 0) == 0) {
         close(pinned_fd);
         pinned_fd = -1;
-#endif
     } else {
-#if defined(__FreeBSD__)
         int saved_errno = errno;
         if (pinned_fd >= 0) close(pinned_fd);
         errno = saved_errno;
         set_system_error(ERR_FILE_IO,
                          "Cannot descriptor-unlink GPG recovery quarantine: %s",
                          residue->name);
-#else
-        int restore_rc = g_rename_noreplace(
-            base_fd, quarantine, base_fd, residue->name);
-        set_error(
-            ERR_FILE_IO,
-            "Platform lacks descriptor-bound GPG recovery retirement; "
-            "artifact %s: %s",
-            restore_rc == 0 ? "restored" : "retained in quarantine",
-            residue->name);
-#endif
         return -1;
     }
+#else
+    } else {
+        /* AR-15 M8: Linux/macOS lack funlinkat(2), and production never installs
+         * g_identity_unlink, so this quarantined residue was previously never
+         * retired -- permanently blocking every GPG mutation (switch retarget,
+         * drop_current, restore_current_if, targeted reset) through
+         * gpg_reject_stale_quarantines_locked, while advertising a remedy that
+         * could not succeed. Re-prove the exact link identity (inode metadata
+         * and symlink target) immediately before removing the unpredictable
+         * private quarantine name under the held base lock, matching the
+         * FreeBSD descriptor-bound unlink's safety within this platform's
+         * primitives. A proven mismatch preserves the replacement and fails
+         * closed. */
+        gpg_link_identity_t before_unlink;
+
+        if (gpg_capture_link_at(base_fd, quarantine, &before_unlink) != 0 ||
+            !gpg_same_link(&before_unlink, &residue->identity)) {
+            set_error(ERR_FILE_IO,
+                      "GPG recovery quarantine changed before retirement; "
+                      "preserving replacement: %s",
+                      residue->name);
+            return -1;
+        }
+        if (unlinkat(base_fd, quarantine, 0) != 0) {
+            set_system_error(ERR_FILE_IO,
+                             "Cannot retire GPG recovery quarantine: %s",
+                             residue->name);
+            return -1;
+        }
+    }
+#endif
 #if defined(__FreeBSD__)
     if (pinned_fd >= 0) close(pinned_fd);
 #endif

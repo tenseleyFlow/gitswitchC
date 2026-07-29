@@ -162,7 +162,8 @@ typedef enum {
     RETIREMENT_GUARD_CLEAR_AFTER_SETTLED_SLOT_MOVE,
     RETIREMENT_GUARD_CLEAR_AFTER_NAMESPACE_COMMIT,
     RETIREMENT_GUARD_CLEAR_AFTER_PREPARED_PUBLISH,
-    RETIREMENT_GUARD_INSTALL_BEFORE_PRIOR_RETIRE
+    RETIREMENT_GUARD_INSTALL_BEFORE_PRIOR_RETIRE,
+    RETIREMENT_GUARD_INSTALL_AFTER_STAGE_WRITE
 } retirement_guard_clear_test_stage_t;
 typedef int (*retirement_guard_clear_test_hook_fn)(
     retirement_guard_clear_test_stage_t stage, int directory_fd,
@@ -248,7 +249,8 @@ enum {
     RETIREMENT_GUARD_CLEAR_AFTER_SETTLED_SLOT_MOVE,
     RETIREMENT_GUARD_CLEAR_AFTER_NAMESPACE_COMMIT,
     RETIREMENT_GUARD_CLEAR_AFTER_PREPARED_PUBLISH,
-    RETIREMENT_GUARD_INSTALL_BEFORE_PRIOR_RETIRE
+    RETIREMENT_GUARD_INSTALL_BEFORE_PRIOR_RETIRE,
+    RETIREMENT_GUARD_INSTALL_AFTER_STAGE_WRITE
 };
 #define RETIREMENT_GUARD_CLEAR_TEST_CHECKPOINT(stage, fd, name)             \
     ((void)(stage), (void)(fd), (void)(name), 0)
@@ -614,6 +616,33 @@ static int config_select_settled_name_at(
     errno = ENOSPC;
     return -1;
 }
+
+/* Reclaim one arena slot this process just created and proved while the
+ * exclusive directory publication lock is held. Platforms without funlinkat(2)
+ * cannot delete the retired inode by identity in a single step, so
+ * config_retire_exact_name_at relocates the exact proven inode into a private
+ * slot and then calls this to delete it — leaving the arena transient rather
+ * than accumulating one file per successful switch clear or backup prune
+ * (AR-15 H1). The slot is re-pinned through an O_NOFOLLOW descriptor and
+ * unlinked only while its live identity still equals the proven generation, so
+ * a raced replacement is never removed. Deletion failure is deliberately
+ * non-fatal: the canonical retirement already committed and a rare straggler
+ * slot is bounded. */
+static void config_reclaim_settled_slot_at(int dir_fd, const char *slot,
+                                           const struct stat *proven) {
+    struct stat now;
+    int fd;
+
+    if (dir_fd < 0 || !slot || !proven) return;
+    fd = openat(dir_fd, slot, O_RDONLY | O_CLOEXEC | O_NOFOLLOW | O_NONBLOCK);
+    if (fd < 0) return;
+    if (fstat(fd, &now) == 0 &&
+        config_metadata_same_file(proven, &now) &&
+        config_metadata_file_is_safe(&now, false)) {
+        (void)unlinkat(dir_fd, slot, 0);
+    }
+    (void)close(fd);
+}
 #endif
 
 /* Retire one exact pathname generation without ever deleting a later
@@ -693,6 +722,7 @@ static int config_retire_exact_name_at(
                       expected_length, &moved);
 
         if (proof_result == 0) {
+            config_reclaim_settled_slot_at(dir_fd, settled, &moved);
             return 0;
         }
     } else if (config_metadata_same_file(expected, &moved) &&
@@ -703,6 +733,7 @@ static int config_retire_exact_name_at(
                  config_alias_metadata_is_safe(&moved) &&
                  (config_metadata_snapshot_same(expected, &moved) ||
                   config_metadata_ctime_only_change(expected, &moved))))) {
+        config_reclaim_settled_slot_at(dir_fd, settled, &moved);
         return 0;
     }
     {
@@ -5123,6 +5154,89 @@ static int config_retirement_guard_stage_publish_at(
     return 0;
 }
 
+/* AR-15 M2: mirror config_switch_guard_cleanup_owned_stage_at for the
+ * retirement guard. A failure after the fresh .retirement-transition stage is
+ * written but before a successful stage->marker publication would otherwise
+ * leave that stage on disk forever: the only reconciler removes a stage whose
+ * bytes equal a present marker, and a fresh install-token stage matches no
+ * marker, so it permanently blocks every remove/reset/resume with no in-tool
+ * recovery. Under the held lifecycle lock, retire the exact owned stage by
+ * identity (transient per AR-15 H1). A publish that already consumed the stage
+ * leaves ENOENT and is a no-op; a raced same-uid replacement fails the identity
+ * check and is preserved. Callers set *stage_created only after
+ * config_retirement_guard_stage_write_at succeeds, so the stage identity is
+ * always known here. */
+static int config_retirement_guard_cleanup_owned_stage_at(
+    int directory_fd, int lock_fd, const char *directory,
+    const struct stat *directory_identity,
+    const struct stat *stage_identity, bool *stage_created) {
+    struct stat named;
+    int failure_errno = ESTALE;
+
+    if (directory_fd < 0 || lock_fd < 0 || !directory ||
+        !directory_identity || !stage_identity || !stage_created) {
+        errno = EINVAL;
+        return -1;
+    }
+    if (!*stage_created) return 0;
+    if (verify_private_lock_file_at(
+            lock_fd, directory_fd, CONFIG_RETIREMENT_LOCK_NAME) != 0 ||
+        !config_named_directory_matches(directory, directory_identity)) {
+        if (errno == 0) errno = ESTALE;
+        set_system_error(
+            ERR_FILE_IO,
+            "Cannot prove retirement stage cleanup authority");
+        return -1;
+    }
+    errno = 0;
+    if (fstatat(directory_fd, CONFIG_RETIREMENT_STAGE_NAME, &named,
+                AT_SYMLINK_NOFOLLOW) != 0) {
+        if (errno == ENOENT) {
+            *stage_created = false;
+            return 0;
+        }
+        failure_errno = errno ? errno : EIO;
+        goto cleanup_fail;
+    }
+    if (!config_metadata_file_is_safe(&named, true) ||
+        !config_metadata_same_file(stage_identity, &named)) {
+        failure_errno = ESTALE;
+        goto cleanup_fail;
+    }
+    if (config_retire_exact_name_at(
+            directory_fd, CONFIG_RETIREMENT_STAGE_NAME, &named,
+            NULL, 0U, CONFIG_RETIREMENT_SETTLED_PREFIX) != 0) {
+        failure_errno = errno ? errno : EIO;
+        goto cleanup_fail;
+    }
+    *stage_created = false;
+    if (fsync(directory_fd) != 0) {
+        failure_errno = errno ? errno : EIO;
+        goto cleanup_fail;
+    }
+    errno = 0;
+    if (fstatat(directory_fd, CONFIG_RETIREMENT_STAGE_NAME, &named,
+                AT_SYMLINK_NOFOLLOW) == 0) {
+        failure_errno = ESTALE;
+        goto cleanup_fail;
+    }
+    if (errno != ENOENT ||
+        verify_private_lock_file_at(
+            lock_fd, directory_fd, CONFIG_RETIREMENT_LOCK_NAME) != 0 ||
+        !config_named_directory_matches(directory, directory_identity)) {
+        failure_errno = errno ? errno : ESTALE;
+        goto cleanup_fail;
+    }
+    return 0;
+
+cleanup_fail:
+    errno = failure_errno;
+    set_system_error(
+        ERR_FILE_IO,
+        "Cannot remove the exact fresh retirement transition stage");
+    return -1;
+}
+
 #if defined(__FreeBSD__)
 static bool config_retirement_guard_exact_hardlink_at(
     int directory_fd, const char *name, int fd,
@@ -5806,6 +5920,7 @@ int config_retirement_guard_install_or_adopt_with_ssh_alias_obligation(
     int saved_errno = EIO;
     bool legacy_residue = false;
     bool prior_marker_moved = false;
+    bool stage_created = false;
 
     if (!guard || *guard || !config_path ||
         !config_retirement_kind_name(kind) ||
@@ -5966,10 +6081,21 @@ int config_retirement_guard_install_or_adopt_with_ssh_alias_obligation(
     }
     if (config_retirement_guard_stage_write_at(
             directory_fd, marker_data, marker_length, false,
-            &stage_identity) != 0 ||
-        !config_named_directory_matches(
+            &stage_identity) != 0) {
+        goto install_done;
+    }
+    /* The fresh stage now exists on disk with a known identity. Any later
+     * failure before publication consumes it must retire it in install_done
+     * (AR-15 M2), or it permanently blocks retirement with no recovery. */
+    stage_created = true;
+    if (RETIREMENT_GUARD_CLEAR_TEST_CHECKPOINT(
+            RETIREMENT_GUARD_INSTALL_AFTER_STAGE_WRITE,
+            directory_fd, CONFIG_RETIREMENT_STAGE_NAME) != 0) {
+        goto install_done;
+    }
+    if (!config_named_directory_matches(
             directory, &directory_identity)) {
-        if (errno == 0) errno = ESTALE;
+        errno = errno ? errno : ESTALE;
         goto install_done;
     }
     if (config_retirement_guard_pair_exact(&pair)) {
@@ -6008,6 +6134,10 @@ int config_retirement_guard_install_or_adopt_with_ssh_alias_obligation(
             "Cannot publish the fresh retirement guard generation");
         goto install_done;
     }
+    /* Publication renamed the stage into the marker: the .retirement-transition
+     * name no longer exists, so stage cleanup must not run (it would otherwise
+     * see ENOENT and no-op, but clearing the flag is unambiguous). */
+    stage_created = false;
     if (RETIREMENT_GUARD_CLEAR_TEST_CHECKPOINT(
             RETIREMENT_GUARD_INSTALL_BEFORE_DIR_SYNC,
             directory_fd, CONFIG_RETIREMENT_GUARD_NAME) != 0 ||
@@ -6078,6 +6208,28 @@ int config_retirement_guard_install_or_adopt_with_ssh_alias_obligation(
 
 install_done:
     if (result != 0) saved_errno = errno ? errno : EIO;
+    /* AR-15 M2: retire the fresh transition stage this call created but never
+     * published, while the lifecycle lock and pinned directory are still held.
+     * Preserve the original causal failure and append any cleanup diagnostic so
+     * a rare cleanup failure (leaving the stage for locked recovery) is not
+     * silently dropped. */
+    if (result != 0 && stage_created && directory_fd >= 0 && lock_fd >= 0) {
+        error_context_t primary_error = *get_last_error();
+        error_accumulator_t cleanup_failures;
+
+        error_accumulator_init(&cleanup_failures);
+        errno = saved_errno;
+        (void)error_accumulator_add(
+            &cleanup_failures, "retirement guard install", &primary_error);
+        if (config_retirement_guard_cleanup_owned_stage_at(
+                directory_fd, lock_fd, directory, &directory_identity,
+                &stage_identity, &stage_created) != 0) {
+            (void)error_accumulator_add_last(
+                &cleanup_failures, "fresh transition stage cleanup");
+        }
+        (void)error_accumulator_publish(&cleanup_failures);
+        saved_errno = errno ? errno : saved_errno;
+    }
     if (lock_fd >= 0) unlock_private_file(lock_fd);
     if (directory_fd >= 0) close(directory_fd);
     config_retirement_guard_pair_clear(&pair);
