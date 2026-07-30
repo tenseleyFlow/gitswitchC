@@ -1619,6 +1619,26 @@ static int inspect_process_image_real(pid_t pid, ssh_process_image_t *image) {
             return -1;
         }
         close(fd);
+        /* Record the pathname too. Callers gate on an absolute
+         * executable_path, and leaving it empty made every record synthesized
+         * from a live Linux process fail that gate. Only the stat identity is
+         * ever compared, so a resolvable-but-unusable name (for example a
+         * "(deleted)" suffix after an upgrade) is harmless; an unreadable link
+         * simply leaves the name empty for the caller to classify. */
+        {
+            ssize_t linked = readlink(proc_path, image->executable_path,
+                                      sizeof(image->executable_path) - 1U);
+
+            if (linked > 0 &&
+                (size_t)linked < sizeof(image->executable_path) - 1U) {
+                image->executable_path[linked] = '\0';
+                if (image->executable_path[0] != '/') {
+                    image->executable_path[0] = '\0';
+                }
+            } else {
+                image->executable_path[0] = '\0';
+            }
+        }
 
         snprintf(proc_path, sizeof(proc_path), "/proc/%ld/status", (long)pid);
         if (read_proc_file(proc_path, &status, &status_size) != 0 ||
@@ -1739,7 +1759,8 @@ static ssh_process_outcome_t inspect_pid_ssh_agent_image(
     uid_t peer_uid = (uid_t)-1;
 
     if (!record || record->pid <= 1 || !record->image.valid ||
-        record->image.executable_path[0] != '/' ||
+        (!record->image.executable_object_unknown &&
+         record->image.executable_path[0] != '/') ||
         record->image.effective_uid != geteuid()) {
         return SSH_PROCESS_INDETERMINATE;
     }
@@ -1758,6 +1779,14 @@ static ssh_process_outcome_t inspect_pid_ssh_agent_image(
      * socket peer credentials are the authoritative tuple there. */
     return SSH_PROCESS_OWNED;
 #else
+    if (record->image.executable_object_unknown) {
+        /* No executable-object witness exists for this record, so there is
+         * nothing to compare against. The kernel-authenticated socket peer
+         * proved just above, the caller's argv match, and the stable process
+         * generation are the authoritative tuple — exactly the proof the BSD
+         * branch above relies on for the same reason. */
+        return SSH_PROCESS_OWNED;
+    }
     if (g_reap_ops.image(record->pid, &observed) != 0) {
         /* OpenSSH deliberately becomes nondumpable, denying /proc/PID/exe
          * even to its launcher. The durable trusted launch image, unchanged
@@ -10630,23 +10659,57 @@ static int prove_malformed_pid_socket_dead_at(
  * presence bit so the caller re-proves it. */
 static void migrate_legacy_pid_socket_peer_at(
     int dir_fd, const char *socket_dir, const char *socket_name,
-    const char *socket_path, bool *socket_present) {
+    const char *socket_path, const ssh_agent_record_t *legacy_record,
+    bool *socket_present) {
     ssh_agent_record_t adopt;
     pid_t peer_pid = -1;
     uid_t peer_uid = (uid_t)-1;
     struct stat after_reap;
 
-    if (!socket_present || !*socket_present) return;
+    if (!socket_present || !*socket_present || !legacy_record ||
+        legacy_record->pid <= 1) {
+        return;
+    }
+    /* Only the bare-PID form is migrated. A v1 sidecar also classifies as
+     * legacy, but it lacks launch-image and socket-peer provenance and is
+     * migration data rather than signaling authority: by contract it must be
+     * retained for an explicit retry/cleanup decision, never signaled. The two
+     * are distinguishable without re-reading the file, because only the v1
+     * form carries a recorded process generation. */
+    if (ssh_process_generation_valid(&legacy_record->generation)) return;
     if (verify_socket_dir_namespace(dir_fd, socket_dir) != 0) return;
     if (inspect_socket_peer(socket_path, dir_fd, &peer_pid, &peer_uid) != 0 ||
         peer_pid <= 1 || peer_uid != getuid()) {
         return;
     }
     memset(&adopt, 0, sizeof(adopt));
-    adopt.pid = peer_pid;
-    if (g_reap_ops.generation(peer_pid, &adopt.generation) != 0 ||
-        g_reap_ops.image(peer_pid, &adopt.image) != 0 ||
-        !ssh_process_generation_valid(&adopt.generation) ||
+    /* Retire the agent the legacy record names, not the socket peer. ssh-agent
+     * binds and listens before it forks, and the kernel snapshots peer
+     * credentials at listen(2), so SO_PEERCRED reports the pre-fork parent —
+     * which has already exited by the time anyone observes the socket. Building
+     * the record from that dead pid made this migration unreachable against a
+     * real agent and left every upgraded Linux host wedged. The peer still
+     * proves a same-user process created this socket, and it is exactly what
+     * the recorded-peer identity check below compares against. */
+    adopt.pid = legacy_record->pid;
+    if (g_reap_ops.generation(adopt.pid, &adopt.generation) != 0) return;
+    if (g_reap_ops.image(adopt.pid, &adopt.image) != 0) {
+        /* OpenSSH's agent makes itself nondumpable, so Linux denies
+         * /proc/PID/exe even to the owning user. A denied executable object is
+         * expected here, not suspicious: fall back to the argv, uid, generation
+         * and socket-peer proofs the reap still performs in full. Every other
+         * failure stays fail-closed. */
+        if (errno != EACCES && errno != EPERM) return;
+        memset(&adopt.image, 0, sizeof(adopt.image));
+        adopt.image.valid = true;
+        adopt.image.executable_object_unknown = true;
+        adopt.image.effective_uid = geteuid();
+    } else if (adopt.image.executable_path[0] != '/') {
+        /* A readable executable object without a usable pathname is still only
+         * provable through the argv/uid/generation/peer tuple. */
+        adopt.image.executable_object_unknown = true;
+    }
+    if (!ssh_process_generation_valid(&adopt.generation) ||
         !adopt.image.valid) {
         return;
     }
@@ -12672,7 +12735,7 @@ int ssh_manager_reset(const char *account) {
             if (pid_rc == SSH_PID_SIDECAR_LEGACY) {
                 migrate_legacy_pid_socket_peer_at(
                     dir_fd, socket_dir, sock_name, sock_path,
-                    &socket_present);
+                    &record, &socket_present);
             }
             if (prove_malformed_pid_socket_dead_at(
                     dir_fd, socket_dir, sock_name, sock_path, &socket_pin,
@@ -12878,7 +12941,7 @@ static int kill_orphaned_gitswitch_agents(int dir_fd, const char *socket_dir,
             if (!entry_failed && pid_rc == SSH_PID_SIDECAR_LEGACY) {
                 migrate_legacy_pid_socket_peer_at(
                     dir_fd, socket_dir, sock_name, sock_full,
-                    &socket_present);
+                    &record, &socket_present);
             }
             if (!entry_failed &&
                 prove_malformed_pid_socket_dead_at(
