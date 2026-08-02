@@ -11366,6 +11366,164 @@ int config_write_lock(void) {
     return config_write_lock_directory(dir);
 }
 
+static bool config_lock_errno_is_contention(int error) {
+    if (error == EWOULDBLOCK) return true;
+#if EAGAIN != EWOULDBLOCK
+    if (error == EAGAIN) return true;
+#endif
+    return false;
+}
+
+static int config_startup_resume_flock(int fd) {
+    enum {
+        STARTUP_RESUME_WAIT_SECONDS = 2,
+        STARTUP_RESUME_POLL_NANOSECONDS = 20000000
+    };
+    struct timespec started;
+    struct timespec now;
+
+    if (clock_gettime(CLOCK_MONOTONIC, &started) != 0) return -1;
+    for (;;) {
+        if (flock(fd, LOCK_EX | LOCK_NB) == 0) return 0;
+        if (!config_lock_errno_is_contention(errno)) return -1;
+        if (clock_gettime(CLOCK_MONOTONIC, &now) != 0) return -1;
+        if (now.tv_sec < started.tv_sec) {
+            errno = EIO;
+            return -1;
+        }
+        if (now.tv_sec - started.tv_sec > STARTUP_RESUME_WAIT_SECONDS ||
+            (now.tv_sec - started.tv_sec == STARTUP_RESUME_WAIT_SECONDS &&
+             now.tv_nsec >= started.tv_nsec)) {
+            errno = EWOULDBLOCK;
+            return -1;
+        }
+        {
+            struct timespec delay = {
+                .tv_sec = 0,
+                .tv_nsec = STARTUP_RESUME_POLL_NANOSECONDS
+            };
+
+            (void)nanosleep(&delay, NULL);
+        }
+    }
+}
+
+int config_startup_resume_lock(void) {
+    char dir[MAX_PATH_LEN];
+    char lockpath[MAX_PATH_LEN];
+    struct stat dir_identity;
+    struct stat opened;
+    struct stat named;
+    struct stat after;
+    int dir_fd = -1;
+    int lock_fd = -1;
+    int flags = O_RDWR | O_CREAT | O_CLOEXEC | O_NOFOLLOW;
+
+    if (get_config_directory(dir, sizeof(dir)) != 0) return -1;
+    if (create_config_directory_secure(dir) != 0) return -1;
+    if (lstat(dir, &dir_identity) != 0) return -1;
+    if (!config_metadata_dir_is_safe(&dir_identity)) {
+        errno = EACCES;
+        return -1;
+    }
+    if ((size_t)snprintf(lockpath, sizeof(lockpath),
+                         "%s/.startup-resume.lock", dir) >=
+        sizeof(lockpath)) {
+        errno = ENAMETOOLONG;
+        return -1;
+    }
+    if (lstat(lockpath, &named) == 0) {
+        if (!config_metadata_file_is_safe(&named, true)) {
+            errno = EACCES;
+            return -1;
+        }
+    } else if (errno != ENOENT) {
+        return -1;
+    }
+
+    dir_fd = open(dir, O_RDONLY | O_CLOEXEC | O_DIRECTORY | O_NOFOLLOW);
+    if (dir_fd < 0 || fstat(dir_fd, &after) != 0 ||
+        !config_metadata_dir_is_safe(&after) ||
+        !config_metadata_same_file(&dir_identity, &after)) {
+        if (dir_fd >= 0) close(dir_fd);
+        errno = EACCES;
+        return -1;
+    }
+    lock_fd = openat(dir_fd, ".startup-resume.lock", flags, 0600);
+    if (lock_fd < 0) {
+        int saved_errno = errno;
+
+        close(dir_fd);
+        errno = saved_errno;
+        return -1;
+    }
+    if (fstat(lock_fd, &opened) != 0) {
+        int saved_errno = errno;
+
+        close(lock_fd);
+        close(dir_fd);
+        errno = saved_errno;
+        return -1;
+    }
+    if (!config_metadata_file_is_safe(&opened, true)) {
+        close(lock_fd);
+        close(dir_fd);
+        errno = EACCES;
+        return -1;
+    }
+
+    /* This lock is a typed UX handoff, not the mutation safety boundary. It
+     * intentionally avoids the replace-resistant directory flock used by
+     * .config.lock: sharing that guard would make shell startup block behind
+     * unrelated commands that may be waiting at a PIN/passphrase prompt. The
+     * ordinary config lock still gates every restore mutation below. */
+    if (config_startup_resume_flock(lock_fd) != 0) goto startup_lock_error;
+    if (fstatat(dir_fd, ".startup-resume.lock", &named,
+                AT_SYMLINK_NOFOLLOW) != 0) {
+        goto startup_lock_error;
+    }
+    if (!config_metadata_file_is_safe(&named, true)) {
+        errno = EACCES;
+        goto startup_lock_error;
+    }
+    if (!config_metadata_same_file(&opened, &named)) {
+        errno = ESTALE;
+        goto startup_lock_error;
+    }
+    if (lstat(dir, &after) != 0) goto startup_lock_error;
+    if (!config_metadata_dir_is_safe(&after)) {
+        errno = EACCES;
+        goto startup_lock_error;
+    }
+    if (!config_metadata_same_file(&dir_identity, &after)) {
+        errno = ESTALE;
+        goto startup_lock_error;
+    }
+    close(dir_fd);
+    return lock_fd;
+
+startup_lock_error:
+    {
+        int saved_errno = errno ? errno : EIO;
+
+        (void)flock(lock_fd, LOCK_UN);
+        close(lock_fd);
+        close(dir_fd);
+        errno = saved_errno;
+        return -1;
+    }
+}
+
+void config_startup_resume_unlock(int token_fd) {
+    int saved_errno = errno;
+
+    if (token_fd >= 0) {
+        (void)flock(token_fd, LOCK_UN);
+        close(token_fd);
+    }
+    errno = saved_errno;
+}
+
 void config_write_unlock(int token_fd) {
     unlock_private_file(token_fd);
 }

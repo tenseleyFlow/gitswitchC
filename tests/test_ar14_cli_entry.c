@@ -477,13 +477,17 @@ TEST(internal_probes_reject_operands_and_mutual_exclusion) {
     char agent[] = "--ssh-agent-info";
     char resume[] = "--resume-check";
     char hint[] = "--resume-hint-probe";
+    char startup[] = "--startup-resume";
     char operand[] = "status";
     char *agent_operand[] = { program, agent, operand, NULL };
     char *resume_operand[] = { program, resume, operand, NULL };
     char *hint_operand[] = { program, hint, operand, NULL };
-    char *mutual[] = { program, agent, resume, hint, NULL };
-    char **cases[] = { agent_operand, resume_operand, hint_operand, mutual };
-    const int argcs[] = { 3, 3, 3, 4 };
+    char *startup_operand[] = { program, startup, operand, NULL };
+    char *mutual[] = { program, agent, resume, hint, startup, NULL };
+    char **cases[] = {
+        agent_operand, resume_operand, hint_operand, startup_operand, mutual
+    };
+    const int argcs[] = { 3, 3, 3, 3, 5 };
 
     CHECK_EQ_INT(fixture_setup(&fixture), 0);
     for (size_t index = 0; index < sizeof(cases) / sizeof(cases[0]);
@@ -492,7 +496,7 @@ TEST(internal_probes_reject_operands_and_mutual_exclusion) {
 
         CHECK_EQ_INT(result.status, EXIT_FAILURE);
         CHECK(strstr(result.stderr_text,
-                     index < 3 ? "does not accept operands"
+                     index < 4 ? "does not accept operands"
                                : "mutually exclusive") != NULL);
         check_clean_return(&result, 0);
     }
@@ -713,13 +717,15 @@ TEST(resume_check_handles_empty_missing_and_identity_only_active_accounts) {
     check_clean_return(&identity_result, 1);
 }
 
-TEST(resume_check_startup_logging_requires_a_valid_pre_delimiter_option) {
+TEST(internal_startup_logging_requires_a_valid_pre_delimiter_option) {
     static const char startup_message[] =
         "Error handling system initialized";
     cli_fixture_t fixture;
     char program[] = "gitswitch";
     char resume[] = "--resume-check";
     char resume_prefix[] = "--resume-c";
+    char startup[] = "--startup-resume";
+    char startup_prefix[] = "--startup-r";
     char verbose_short[] = "-V";
     char debug_short[] = "-d";
     char verbose_bundle[] = "-nV";
@@ -734,7 +740,10 @@ TEST(resume_check_startup_logging_requires_a_valid_pre_delimiter_option) {
     char *cases[][5] = {
         { program, resume, NULL, NULL, NULL },
         { program, resume_prefix, NULL, NULL, NULL },
+        { program, startup, NULL, NULL, NULL },
+        { program, startup_prefix, NULL, NULL, NULL },
         { program, verbose_short, resume, NULL, NULL },
+        { program, verbose_short, startup, NULL, NULL },
         { program, debug_short, resume, NULL, NULL },
         { program, verbose_bundle, resume, NULL, NULL },
         { program, verbose_long, resume, NULL, NULL },
@@ -747,14 +756,16 @@ TEST(resume_check_startup_logging_requires_a_valid_pre_delimiter_option) {
         { program, malformed_long, resume, NULL, NULL }
     };
     const int argcs[] = {
-        2, 2, 3, 3, 3, 3, 3, 3, 3, 4, 3, 3, 3
+        2, 2, 2, 2, 3, 3, 3, 3, 3, 3, 3, 3, 4, 3, 3, 3
     };
     const bool succeeds[] = {
-        true, true, true, true, true, true, true, true, true,
+        true, true, true, true, true, true, true, true, true, true,
+        true, true,
         false, false, false, false
     };
     const bool requests_logging[] = {
-        false, false, true, true, true, true, true, true, true,
+        false, false, false, false, true, true, true, true, true, true,
+        true, true,
         false, false, false, false
     };
 
@@ -925,7 +936,7 @@ int main(void) {
     RUN_TEST(
         resume_check_handles_empty_missing_and_identity_only_active_accounts);
     RUN_TEST(
-        resume_check_startup_logging_requires_a_valid_pre_delimiter_option);
+        internal_startup_logging_requires_a_valid_pre_delimiter_option);
     RUN_TEST(retirement_guard_blocks_switch_resume_and_unrelated_mutation);
     RUN_TEST(
         switch_guard_blocks_mutation_but_readiness_probe_fails_closed_silently);

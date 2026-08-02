@@ -611,6 +611,18 @@ int config_write_lock(void);
 void config_write_unlock(int token_fd);
 
 /**
+ * Serialize generated shell-startup resume operations for one configuration.
+ * Unlike config_write_lock(), this typed handoff waits briefly for another
+ * startup resume to finish so concurrent shells can recheck the final runtime
+ * before refreshing their environment. The wait is bounded because the owner
+ * may itself be waiting at a PIN/passphrase prompt. Acquire it before the
+ * ordinary config write lock and release it with
+ * config_startup_resume_unlock(). EAGAIN/EWOULDBLOCK means the bound expired.
+ */
+int config_startup_resume_lock(void);
+void config_startup_resume_unlock(int token_fd);
+
+/**
  * Create default configuration file
  */
 int config_create_default(const char *config_path);

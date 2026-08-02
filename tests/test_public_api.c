@@ -118,6 +118,8 @@ TEST(all_retained_public_apis_compile_and_link) {
     REQUIRE_PUBLIC_API(config_resume_hint_snapshot_clear);
     REQUIRE_PUBLIC_API(config_resume_hint_snapshot_restore);
     REQUIRE_PUBLIC_API(config_resume_hint_snapshot_settle);
+    REQUIRE_PUBLIC_API(config_startup_resume_lock);
+    REQUIRE_PUBLIC_API(config_startup_resume_unlock);
     REQUIRE_PUBLIC_API(config_switch_guard_abandon);
     REQUIRE_PUBLIC_API(config_switch_guard_clear);
     REQUIRE_PUBLIC_API(config_switch_guard_retain);

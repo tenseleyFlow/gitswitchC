@@ -861,6 +861,130 @@ TEST(config_lock_rejects_symlink_fifo_and_unsafe_mode) {
     restore_home_env(saved_home);
 }
 
+TEST(startup_resume_lock_rejects_unsafe_metadata) {
+    char home[128], saved_home[512], dotconfig[256], config_dir[512];
+    char lock[640], victim[640], before[64], after[64];
+    struct stat st;
+    int fd;
+
+    save_home_env(saved_home, sizeof(saved_home));
+    CHECK_EQ_INT(make_scratch_dir(home, sizeof(home)), 0);
+    snprintf(dotconfig, sizeof(dotconfig), "%s/.config", home);
+    snprintf(config_dir, sizeof(config_dir), "%s/gitswitch", dotconfig);
+    snprintf(lock, sizeof(lock), "%s/.startup-resume.lock", config_dir);
+    snprintf(victim, sizeof(victim), "%s/startup-lock-victim", home);
+    CHECK_EQ_INT(mkdir(dotconfig, 0700), 0);
+    CHECK_EQ_INT(mkdir(config_dir, 0700), 0);
+    CHECK_EQ_INT(write_config(victim, "victim-content\n", 15), 0);
+    CHECK(slurp(victim, before, sizeof(before)) > 0);
+    CHECK_EQ_INT(symlink(victim, lock), 0);
+    CHECK_EQ_INT(setenv("HOME", home, 1), 0);
+
+    fd = config_startup_resume_lock();
+    CHECK_EQ_INT(fd, -1);
+    if (fd >= 0) config_startup_resume_unlock(fd);
+    CHECK_EQ_INT(lstat(lock, &st), 0);
+    CHECK(S_ISLNK(st.st_mode));
+    CHECK(slurp(victim, after, sizeof(after)) > 0);
+    CHECK_STR_EQ(after, before);
+
+    CHECK_EQ_INT(unlink(lock), 0);
+    CHECK_EQ_INT(write_config(lock, "", 0), 0);
+    CHECK_EQ_INT(chmod(lock, 0660), 0);
+    fd = config_startup_resume_lock();
+    CHECK_EQ_INT(fd, -1);
+    if (fd >= 0) config_startup_resume_unlock(fd);
+
+    CHECK_EQ_INT(chmod(lock, 0600), 0);
+    fd = config_startup_resume_lock();
+    CHECK(fd >= 0);
+    if (fd >= 0) config_startup_resume_unlock(fd);
+
+    restore_home_env(saved_home);
+    ts_rm_rf(home);
+}
+
+TEST(startup_resume_handoff_is_typed_and_independent_of_config_lock) {
+    char home[128], saved_home[512], dotconfig[256], config_dir[512];
+    int config_token = -1;
+    int startup_token = -1;
+    int status = 0;
+    pid_t child = -1;
+    pid_t observed = 0;
+
+    save_home_env(saved_home, sizeof(saved_home));
+    CHECK_EQ_INT(make_scratch_dir(home, sizeof(home)), 0);
+    snprintf(dotconfig, sizeof(dotconfig), "%s/.config", home);
+    snprintf(config_dir, sizeof(config_dir), "%s/gitswitch", dotconfig);
+    CHECK_EQ_INT(mkdir(dotconfig, 0700), 0);
+    CHECK_EQ_INT(mkdir(config_dir, 0700), 0);
+    CHECK_EQ_INT(setenv("HOME", home, 1), 0);
+
+    /* An unrelated config mutation must not make startup block before it can
+     * reach the ordinary nonblocking config-lock decision in main. */
+    config_token = config_write_lock();
+    CHECK(config_token >= 0);
+    if (config_token >= 0) {
+        child = fork();
+        CHECK(child >= 0);
+        if (child == 0) {
+            int token = config_startup_resume_lock();
+            if (token >= 0) config_startup_resume_unlock(token);
+            _exit(token >= 0 ? 0 : 7);
+        }
+        for (int waited = 0; child > 0 && waited < 1000; waited += 10) {
+            struct timespec ts = { .tv_sec = 0, .tv_nsec = 10000000 };
+
+            observed = waitpid(child, &status, WNOHANG);
+            if (observed != 0) break;
+            nanosleep(&ts, NULL);
+        }
+        CHECK(observed == child);
+        config_write_unlock(config_token);
+        config_token = -1;
+        if (observed == 0 && child > 0) {
+            CHECK(waitpid(child, &status, 0) == child);
+            observed = child;
+        }
+        CHECK(WIFEXITED(status) && WEXITSTATUS(status) == 0);
+    }
+
+    /* Another startup handoff is typed: later startup calls wait until its
+     * owner finishes, then acquire and recheck runtime themselves. */
+    startup_token = config_startup_resume_lock();
+    CHECK(startup_token >= 0);
+    if (startup_token >= 0) {
+        child = fork();
+        CHECK(child >= 0);
+        if (child == 0) {
+            int token;
+
+            close(startup_token);
+            token = config_startup_resume_lock();
+            if (token >= 0) config_startup_resume_unlock(token);
+            _exit(token >= 0 ? 0 : 8);
+        }
+        if (child > 0) {
+            struct timespec ts = { .tv_sec = 0, .tv_nsec = 100000000 };
+
+            nanosleep(&ts, NULL);
+            observed = waitpid(child, &status, WNOHANG);
+            CHECK_EQ_INT(observed, 0);
+        }
+        config_startup_resume_unlock(startup_token);
+        startup_token = -1;
+        if (child > 0 && observed == 0) {
+            CHECK(waitpid(child, &status, 0) == child);
+        }
+        CHECK(WIFEXITED(status) && WEXITSTATUS(status) == 0);
+    }
+
+    if (config_token >= 0) config_write_unlock(config_token);
+    if (startup_token >= 0) config_startup_resume_unlock(startup_token);
+    restore_home_env(saved_home);
+    ts_rm_rf(home);
+}
+
 TEST(config_lock_startup_cleans_only_proven_resume_hint_temp_residue) {
     static const char settled_prefix[] =
         ".gitswitch-resume-hint-settled-";
@@ -2755,6 +2879,8 @@ TEST_MAIN_BEGIN()
     RUN_TEST(config_init_secures_real_or_absent_final_directory);
     RUN_TEST(config_get_path_uses_home_or_passwd_without_filesystem_mutation);
     RUN_TEST(config_lock_rejects_symlink_fifo_and_unsafe_mode);
+    RUN_TEST(startup_resume_lock_rejects_unsafe_metadata);
+    RUN_TEST(startup_resume_handoff_is_typed_and_independent_of_config_lock);
     RUN_TEST(config_lock_startup_cleans_only_proven_resume_hint_temp_residue);
     RUN_TEST(config_lock_release_preserves_reused_fd_and_retires_context);
     RUN_TEST(config_lock_survives_post_acquisition_namespace_replacement);

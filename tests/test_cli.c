@@ -848,6 +848,28 @@ TEST(mutating_commands_fail_fast_on_config_lock_readonly_dont) {
     CHECK(strstr(out, "Another gitswitch holds the config lock") != NULL);
     CHECK(strstr(out, "try again after that command finishes") != NULL);
 
+    /* Generated shell startup has the same truthful nonzero result, but its
+     * expected fan-out contention is status-only: another shell may still be
+     * completing the one real restore. Do not turn that routine race into an
+     * error at every newly spawned prompt. */
+    snprintf(cmd, sizeof(cmd),
+             "HOME='%s' XDG_RUNTIME_DIR='%s' '%s' --startup-resume >'%s' 2>&1",
+             home, rt, g_bin, out_path);
+    rc = run_shell(cmd);
+    CHECK(rc > 0 && rc < 126);
+    CHECK(access(done, F_OK) != 0);
+    CHECK(slurp(out_path, out, sizeof(out))[0] == '\0');
+
+    /* The hidden mode remains diagnosable when explicitly requested. */
+    snprintf(cmd, sizeof(cmd),
+             "HOME='%s' XDG_RUNTIME_DIR='%s' '%s' -V --startup-resume >'%s' 2>&1",
+             home, rt, g_bin, out_path);
+    rc = run_shell(cmd);
+    CHECK(rc > 0 && rc < 126);
+    CHECK(access(done, F_OK) != 0);
+    CHECK(strstr(slurp(out_path, out, sizeof(out)),
+                 "Another gitswitch holds the config lock") != NULL);
+
     /* Ordinary mutating commands report contention and return immediately. */
     snprintf(cmd, sizeof(cmd),
              "HOME='%s' XDG_RUNTIME_DIR='%s' '%s' -y reset >'%s' 2>&1",
@@ -878,6 +900,208 @@ TEST(mutating_commands_fail_fast_on_config_lock_readonly_dont) {
 
     CHECK(waitpid(pid, &status, 0) == pid);
     CHECK(WIFEXITED(status) && WEXITSTATUS(status) == 0);
+
+    remove_tree(home);
+    remove_tree(rt);
+}
+
+/* Generated startup resumes share a typed, blocking handoff lock. Unlike the
+ * unclassified config lock above, this proves the holder is another startup
+ * restore: later shells wait for it, then run the ordinary idempotent resume
+ * check before refreshing their own environment. */
+TEST(startup_resume_coalesces_behind_another_startup_resume) {
+    static const char empty_config[] =
+        "[settings]\n"
+        "default_scope = \"global\"\n";
+    char home[256], rt[256], lockpath[4352];
+    char held[4352], release[4352], out_path[4352];
+    char cmd[16384], out[8192];
+    pid_t holder = -1, runner = -1;
+    int holder_status = 0, runner_status = 0, waited = 0;
+    bool runner_reaped = false;
+
+    if (!make_temp_dir(home, sizeof(home)) || !make_temp_dir(rt, sizeof(rt))) {
+        CHECK(!"mkdtemp failed");
+        return;
+    }
+    CHECK_EQ_INT(write_config(home, empty_config), 0);
+    snprintf(lockpath, sizeof(lockpath),
+             "%s/.config/gitswitch/.startup-resume.lock", home);
+    snprintf(held, sizeof(held), "%s/startup-lock-held", rt);
+    snprintf(release, sizeof(release), "%s/startup-lock-release", rt);
+    snprintf(out_path, sizeof(out_path), "%s/startup-command.out", rt);
+
+    fflush(NULL);
+    holder = fork();
+    CHECK(holder >= 0);
+    if (holder == 0) {
+        struct timespec ts = { .tv_sec = 0, .tv_nsec = 10000000 };
+        int child_waited = 0;
+        int fd = open(lockpath, O_RDWR | O_CREAT | O_CLOEXEC, 0600);
+        FILE *marker;
+
+        if (fd < 0 || flock(fd, LOCK_EX) != 0) _exit(9);
+        marker = fopen(held, "w");
+        if (!marker) _exit(9);
+        fclose(marker);
+        while (access(release, F_OK) != 0 && child_waited < 5000) {
+            nanosleep(&ts, NULL);
+            child_waited += 10;
+        }
+        flock(fd, LOCK_UN);
+        close(fd);
+        _exit(access(release, F_OK) == 0 ? 0 : 9);
+    }
+
+    while (access(held, F_OK) != 0 && waited < 5000) {
+        struct timespec ts = { .tv_sec = 0, .tv_nsec = 10000000 };
+        nanosleep(&ts, NULL);
+        waited += 10;
+    }
+    CHECK(access(held, F_OK) == 0);
+
+    snprintf(cmd, sizeof(cmd),
+             "HOME='%s' XDG_RUNTIME_DIR='%s' '%s' --startup-resume >'%s' 2>&1",
+             home, rt, g_bin, out_path);
+    fflush(NULL);
+    runner = fork();
+    CHECK(runner >= 0);
+    if (runner == 0) {
+        _exit(run_shell(cmd) == 0 ? 0 : 8);
+    }
+
+    {
+        struct timespec ts = { .tv_sec = 0, .tv_nsec = 100000000 };
+        pid_t observed;
+
+        nanosleep(&ts, NULL);
+        observed = waitpid(runner, &runner_status, WNOHANG);
+        CHECK_EQ_INT(observed, 0);
+        runner_reaped = observed == runner;
+    }
+
+    {
+        FILE *marker = fopen(release, "w");
+        CHECK(marker != NULL);
+        if (marker) fclose(marker);
+    }
+    CHECK(waitpid(holder, &holder_status, 0) == holder);
+    CHECK(WIFEXITED(holder_status) && WEXITSTATUS(holder_status) == 0);
+    if (!runner_reaped) {
+        CHECK(waitpid(runner, &runner_status, 0) == runner);
+    }
+    CHECK(WIFEXITED(runner_status) && WEXITSTATUS(runner_status) == 0);
+    CHECK(slurp(out_path, out, sizeof(out))[0] == '\0');
+
+    remove_tree(home);
+    remove_tree(rt);
+}
+
+TEST(startup_resume_handoff_timeout_is_bounded_and_quiet) {
+    static const char empty_config[] =
+        "[settings]\n"
+        "default_scope = \"global\"\n";
+    char home[256], rt[256], lockpath[4352];
+    char held[4352], release[4352], out_path[4352];
+    char cmd[16384], out[8192];
+    pid_t holder = -1;
+    int holder_status = 0, waited = 0, rc;
+
+    if (!make_temp_dir(home, sizeof(home)) || !make_temp_dir(rt, sizeof(rt))) {
+        CHECK(!"mkdtemp failed");
+        return;
+    }
+    CHECK_EQ_INT(write_config(home, empty_config), 0);
+    snprintf(lockpath, sizeof(lockpath),
+             "%s/.config/gitswitch/.startup-resume.lock", home);
+    snprintf(held, sizeof(held), "%s/timeout-lock-held", rt);
+    snprintf(release, sizeof(release), "%s/timeout-lock-release", rt);
+    snprintf(out_path, sizeof(out_path), "%s/timeout-command.out", rt);
+
+    fflush(NULL);
+    holder = fork();
+    CHECK(holder >= 0);
+    if (holder == 0) {
+        struct timespec ts = { .tv_sec = 0, .tv_nsec = 10000000 };
+        int child_waited = 0;
+        int fd = open(lockpath, O_RDWR | O_CREAT | O_CLOEXEC, 0600);
+        FILE *marker;
+
+        if (fd < 0 || flock(fd, LOCK_EX) != 0) _exit(9);
+        marker = fopen(held, "w");
+        if (!marker) _exit(9);
+        fclose(marker);
+        while (access(release, F_OK) != 0 && child_waited < 5000) {
+            nanosleep(&ts, NULL);
+            child_waited += 10;
+        }
+        flock(fd, LOCK_UN);
+        close(fd);
+        _exit(access(release, F_OK) == 0 ? 0 : 9);
+    }
+
+    while (access(held, F_OK) != 0 && waited < 5000) {
+        struct timespec ts = { .tv_sec = 0, .tv_nsec = 10000000 };
+        nanosleep(&ts, NULL);
+        waited += 10;
+    }
+    CHECK(access(held, F_OK) == 0);
+
+    snprintf(cmd, sizeof(cmd),
+             "HOME='%s' XDG_RUNTIME_DIR='%s' '%s' --startup-resume >'%s' 2>&1",
+             home, rt, g_bin, out_path);
+    rc = run_shell(cmd);
+    CHECK(rc > 0 && rc < 126);
+    CHECK_EQ_INT(waitpid(holder, &holder_status, WNOHANG), 0);
+    CHECK(slurp(out_path, out, sizeof(out))[0] == '\0');
+
+    {
+        FILE *marker = fopen(release, "w");
+        CHECK(marker != NULL);
+        if (marker) fclose(marker);
+    }
+    CHECK(waitpid(holder, &holder_status, 0) == holder);
+    CHECK(WIFEXITED(holder_status) && WEXITSTATUS(holder_status) == 0);
+
+    remove_tree(home);
+    remove_tree(rt);
+}
+
+TEST(startup_resume_metadata_failure_remains_visible) {
+    static const char empty_config[] =
+        "[settings]\n"
+        "default_scope = \"global\"\n";
+    char home[256], rt[256], lockpath[4352], out_path[4352];
+    char cmd[16384], out[8192];
+    FILE *lock_file;
+    int rc;
+
+    if (!make_temp_dir(home, sizeof(home)) || !make_temp_dir(rt, sizeof(rt))) {
+        CHECK(!"mkdtemp failed");
+        return;
+    }
+    CHECK_EQ_INT(write_config(home, empty_config), 0);
+    snprintf(lockpath, sizeof(lockpath),
+             "%s/.config/gitswitch/.startup-resume.lock", home);
+    snprintf(out_path, sizeof(out_path), "%s/unsafe-startup-lock.out", rt);
+    lock_file = fopen(lockpath, "w");
+    CHECK(lock_file != NULL);
+    if (!lock_file) {
+        remove_tree(home);
+        remove_tree(rt);
+        return;
+    }
+    CHECK_EQ_INT(fclose(lock_file), 0);
+    CHECK_EQ_INT(chmod(lockpath, 0644), 0);
+
+    snprintf(cmd, sizeof(cmd),
+             "HOME='%s' XDG_RUNTIME_DIR='%s' '%s' --startup-resume >'%s' 2>&1",
+             home, rt, g_bin, out_path);
+    rc = run_shell(cmd);
+    CHECK(rc > 0 && rc < 126);
+    CHECK(strstr(slurp(out_path, out, sizeof(out)),
+                 "Could not coordinate shell startup resume") != NULL);
+    CHECK(strstr(out, "startup lock is unavailable") != NULL);
 
     remove_tree(home);
     remove_tree(rt);
@@ -1639,6 +1863,9 @@ TEST_MAIN_BEGIN()
     RUN_TEST(reset_account_removes_current_sock_pointing_at_it);
     RUN_TEST(reset_other_account_keeps_current_sock);
     RUN_TEST(mutating_commands_fail_fast_on_config_lock_readonly_dont);
+    RUN_TEST(startup_resume_coalesces_behind_another_startup_resume);
+    RUN_TEST(startup_resume_handoff_timeout_is_bounded_and_quiet);
+    RUN_TEST(startup_resume_metadata_failure_remains_visible);
     RUN_TEST(utf8_account_name_cli_round_trip);
     RUN_TEST(no_color_output_contains_no_escape_bytes);
     RUN_TEST(add_after_uint32_max_id_does_not_wrap_to_zero);
