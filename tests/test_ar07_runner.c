@@ -27,6 +27,20 @@
 
 static char g_self_path[MAX_PATH_LEN];
 
+/* After a checked setup-failure record, run_argv signals the child (or proven
+ * process group) with SIGKILL before reaping it.  The reporter's _exit() can
+ * win that race, or the cleanup SIGKILL can; errno and the structured error
+ * retain the primary failure while run_result truthfully records either
+ * terminal wait status. */
+static bool setup_failure_wait_status_is_valid(
+    const run_result_t *result, int declared_exit_code) {
+    if (!result) return false;
+    return (result->exit_code == declared_exit_code &&
+            result->term_signal == 0) ||
+           (result->exit_code == -1 &&
+            result->term_signal == SIGKILL);
+}
+
 typedef enum {
     SIGPIPE_DISPOSITION_DEFAULT = 0,
     SIGPIPE_DISPOSITION_IGNORE,
@@ -613,7 +627,7 @@ TEST(child_setup_status_is_reported_explicitly) {
     clear_error();
     CHECK_EQ_INT(run_argv(argv, &opts, &result), -1);
     CHECK(result.spawned);
-    CHECK_EQ_INT(result.exit_code, 126);
+    CHECK(setup_failure_wait_status_is_valid(&result, 126));
     CHECK(strstr(get_last_error()->message, "environment setup failed") != NULL);
 }
 
@@ -632,7 +646,7 @@ TEST(process_group_supervisor_setup_failure_is_truthful_and_reaped) {
 
     CHECK_EQ_INT(returned_errno, EPERM);
     CHECK(failed.spawned);
-    CHECK_EQ_INT(failed.exit_code, 126);
+    CHECK(setup_failure_wait_status_is_valid(&failed, 126));
     CHECK(elapsed >= 0 && elapsed < 1000);
     CHECK(strstr(get_last_error()->message,
                  "process-group supervisor setup failed") != NULL);
@@ -748,7 +762,7 @@ TEST(supervisor_stage_failures_are_truthful_reaped_and_one_shot) {
 
         CHECK_EQ_INT(returned_errno, cases[i].system_errno);
         CHECK(failed.spawned);
-        CHECK_EQ_INT(failed.exit_code, 126);
+        CHECK(setup_failure_wait_status_is_valid(&failed, 126));
         CHECK(elapsed >= 0 && elapsed < 1000);
         CHECK(strstr(get_last_error()->message,
                      "process-group supervisor setup failed") != NULL);
@@ -1536,7 +1550,8 @@ static int pending_replay_failure_worker(void) {
 
     outcome =
         run_rc == -1 && returned_errno == EIO &&
-                failed.spawned && failed.exit_code == 126 &&
+                failed.spawned &&
+                setup_failure_wait_status_is_valid(&failed, 126) &&
                 reported_group_failure && !pending_signal_published &&
                 retry_rc == 0 && retry.spawned && retry.exit_code == 0 &&
                 guard_end_rc == 0 &&
@@ -2532,7 +2547,7 @@ TEST(forced_bulk_failure_is_reported_without_fallback) {
     CHECK_EQ_INT(run_test_set_fd_close_strategy(RUN_TEST_FD_CLOSE_AUTO), 0);
     CHECK_EQ_INT(rc, -1);
     CHECK(result.spawned);
-    CHECK_EQ_INT(result.exit_code, 126);
+    CHECK(setup_failure_wait_status_is_valid(&result, 126));
     CHECK(error && strstr(error->message,
                           "child descriptor cleanup failed") != NULL);
     CHECK(observed);
@@ -2570,7 +2585,8 @@ static bool auto_bulk_failure_fails_closed(const struct rlimit *limit,
         int rc = run_argv(argv, NULL, &result);
         const error_context_t *error = get_last_error();
         bool failed_closed =
-            rc == -1 && result.spawned && result.exit_code == 126 && error &&
+            rc == -1 && result.spawned &&
+            setup_failure_wait_status_is_valid(&result, 126) && error &&
             strstr(error->message,
                    "child descriptor cleanup failed") != NULL;
 
