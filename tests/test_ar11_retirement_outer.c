@@ -165,7 +165,10 @@ typedef struct {
 
 typedef struct {
     char root[MAX_PATH_LEN];
+    char commands_dir[MAX_PATH_LEN];
     char home[MAX_PATH_LEN];
+    char bin_dir[MAX_PATH_LEN];
+    char data_dir[MAX_PATH_LEN];
     char config_parent[MAX_PATH_LEN];
     char runtime[MAX_PATH_LEN];
     char config_dir[MAX_PATH_LEN];
@@ -191,6 +194,18 @@ typedef struct {
     publication_record_t no_op_record;
 } m18_fixture_t;
 
+typedef struct {
+    char root[MAX_PATH_LEN];
+    char commands_dir[MAX_PATH_LEN];
+    char data_dir[MAX_PATH_LEN];
+    char bin_dir[MAX_PATH_LEN];
+    char git_program[MAX_PATH_LEN];
+    char ssh_program[MAX_PATH_LEN];
+    bool ready;
+} m18_suite_fixture_t;
+
+static m18_suite_fixture_t m18_suite_fixture;
+
 static bool m18_guard_is_unblocked_and_bounded(
     const m18_fixture_t *fixture);
 static bool m18_guard_is_private_and_blocking(
@@ -198,6 +213,7 @@ static bool m18_guard_is_private_and_blocking(
 static bool m18_ledger_matches_live_restored_git(
     const m18_fixture_t *fixture);
 static bool m18_completion_absent(const m18_fixture_t *fixture);
+static bool m18_git_trace_has_unset(const m18_fixture_t *fixture);
 
 static config_io_boundary_t m18_fault_boundary;
 static bool m18_fault_observed;
@@ -298,6 +314,8 @@ static int m18_read_bytes(const char *path, m18_bytes_t *bytes);
 static void m18_bytes_clear(m18_bytes_t *bytes);
 static int m18_force_ctime_only_drift(const char *path);
 static int m18_rewrite_marker_byte_preserving_mtime(const char *path);
+static int m18_stabilize_command_tree(const m18_fixture_t *fixture);
+static int m18_suite_fixture_setup(void);
 static int m24_fixture_replace_with_live_alias_claimant(
     const m18_fixture_t *fixture);
 static int m18_terminal_writer_hook(
@@ -801,6 +819,158 @@ static void m18_bytes_clear(m18_bytes_t *bytes) {
     memset(bytes, 0, sizeof(*bytes));
 }
 
+static int m18_sync_directory(const char *path) {
+    int fd;
+    int result;
+    int saved_errno = 0;
+
+    if (!path) {
+        errno = EINVAL;
+        return -1;
+    }
+    fd = open(path, O_RDONLY | O_DIRECTORY | O_CLOEXEC | O_NOFOLLOW);
+    if (fd < 0) return -1;
+    do {
+        result = fsync(fd);
+    } while (result != 0 && errno == EINTR);
+    if (result != 0) saved_errno = errno;
+    if (close(fd) != 0 && result == 0) {
+        result = -1;
+        saved_errno = errno;
+    }
+    errno = result == 0 ? 0 : saved_errno;
+    return result;
+}
+
+/* The trusted executable branch is immutable after setup. Flush every
+ * directory in that branch and its namespace publication, then require one
+ * complete pass in which both absolute wrappers survive the resolver's
+ * fail-closed metadata checks. UFS may expose a bounded delayed ctime
+ * successor after the flush, so only that transient classification is
+ * retried in this otherwise quiescent test tree. */
+static int m18_stabilize_command_tree(const m18_fixture_t *fixture) {
+    char parent[MAX_PATH_LEN];
+    char resolved[MAX_PATH_LEN];
+    char *slash;
+
+    if (!fixture ||
+        safe_strncpy(parent, fixture->root, sizeof(parent)) != 0) {
+        errno = EINVAL;
+        return -1;
+    }
+    slash = strrchr(parent, '/');
+    if (!slash) {
+        errno = EINVAL;
+        return -1;
+    }
+    if (slash == parent) {
+        slash[1] = '\0';
+    } else {
+        *slash = '\0';
+    }
+    if (m18_sync_directory(fixture->bin_dir) != 0 ||
+        m18_sync_directory(fixture->commands_dir) != 0 ||
+        m18_sync_directory(fixture->root) != 0 ||
+        m18_sync_directory(parent) != 0) {
+        return -1;
+    }
+    for (unsigned attempt = 0U; attempt < 16U; attempt++) {
+        errno = 0;
+        if (find_command_path(fixture->git_program, resolved,
+                              sizeof(resolved)) != 0) {
+            if (errno == ESTALE || errno == EAGAIN) continue;
+            return -1;
+        }
+        if (strcmp(resolved, fixture->git_program) != 0) {
+            errno = EIO;
+            return -1;
+        }
+        errno = 0;
+        if (find_command_path(fixture->ssh_program, resolved,
+                              sizeof(resolved)) != 0) {
+            if (errno == ESTALE || errno == EAGAIN) continue;
+            return -1;
+        }
+        if (strcmp(resolved, fixture->ssh_program) != 0) {
+            errno = EIO;
+            return -1;
+        }
+        clear_error();
+        errno = 0;
+        return 0;
+    }
+    errno = ESTALE;
+    return -1;
+}
+
+/* Keep the resolver's entire executable ancestry quiescent for the lifetime
+ * of the suite. Per-test fixtures live below the sibling data directory, so
+ * creating and removing them cannot change HOME or any commands/bin ancestor
+ * while child processes are resolving the trusted git and ssh wrappers. */
+static int m18_suite_fixture_setup(void) {
+    static const char ssh_program_body[] = "#!/bin/sh\nexit 0\n";
+    static const char git_program_body[] =
+        "#!/bin/sh\nPATH=/usr/local/bin:/usr/bin:/bin\n"
+        "export PATH\n"
+        "if [ -n \"${GITSWITCH_TEST_GIT_TRACE:-}\" ]; then\n"
+        "  printf '%s\\n' \"$*\" >> \"$GITSWITCH_TEST_GIT_TRACE\"\n"
+        "fi\n"
+        "exec git \"$@\"\n";
+    m18_fixture_t command_fixture;
+
+    if (m18_suite_fixture.ready) return 0;
+    memset(&m18_suite_fixture, 0, sizeof(m18_suite_fixture));
+    if (!ts_mkdtemp_trusted(m18_suite_fixture.root,
+                            sizeof(m18_suite_fixture.root),
+                            "gsw-ar11-m18-suite") ||
+        ts_canonicalize_dir_path(m18_suite_fixture.root,
+                                 sizeof(m18_suite_fixture.root)) != 0 ||
+        safe_snprintf(m18_suite_fixture.commands_dir,
+                      sizeof(m18_suite_fixture.commands_dir),
+                      "%s/commands", m18_suite_fixture.root) != 0 ||
+        safe_snprintf(m18_suite_fixture.data_dir,
+                      sizeof(m18_suite_fixture.data_dir),
+                      "%s/data", m18_suite_fixture.root) != 0 ||
+        safe_snprintf(m18_suite_fixture.bin_dir,
+                      sizeof(m18_suite_fixture.bin_dir),
+                      "%s/bin", m18_suite_fixture.commands_dir) != 0 ||
+        safe_snprintf(m18_suite_fixture.git_program,
+                      sizeof(m18_suite_fixture.git_program),
+                      "%s/git", m18_suite_fixture.bin_dir) != 0 ||
+        safe_snprintf(m18_suite_fixture.ssh_program,
+                      sizeof(m18_suite_fixture.ssh_program),
+                      "%s/ssh", m18_suite_fixture.bin_dir) != 0 ||
+        mkdir(m18_suite_fixture.commands_dir, 0700) != 0 ||
+        mkdir(m18_suite_fixture.data_dir, 0700) != 0 ||
+        mkdir(m18_suite_fixture.bin_dir, 0700) != 0 ||
+        m18_write_file(m18_suite_fixture.git_program, git_program_body,
+                       sizeof(git_program_body) - 1U, 0700) != 0 ||
+        m18_write_file(m18_suite_fixture.ssh_program, ssh_program_body,
+                       sizeof(ssh_program_body) - 1U, 0700) != 0) {
+        return -1;
+    }
+
+    memset(&command_fixture, 0, sizeof(command_fixture));
+    if (safe_strncpy(command_fixture.root, m18_suite_fixture.root,
+                     sizeof(command_fixture.root)) != 0 ||
+        safe_strncpy(command_fixture.commands_dir,
+                     m18_suite_fixture.commands_dir,
+                     sizeof(command_fixture.commands_dir)) != 0 ||
+        safe_strncpy(command_fixture.bin_dir, m18_suite_fixture.bin_dir,
+                     sizeof(command_fixture.bin_dir)) != 0 ||
+        safe_strncpy(command_fixture.git_program,
+                     m18_suite_fixture.git_program,
+                     sizeof(command_fixture.git_program)) != 0 ||
+        safe_strncpy(command_fixture.ssh_program,
+                     m18_suite_fixture.ssh_program,
+                     sizeof(command_fixture.ssh_program)) != 0 ||
+        m18_stabilize_command_tree(&command_fixture) != 0) {
+        return -1;
+    }
+    m18_suite_fixture.ready = true;
+    return 0;
+}
+
 static int m18_build_ssh_command(m18_fixture_t *fixture) {
     const char *path = getenv("PATH");
     char *saved_path = path ? strdup(path) : NULL;
@@ -808,7 +978,7 @@ static int m18_build_ssh_command(m18_fixture_t *fixture) {
     int restore_result;
 
     if (!fixture || (path && !saved_path) ||
-        setenv("PATH", fixture->home, 1) != 0) {
+        setenv("PATH", fixture->bin_dir, 1) != 0) {
         free(saved_path);
         return -1;
     }
@@ -888,14 +1058,6 @@ cleanup:
 }
 
 static int m18_fixture_setup(m18_fixture_t *fixture) {
-    static const char ssh_program_body[] = "#!/bin/sh\nexit 0\n";
-    static const char git_program_body[] =
-        "#!/bin/sh\nPATH=/usr/local/bin:/usr/bin:/bin\n"
-        "export PATH\n"
-        "if [ -n \"${GITSWITCH_TEST_GIT_TRACE:-}\" ]; then\n"
-        "  printf '%s\\n' \"$*\" >> \"$GITSWITCH_TEST_GIT_TRACE\"\n"
-        "fi\n"
-        "exec git \"$@\"\n";
     char config_body[2U * MAX_PATH_LEN];
     char git_body[PUBLICATION_SSH_COMMAND_MAX + 128U];
     struct stat st;
@@ -903,14 +1065,22 @@ static int m18_fixture_setup(m18_fixture_t *fixture) {
 
     if (!fixture) return -1;
     memset(fixture, 0, sizeof(*fixture));
-    if (!ts_mkdtemp_trusted(fixture->root, sizeof(fixture->root),
-                            "gsw-ar11-m18") ||
-        ts_canonicalize_dir_path(fixture->root,
-                                 sizeof(fixture->root)) != 0 ||
+    if (m18_suite_fixture_setup() != 0 ||
+        safe_snprintf(fixture->root, sizeof(fixture->root),
+                      "%s/case.XXXXXX",
+                      m18_suite_fixture.data_dir) != 0 ||
+        !mkdtemp(fixture->root) || chmod(fixture->root, 0700) != 0 ||
+        safe_strncpy(fixture->commands_dir,
+                     m18_suite_fixture.commands_dir,
+                     sizeof(fixture->commands_dir)) != 0 ||
+        safe_snprintf(fixture->data_dir, sizeof(fixture->data_dir),
+                      "%s/data", fixture->root) != 0 ||
         safe_snprintf(fixture->home, sizeof(fixture->home),
-                      "%s/home", fixture->root) != 0 ||
+                      "%s/home", fixture->data_dir) != 0 ||
+        safe_strncpy(fixture->bin_dir, m18_suite_fixture.bin_dir,
+                     sizeof(fixture->bin_dir)) != 0 ||
         safe_snprintf(fixture->runtime, sizeof(fixture->runtime),
-                      "%s/runtime", fixture->root) != 0 ||
+                      "%s/runtime", fixture->data_dir) != 0 ||
         safe_snprintf(fixture->config_parent,
                       sizeof(fixture->config_parent),
                       "%s/.config", fixture->home) != 0 ||
@@ -933,34 +1103,32 @@ static int m18_fixture_setup(m18_fixture_t *fixture) {
                       "%s/.retirement-transition",
                       fixture->config_dir) != 0 ||
         safe_snprintf(fixture->output_path, sizeof(fixture->output_path),
-                      "%s/output", fixture->root) != 0 ||
+                      "%s/output", fixture->data_dir) != 0 ||
         safe_snprintf(fixture->git_trace_path,
                       sizeof(fixture->git_trace_path),
-                      "%s/git.trace", fixture->root) != 0 ||
+                      "%s/git.trace", fixture->data_dir) != 0 ||
         safe_snprintf(fixture->git_path, sizeof(fixture->git_path),
                       "%s/.gitconfig", fixture->home) != 0 ||
-        safe_snprintf(fixture->git_program,
-                      sizeof(fixture->git_program),
-                      "%s/git", fixture->home) != 0 ||
-        safe_snprintf(fixture->ssh_program,
-                      sizeof(fixture->ssh_program),
-                      "%s/ssh", fixture->home) != 0 ||
+        safe_strncpy(fixture->git_program,
+                     m18_suite_fixture.git_program,
+                     sizeof(fixture->git_program)) != 0 ||
+        safe_strncpy(fixture->ssh_program,
+                     m18_suite_fixture.ssh_program,
+                     sizeof(fixture->ssh_program)) != 0 ||
         safe_snprintf(fixture->ssh_key, sizeof(fixture->ssh_key),
                       "%s/id_key", fixture->home) != 0 ||
         safe_snprintf(fixture->ssh_dir, sizeof(fixture->ssh_dir),
                       "%s/.ssh", fixture->home) != 0 ||
         safe_snprintf(fixture->ssh_config, sizeof(fixture->ssh_config),
                       "%s/config", fixture->ssh_dir) != 0 ||
+        mkdir(fixture->data_dir, 0700) != 0 ||
         mkdir(fixture->home, 0700) != 0 ||
         mkdir(fixture->runtime, 0700) != 0 ||
         mkdir(fixture->config_parent, 0700) != 0 ||
         mkdir(fixture->config_dir, 0700) != 0) {
         return -1;
     }
-    if (m18_write_file(fixture->git_program, git_program_body,
-                       sizeof(git_program_body) - 1U, 0700) != 0 ||
-        m18_write_file(fixture->ssh_program, ssh_program_body,
-                       sizeof(ssh_program_body) - 1U, 0700) != 0 ||
+    if (m18_write_file(fixture->output_path, "", 0U, 0600) != 0 ||
         m18_write_file(fixture->git_trace_path, "", 0U, 0600) != 0 ||
         m18_generate_ssh_key(fixture->ssh_key) != 0) {
         return -1;
@@ -1108,7 +1276,7 @@ static int m18_fixture_add_shared_and_no_op_destinations(
                       "%s/.gitconfig-no-op", fixture->home) != 0 ||
         safe_snprintf(fixture->shared_repository,
                       sizeof(fixture->shared_repository),
-                      "%s/linked-worktree", fixture->root) != 0 ||
+                      "%s/linked-worktree", fixture->data_dir) != 0 ||
         mkdir(fixture->shared_repository, 0700) != 0 ||
         m18_write_file(fixture->no_op_git_path, no_op_git_body,
                        sizeof(no_op_git_body) - 1U, 0600) != 0) {
@@ -1195,7 +1363,7 @@ static int m18_fixture_use_local_repository(m18_fixture_t *fixture) {
         m18_read_bytes(fixture->git_path, &global_config) != 0 ||
         safe_snprintf(fixture->shared_repository,
                       sizeof(fixture->shared_repository),
-                      "%s/repository", fixture->root) != 0 ||
+                      "%s/repository", fixture->data_dir) != 0 ||
         safe_snprintf(git_dir, sizeof(git_dir), "%s/.git",
                       fixture->shared_repository) != 0 ||
         safe_snprintf(local_config, sizeof(local_config), "%s/config",
@@ -2020,6 +2188,8 @@ static int m18_run_cli_after_matches(
     size_t fault_limit, config_io_boundary_t boundary,
     size_t fault_matches_to_skip, bool *fault_observed) {
     int observed_pipe[2];
+    bool observation_read_failed = false;
+    bool requested_fault_unobserved = false;
     pid_t child;
 
     if (!fixture || pipe(observed_pipe) != 0) return -1;
@@ -2068,7 +2238,7 @@ static int m18_run_cli_after_matches(
 
         (void)close(observed_pipe[0]);
         if (safe_snprintf(trusted_path, sizeof(trusted_path),
-                          "%s:/usr/bin:/bin", fixture->home) != 0 ||
+                          "%s:/usr/bin:/bin", fixture->bin_dir) != 0 ||
             setenv("PATH", trusted_path, 1) != 0 ||
             setenv("HOME", command_home, 1) != 0 ||
             (m24_home_override[0] != '\0' &&
@@ -2328,6 +2498,10 @@ static int m18_run_cli_after_matches(
         do {
             got = read(observed_pipe[0], &observed, 1U);
         } while (got < 0 && errno == EINTR);
+        observation_read_failed = got != 1;
+        requested_fault_unobserved =
+            fault_limit != M18_FAULT_NONE &&
+            (got != 1 || (observed & 1U) == 0U);
         if (fault_observed && got == 1) {
             *fault_observed = (observed & 1U) != 0U;
         }
@@ -2348,8 +2522,12 @@ static int m18_run_cli_after_matches(
     {
         int status = m18_wait_status(child);
         const char *debug = getenv("M18_DEBUG");
+        bool harness_sentinel =
+            WIFEXITED(status) && WEXITSTATUS(status) >= 120 &&
+            WEXITSTATUS(status) <= 136;
 
-        if (debug && strcmp(debug, "1") == 0) {
+        if (observation_read_failed || requested_fault_unobserved ||
+            harness_sentinel || (debug && strcmp(debug, "1") == 0)) {
             m18_bytes_t output = {0};
             if (m18_read_bytes(fixture->output_path, &output) == 0) {
                 fprintf(stderr, "\n[M18 child output]\n%.*s\n",
@@ -2592,6 +2770,348 @@ typedef enum {
     M18_PHASE_CANCEL
 } m18_phase_mode_t;
 
+typedef enum {
+    M18_PREPARE_GUARD_FRESH = 0,
+    M18_PREPARE_GUARD_ADOPTED,
+    M18_PREPARE_GUARD_CLEAR_UNCERTAIN
+} m18_prepare_guard_mode_t;
+
+typedef enum {
+    M18_PUBLISH_GUARD_NO_MUTATION_FRESH = 0,
+    M18_PUBLISH_GUARD_MUTATION_CAPABLE_FRESH,
+    M18_PUBLISH_GUARD_NO_MUTATION_ADOPTED,
+    M18_PUBLISH_GUARD_CLEANUP_UNCERTAIN_FRESH
+} m18_publish_guard_mode_t;
+
+static m18_publish_guard_mode_t m18_publish_guard_mode;
+static const m18_fixture_t *m18_publish_guard_fixture;
+static bool m18_publish_guard_fault_observed;
+static bool m18_publish_guard_cleanup_fault_observed;
+
+static bool m18_publish_guard_fault(
+    git_retirement_test_stage_t stage, const char *path,
+    const char *key, const char *value) {
+    git_retirement_test_stage_t expected_stage =
+        m18_publish_guard_mode ==
+                M18_PUBLISH_GUARD_MUTATION_CAPABLE_FRESH
+            ? GIT_RETIREMENT_TEST_BEFORE_PUBLISH
+            : GIT_RETIREMENT_TEST_AFTER_PRELOCK_WITNESS;
+
+    (void)key;
+    (void)value;
+    if (!m18_publish_guard_fixture || !path ||
+        strcmp(path, m18_publish_guard_fixture->git_path) != 0) {
+        return false;
+    }
+    if (m18_publish_guard_mode ==
+        M18_PUBLISH_GUARD_CLEANUP_UNCERTAIN_FRESH) {
+        if (stage == GIT_RETIREMENT_TEST_BEFORE_ABSENT_REVALIDATE) {
+            m18_publish_guard_fault_observed = true;
+            errno = EIO;
+            return true;
+        }
+        if (stage == GIT_RETIREMENT_TEST_BEFORE_CLEANUP) {
+            m18_publish_guard_cleanup_fault_observed = true;
+            errno = EIO;
+            return true;
+        }
+        return false;
+    }
+    if (stage != expected_stage) return false;
+    m18_publish_guard_fault_observed = true;
+    errno = EIO;
+    return true;
+}
+
+static int m18_reject_command_runner(const char *const argv[],
+                                     const run_opts_t *opts,
+                                     run_result_t *result) {
+    (void)argv;
+    (void)opts;
+    if (result) memset(result, 0, sizeof(*result));
+    errno = EIO;
+    return -1;
+}
+
+/* Force the public reset-retirement prepare path to reject its non-default
+ * runner after guard installation/adoption. This keeps the regression on the
+ * production ordering seam and proves cleanup without any Git/SSH/config
+ * mutation. */
+static int m18_run_preprepare_guard_cleanup_contract(
+    const m18_fixture_t *fixture, m18_prepare_guard_mode_t mode) {
+    pid_t child;
+
+    if (!fixture) return -1;
+    child = fork();
+    if (child < 0) return -1;
+    if (child == 0) {
+        gitswitch_ctx_t ctx;
+        accounts_transaction_token_t token = 0;
+        command_runner_fn previous_runner;
+        config_retirement_guard_t *installed = NULL;
+        config_retirement_owner_t owner;
+        error_context_t prepare_error;
+        m18_bytes_t accounts_before = {0};
+        m18_bytes_t git_before = {0};
+        m18_bytes_t ssh_before = {0};
+        m18_bytes_t marker_before = {0};
+        m18_bytes_t trace = {0};
+        char trusted_path[2U * MAX_PATH_LEN];
+        int prepare_errno;
+
+        if (safe_snprintf(trusted_path, sizeof(trusted_path),
+                          "%s:/usr/bin:/bin", fixture->bin_dir) != 0 ||
+            setenv("PATH", trusted_path, 1) != 0 ||
+            setenv("HOME", fixture->home, 1) != 0 ||
+            setenv("XDG_RUNTIME_DIR", fixture->runtime, 1) != 0 ||
+            setenv("GITSWITCH_ALLOW_TMP_GPG", "1", 1) != 0 ||
+            setenv("GIT_CONFIG_GLOBAL", fixture->git_path, 1) != 0 ||
+            setenv("GIT_CONFIG_NOSYSTEM", "1", 1) != 0 ||
+            setenv("GITSWITCH_TEST_GIT_TRACE",
+                   fixture->git_trace_path, 1) != 0 ||
+            unsetenv("GIT_CONFIG_COUNT") != 0 ||
+            config_init_readonly(&ctx) != 0 || ctx.account_count != 1U ||
+            m18_read_bytes(fixture->accounts_path, &accounts_before) != 0 ||
+            m18_read_bytes(fixture->git_path, &git_before) != 0 ||
+            m18_read_bytes(fixture->ssh_config, &ssh_before) != 0) {
+            _exit(101);
+        }
+        if (mode == M18_PREPARE_GUARD_ADOPTED) {
+            memset(&owner, 0, sizeof(owner));
+            owner.account_id = ctx.accounts[0].id;
+            if (safe_strncpy(owner.account_incarnation,
+                             ctx.accounts[0].incarnation,
+                             sizeof(owner.account_incarnation)) != 0 ||
+                config_retirement_guard_install_or_adopt(
+                    fixture->accounts_path, CONFIG_RETIREMENT_RESET,
+                    &owner, 1U, &installed) != 0 ||
+                !config_retirement_guard_was_created(installed)) {
+                _exit(102);
+            }
+            config_retirement_guard_abandon(&installed);
+            if (installed ||
+                m18_read_bytes(fixture->guard_path,
+                               &marker_before) != 0) {
+                _exit(103);
+            }
+        }
+        if (accounts_transaction_begin(
+                &ctx, ACCOUNTS_TRANSACTION_RESET, &token) != 0 ||
+            token == 0 || accounts_transaction_rollback_begin(
+                              &ctx, ACCOUNTS_TRANSACTION_RESET,
+                              token) != 0) {
+            _exit(104);
+        }
+        m18_clear_after_stage_write_fault =
+            mode == M18_PREPARE_GUARD_CLEAR_UNCERTAIN;
+        m18_clear_after_stage_write_observed = false;
+        if (m18_clear_after_stage_write_fault) {
+            (void)gitswitch_test_set_retirement_guard_clear_hook(
+                m18_retirement_clear_fault);
+        }
+        previous_runner = run_set_runner(m18_reject_command_runner);
+        errno = 0;
+        if (accounts_reset_retirement_prepare(
+                &ctx, token, &ctx.accounts[0]) != -1) {
+            _exit(105);
+        }
+        prepare_error = *get_last_error();
+        prepare_errno = errno;
+        (void)run_set_runner(previous_runner);
+        (void)gitswitch_test_set_retirement_guard_clear_hook(NULL);
+        m18_clear_after_stage_write_fault = false;
+
+        if (prepare_errno != EINVAL ||
+            prepare_error.code != ERR_INVALID_ARGS ||
+            strcmp(prepare_error.message,
+                   "Invalid outer Git retirement transaction request") != 0 ||
+            !m18_file_equals(fixture->accounts_path, &accounts_before) ||
+            !m18_file_equals(fixture->git_path, &git_before) ||
+            !m18_file_equals(fixture->ssh_config, &ssh_before) ||
+            m18_read_bytes(fixture->git_trace_path, &trace) != 0 ||
+            trace.length != 0U) {
+            _exit(106);
+        }
+        if (mode == M18_PREPARE_GUARD_FRESH) {
+            if (!m18_guard_is_unblocked_and_bounded(fixture)) _exit(107);
+        } else if (mode == M18_PREPARE_GUARD_ADOPTED) {
+            if (!m18_file_equals(fixture->guard_path, &marker_before) ||
+                !m18_guard_is_private_and_blocking(fixture, "reset") ||
+                !m18_completion_absent(fixture)) {
+                _exit(108);
+            }
+        } else if (!m18_clear_after_stage_write_observed ||
+                   !m18_guard_is_private_and_blocking(fixture, "reset") ||
+                   strstr(prepare_error.details,
+                          "retirement preparation guard clear") == NULL) {
+            _exit(109);
+        }
+        if (accounts_transaction_rollback_end(
+                &ctx, ACCOUNTS_TRANSACTION_RESET, token) != 0 ||
+            accounts_transaction_finish(
+                &ctx, ACCOUNTS_TRANSACTION_RESET, token) != 0) {
+            _exit(110);
+        }
+        m18_bytes_clear(&accounts_before);
+        m18_bytes_clear(&git_before);
+        m18_bytes_clear(&ssh_before);
+        m18_bytes_clear(&marker_before);
+        m18_bytes_clear(&trace);
+        _exit(0);
+    }
+    return m18_wait_status(child);
+}
+
+/* Exercise failures that inner Git preparation deliberately defers until
+ * publish. The two hook seams distinguish a proven pre-backend failure from
+ * a failure after a mutation-capable publication backend is entered. */
+static int m18_run_failed_publish_guard_contract(
+    const m18_fixture_t *fixture, m18_publish_guard_mode_t mode) {
+    pid_t child;
+
+    if (!fixture) return -1;
+    child = fork();
+    if (child < 0) return -1;
+    if (child == 0) {
+        gitswitch_ctx_t ctx;
+        accounts_transaction_token_t token = 0;
+        config_retirement_guard_t *installed = NULL;
+        config_retirement_owner_t owner;
+        error_context_t publish_error;
+        m18_bytes_t accounts_before = {0};
+        m18_bytes_t git_before = {0};
+        m18_bytes_t ssh_before = {0};
+        m18_bytes_t marker_before = {0};
+        char trusted_path[2U * MAX_PATH_LEN];
+        char lock_path[MAX_PATH_LEN];
+        bool cleanup_mode =
+            mode == M18_PUBLISH_GUARD_CLEANUP_UNCERTAIN_FRESH;
+        bool git_matches;
+        bool lock_absent;
+        size_t cleared = 99U;
+
+        if (safe_snprintf(trusted_path, sizeof(trusted_path),
+                          "%s:/usr/bin:/bin", fixture->bin_dir) != 0 ||
+            safe_snprintf(lock_path, sizeof(lock_path), "%s.lock",
+                          fixture->git_path) != 0 ||
+            setenv("PATH", trusted_path, 1) != 0 ||
+            setenv("HOME", fixture->home, 1) != 0 ||
+            setenv("XDG_RUNTIME_DIR", fixture->runtime, 1) != 0 ||
+            setenv("GITSWITCH_ALLOW_TMP_GPG", "1", 1) != 0 ||
+            setenv("GIT_CONFIG_GLOBAL", fixture->git_path, 1) != 0 ||
+            setenv("GIT_CONFIG_NOSYSTEM", "1", 1) != 0 ||
+            setenv("GITSWITCH_TEST_GIT_TRACE",
+                   fixture->git_trace_path, 1) != 0 ||
+            unsetenv("GIT_CONFIG_COUNT") != 0 ||
+            config_init_readonly(&ctx) != 0 || ctx.account_count != 1U ||
+            m18_read_bytes(fixture->accounts_path, &accounts_before) != 0 ||
+            m18_read_bytes(fixture->git_path, &git_before) != 0 ||
+            m18_read_bytes(fixture->ssh_config, &ssh_before) != 0) {
+            _exit(111);
+        }
+        if (mode == M18_PUBLISH_GUARD_NO_MUTATION_ADOPTED) {
+            memset(&owner, 0, sizeof(owner));
+            owner.account_id = ctx.accounts[0].id;
+            if (safe_strncpy(owner.account_incarnation,
+                             ctx.accounts[0].incarnation,
+                             sizeof(owner.account_incarnation)) != 0 ||
+                config_retirement_guard_install_or_adopt(
+                    fixture->accounts_path, CONFIG_RETIREMENT_RESET,
+                    &owner, 1U, &installed) != 0 ||
+                !config_retirement_guard_was_created(installed)) {
+                _exit(112);
+            }
+            config_retirement_guard_abandon(&installed);
+            if (installed ||
+                m18_read_bytes(fixture->guard_path,
+                               &marker_before) != 0) {
+                _exit(113);
+            }
+        }
+        if (cleanup_mode && unlink(fixture->git_path) != 0) {
+            _exit(114);
+        }
+        if (accounts_transaction_begin(
+                &ctx, ACCOUNTS_TRANSACTION_RESET, &token) != 0 ||
+            token == 0 ||
+            accounts_transaction_rollback_begin(
+                &ctx, ACCOUNTS_TRANSACTION_RESET, token) != 0) {
+            _exit(114);
+        }
+
+        m18_publish_guard_mode = mode;
+        m18_publish_guard_fixture = fixture;
+        m18_publish_guard_fault_observed = false;
+        m18_publish_guard_cleanup_fault_observed = false;
+        (void)git_ops_test_set_retirement_hook(
+            m18_publish_guard_fault);
+        if (accounts_reset_retirement_prepare(
+                &ctx, token, &ctx.accounts[0]) != 0 ||
+            !m18_guard_is_private_and_blocking(fixture, "reset")) {
+            _exit(115);
+        }
+        errno = 0;
+        if (accounts_reset_retirement_publish(
+                &ctx, token, &cleared) != -1) {
+            _exit(116);
+        }
+        publish_error = *get_last_error();
+        (void)git_ops_test_set_retirement_hook(NULL);
+        m18_publish_guard_fixture = NULL;
+
+        errno = 0;
+        git_matches = cleanup_mode
+            ? access(fixture->git_path, F_OK) != 0 && errno == ENOENT
+            : m18_file_equals(fixture->git_path, &git_before);
+        errno = 0;
+        lock_absent = access(lock_path, F_OK) != 0 && errno == ENOENT;
+        if (!m18_publish_guard_fault_observed || cleared != 0U ||
+            publish_error.code != ERR_GIT_CONFIG_FAILED ||
+            strstr(publish_error.details,
+                   "Git retirement batch cleared 0 key(s)") == NULL ||
+            !m18_file_equals(fixture->accounts_path, &accounts_before) ||
+            !git_matches ||
+            !m18_file_equals(fixture->ssh_config, &ssh_before) ||
+            !lock_absent) {
+            _exit(117);
+        }
+        if (mode == M18_PUBLISH_GUARD_NO_MUTATION_FRESH) {
+            if (!m18_guard_is_unblocked_and_bounded(fixture)) _exit(118);
+        } else if (mode ==
+                   M18_PUBLISH_GUARD_MUTATION_CAPABLE_FRESH) {
+            if (!m18_guard_is_private_and_blocking(fixture, "reset") ||
+                !m18_completion_absent(fixture)) {
+                _exit(119);
+            }
+        } else if (cleanup_mode) {
+            if (!m18_publish_guard_cleanup_fault_observed ||
+                strstr(publish_error.details, "cleanup") == NULL ||
+                !m18_guard_is_private_and_blocking(fixture, "reset") ||
+                !m18_completion_absent(fixture)) {
+                _exit(122);
+            }
+        } else if (!m18_file_equals(
+                       fixture->guard_path, &marker_before) ||
+                   !m18_guard_is_private_and_blocking(
+                       fixture, "reset") ||
+                   !m18_completion_absent(fixture)) {
+            _exit(120);
+        }
+        if (accounts_transaction_rollback_end(
+                &ctx, ACCOUNTS_TRANSACTION_RESET, token) != 0 ||
+            accounts_transaction_finish(
+                &ctx, ACCOUNTS_TRANSACTION_RESET, token) != 0) {
+            _exit(121);
+        }
+        m18_bytes_clear(&accounts_before);
+        m18_bytes_clear(&git_before);
+        m18_bytes_clear(&ssh_before);
+        m18_bytes_clear(&marker_before);
+        _exit(0);
+    }
+    return m18_wait_status(child);
+}
+
 /* POSIX record locks are process-owned and are not inherited across fork().
  * Probe from a separate process so the transaction owner cannot accidentally
  * reacquire its own lock and turn this assertion into a false positive. */
@@ -2653,7 +3173,7 @@ static int m18_run_forked_finalization_contract(
         int claimant_status;
 
         if (safe_snprintf(trusted_path, sizeof(trusted_path),
-                          "%s:/usr/bin:/bin", fixture->home) != 0 ||
+                          "%s:/usr/bin:/bin", fixture->bin_dir) != 0 ||
             safe_snprintf(lock_path, sizeof(lock_path), "%s.lock",
                           fixture->git_path) != 0 ||
             setenv("PATH", trusted_path, 1) != 0 ||
@@ -2886,7 +3406,7 @@ static int m18_run_foreign_git_capability_fd_aba(
 
         memset(&ctx, 0, sizeof(ctx));
         if (safe_snprintf(trusted_path, sizeof(trusted_path),
-                          "%s:/usr/bin:/bin", fixture->home) != 0 ||
+                          "%s:/usr/bin:/bin", fixture->bin_dir) != 0 ||
             setenv("PATH", trusted_path, 1) != 0 ||
             setenv("HOME", fixture->home, 1) != 0 ||
             setenv("XDG_RUNTIME_DIR", fixture->runtime, 1) != 0 ||
@@ -3084,7 +3604,7 @@ static int m18_run_terminal_writer_contract(
         int finalize_result;
 
         if (safe_snprintf(trusted_path, sizeof(trusted_path),
-                          "%s:/usr/bin:/bin", fixture->home) != 0 ||
+                          "%s:/usr/bin:/bin", fixture->bin_dir) != 0 ||
             safe_snprintf(lock_path, sizeof(lock_path), "%s.lock",
                           fixture->git_path) != 0 ||
             setenv("PATH", trusted_path, 1) != 0 ||
@@ -3205,7 +3725,7 @@ static int m18_run_terminal_cleanup_contract(
         int finalize_result;
 
         if (safe_snprintf(trusted_path, sizeof(trusted_path),
-                          "%s:/usr/bin:/bin", fixture->home) != 0 ||
+                          "%s:/usr/bin:/bin", fixture->bin_dir) != 0 ||
             safe_snprintf(lock_path, sizeof(lock_path), "%s.lock",
                           fixture->git_path) != 0 ||
             safe_snprintf(foreign_path, sizeof(foreign_path),
@@ -3307,7 +3827,7 @@ static int m18_run_fresh_managed_write(
         struct stat ignored;
 
         if (safe_snprintf(trusted_path, sizeof(trusted_path),
-                          "%s:/usr/bin:/bin", fixture->home) != 0 ||
+                          "%s:/usr/bin:/bin", fixture->bin_dir) != 0 ||
             safe_snprintf(lock_path, sizeof(lock_path), "%s.lock",
                           fixture->git_path) != 0 ||
             safe_snprintf(foreign_path, sizeof(foreign_path),
@@ -3397,7 +3917,7 @@ static int m18_run_phase_contract(const m18_fixture_t *fixture,
         size_t cleared = 99U;
 
         if (safe_snprintf(trusted_path, sizeof(trusted_path),
-                          "%s:/usr/bin:/bin", fixture->home) != 0 ||
+                          "%s:/usr/bin:/bin", fixture->bin_dir) != 0 ||
             setenv("PATH", trusted_path, 1) != 0 ||
             setenv("HOME", fixture->home, 1) != 0 ||
             setenv("XDG_RUNTIME_DIR", fixture->runtime, 1) != 0 ||
@@ -4991,7 +5511,7 @@ TEST(same_filesystem_repository_move_retains_guard_and_retry_authority) {
     CHECK_EQ_INT(m18_fixture_use_local_repository(&fixture), 0);
     CHECK_EQ_INT(safe_snprintf(
                      moved_repository, sizeof(moved_repository),
-                     "%s/repository-away", fixture.root), 0);
+                     "%s/repository-away", fixture.data_dir), 0);
     CHECK_EQ_INT(safe_snprintf(
                      moved_config, sizeof(moved_config),
                      "%s/.git/config", moved_repository), 0);
@@ -5547,7 +6067,7 @@ TEST(alias_recovery_rejects_retargeted_home_without_touching_either_config) {
 
     CHECK_EQ_INT(safe_snprintf(
                      alternate_home, sizeof(alternate_home),
-                     "%s/retargeted-home", fixture.root), 0);
+                     "%s/retargeted-home", fixture.data_dir), 0);
     CHECK_EQ_INT(safe_snprintf(
                      alternate_ssh, sizeof(alternate_ssh),
                      "%s/.ssh", alternate_home), 0);
@@ -5924,7 +6444,7 @@ static int m18_parent_runtime_begin(
     }
     if (
         safe_snprintf(trusted_path, sizeof(trusted_path),
-                      "%s:/usr/bin:/bin", fixture->home) != 0 ||
+                      "%s:/usr/bin:/bin", fixture->bin_dir) != 0 ||
         setenv("PATH", trusted_path, 1) != 0 ||
         setenv("HOME", fixture->home, 1) != 0 ||
         setenv("XDG_RUNTIME_DIR", fixture->runtime, 1) != 0 ||
@@ -6812,6 +7332,97 @@ TEST(forked_child_signal_reset_retry_admits_fresh_transaction) {
     CHECK(accounts_transaction_context_release_safe(&ctx));
 }
 
+TEST(preprepare_failure_clears_only_fresh_guard_without_mutation) {
+    m18_fixture_t fixture;
+    int status;
+
+    CHECK_EQ_INT(m18_fixture_setup(&fixture), 0);
+    CHECK_EQ_INT(m24_fixture_add_managed_alias(&fixture), 0);
+    status = m18_run_preprepare_guard_cleanup_contract(
+        &fixture, M18_PREPARE_GUARD_FRESH);
+    CHECK(WIFEXITED(status));
+    if (WIFEXITED(status)) CHECK_EQ_INT(WEXITSTATUS(status), 0);
+    m18_fixture_cleanup(&fixture);
+}
+
+TEST(preprepare_failure_retains_adopted_guard_without_mutation) {
+    m18_fixture_t fixture;
+    int status;
+
+    CHECK_EQ_INT(m18_fixture_setup(&fixture), 0);
+    CHECK_EQ_INT(m24_fixture_add_managed_alias(&fixture), 0);
+    status = m18_run_preprepare_guard_cleanup_contract(
+        &fixture, M18_PREPARE_GUARD_ADOPTED);
+    CHECK(WIFEXITED(status));
+    if (WIFEXITED(status)) CHECK_EQ_INT(WEXITSTATUS(status), 0);
+    m18_fixture_cleanup(&fixture);
+}
+
+TEST(preprepare_clear_uncertainty_retains_blocker_and_primary_error) {
+    m18_fixture_t fixture;
+    int status;
+
+    CHECK_EQ_INT(m18_fixture_setup(&fixture), 0);
+    CHECK_EQ_INT(m24_fixture_add_managed_alias(&fixture), 0);
+    status = m18_run_preprepare_guard_cleanup_contract(
+        &fixture, M18_PREPARE_GUARD_CLEAR_UNCERTAIN);
+    CHECK(WIFEXITED(status));
+    if (WIFEXITED(status)) CHECK_EQ_INT(WEXITSTATUS(status), 0);
+    m18_fixture_cleanup(&fixture);
+}
+
+TEST(deferred_publish_without_mutation_clears_fresh_guard) {
+    m18_fixture_t fixture;
+    int status;
+
+    CHECK_EQ_INT(m18_fixture_setup(&fixture), 0);
+    CHECK_EQ_INT(m24_fixture_add_managed_alias(&fixture), 0);
+    status = m18_run_failed_publish_guard_contract(
+        &fixture, M18_PUBLISH_GUARD_NO_MUTATION_FRESH);
+    CHECK(WIFEXITED(status));
+    if (WIFEXITED(status)) CHECK_EQ_INT(WEXITSTATUS(status), 0);
+    m18_fixture_cleanup(&fixture);
+}
+
+TEST(mutation_capable_publish_failure_retains_fresh_guard) {
+    m18_fixture_t fixture;
+    int status;
+
+    CHECK_EQ_INT(m18_fixture_setup(&fixture), 0);
+    CHECK_EQ_INT(m24_fixture_add_managed_alias(&fixture), 0);
+    status = m18_run_failed_publish_guard_contract(
+        &fixture, M18_PUBLISH_GUARD_MUTATION_CAPABLE_FRESH);
+    CHECK(WIFEXITED(status));
+    if (WIFEXITED(status)) CHECK_EQ_INT(WEXITSTATUS(status), 0);
+    m18_fixture_cleanup(&fixture);
+}
+
+TEST(deferred_publish_without_mutation_retains_adopted_guard) {
+    m18_fixture_t fixture;
+    int status;
+
+    CHECK_EQ_INT(m18_fixture_setup(&fixture), 0);
+    CHECK_EQ_INT(m24_fixture_add_managed_alias(&fixture), 0);
+    status = m18_run_failed_publish_guard_contract(
+        &fixture, M18_PUBLISH_GUARD_NO_MUTATION_ADOPTED);
+    CHECK(WIFEXITED(status));
+    if (WIFEXITED(status)) CHECK_EQ_INT(WEXITSTATUS(status), 0);
+    m18_fixture_cleanup(&fixture);
+}
+
+TEST(failed_publish_cleanup_uncertainty_retains_fresh_guard) {
+    m18_fixture_t fixture;
+    int status;
+
+    CHECK_EQ_INT(m18_fixture_setup(&fixture), 0);
+    CHECK_EQ_INT(m24_fixture_add_managed_alias(&fixture), 0);
+    status = m18_run_failed_publish_guard_contract(
+        &fixture, M18_PUBLISH_GUARD_CLEANUP_UNCERTAIN_FRESH);
+    CHECK(WIFEXITED(status));
+    if (WIFEXITED(status)) CHECK_EQ_INT(WEXITSTATUS(status), 0);
+    m18_fixture_cleanup(&fixture);
+}
+
 TEST(durable_terminal_commit_blocks_git_writer_at_post_barrier_checkpoint) {
     m18_fixture_t fixture;
     int status;
@@ -6898,6 +7509,11 @@ TEST(crash_before_terminal_marker_release_self_heals_in_fresh_writer) {
 }
 
 TEST_MAIN_BEGIN()
+    if (m18_suite_fixture_setup() != 0) {
+        fprintf(stderr, "HARNESS FAIL: stable command fixture: %s\n",
+                strerror(errno));
+        return EXIT_FAILURE;
+    }
     error_init(LOG_LEVEL_WARNING, NULL);
     RUN_TEST(remove_save_boundary_matrix_preserves_outer_coherence);
     RUN_TEST(remove_uncertain_install_recovers_in_fresh_process);
@@ -6948,6 +7564,13 @@ TEST_MAIN_BEGIN()
     RUN_TEST(forked_child_cannot_finalize_parent_published_retirement);
     RUN_TEST(foreign_git_capability_disposal_preserves_reused_fds);
     RUN_TEST(forked_child_signal_reset_retry_admits_fresh_transaction);
+    RUN_TEST(preprepare_failure_clears_only_fresh_guard_without_mutation);
+    RUN_TEST(preprepare_failure_retains_adopted_guard_without_mutation);
+    RUN_TEST(preprepare_clear_uncertainty_retains_blocker_and_primary_error);
+    RUN_TEST(deferred_publish_without_mutation_clears_fresh_guard);
+    RUN_TEST(mutation_capable_publish_failure_retains_fresh_guard);
+    RUN_TEST(deferred_publish_without_mutation_retains_adopted_guard);
+    RUN_TEST(failed_publish_cleanup_uncertainty_retains_fresh_guard);
     RUN_TEST(durable_terminal_commit_blocks_git_writer_at_post_barrier_checkpoint);
     RUN_TEST(durable_terminal_precommit_failure_retains_marker_and_guard);
     RUN_TEST(post_guard_terminal_cleanup_failure_is_consumed_and_self_heals);

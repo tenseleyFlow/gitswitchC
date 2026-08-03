@@ -181,7 +181,9 @@ typedef enum {
     AT_HOOK_POST_READ_SAME_SIZE_REWRITE,
     AT_HOOK_FINAL_READ_CTIME_ONCE,
     AT_HOOK_FINAL_READ_CTIME_REPEATED,
-    AT_HOOK_FINAL_READ_SAME_SIZE_REWRITE
+    AT_HOOK_FINAL_READ_SAME_SIZE_REWRITE,
+    AT_HOOK_FAIL_TARGET_PRELOCK,
+    AT_HOOK_FAIL_TARGET_PRELOCK_AND_CLEANUP
 } at_hook_mode_t;
 
 static at_hook_mode_t at_hook_mode;
@@ -1464,7 +1466,23 @@ static bool at_retirement_hook(git_retirement_test_stage_t stage,
                                const char *value) {
     char lock_path[MAX_PATH_LEN];
 
-    (void)value;
+    if ((at_hook_mode == AT_HOOK_FAIL_TARGET_PRELOCK ||
+         at_hook_mode == AT_HOOK_FAIL_TARGET_PRELOCK_AND_CLEANUP) &&
+        stage == GIT_RETIREMENT_TEST_AFTER_PRELOCK_WITNESS && path &&
+        strcmp(path, at_hook_config) == 0) {
+        at_hook_attempts++;
+        at_hook_observed = true;
+        errno = EIO;
+        return true;
+    }
+    if (at_hook_mode == AT_HOOK_FAIL_TARGET_PRELOCK_AND_CLEANUP &&
+        stage == GIT_RETIREMENT_TEST_CLEANUP_UNLINK && value &&
+        strcmp(value, "canonical lock") == 0) {
+        at_hook_attempts++;
+        at_hook_observed = true;
+        errno = EIO;
+        return true;
+    }
     if ((at_hook_mode == AT_HOOK_PRELOCK_CTIME_ONLY_DRIFT ||
          at_hook_mode == AT_HOOK_PRELOCK_SAME_SIZE_REWRITE) &&
         stage == GIT_RETIREMENT_TEST_AFTER_PRELOCK_WITNESS) {
@@ -2167,6 +2185,8 @@ TEST(absent_first_later_witness_budget_failure_has_no_namespace_mutation) {
     size_t syncs_after = 0U;
     size_t previous_budget =
         git_ops_test_set_retirement_prelock_witness_budget(16U);
+    git_retirement_failed_publish_outcome_t outcome =
+        GIT_RETIREMENT_FAILED_PUBLISH_MUTATED_OR_UNCERTAIN;
     size_t cleared = 99U;
 
     CHECK_EQ_INT(at_fixture_init(&fixture, PUBLICATION_SCOPE_GLOBAL,
@@ -2217,7 +2237,11 @@ TEST(absent_first_later_witness_budget_failure_has_no_namespace_mutation) {
         CHECK_EQ_INT(errno, EFBIG);
         CHECK(strstr(get_last_error()->message,
                      "bounded transaction budget") != NULL);
-        CHECK_EQ_INT(git_retirement_transaction_commit(&transaction), 0);
+        CHECK_EQ_INT(git_retirement_transaction_dispose_failed_publish(
+                         &transaction, &outcome), 0);
+        CHECK_EQ_INT(
+            outcome,
+            GIT_RETIREMENT_FAILED_PUBLISH_MUTATED_OR_UNCERTAIN);
     }
     CHECK(transaction == NULL);
     CHECK(at_file_equals_bytes(fixture.config_path, &present_before));
@@ -2262,16 +2286,33 @@ TEST(every_ordered_removal_failure_is_byte_atomic_and_retry_succeeds) {
 TEST(prepublication_failure_is_byte_atomic_and_retry_succeeds) {
     at_fixture_t fixture;
     at_bytes_t before;
+    const account_t *accounts[1];
+    const publication_record_t *publications[1];
+    git_retirement_transaction_t *transaction = NULL;
+    git_retirement_failed_publish_outcome_t outcome =
+        GIT_RETIREMENT_FAILED_PUBLISH_UNCHANGED_CLEAN;
     size_t cleared = 99U;
 
     CHECK_EQ_INT(at_fixture_init(&fixture, PUBLICATION_SCOPE_GLOBAL,
                                  false, 0600), 0);
     CHECK_EQ_INT(at_read_bytes(fixture.config_path, &before), 0);
+    accounts[0] = &fixture.account;
+    publications[0] = &fixture.publication;
+    CHECK_EQ_INT(git_retirement_transaction_prepare(
+                     accounts, publications, 1U, &transaction), 0);
+    CHECK(transaction != NULL);
     at_install_hook(&fixture, AT_HOOK_FAIL_PUBLISH, NULL);
-    CHECK_EQ_INT(at_retire(&fixture, &cleared), -1);
+    CHECK_EQ_INT(git_retirement_transaction_publish(
+                     transaction, &cleared), -1);
     CHECK(at_hook_observed);
     at_clear_hook();
     CHECK_EQ_INT((long)cleared, 0);
+    CHECK_EQ_INT(git_retirement_transaction_dispose_failed_publish(
+                     &transaction, &outcome), 0);
+    CHECK(transaction == NULL);
+    CHECK_EQ_INT(
+        outcome,
+        GIT_RETIREMENT_FAILED_PUBLISH_MUTATED_OR_UNCERTAIN);
     CHECK(at_file_equals_bytes(fixture.config_path, &before));
     CHECK(access(fixture.lock_path, F_OK) != 0 && errno == ENOENT);
     cleared = 99U;
@@ -2279,6 +2320,220 @@ TEST(prepublication_failure_is_byte_atomic_and_retry_succeeds) {
     CHECK_EQ_INT((long)cleared, (long)AT_KEY_COUNT);
     at_check_owned_absent(&fixture);
     at_bytes_clear(&before);
+}
+
+static int at_make_destination_noop(at_fixture_t *fixture) {
+    static const char clean_config[] =
+        "[fixture]\n\tmarker = already-clean\n";
+
+    if (!fixture ||
+        at_write_file(fixture->config_path, clean_config, 0600) != 0) {
+        return -1;
+    }
+    return at_reseal_post_config(
+        fixture->config_path, &fixture->publication.post_config);
+}
+
+TEST(failed_publish_cleanup_fault_overrides_exact_unchanged_reproof) {
+    at_fixture_t prepared;
+    at_fixture_t failed;
+    at_bytes_t prepared_before = {0};
+    at_bytes_t failed_before = {0};
+    const account_t *accounts[2];
+    const publication_record_t *publications[2];
+    git_retirement_transaction_t *transaction = NULL;
+    git_retirement_failed_publish_outcome_t outcome =
+        GIT_RETIREMENT_FAILED_PUBLISH_UNCHANGED_CLEAN;
+    size_t cleared = 99U;
+
+    CHECK_EQ_INT(at_fixture_init(&prepared, PUBLICATION_SCOPE_GLOBAL,
+                                 false, 0600), 0);
+    CHECK_EQ_INT(at_make_destination_noop(&prepared), 0);
+    CHECK_EQ_INT(at_fixture_init(&failed, PUBLICATION_SCOPE_GLOBAL,
+                                 false, 0600), 0);
+    CHECK_EQ_INT(at_read_bytes(prepared.config_path, &prepared_before), 0);
+    CHECK_EQ_INT(at_read_bytes(failed.config_path, &failed_before), 0);
+    accounts[0] = &prepared.account;
+    accounts[1] = &failed.account;
+    publications[0] = &prepared.publication;
+    publications[1] = &failed.publication;
+    at_install_hook(
+        &failed, AT_HOOK_FAIL_TARGET_PRELOCK_AND_CLEANUP, NULL);
+
+    CHECK_EQ_INT(git_retirement_transaction_prepare(
+                     accounts, publications, 2U, &transaction), 0);
+    CHECK(transaction != NULL);
+    CHECK_EQ_INT(git_retirement_transaction_publish(
+                     transaction, &cleared), -1);
+    CHECK(at_hook_observed);
+    CHECK(at_hook_attempts >= 2U);
+    at_clear_hook();
+    CHECK_EQ_INT((long)cleared, 0);
+    CHECK_EQ_INT(git_retirement_transaction_dispose_failed_publish(
+                     &transaction, &outcome), 0);
+    CHECK(transaction == NULL);
+    CHECK_EQ_INT(
+        outcome,
+        GIT_RETIREMENT_FAILED_PUBLISH_MUTATED_OR_UNCERTAIN);
+    CHECK(at_file_equals_bytes(prepared.config_path, &prepared_before));
+    CHECK(at_file_equals_bytes(failed.config_path, &failed_before));
+
+    at_bytes_clear(&prepared_before);
+    at_bytes_clear(&failed_before);
+}
+
+TEST(multigroup_failed_publish_exactly_reproves_prepared_and_unprepared) {
+    at_fixture_t prepared;
+    at_fixture_t absent;
+    at_fixture_t failed;
+    at_bytes_t prepared_before = {0};
+    at_bytes_t failed_before = {0};
+    const account_t *accounts[3];
+    const publication_record_t *publications[3];
+    git_retirement_transaction_t *transaction = NULL;
+    git_retirement_failed_publish_outcome_t outcome =
+        GIT_RETIREMENT_FAILED_PUBLISH_MUTATED_OR_UNCERTAIN;
+    size_t cleared = 99U;
+
+    CHECK_EQ_INT(at_fixture_init(&prepared, PUBLICATION_SCOPE_GLOBAL,
+                                 false, 0600), 0);
+    CHECK_EQ_INT(at_make_destination_noop(&prepared), 0);
+    CHECK_EQ_INT(at_fixture_init(&absent, PUBLICATION_SCOPE_GLOBAL,
+                                 false, 0600), 0);
+    CHECK_EQ_INT(at_reseal_post_config(
+                     absent.config_path,
+                     &absent.publication.post_config), 0);
+    CHECK_EQ_INT(unlink(absent.config_path), 0);
+    CHECK_EQ_INT(at_fixture_init(&failed, PUBLICATION_SCOPE_GLOBAL,
+                                 false, 0600), 0);
+    CHECK_EQ_INT(at_read_bytes(prepared.config_path, &prepared_before), 0);
+    CHECK_EQ_INT(at_read_bytes(failed.config_path, &failed_before), 0);
+    accounts[0] = &prepared.account;
+    accounts[1] = &absent.account;
+    accounts[2] = &failed.account;
+    publications[0] = &prepared.publication;
+    publications[1] = &absent.publication;
+    publications[2] = &failed.publication;
+    at_install_hook(&failed, AT_HOOK_FAIL_TARGET_PRELOCK, NULL);
+
+    CHECK_EQ_INT(git_retirement_transaction_prepare(
+                     accounts, publications, 3U, &transaction), 0);
+    CHECK(transaction != NULL);
+    CHECK_EQ_INT(git_retirement_transaction_publish(
+                     transaction, &cleared), -1);
+    CHECK(at_hook_observed);
+    at_clear_hook();
+    CHECK_EQ_INT((long)cleared, 0);
+    CHECK_EQ_INT(git_retirement_transaction_dispose_failed_publish(
+                     &transaction, &outcome), 0);
+    CHECK(transaction == NULL);
+    CHECK_EQ_INT(
+        outcome,
+        GIT_RETIREMENT_FAILED_PUBLISH_UNCHANGED_CLEAN);
+    CHECK(at_file_equals_bytes(prepared.config_path, &prepared_before));
+    CHECK(at_file_equals_bytes(failed.config_path, &failed_before));
+    errno = 0;
+    CHECK(access(prepared.lock_path, F_OK) != 0 && errno == ENOENT);
+    errno = 0;
+    CHECK(access(absent.config_path, F_OK) != 0 && errno == ENOENT);
+    errno = 0;
+    CHECK(access(absent.lock_path, F_OK) != 0 && errno == ENOENT);
+
+    at_bytes_clear(&prepared_before);
+    at_bytes_clear(&failed_before);
+}
+
+TEST(shared_destination_records_are_covered_once_by_unchanged_reproof) {
+    at_fixture_t fixture;
+    at_bytes_t before = {0};
+    const account_t *accounts[2];
+    const publication_record_t *publications[2];
+    git_retirement_transaction_t *transaction = NULL;
+    git_retirement_failed_publish_outcome_t outcome =
+        GIT_RETIREMENT_FAILED_PUBLISH_MUTATED_OR_UNCERTAIN;
+    size_t cleared = 99U;
+
+    CHECK_EQ_INT(at_fixture_init(&fixture, PUBLICATION_SCOPE_GLOBAL,
+                                 false, 0600), 0);
+    CHECK_EQ_INT(at_read_bytes(fixture.config_path, &before), 0);
+    accounts[0] = &fixture.account;
+    accounts[1] = &fixture.account;
+    publications[0] = &fixture.publication;
+    publications[1] = &fixture.publication;
+    at_install_hook(&fixture, AT_HOOK_FAIL_TARGET_PRELOCK, NULL);
+
+    CHECK_EQ_INT(git_retirement_transaction_prepare(
+                     accounts, publications, 2U, &transaction), 0);
+    CHECK(transaction != NULL);
+    CHECK_EQ_INT(git_retirement_transaction_publish(
+                     transaction, &cleared), -1);
+    CHECK(at_hook_observed);
+    at_clear_hook();
+    CHECK_EQ_INT((long)cleared, 0);
+    CHECK_EQ_INT(git_retirement_transaction_dispose_failed_publish(
+                     &transaction, &outcome), 0);
+    CHECK(transaction == NULL);
+    CHECK_EQ_INT(
+        outcome,
+        GIT_RETIREMENT_FAILED_PUBLISH_UNCHANGED_CLEAN);
+    CHECK(at_file_equals_bytes(fixture.config_path, &before));
+    errno = 0;
+    CHECK(access(fixture.lock_path, F_OK) != 0 && errno == ENOENT);
+
+    at_bytes_clear(&before);
+}
+
+TEST(prepared_stale_clean_group_is_exactly_reproved_after_peer_failure) {
+    at_fixture_t stale;
+    at_fixture_t failed;
+    at_bytes_t stale_before = {0};
+    at_bytes_t failed_before = {0};
+    const account_t *accounts[2];
+    const publication_record_t *publications[2];
+    git_retirement_transaction_t *transaction = NULL;
+    git_retirement_failed_publish_outcome_t outcome =
+        GIT_RETIREMENT_FAILED_PUBLISH_MUTATED_OR_UNCERTAIN;
+    size_t cleared = 99U;
+
+    CHECK_EQ_INT(at_fixture_init(&stale, PUBLICATION_SCOPE_GLOBAL,
+                                 false, 0600), 0);
+    at_install_hook(&stale, AT_HOOK_FAIL_DIRECTORY_SYNC, NULL);
+    CHECK_EQ_INT(at_retire(&stale, &cleared), -1);
+    CHECK(at_hook_observed);
+    at_clear_hook();
+    at_check_owned_absent(&stale);
+    CHECK_EQ_INT(at_fixture_init(&failed, PUBLICATION_SCOPE_GLOBAL,
+                                 false, 0600), 0);
+    CHECK_EQ_INT(at_read_bytes(stale.config_path, &stale_before), 0);
+    CHECK_EQ_INT(at_read_bytes(failed.config_path, &failed_before), 0);
+    accounts[0] = &stale.account;
+    accounts[1] = &failed.account;
+    publications[0] = &stale.publication;
+    publications[1] = &failed.publication;
+    at_install_hook(&failed, AT_HOOK_FAIL_TARGET_PRELOCK, NULL);
+    cleared = 99U;
+
+    CHECK_EQ_INT(git_retirement_transaction_prepare(
+                     accounts, publications, 2U, &transaction), 0);
+    CHECK(transaction != NULL);
+    CHECK_EQ_INT(git_retirement_transaction_publish(
+                     transaction, &cleared), -1);
+    CHECK(at_hook_observed);
+    at_clear_hook();
+    CHECK_EQ_INT((long)cleared, 0);
+    CHECK_EQ_INT(git_retirement_transaction_dispose_failed_publish(
+                     &transaction, &outcome), 0);
+    CHECK(transaction == NULL);
+    CHECK_EQ_INT(
+        outcome,
+        GIT_RETIREMENT_FAILED_PUBLISH_UNCHANGED_CLEAN);
+    CHECK(at_file_equals_bytes(stale.config_path, &stale_before));
+    CHECK(at_file_equals_bytes(failed.config_path, &failed_before));
+    errno = 0;
+    CHECK(access(stale.lock_path, F_OK) != 0 && errno == ENOENT);
+
+    at_bytes_clear(&stale_before);
+    at_bytes_clear(&failed_before);
 }
 
 static void at_run_late_replacement_scope(publication_scope_t scope) {
@@ -4901,6 +5156,10 @@ TEST_MAIN_BEGIN()
     RUN_TEST(absent_first_later_witness_budget_failure_has_no_namespace_mutation);
     RUN_TEST(every_ordered_removal_failure_is_byte_atomic_and_retry_succeeds);
     RUN_TEST(prepublication_failure_is_byte_atomic_and_retry_succeeds);
+    RUN_TEST(failed_publish_cleanup_fault_overrides_exact_unchanged_reproof);
+    RUN_TEST(multigroup_failed_publish_exactly_reproves_prepared_and_unprepared);
+    RUN_TEST(shared_destination_records_are_covered_once_by_unchanged_reproof);
+    RUN_TEST(prepared_stale_clean_group_is_exactly_reproved_after_peer_failure);
     RUN_TEST(late_generation_replacement_survives_exchange_in_every_scope);
     RUN_TEST(late_hardlink_race_is_reversed_without_publish_in_every_scope);
     RUN_TEST(postpublication_directory_sync_failure_reconciles_on_retry);
