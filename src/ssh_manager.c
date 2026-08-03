@@ -10697,20 +10697,33 @@ static void migrate_legacy_pid_socket_peer_at(
     adopt.pid = legacy_record->pid;
     if (g_reap_ops.generation(adopt.pid, &adopt.generation) != 0) return;
     if (g_reap_ops.image(adopt.pid, &adopt.image) != 0) {
+#ifdef __linux__
         /* OpenSSH's agent makes itself nondumpable, so Linux denies
          * /proc/PID/exe even to the owning user. A denied executable object is
          * expected here, not suspicious: fall back to the argv, uid, generation
          * and socket-peer proofs the reap still performs in full. Every other
          * failure stays fail-closed. */
-        if (errno != EACCES && errno != EPERM) return;
+        if ((errno != EACCES && errno != EPERM) ||
+            adopt.generation.kind != SSH_PROCESS_GENERATION_LINUX) {
+            return;
+        }
         memset(&adopt.image, 0, sizeof(adopt.image));
         adopt.image.valid = true;
         adopt.image.executable_object_unknown = true;
         adopt.image.effective_uid = geteuid();
+#else
+        return;
+#endif
     } else if (adopt.image.executable_path[0] != '/') {
+#ifdef __linux__
         /* A readable executable object without a usable pathname is still only
-         * provable through the argv/uid/generation/peer tuple. */
+         * provable through the argv/uid/generation/peer tuple on Linux, where
+         * the nondumpable-agent compatibility exception is required. */
+        if (adopt.generation.kind != SSH_PROCESS_GENERATION_LINUX) return;
         adopt.image.executable_object_unknown = true;
+#else
+        return;
+#endif
     }
     if (!ssh_process_generation_valid(&adopt.generation) ||
         !adopt.image.valid) {

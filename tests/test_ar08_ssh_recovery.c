@@ -1058,6 +1058,21 @@ static int generation_matches_record(
     return 0;
 }
 
+static int portable_generation_matches_record(
+    pid_t pid, ssh_process_generation_t *generation) {
+    if (generation_matches_record(pid, generation) != 0) return -1;
+    generation->kind = SSH_PROCESS_GENERATION_DARWIN;
+    return 0;
+}
+
+static int process_image_permission_denied(
+    pid_t pid, ssh_process_image_t *image) {
+    (void)pid;
+    (void)image;
+    errno = EACCES;
+    return -1;
+}
+
 static ssh_process_generation_t g_observed_generation;
 static int g_generation_calls;
 static int g_term_calls;
@@ -2800,6 +2815,47 @@ TEST(legacy_live_unprovable_sidecar_stays_fail_closed) {
     close(fixture.dir_fd);
 }
 
+/* The EACCES/EPERM executable-object downgrade exists only for Linux's
+ * nondumpable ssh-agent /proc/PID/exe behavior. A portable process generation
+ * models the macOS/FreeBSD policy while retaining a platform-neutral injected
+ * image denial: it must never synthesize a valid image or reach the reap, even
+ * when this regression itself runs on Linux. */
+TEST(legacy_live_image_denial_without_linux_provenance_stays_fail_closed) {
+    char legacy[64];
+    ssh_fixture_t fixture;
+    test_agent_server_t server = {.pid = -1, .trace_fd = -1};
+    ssh_reap_test_ops_t ops = {
+        .generation = portable_generation_matches_record,
+        .image = process_image_permission_denied
+    };
+    ssh_reap_test_ops_t previous_ops;
+    ssh_reap_fn previous_reap;
+
+    CHECK_EQ_INT(make_fixture(&fixture, "gsar16legacyportable"), 0);
+    if (fixture.dir_fd < 0) return;
+    CHECK_EQ_INT(start_test_agent_server(
+                     fixture.socket, TEST_AGENT_IDENTITIES_ONE, &server), 0);
+    g_runner_server_pid = server.pid;
+    g_runner_server_trace_fd = server.trace_fd;
+    CHECK(snprintf(legacy, sizeof(legacy), "%ld\n", (long)server.pid) > 0);
+    CHECK_EQ_INT(write_sidecar_bytes(&fixture, legacy,
+                                     strlen(legacy), 0600), 0);
+
+    g_malformed_reap_calls = 0;
+    previous_ops = ssh_manager_set_reap_test_ops(&ops);
+    previous_reap = ssh_manager_set_reap_fn(malformed_reap_must_not_run);
+    CHECK_EQ_INT(ssh_manager_reset("work"), -1);
+    ssh_manager_set_reap_fn(previous_reap);
+    ssh_manager_set_reap_test_ops(&previous_ops);
+
+    CHECK_EQ_INT(g_malformed_reap_calls, 0);
+    CHECK_EQ_INT(kill(server.pid, 0), 0);
+    CHECK(entry_exists(fixture.sidecar));
+    CHECK(entry_exists(fixture.socket));
+    cleanup_retained_fixture(&fixture);
+    close(fixture.dir_fd);
+}
+
 TEST(legacy_dead_sidecar_is_cleaned_without_reap) {
     static const char legacy[] = "1073741824\n";
     ssh_fixture_t fixture;
@@ -4483,6 +4539,7 @@ TEST_MAIN_BEGIN()
     RUN_TEST(generation_inspection_error_never_terminates_or_consumes_tuple);
     RUN_TEST(legacy_live_owned_sidecar_is_migrated_and_reset_converges);
     RUN_TEST(legacy_live_unprovable_sidecar_stays_fail_closed);
+    RUN_TEST(legacy_live_image_denial_without_linux_provenance_stays_fail_closed);
     RUN_TEST(legacy_dead_sidecar_is_cleaned_without_reap);
     RUN_TEST(stopped_session_preserves_same_pid_replacement_generation);
     RUN_TEST(gone_record_with_live_replacement_preserves_complete_tuple);
