@@ -543,8 +543,10 @@ static int prepare_init_fixture(const char *home, const char *runtime,
     snprintf(path, sizeof(path), "%s/gitswitch", shim_dir);
     if (write_text(path,
                    "#!/bin/sh\n"
-                   "if [ \"$1\" = --resume-hint-probe ]; then exec \"$GS_REAL_BIN\" \"$@\"; fi\n"
-                   "if [ \"$1\" = resume ]; then printf 'resume\\n' >>\"$GS_TEST_RESUME_LOG\"; fi\n"
+                   "case ${1-} in\n"
+                   "    --resume-hint-probe) exec \"$GS_REAL_BIN\" \"$@\" ;;\n"
+                   "    --startup-resume) printf 'startup\\n' >>\"$GS_TEST_RESUME_LOG\" ;;\n"
+                   "esac\n"
                    "exit 0\n", 0700) != 0) {
         return -1;
     }
