@@ -2727,12 +2727,16 @@ TEST(generation_inspection_error_never_terminates_or_consumes_tuple) {
 /* AR-15 H2: after an in-place upgrade from a release that wrote bare-PID
  * sidecars, a legacy record names a still-running managed agent. The reachable
  * socket used to make retirement impossible, permanently locking switch and
- * reset. The fix reconstructs a record from the kernel socket peer and runs the
- * standard reap; when it proves OWNED and terminates the agent, the socket goes
- * dead and reset converges with no manual kill. reap_gone models that proven
- * termination by stopping the live agent server exactly when the migration
- * reaps. With the migration reverted, the still-live socket keeps reset at -1,
- * so this test fails closed on the old behavior. */
+ * reset. The fix treats the recorded decimal PID as a candidate, authenticates
+ * the reachable endpoint as same-user, captures the candidate generation, and
+ * runs the standard reap. Its exact argv, generation, socket-peer, and Linux
+ * pidfd checks establish ownership; executable-object identity is additional
+ * evidence when /proc/PID/exe is readable, not a requirement for nondumpable
+ * ssh-agent. When the reap terminates the agent, the socket goes dead and reset
+ * converges with no manual kill. reap_gone models that proven termination by
+ * stopping the live agent server exactly when the migration reaps. With the
+ * migration reverted, the still-live socket keeps reset at -1, so this test
+ * fails closed on the old behavior. */
 TEST(legacy_live_owned_sidecar_is_migrated_and_reset_converges) {
     char legacy[64];
     ssh_fixture_t fixture;

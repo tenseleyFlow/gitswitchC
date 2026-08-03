@@ -10645,16 +10645,19 @@ static int prove_malformed_pid_socket_dead_at(
  * authorize signaling, and because a managed agent deliberately outlives the
  * process the reachable socket makes the dead-socket proof above impossible, so
  * orphan cleanup and reset would be permanently blocked with a misleading
- * "retained for retry". When the managed socket is live, reconstruct a full
- * agent record from the kernel socket peer -- never from the untrusted decimal
- * -- and run the standard reap. The reap's own generation + argv
- * (-a <this exact managed socket>) + executable-image proof is the sole
- * authority to signal, identical to a v2 record: a genuine managed agent
- * classifies OWNED and is reaped; any other live process classifies UNRELATED
- * and is never signaled, leaving the reachable socket in place so the caller's
- * UNCHANGED dead-socket proof still fails closed. The helper writes and unlinks
- * nothing. It mirrors the valid-record path's post-reap presence refresh: a
- * cleanly terminated agent removes its own socket, so *socket_present flips to
+ * "retained for retry". When the managed socket is live, treat the bare decimal
+ * as a candidate process, authenticate the socket as a same-user endpoint, and
+ * run the standard reap with the candidate's captured generation and the
+ * kernel-reported socket-peer credentials. On Linux, signaling still requires
+ * the stable generation, exact argv (-a <this exact managed socket>), same-user
+ * peer, and pidfd-backed checks. Executable-object identity is compared when
+ * available, but may remain explicitly unknown because a nondumpable ssh-agent
+ * can deny /proc/PID/exe. A genuine managed agent classifies OWNED and is
+ * reaped; any other live process classifies UNRELATED and is never signaled,
+ * leaving the reachable socket in place so the caller's UNCHANGED dead-socket
+ * proof still fails closed. The helper writes and unlinks nothing. It mirrors
+ * the valid-record path's post-reap presence refresh: a cleanly terminated
+ * agent removes its own socket, so *socket_present flips to
  * false only on a proven ENOENT, and any other outcome conservatively keeps the
  * presence bit so the caller re-proves it. */
 static void migrate_legacy_pid_socket_peer_at(
