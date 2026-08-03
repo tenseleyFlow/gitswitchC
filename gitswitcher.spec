@@ -1,5 +1,5 @@
 Name:           gitswitcher
-Version:        1.9.0
+Version:        1.9.1
 Release:        1%{?dist}
 Summary:        Secure Git identity and SSH/GPG key management tool for seamless account switching
 
@@ -84,6 +84,10 @@ make test BUILD_TYPE=release READLINE=1 VERSION=%{version} COMMIT=rpm
 %{_datadir}/fish/vendor_completions.d/gitswitch.fish
 
 %changelog
+* Sun Aug 02 2026 mfw <espadonne@outlook.com> - 1.9.1-1
+- Repair Linux migration of live pre-1.9.0 PID-only ssh-agent records while preserving fail-closed ownership and process-identity checks.
+- Coalesce concurrent shell-startup resume attempts so ordinary terminal fan-out stays quiet while explicit and unsafe-lock failures remain diagnostic.
+
 * Wed Jul 29 2026 mfw <espadonne@outlook.com> - 1.9.0-1
 - First release since 1.8.0; ships the full audit-remediation backlog (AR-01..AR-15). Every switch/remove/reset/resume is transactional and fail-closed.
 - AR-15: settled-arena files no longer accumulate and brick mutating commands (0659967); upgrades with a live pre-upgrade ssh-agent no longer wedge switch/reset (dd3a45c); interrupted retirement-guard install no longer leaves a blocking stage (d87bd2a); SSH alias-retirement recovery survives a benign chmod/delete/recreate of ~/.ssh (c3586ad); orphaned GPG recovery residue is retired on Linux/macOS (5ed994d).
