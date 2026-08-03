@@ -1029,7 +1029,7 @@ cleanup:
  * on the same exact bytes and metadata generation. */
 static int m18_stabilize_fixture_git_record(m18_fixture_t *fixture) {
     m18_bytes_t expected = {0};
-    struct stat previous;
+    struct stat previous = {0};
     struct stat current;
     struct stat verified;
     bool have_previous = false;
