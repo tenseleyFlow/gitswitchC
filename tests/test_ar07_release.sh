@@ -4308,8 +4308,10 @@ EOF
         fail "release contract did not remove its inspected test residue"
     fi
 
-    "$make_cmd" -C "$clean_repo" dist >"$out" 2>&1 ||
+    "$make_cmd" -C "$clean_repo" dist >"$out" 2>&1 || {
+        sed -n '1,200p' "$out" >&2
         fail "clean committed release failed"
+    }
     assert_archive_metadata "$archive" "$dist_root" "$version"
     inspect_dist_residue "$archive" "$copy_platform"
 
@@ -4476,17 +4478,19 @@ EOF
             *:B) durability_make_prefix=FDB ;;
             *:R) durability_make_prefix=FDBR ;;
         esac
+        grep -F "durability stage $durability_make_fail_stage" "$out" \
+            >/dev/null || {
+            sed -n '1,200p' "$out" >&2
+            sed -n '1,160p' "$durability_make_trace" >&2
+            fail "real Make failed before injected durability stage $durability_make_fail_stage"
+        }
         durability_make_actual=$(awk '{ printf "%s", $1 }' \
             "$durability_make_trace") ||
             fail "cannot inspect failed real Make durability trace"
         [ "$durability_make_actual" = "$durability_make_prefix" ] || {
+            sed -n '1,200p' "$out" >&2
             sed -n '1,160p' "$durability_make_trace" >&2
             fail "failed real Make durability order was $durability_make_actual; expected $durability_make_prefix"
-        }
-        grep -F "durability stage $durability_make_fail_stage" "$out" \
-            >/dev/null || {
-            sed -n '1,200p' "$out" >&2
-            fail "real Make failure lacked durability stage $durability_make_fail_stage"
         }
         [ ! -e "$clean_publish_lock" ] && [ ! -L "$clean_publish_lock" ] ||
             fail "failed real Make durability flow retained its mutex"
