@@ -5576,6 +5576,10 @@ static int pending_retirement_publish_failure(
     pending_retirement_t *retirement, const char *label) {
     error_accumulator_t failures;
     error_context_t primary;
+    git_retirement_failed_publish_outcome_t git_outcome =
+        GIT_RETIREMENT_FAILED_PUBLISH_MUTATED_OR_UNCERTAIN;
+    bool created;
+    bool git_unchanged_clean = false;
     int primary_errno;
 
     if (!retirement) {
@@ -5586,18 +5590,34 @@ static int pending_retirement_publish_failure(
     }
     primary = *get_last_error();
     primary_errno = errno ? errno : EIO;
+    created = retirement->guard &&
+        config_retirement_guard_was_created(retirement->guard);
     error_accumulator_init(&failures);
     errno = primary_errno;
     (void)error_accumulator_add(&failures,
                                 label ? label : "Git retirement",
                                 &primary);
-    /* A publish failure may have completed independent destinations.  Accept
-     * that exact partial state, release every checked artifact, and preserve
-     * the durable guard as the only cross-process recovery authority. */
-    if (retirement->git &&
-        git_retirement_transaction_commit(&retirement->git) != 0) {
+    /* A publish failure may have completed independent destinations or lost
+     * acknowledgement after canonical mutation. Consume the failed Git
+     * capability through the classifier that couples mutation and cleanup
+     * proof. Only a fresh guard may be settled, and only when the classifier
+     * proves that no mutation-capable backend was entered and every private
+     * artifact was checked-cleaned. */
+    if (retirement->git) {
+        if (git_retirement_transaction_dispose_failed_publish(
+                &retirement->git, &git_outcome) != 0) {
+            (void)error_accumulator_add_last(
+                &failures, "Git retirement artifact cleanup");
+        } else if (
+            git_outcome ==
+            GIT_RETIREMENT_FAILED_PUBLISH_UNCHANGED_CLEAN) {
+            git_unchanged_clean = true;
+        }
+    }
+    if (created && git_unchanged_clean && retirement->guard &&
+        config_retirement_guard_clear(&retirement->guard) != 0) {
         (void)error_accumulator_add_last(
-            &failures, "Git retirement artifact cleanup");
+            &failures, "failed-publication retirement guard clear");
     }
     if (retirement->guard) {
         config_retirement_guard_abandon(&retirement->guard);
@@ -5776,15 +5796,46 @@ static int pending_retirement_prepare(
     result = 0;
 
 done:
-    publication_ledger_clear(&ledger);
     if (result != 0) {
-        if (retirement->git) {
-            (void)git_retirement_transaction_commit(&retirement->git);
+        error_accumulator_t failures;
+        error_context_t primary = *get_last_error();
+        int primary_errno = errno;
+        bool created = retirement->guard &&
+            config_retirement_guard_was_created(retirement->guard);
+        bool git_clean = true;
+
+        publication_ledger_clear(&ledger);
+        error_accumulator_init(&failures);
+        errno = primary_errno;
+        (void)error_accumulator_add(
+            &failures, "outer Git retirement preparation", &primary);
+        /* Preparation can fail after publishing or adopting the durable
+         * blocker and after partially allocating Git transaction artifacts.
+         * Dispose the latter with its checked owner API before deciding
+         * whether a marker created by this invocation is safe to settle.
+         * A NULL transaction is a proven-clean Git preparation failure. */
+        if (retirement->git &&
+            git_retirement_transaction_commit(&retirement->git) != 0) {
+            (void)error_accumulator_add_last(
+                &failures, "Git retirement preparation cleanup");
+            git_clean = false;
+        }
+        /* Never consume an adopted recovery authority. A fresh marker is
+         * cleared only after Git cleanup is proven clean; clear() failures
+         * retain a blocking marker/stage and are aggregated behind the
+         * original preparation diagnostic. */
+        if (created && git_clean && retirement->guard &&
+            config_retirement_guard_clear(&retirement->guard) != 0) {
+            (void)error_accumulator_add_last(
+                &failures, "retirement preparation guard clear");
         }
         if (retirement->guard) {
             config_retirement_guard_abandon(&retirement->guard);
         }
         secure_zero_memory(retirement, sizeof(*retirement));
+        (void)error_accumulator_publish(&failures);
+    } else {
+        publication_ledger_clear(&ledger);
     }
     return result;
 }

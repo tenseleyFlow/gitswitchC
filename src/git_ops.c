@@ -1619,6 +1619,7 @@ typedef struct {
     bool detached_original_recovery_required;
     bool freebsd_authority_recovered;
     bool generation_conflict;
+    bool cleanup_uncertain;
 } git_scope_lock_t;
 
 static void git_scope_lock_init(git_scope_lock_t *lock) {
@@ -4335,6 +4336,7 @@ static int git_scope_lock_recover_freebsd_authority(
     int matches = 0;
     int saved_errno = 0;
     int result = -1;
+    bool namespace_mutation_possible = false;
 
     memset(&authority, 0, sizeof(authority));
     memset(&marker, 0, sizeof(marker));
@@ -4481,18 +4483,29 @@ static int git_scope_lock_recover_freebsd_authority(
             if (lease_fd < 0 ||
                 !git_file_at_matches_witness(
                     lock->dir_fd, lock->lock_leaf, lease_fd,
-                    &witness_stat, NULL, 0U, NULL) ||
-                funlinkat(lock->dir_fd, lock->lock_leaf,
-                          witness_fd, 0) != 0 ||
-                fstat(witness_fd, &witness_stat) != 0 ||
+                    &witness_stat, NULL, 0U, NULL)) {
+                saved_errno = errno ? errno : ESTALE;
+                goto done;
+            }
+            if (funlinkat(lock->dir_fd, lock->lock_leaf,
+                          witness_fd, 0) != 0) {
+                saved_errno = errno ? errno : ESTALE;
+                goto done;
+            }
+            namespace_mutation_possible = true;
+            if (fstat(witness_fd, &witness_stat) != 0 ||
                 witness_stat.st_nlink != 1) {
                 saved_errno = errno ? errno : ESTALE;
                 goto done;
             }
         }
         if (funlinkat(lock->dir_fd, lease_leaf,
-                      witness_fd, 0) != 0 ||
-            fsync(lock->dir_fd) != 0) {
+                      witness_fd, 0) != 0) {
+            saved_errno = errno ? errno : EIO;
+            goto done;
+        }
+        namespace_mutation_possible = true;
+        if (fsync(lock->dir_fd) != 0) {
             saved_errno = errno ? errno : EIO;
             goto done;
         }
@@ -4580,6 +4593,7 @@ static int git_scope_lock_recover_freebsd_authority(
             lock->dir_fd, marker.stage_leaf,
             O_RDONLY | O_CLOEXEC | O_NOFOLLOW);
         if (stage_fd >= 0) {
+            namespace_mutation_possible = true;
             cleanup = git_scope_lock_cleanup_name(
                 lock, marker.stage_leaf,
                 "FreeBSD recovery staging file", stage_fd,
@@ -4598,6 +4612,7 @@ static int git_scope_lock_recover_freebsd_authority(
         saved_errno = errno ? errno : EIO;
         goto done;
     }
+    namespace_mutation_possible = true;
     cleanup = git_scope_lock_cleanup_name(
         lock, authority_leaf, "FreeBSD recovery authority",
         authority_fd, &authority_stat, authority_data,
@@ -4608,6 +4623,7 @@ static int git_scope_lock_recover_freebsd_authority(
         goto done;
     }
     if (lease_fd >= 0) {
+        namespace_mutation_possible = true;
         cleanup = git_scope_lock_cleanup_name(
             lock, lock->lock_leaf,
             "FreeBSD recovery canonical lease", lease_fd,
@@ -4623,6 +4639,7 @@ static int git_scope_lock_recover_freebsd_authority(
         saved_errno = errno ? errno : EAGAIN;
         goto done;
     }
+    namespace_mutation_possible = true;
     cleanup = git_scope_lock_cleanup_name(
         lock, lease_leaf, "FreeBSD recovery lease witness",
         witness_fd, &lease_stat, NULL, 0U, true, false);
@@ -4634,6 +4651,9 @@ static int git_scope_lock_recover_freebsd_authority(
     result = 1;
 
 done:
+    if (result < 0 && namespace_mutation_possible) {
+        lock->cleanup_uncertain = true;
+    }
     if (stage_fd >= 0) (void)close(stage_fd);
     if (witness_fd >= 0) (void)close(witness_fd);
     if (lease_fd >= 0) (void)close(lease_fd);
@@ -4653,6 +4673,7 @@ static int git_scope_lock_create_freebsd_lease(
     struct stat lease_stat;
     int lease_fd = -1;
     bool canonical_linked = false;
+    bool cleanup_proven;
 
     if (!lock || lock->dir_fd < 0 || !lease_fd_out) {
         errno = EINVAL;
@@ -4689,8 +4710,10 @@ static int git_scope_lock_create_freebsd_lease(
                lock->lock_leaf, 0) != 0) {
         int saved_errno = errno ? errno : EIO;
 
-        (void)funlinkat(lock->dir_fd, lease_leaf, lease_fd, 0);
-        (void)fsync(lock->dir_fd);
+        cleanup_proven =
+            funlinkat(lock->dir_fd, lease_leaf, lease_fd, 0) == 0 &&
+            fsync(lock->dir_fd) == 0;
+        if (!cleanup_proven) lock->cleanup_uncertain = true;
         (void)close(lease_fd);
         errno = saved_errno;
         return -1;
@@ -4707,13 +4730,16 @@ static int git_scope_lock_create_freebsd_lease(
         fsync(lock->dir_fd) != 0) {
         int saved_errno = errno ? errno : EIO;
 
+        cleanup_proven = false;
         if (funlinkat(lock->dir_fd, lock->lock_leaf,
                       lease_fd, 0) == 0 &&
             fsync(lock->dir_fd) == 0) {
             canonical_linked = false;
-            (void)funlinkat(lock->dir_fd, lease_leaf, lease_fd, 0);
-            (void)fsync(lock->dir_fd);
+            cleanup_proven =
+                funlinkat(lock->dir_fd, lease_leaf, lease_fd, 0) == 0 &&
+                fsync(lock->dir_fd) == 0;
         }
+        if (!cleanup_proven) lock->cleanup_uncertain = true;
         (void)close(lease_fd);
         errno = saved_errno;
         return -1;
@@ -4723,14 +4749,17 @@ static int git_scope_lock_create_freebsd_lease(
             sizeof(lock->recovery_lease_leaf)) != 0) {
         int saved_errno = errno ? errno : EIO;
 
+        cleanup_proven = false;
         if (canonical_linked &&
             funlinkat(lock->dir_fd, lock->lock_leaf,
                       lease_fd, 0) == 0 &&
             fsync(lock->dir_fd) == 0) {
             canonical_linked = false;
-            (void)funlinkat(lock->dir_fd, lease_leaf, lease_fd, 0);
-            (void)fsync(lock->dir_fd);
+            cleanup_proven =
+                funlinkat(lock->dir_fd, lease_leaf, lease_fd, 0) == 0 &&
+                fsync(lock->dir_fd) == 0;
         }
+        if (!cleanup_proven) lock->cleanup_uncertain = true;
         (void)close(lease_fd);
         errno = saved_errno;
         return -1;
@@ -4761,6 +4790,7 @@ static int git_recovery_remove_linked_private_alias(
     int saved_errno = EEXIST;
     int matches = 0;
     git_cleanup_result_t cleanup;
+    bool namespace_mutation_possible = false;
 
     if (!lock || lock->dir_fd < 0 || marker_fd < 0 || !marker_data ||
         !marker_stat || marker_stat->st_nlink != 2) {
@@ -4823,6 +4853,7 @@ static int git_recovery_remove_linked_private_alias(
         saved_errno = errno ? errno : EAGAIN;
         goto done;
     }
+    namespace_mutation_possible = true;
     cleanup = git_scope_lock_cleanup_name_once(
         lock, alias_leaf, "linked private recovery marker", alias_fd,
         marker_stat, marker_data, marker_length, true, false);
@@ -4848,6 +4879,9 @@ static int git_recovery_remove_linked_private_alias(
     saved_errno = 0;
 
 done:
+    if (saved_errno != 0 && namespace_mutation_possible) {
+        lock->cleanup_uncertain = true;
+    }
     if (alias_fd >= 0) (void)close(alias_fd);
     if (directory) (void)closedir(directory);
     errno = saved_errno;
@@ -4864,6 +4898,7 @@ static int git_scope_lock_recover_marker(git_scope_lock_t *lock) {
     int stage_fd = -1;
     int result = -1;
     int saved_errno = EEXIST;
+    bool namespace_mutation_possible = false;
 
     memset(&marker, 0, sizeof(marker));
     if (!lock || lock->dir_fd < 0) {
@@ -4900,12 +4935,13 @@ static int git_scope_lock_recover_marker(git_scope_lock_t *lock) {
         saved_errno = EEXIST;
         goto done;
     }
-    if (marker_stat.st_nlink == 2 &&
-        git_recovery_remove_linked_private_alias(
-            lock, marker_fd, marker_data, marker_length,
-            &marker_stat) != 0) {
-        saved_errno = errno ? errno : EEXIST;
-        goto done;
+    if (marker_stat.st_nlink == 2) {
+        if (git_recovery_remove_linked_private_alias(
+                lock, marker_fd, marker_data, marker_length,
+                &marker_stat) != 0) {
+            saved_errno = errno ? errno : EEXIST;
+            goto done;
+        }
     }
     if (marker.stage_present) {
         stage_fd = openat(lock->dir_fd, marker.stage_leaf,
@@ -4916,6 +4952,7 @@ static int git_scope_lock_recover_marker(git_scope_lock_t *lock) {
                 goto done;
             }
         } else {
+            namespace_mutation_possible = true;
             cleanup = git_scope_lock_cleanup_name_once(
                 lock, marker.stage_leaf, "recovery staging file", stage_fd,
                 &marker.stage_stat, marker.stage_data, marker.stage_length,
@@ -4933,6 +4970,7 @@ static int git_scope_lock_recover_marker(git_scope_lock_t *lock) {
             goto done;
         }
     }
+    namespace_mutation_possible = true;
     cleanup = git_scope_lock_cleanup_name_once(
         lock, lock->lock_leaf, "recovery marker", marker_fd, &marker_stat,
         marker_data, marker_length, true, false);
@@ -4947,6 +4985,9 @@ static int git_scope_lock_recover_marker(git_scope_lock_t *lock) {
     result = 0;
 
 done:
+    if (result != 0 && namespace_mutation_possible) {
+        lock->cleanup_uncertain = true;
+    }
     if (stage_fd >= 0) (void)close(stage_fd);
     if (marker_fd >= 0) (void)close(marker_fd);
     if (marker_data) {
@@ -5196,6 +5237,7 @@ static int git_scope_lock_discard_checked(git_scope_lock_t *lock,
             &failures, "Git transaction artifact directory sync");
         result = -1;
     }
+    if (result != 0) lock->cleanup_uncertain = true;
     git_scope_lock_close(lock);
     if (failures.active) {
         (void)error_accumulator_publish(&failures);
@@ -9622,6 +9664,42 @@ static bool git_retirement_directory_identity_matches(
                ((uintmax_t)st->st_mode & (uintmax_t)S_IFMT);
 }
 
+static int git_retirement_verify_repository_namespace(
+    const publication_record_t *publication) {
+    char repository[MAX_PATH_LEN];
+    struct stat repository_stat;
+    int repository_fd = -1;
+    int result = -1;
+
+    if (!publication || publication_record_validate(publication) != 0) {
+        return -1;
+    }
+    if (publication->scope == PUBLICATION_SCOPE_GLOBAL) return 0;
+    if (realpath(publication->repository_path, repository) == NULL ||
+        strcmp(repository, publication->repository_path) != 0) {
+        goto mismatch;
+    }
+    repository_fd = open(publication->repository_path,
+                         O_RDONLY | O_DIRECTORY | O_CLOEXEC |
+                             O_NOFOLLOW);
+    if (repository_fd < 0 ||
+        fstat(repository_fd, &repository_stat) != 0 ||
+        !git_retirement_directory_identity_matches(
+            &publication->repository, &repository_stat)) {
+        goto mismatch;
+    }
+    result = 0;
+    goto cleanup;
+
+mismatch:
+    errno = ESTALE;
+    set_error(ERR_GIT_CONFIG_FAILED,
+              "Recorded Git retirement repository namespace changed");
+cleanup:
+    if (repository_fd >= 0) (void)close(repository_fd);
+    return result;
+}
+
 /* A completed atomic retirement necessarily changes the config generation.
  * For retry/idempotence, retain the durable namespace and repository proof
  * while allowing the caller to inspect whether every exact owned value is
@@ -9630,15 +9708,12 @@ static int git_retirement_verify_live_namespace(
     const publication_record_t *publication) {
     char canonical[MAX_PATH_LEN];
     char parent[MAX_PATH_LEN];
-    char repository[MAX_PATH_LEN];
     const char *slash;
     const char *leaf;
     struct stat parent_stat;
     struct stat config_stat;
-    struct stat repository_stat;
     int parent_fd = -1;
     int config_fd = -1;
-    int repository_fd = -1;
     int result = -1;
 
     if (!publication || publication_record_validate(publication) != 0) {
@@ -9671,20 +9746,8 @@ static int git_retirement_verify_live_namespace(
         !S_ISREG(config_stat.st_mode)) {
         goto mismatch;
     }
-    if (publication->scope != PUBLICATION_SCOPE_GLOBAL) {
-        if (realpath(publication->repository_path, repository) == NULL ||
-            strcmp(repository, publication->repository_path) != 0) {
-            goto mismatch;
-        }
-        repository_fd = open(publication->repository_path,
-                             O_RDONLY | O_DIRECTORY | O_CLOEXEC |
-                                 O_NOFOLLOW);
-        if (repository_fd < 0 ||
-            fstat(repository_fd, &repository_stat) != 0 ||
-            !git_retirement_directory_identity_matches(
-                &publication->repository, &repository_stat)) {
-            goto mismatch;
-        }
+    if (git_retirement_verify_repository_namespace(publication) != 0) {
+        goto mismatch;
     }
     result = 0;
     goto cleanup;
@@ -9694,7 +9757,6 @@ mismatch:
     set_error(ERR_GIT_CONFIG_FAILED,
               "Recorded Git retirement namespace is inaccessible or changed");
 cleanup:
-    if (repository_fd >= 0) (void)close(repository_fd);
     if (config_fd >= 0) (void)close(config_fd);
     if (parent_fd >= 0) (void)close(parent_fd);
     return result;
@@ -9760,6 +9822,7 @@ typedef struct {
     bool terminal_clean_witness_ready;
     bool terminal_clean_uses_published;
     bool terminal_release_only;
+    bool cleanup_uncertain;
 } git_retirement_group_t;
 
 typedef struct {
@@ -9808,6 +9871,9 @@ struct git_retirement_transaction {
     git_retirement_enumeration_mode_t enumeration_mode;
     git_retirement_terminal_kind_t terminal_kind;
     bool snapshot_indeterminate;
+    bool canonical_mutation_possible;
+    bool cleanup_uncertain;
+    bool unchanged_state_reproved;
     bool command_runner;
     bool recovery_proof_only;
     bool terminal_release_only;
@@ -10678,6 +10744,7 @@ done:
     }
     if (result != 0 && group->lock.dir_fd >= 0 &&
         git_scope_lock_discard_checked(&group->lock, true) != 0) {
+        group->cleanup_uncertain = true;
         (void)error_accumulator_add_last(
             &failures, "absent Git retirement cleanup");
     }
@@ -11009,6 +11076,7 @@ done:
     }
     if (result != 0 && group->lock.dir_fd >= 0 &&
         git_scope_lock_discard_checked(&group->lock, true) != 0) {
+        group->cleanup_uncertain = true;
         (void)error_accumulator_add_last(
             &failures, "stale retirement artifact cleanup");
         result = -1;
@@ -11142,12 +11210,10 @@ static int git_retirement_prepare_group_atomic(
             config_path, NULL, NULL)) {
         set_error(ERR_GIT_CONFIG_FAILED,
                   "Injected Git retirement pre-lock witness failure");
-        git_retirement_group_clear_prelock_witness(group);
         return -1;
     }
     if (git_scope_lock_acquire(group->scope, config_path, &group->lock,
                                NULL) != 0) {
-        git_retirement_group_clear_prelock_witness(group);
         return -1;
     }
     group->lock_ready = true;
@@ -11176,7 +11242,6 @@ static int git_retirement_prepare_group_atomic(
         publication_identity_admitted = true;
     }
 #endif
-    git_retirement_group_clear_prelock_witness(group);
     if (!publication_identity_admitted) {
         set_error(ERR_GIT_CONFIG_FAILED,
                   "Git retirement destination changed before its canonical lock was acquired");
@@ -11253,7 +11318,9 @@ static int git_retirement_prepare_group_atomic(
     result = 0;
 
 done:
-    git_retirement_group_clear_prelock_witness(group);
+    if (result == 0) {
+        git_retirement_group_clear_prelock_witness(group);
+    }
     git_scope_snapshot_clear(&locked);
     git_scope_snapshot_clear(&expected);
     git_scope_snapshot_clear(&observed);
@@ -11263,6 +11330,7 @@ done:
     }
     if (result != 0 && group->lock.dir_fd >= 0 &&
         git_scope_lock_discard_checked(&group->lock, true) != 0) {
+        group->cleanup_uncertain = true;
         (void)error_accumulator_add_last(
             &failures, "failed Git retirement preparation cleanup");
         result = -1;
@@ -11318,6 +11386,180 @@ static int git_retirement_publish_group_atomic(
     log_info("Retired %zu durable Git identity key(s) selecting '%s'",
              group->planned, account->name);
     return 0;
+}
+
+static bool git_retirement_failed_publish_verify_group_records(
+    const git_retirement_transaction_t *transaction,
+    const git_retirement_group_t *group, bool repository_only) {
+    const publication_record_t *representative;
+    size_t matched = 0U;
+
+    if (!transaction || !group ||
+        group->representative >= transaction->item_count) {
+        return false;
+    }
+    representative =
+        transaction->publication_refs[group->representative];
+    for (size_t i = 0U; i < transaction->item_count; i++) {
+        const publication_record_t *publication =
+            transaction->publication_refs[i];
+
+        if (!publication_record_same_config_destination(
+                representative, publication)) {
+            continue;
+        }
+        matched++;
+        if ((repository_only
+                 ? git_retirement_verify_repository_namespace(publication)
+                 : git_retirement_verify_live_namespace(publication)) != 0) {
+            return false;
+        }
+    }
+    return matched != 0U;
+}
+
+static bool git_retirement_failed_publish_verify_prelock(
+    const git_retirement_transaction_t *transaction,
+    const git_retirement_group_t *group) {
+    struct stat current_stat;
+    unsigned char *current_data = NULL;
+    size_t current_length = 0U;
+    bool matches = false;
+
+    if (!transaction || !group || group->stale_generation ||
+        !group->live_generation || !group->prelock_witness_ready ||
+        !git_retirement_failed_publish_verify_group_records(
+            transaction, group, false)) {
+        return false;
+    }
+    if (git_retirement_capture_prelock_witness(
+            group->live_generation,
+            &group->live_generation->post_config,
+            &current_stat, &current_data, &current_length,
+            g_retirement_prelock_witness_budget) != 0) {
+        goto done;
+    }
+    matches = git_same_file_observation(
+                  &group->prelock_stat, &current_stat) &&
+              group->prelock_length == current_length &&
+              (current_length == 0U ||
+               memcmp(group->prelock_data, current_data,
+                      current_length) == 0) &&
+              git_retirement_failed_publish_verify_group_records(
+                  transaction, group, false);
+
+done:
+    if (current_data) {
+        secure_zero_memory(current_data, current_length);
+        free(current_data);
+    }
+    return matches;
+}
+
+static bool git_retirement_failed_publish_verify_prepared_present(
+    const git_retirement_transaction_t *transaction,
+    const git_retirement_group_t *group) {
+    if (!transaction || !group || !group->prepared ||
+        !group->lock_ready || group->absent_destination ||
+        group->lock.dir_fd < 0 || group->lock.original_fd < 0 ||
+        !group->lock.original_witness_valid ||
+        !git_retirement_failed_publish_verify_group_records(
+            transaction, group, false) ||
+        !git_file_at_matches_witness(
+            group->lock.dir_fd, group->lock.leaf,
+            group->lock.original_fd, &group->lock.original_stat,
+            group->lock.original_data, group->lock.original_length,
+            NULL) ||
+        fsync(group->lock.dir_fd) != 0 ||
+        !git_file_at_matches_witness(
+            group->lock.dir_fd, group->lock.leaf,
+            group->lock.original_fd, &group->lock.original_stat,
+            group->lock.original_data, group->lock.original_length,
+            NULL) ||
+        !git_retirement_failed_publish_verify_group_records(
+            transaction, group, false)) {
+        return false;
+    }
+    return true;
+}
+
+static bool git_retirement_failed_publish_verify_absent(
+    const git_retirement_transaction_t *transaction,
+    git_retirement_group_t *group) {
+    const publication_record_t *representative;
+
+    if (!transaction || !group || !group->absent_destination ||
+        !group->prepared || !group->lock_ready ||
+        group->representative >= transaction->item_count) {
+        return false;
+    }
+    representative =
+        transaction->publication_refs[group->representative];
+    return git_retirement_failed_publish_verify_group_records(
+               transaction, group, true) &&
+           git_retirement_revalidate_absent_group(
+               representative, group, false) == 0 &&
+           git_retirement_failed_publish_verify_group_records(
+               transaction, group, true);
+}
+
+static bool git_retirement_transaction_reprove_unchanged(
+    git_retirement_transaction_t *transaction) {
+    error_context_t entry_error = *get_last_error();
+    int entry_errno = errno;
+    bool covered[PUBLICATION_LEDGER_MAX_RECORDS] = {false};
+    bool result = false;
+
+    if (!transaction || transaction->command_runner ||
+        transaction->snapshot_indeterminate ||
+        transaction->canonical_mutation_possible ||
+        transaction->item_count == 0U ||
+        transaction->group_count == 0U) {
+        goto done;
+    }
+    for (size_t i = 0U; i < transaction->group_count; i++) {
+        git_retirement_group_t *group = &transaction->groups[i];
+        const publication_record_t *representative;
+        size_t matched = 0U;
+
+        if (group->representative >= transaction->item_count) goto done;
+        representative =
+            transaction->publication_refs[group->representative];
+        for (size_t j = 0U; j < transaction->item_count; j++) {
+            if (!publication_record_same_config_destination(
+                    representative, transaction->publication_refs[j])) {
+                continue;
+            }
+            if (covered[j]) goto done;
+            covered[j] = true;
+            matched++;
+        }
+        if (matched == 0U) goto done;
+        if (group->absent_destination) {
+            if (!git_retirement_failed_publish_verify_absent(
+                    transaction, group)) {
+                goto done;
+            }
+        } else if (group->prepared) {
+            if (!git_retirement_failed_publish_verify_prepared_present(
+                    transaction, group)) {
+                goto done;
+            }
+        } else if (group->stale_generation ||
+                   !git_retirement_failed_publish_verify_prelock(
+                       transaction, group)) {
+            goto done;
+        }
+    }
+    for (size_t i = 0U; i < transaction->item_count; i++) {
+        if (!covered[i]) goto done;
+    }
+    result = true;
+
+done:
+    g_last_error = entry_error;
+    errno = entry_errno;
+    return result;
 }
 
 static void git_retirement_transaction_release_mode(
@@ -11737,12 +11979,6 @@ static int git_retirement_transaction_prepare_internal(
      * complete preflight may enter destructive work. Stale destination
      * witnesses and later mutation failures retain M10's independent-group
      * continuation; snapshot indeterminacy authorizes no mutation anywhere. */
-    if (transaction->snapshot_indeterminate) {
-        for (size_t i = 0U; i < transaction->group_count; i++) {
-            git_retirement_group_clear_prelock_witness(
-                &transaction->groups[i]);
-        }
-    }
     if (!transaction->snapshot_indeterminate) {
         for (size_t i = 0U; i < transaction->group_count; i++) {
             git_retirement_group_t *group = &transaction->groups[i];
@@ -11859,6 +12095,12 @@ int git_retirement_transaction_publish(
             int publish_result;
 
             if (!group->prepared) continue;
+            /* Crossing into either publication backend can mutate canonical
+             * Git configuration or lose the acknowledgement of a completed
+             * mutation. Mark the transaction before any such call. */
+            if (!group->absent_destination && group->planned > 0U) {
+                transaction->canonical_mutation_possible = true;
+            }
             if (transaction->command_runner &&
                 !group->absent_destination &&
                 !group->stale_generation) {
@@ -11883,6 +12125,14 @@ int git_retirement_transaction_publish(
     }
     transaction->published_cleared = total_cleared;
     if (cleared) *cleared = total_cleared;
+    if (transaction->failure_count != 0U) {
+        /* Prove the exact pre-operation namespace while every successfully
+         * prepared group still retains its canonical lock. The proof is a
+         * one-way latch consumed only by failed-publish disposal; failure
+         * deliberately leaves the original publication diagnostic intact. */
+        transaction->unchanged_state_reproved =
+            git_retirement_transaction_reprove_unchanged(transaction);
+    }
     if (transaction->failure_count == 0U) {
         transaction->state = GIT_RETIREMENT_TRANSACTION_PUBLISHED;
         clear_error();
@@ -11898,6 +12148,8 @@ int git_retirement_transaction_publish(
 
         if (!group->lock_ready || group->settled) continue;
         if (git_scope_lock_discard_checked(&group->lock, true) != 0) {
+            transaction->cleanup_uncertain = true;
+            group->cleanup_uncertain = true;
             (void)snprintf(label, sizeof(label),
                            "account '%s' destination %zu cleanup (%s)",
                            transaction->items[
@@ -13602,6 +13854,58 @@ int git_retirement_transaction_commit(
     git_retirement_transaction_release(transaction);
     *transaction_ptr = NULL;
     if (failures.active) (void)error_accumulator_publish(&failures);
+    return result;
+}
+
+int git_retirement_transaction_dispose_failed_publish(
+    git_retirement_transaction_t **transaction_ptr,
+    git_retirement_failed_publish_outcome_t *outcome) {
+    git_retirement_transaction_t *transaction;
+    bool unchanged_candidate;
+    int result;
+
+    if (outcome) {
+        *outcome =
+            GIT_RETIREMENT_FAILED_PUBLISH_MUTATED_OR_UNCERTAIN;
+    }
+    if (!transaction_ptr || !*transaction_ptr || !outcome) {
+        errno = EINVAL;
+        set_error(ERR_INVALID_ARGS,
+                  "Invalid failed Git retirement disposal request");
+        return -1;
+    }
+    transaction = *transaction_ptr;
+    if (transaction->creator_pid != getpid()) {
+        git_retirement_transaction_release_mode(transaction, true);
+        *transaction_ptr = NULL;
+        errno = EINVAL;
+        set_error(
+            ERR_INVALID_ARGS,
+            "Cannot dispose a failed Git retirement capability inherited by a different process");
+        return -1;
+    }
+    if (transaction->state !=
+        GIT_RETIREMENT_TRANSACTION_PUBLISH_FAILED) {
+        errno = EINVAL;
+        set_error(ERR_INVALID_ARGS,
+                  "Git retirement transaction has no failed publish outcome");
+        return -1;
+    }
+
+    unchanged_candidate =
+        !transaction->canonical_mutation_possible &&
+        !transaction->cleanup_uncertain &&
+        transaction->unchanged_state_reproved;
+    for (size_t i = 0U;
+         unchanged_candidate && i < transaction->group_count; i++) {
+        unchanged_candidate =
+            !transaction->groups[i].cleanup_uncertain &&
+            !transaction->groups[i].lock.cleanup_uncertain;
+    }
+    result = git_retirement_transaction_commit(transaction_ptr);
+    if (result == 0 && unchanged_candidate) {
+        *outcome = GIT_RETIREMENT_FAILED_PUBLISH_UNCHANGED_CLEAN;
+    }
     return result;
 }
 

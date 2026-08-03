@@ -8,6 +8,24 @@
 typedef struct git_config_finalization git_config_finalization_t;
 typedef struct git_retirement_recovery git_retirement_recovery_t;
 
+typedef enum {
+    GIT_RETIREMENT_FAILED_PUBLISH_MUTATED_OR_UNCERTAIN = 0,
+    GIT_RETIREMENT_FAILED_PUBLISH_UNCHANGED_CLEAN
+} git_retirement_failed_publish_outcome_t;
+
+/* Consume a transaction whose publish operation failed and classify whether
+ * the caller may safely treat canonical Git configuration as unchanged.
+ * The output is initialized fail-closed. UNCHANGED_CLEAN is returned only
+ * when no mutation-capable publication backend was entered, no earlier
+ * checked cleanup was uncertain, and final checked disposal succeeds.
+ *
+ * A NULL, inherited, or wrong-state capability is rejected with -1 and the
+ * fail-closed outcome. A valid publish-failed capability is consumed and its
+ * caller-owned pointer is set to NULL on both cleanup success and failure. */
+int git_retirement_transaction_dispose_failed_publish(
+    git_retirement_transaction_t **transaction,
+    git_retirement_failed_publish_outcome_t *outcome);
+
 /* A fork child may inherit process-global snapshot descriptors but never the
  * parent's namespace authority. Forget raw descriptor numbers and free that
  * transaction state without rollback, finalization, marker recovery, or any
