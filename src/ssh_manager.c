@@ -1626,6 +1626,10 @@ static int inspect_process_image_real(pid_t pid, ssh_process_image_t *image) {
          * "(deleted)" suffix after an upgrade) is harmless; an unreadable link
          * simply leaves the name empty for the caller to classify. */
         {
+            /* proc_path is /proc/<validated pid>/exe and its descriptor was
+             * opened/fstat'd above. This advisory read is bounded, with
+             * truncation and NUL termination checked explicitly below. */
+            // flawfinder: ignore
             ssize_t linked = readlink(proc_path, image->executable_path,
                                       sizeof(image->executable_path) - 1U);
 
