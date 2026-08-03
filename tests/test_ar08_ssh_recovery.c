@@ -3446,6 +3446,7 @@ static int wait_process_absent(pid_t pid) {
  * permanently wedged behind its live pre-upgrade agent. This drives a REAL
  * ssh-agent on the managed socket with a legacy bare-PID sidecar through the
  * REAL reap, which is the only arrangement that can observe that defect. */
+#ifdef __linux__
 TEST(legacy_live_socket_converges_through_the_real_reap) {
     ssh_fixture_t fixture;
     struct stat runtime_identity;
@@ -3526,6 +3527,7 @@ TEST(legacy_live_socket_converges_through_the_real_reap) {
     stop_process(pid);
     close(fixture.dir_fd);
 }
+#endif
 
 TEST(runtime_root_provenance_prevents_cross_root_reap) {
     ssh_fixture_t first;
@@ -4556,7 +4558,9 @@ TEST_MAIN_BEGIN()
     RUN_TEST(portable_final_quarantine_substitution_is_not_deleted);
     RUN_TEST(portable_restore_retirement_substitution_is_preserved);
     RUN_TEST(unrelated_live_pid_is_not_signaled);
+#ifdef __linux__
     RUN_TEST(legacy_live_socket_converges_through_the_real_reap);
+#endif
     RUN_TEST(runtime_root_provenance_prevents_cross_root_reap);
     RUN_TEST(unrecorded_launch_cleanup_keeps_original_captured_generation);
     RUN_TEST(runner_failure_indeterminate_reap_publishes_retry_tuple);
