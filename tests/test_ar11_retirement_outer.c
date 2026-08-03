@@ -5057,6 +5057,67 @@ TEST(remove_uncertain_install_recovers_in_fresh_process) {
     m18_fixture_cleanup(&fixture);
 }
 
+/* AR-15 M4: compose AR-14 H2 (restart recovery of an installed-but-uncertain
+ * remove) with H3/H4 (destination-absence oracle). If the recorded Git
+ * destination is absent at recovery time, the proof-only recovery must form a
+ * zero-mutation absent group, re-prove ENOENT under the canonical lock, and
+ * settle -- instead of permanently wedging the retirement guard (and thus every
+ * account mutation). Deleting the destination before recovery and asserting
+ * settlement fails (recovery stays blocked, exit FAILURE) when the recovery
+ * absence arm is reverted. */
+TEST(remove_uncertain_install_recovers_when_destination_absent) {
+    m18_fixture_t fixture;
+    m18_bytes_t marker_after_failure = {0};
+    m18_bytes_t output = {0};
+    struct stat git_stat;
+    bool observed = false;
+    int status;
+
+    CHECK_EQ_INT(m18_fixture_setup(&fixture), 0);
+
+    status = m18_run_cli(
+        &fixture, M18_COMMAND_REMOVE_NUMERIC, M18_FAULT_ONCE,
+        CONFIG_IO_DOCUMENT_BEFORE_DIR_SYNC, &observed);
+    CHECK(WIFEXITED(status));
+    if (WIFEXITED(status)) {
+        CHECK_EQ_INT(WEXITSTATUS(status), EXIT_FAILURE);
+    }
+    CHECK(observed);
+    CHECK(m18_ledger_has_exact_retiring_work(&fixture));
+    CHECK(m18_guard_is_private_and_blocking(&fixture, "remove"));
+    CHECK(m18_completion_absent(&fixture));
+    CHECK_EQ_INT(m18_read_bytes(fixture.guard_path,
+                                &marker_after_failure), 0);
+
+    /* The recorded Git destination disappears before recovery (e.g. the repo
+     * config was deleted). The managed identity is necessarily gone, so a
+     * fresh-process recovery must settle the goal, not wedge. */
+    CHECK_EQ_INT(unlink(fixture.git_path), 0);
+
+    status = m18_run_cli(
+        &fixture, M18_COMMAND_REMOVE_NUMERIC, M18_FAULT_NONE,
+        CONFIG_IO_DEFAULT_AFTER_TEMP, NULL);
+    CHECK(WIFEXITED(status));
+    if (WIFEXITED(status)) {
+        CHECK_EQ_INT(WEXITSTATUS(status), EXIT_SUCCESS);
+    }
+    CHECK(m18_accounts_omit_work(&fixture));
+    CHECK(m18_ledger_has_exact_retiring_work(&fixture));
+    CHECK(m18_guard_has_exact_completion_pair(
+        &fixture, &marker_after_failure));
+    CHECK(m18_guard_is_unblocked_and_bounded(&fixture));
+    /* Proof-only recovery never recreates the absent destination. */
+    errno = 0;
+    CHECK(lstat(fixture.git_path, &git_stat) != 0 && errno == ENOENT);
+    CHECK_EQ_INT(m18_read_bytes(fixture.output_path, &output), 0);
+    CHECK(m18_output_contains(
+        &output, "Completed interrupted removal for account ID 1."));
+
+    m18_bytes_clear(&marker_after_failure);
+    m18_bytes_clear(&output);
+    m18_fixture_cleanup(&fixture);
+}
+
 TEST(recovery_terminal_verify_follows_final_prepared_guard_reads) {
     m18_fixture_t fixture;
     m18_bytes_t marker = {0};
@@ -7517,6 +7578,7 @@ TEST_MAIN_BEGIN()
     error_init(LOG_LEVEL_WARNING, NULL);
     RUN_TEST(remove_save_boundary_matrix_preserves_outer_coherence);
     RUN_TEST(remove_uncertain_install_recovers_in_fresh_process);
+    RUN_TEST(remove_uncertain_install_recovers_when_destination_absent);
     RUN_TEST(recovery_terminal_verify_follows_final_prepared_guard_reads);
     RUN_TEST(recovery_post_guard_cleanup_failure_is_success_and_self_heals);
     RUN_TEST(remove_recovery_reconciles_interrupted_completion_stage);

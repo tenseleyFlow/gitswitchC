@@ -6027,6 +6027,116 @@ static int git_freebsd_restore_detached_original(
     *restored_stat = settled;
     return 0;
 }
+#else
+/* Portable no-native-exchange fallback for filesystems without RENAME_EXCHANGE
+ * (many NFS/FUSE homes). Unlike FreeBSD's funlinkat/linkat two-step, plain
+ * renameat(2) is an atomic replace: the canonical destination is a complete
+ * config at every instant, so there is no leaf-absent crash window to recover.
+ * The original is first preserved as a checked backup hardlink so a reverse
+ * retirement (or outer abort) can atomically restore it; a leftover backup is
+ * an owned name the existing quarantine cleanup removes. */
+static unsigned long git_fallback_backup_nonce;
+
+static int git_scope_lock_preserve_fallback_original(
+    git_scope_lock_t *lock, char backup_leaf[96],
+    struct stat *linked_original) {
+    if (!lock || !backup_leaf || !linked_original ||
+        !lock->original_present || !lock->original_witness_valid ||
+        lock->original_fd < 0) {
+        errno = EINVAL;
+        return -1;
+    }
+    for (unsigned attempt = 0U; attempt < 100U; attempt++) {
+        unsigned long nonce = ++git_fallback_backup_nonce;
+
+        if ((size_t)snprintf(backup_leaf, 96U,
+                             ".gitswitch-config-%ld-o%lu", (long)getpid(),
+                             nonce) >= 96U) {
+            errno = ENAMETOOLONG;
+            set_system_error(
+                ERR_GIT_CONFIG_FAILED,
+                "Cannot derive the bounded original Git retirement witness");
+            return -1;
+        }
+        if (linkat(lock->dir_fd, lock->leaf,
+                   lock->dir_fd, backup_leaf, 0) == 0) {
+            if (fstat(lock->original_fd, linked_original) == 0 &&
+                linked_original->st_nlink == 2 &&
+                git_file_at_matches_witness(
+                    lock->dir_fd, lock->leaf, lock->original_fd,
+                    linked_original, lock->original_data,
+                    lock->original_length, NULL) &&
+                git_file_at_matches_witness(
+                    lock->dir_fd, backup_leaf, lock->original_fd,
+                    linked_original, lock->original_data,
+                    lock->original_length, NULL)) {
+                return 0;
+            }
+            {
+                int saved_errno = errno ? errno : EAGAIN;
+
+                (void)git_scope_lock_cleanup_name(
+                    lock, backup_leaf, "unproven fallback original backup",
+                    lock->original_fd, linked_original, lock->original_data,
+                    lock->original_length, true, false);
+                errno = saved_errno;
+            }
+            break;
+        }
+        if (errno != EEXIST) break;
+    }
+    set_system_error(
+        ERR_GIT_CONFIG_FAILED,
+        "Cannot preserve the original Git retirement generation for fallback rollback");
+    return -1;
+}
+
+/* Repoint the lock's stage bookkeeping at the detached-original backup so the
+ * existing owned-name cleanup, recovery marker, and reverse path all operate on
+ * it. Pure bookkeeping — no I/O. */
+static int git_scope_lock_track_detached_original(
+    git_scope_lock_t *lock, const char *original_leaf,
+    const struct stat *original_stat, bool recovery_required) {
+    if (!lock || !original_leaf || !original_stat ||
+        original_stat->st_nlink != 1 ||
+        safe_strncpy(lock->stage_leaf, original_leaf,
+                     sizeof(lock->stage_leaf)) != 0 ||
+        (size_t)snprintf(lock->stage_path, sizeof(lock->stage_path),
+                         "%s/%s", lock->parent,
+                         original_leaf) >= sizeof(lock->stage_path)) {
+        errno = errno ? errno : EINVAL;
+        return -1;
+    }
+    git_scope_lock_clear_stage_witness(lock);
+    lock->original_stat = *original_stat;
+    lock->stage_created = true;
+    lock->stage_witness_kind = GIT_STAGE_WITNESS_ORIGINAL;
+    lock->detached_original_recovery_required = recovery_required;
+    return 0;
+}
+
+/* Atomically restore the detached original over the current destination.
+ * renameat(2) replaces the canonical name in one step; the backup name is
+ * consumed and the leaf becomes the exact original generation (nlink 1). */
+static int git_scope_lock_restore_detached_original(
+    git_scope_lock_t *lock, const char *original_leaf,
+    struct stat *restored_stat) {
+    struct stat settled;
+
+    if (!lock || !original_leaf || !restored_stat ||
+        renameat(lock->dir_fd, original_leaf,
+                 lock->dir_fd, lock->leaf) != 0 ||
+        fstat(lock->original_fd, &settled) != 0 ||
+        settled.st_nlink != 1 ||
+        !git_file_at_matches_witness(
+            lock->dir_fd, lock->leaf, lock->original_fd,
+            &settled, lock->original_data, lock->original_length, NULL)) {
+        errno = errno ? errno : EAGAIN;
+        return -1;
+    }
+    *restored_stat = settled;
+    return 0;
+}
 #endif
 
 static int git_scope_lock_publish(git_scope_lock_t *lock,
@@ -6041,10 +6151,8 @@ static int git_scope_lock_publish(git_scope_lock_t *lock,
     int verify_fd;
     int exchange_result;
     bool original_unchanged;
-#if defined(__FreeBSD__)
     char fallback_original_leaf[96] = "";
     struct stat linked_original;
-#endif
 
     verify_fd = openat(lock->dir_fd, lock->stage_leaf,
                        O_RDONLY | O_CLOEXEC | O_NOFOLLOW);
@@ -6368,16 +6476,92 @@ static int git_scope_lock_publish(git_scope_lock_t *lock,
         lock->stage_created = false;
     }
 #else
-    {
-        git_noreplace_move_result_t moved;
+    if (lock->original_present) {
+        /* No native name exchange: preserve the original as a checked backup
+         * hardlink, then atomically replace the destination with the prepared
+         * image via renameat(2). The replace is atomic, so the canonical name
+         * is a complete config at every instant (no leaf-absent window), and
+         * the detached original survives under the backup for reverse/abort. */
+        bool force_publish_failure =
+            retirement_exact && g_retirement_test_hook &&
+            g_retirement_test_hook(
+                GIT_RETIREMENT_TEST_FORCE_FALLBACK_LINK_FAILURE,
+                lock->path, lock->stage_leaf, NULL);
+        struct stat detached_original;
+        struct stat linked_stage;
 
-        if (lock->original_present) {
-            errno = ENOTSUP;
-            moved = GIT_NOREPLACE_MOVE_UNSUPPORTED;
-        } else {
-            moved = git_rename_noreplace_at(
-                lock->dir_fd, lock->stage_leaf, lock->leaf);
+        if (git_scope_lock_preserve_fallback_original(
+                lock, fallback_original_leaf, &linked_original) != 0) {
+            return -1;
         }
+        if (force_publish_failure ||
+            renameat(lock->dir_fd, lock->stage_leaf,
+                     lock->dir_fd, lock->leaf) != 0) {
+            int saved_errno =
+                force_publish_failure ? EIO : (errno ? errno : EIO);
+
+            (void)git_scope_lock_cleanup_name(
+                lock, fallback_original_leaf, "fallback original backup",
+                lock->original_fd, &linked_original, lock->original_data,
+                lock->original_length, true, false);
+            errno = saved_errno;
+            set_system_error(
+                ERR_GIT_CONFIG_FAILED,
+                "Cannot publish prepared Git rollback image without overwriting a raced replacement: %s",
+                lock->path);
+            return -1;
+        }
+        /* The atomic replace is the publication linearization point: the
+         * prepared image is canonical and the stage name is consumed. */
+        lock->published = true;
+        if (fstat(lock->original_fd, &detached_original) != 0 ||
+            detached_original.st_nlink != 1 ||
+            !git_file_at_matches_witness(
+                lock->dir_fd, fallback_original_leaf, lock->original_fd,
+                &detached_original, lock->original_data,
+                lock->original_length, NULL) ||
+            !git_file_at_matches_witness(
+                lock->dir_fd, lock->leaf, lock->published_fd,
+                &lock->published_stat, lock->published_data,
+                lock->published_length, &linked_stage)) {
+            int saved_errno = errno ? errno : EAGAIN;
+
+            (void)git_scope_lock_track_detached_original(
+                lock, fallback_original_leaf, &detached_original, true);
+            errno = saved_errno;
+            set_system_error(
+                ERR_GIT_CONFIG_FAILED,
+                "Cannot prove the atomically published Git rollback image");
+            return -1;
+        }
+        lock->published_stat = linked_stage;
+        if (retirement_exact && g_retirement_test_hook &&
+            g_retirement_test_hook(
+                GIT_RETIREMENT_TEST_AFTER_FALLBACK_ORIGINAL_UNLINK,
+                lock->path, fallback_original_leaf, NULL)) {
+            (void)git_scope_lock_track_detached_original(
+                lock, fallback_original_leaf, &detached_original, true);
+            errno = EIO;
+            set_system_error(
+                ERR_GIT_CONFIG_FAILED,
+                "Injected interruption after detaching the original Git rollback generation");
+            return -1;
+        }
+        /* Retain the detached original under the checked backup so a reverse
+         * retirement or outer abort can atomically restore it; final commit
+         * reclaims it as an owned stage name. */
+        if (git_scope_lock_track_detached_original(
+                lock, fallback_original_leaf, &detached_original,
+                false) != 0) {
+            set_error(
+                ERR_GIT_CONFIG_FAILED,
+                "Git retirement fallback lost its exact original rollback witness");
+            return -1;
+        }
+    } else {
+        git_noreplace_move_result_t moved = git_rename_noreplace_at(
+            lock->dir_fd, lock->stage_leaf, lock->leaf);
+
         if (moved != GIT_NOREPLACE_MOVE_OK) {
             if (moved == GIT_NOREPLACE_MOVE_UNSUPPORTED) {
                 errno = ENOTSUP;
@@ -11779,7 +11963,13 @@ static int git_retirement_transaction_prepare_internal(
             clear_error();
             continue;
         }
-        if (!transaction->recovery_proof_only) {
+        /* AR-15 M4: detect an absence candidate in recovery too. AR-14 H3/H4
+         * gave the forward transaction this arm; restart recovery
+         * (recovery_proof_only) must compose with it so an installed-but-
+         * uncertain remove whose recorded destination is now absent can settle
+         * rather than permanently wedging the retirement guard. Grouping and the
+         * under-lock absence reproof below still gate any settlement authority. */
+        {
             namespace_error = *get_last_error();
             namespace_errno = errno ? errno : ESTALE;
             errno = 0;
@@ -11830,8 +12020,10 @@ static int git_retirement_transaction_prepare_internal(
             }
         }
         if (representative == SIZE_MAX) {
-            if (transaction->recovery_proof_only ||
-                absent_representative == SIZE_MAX) {
+            /* AR-15 M4: recovery may also form a zero-mutation absent group.
+             * The under-lock absence proof (prepare_absent_group_atomic) and
+             * the recovery reprove arm re-establish and re-verify ENOENT. */
+            if (absent_representative == SIZE_MAX) {
                 continue;
             }
             representative = absent_representative;
@@ -12247,8 +12439,21 @@ static int git_scope_lock_reverse_retirement(git_scope_lock_t *lock) {
                               lock->dir_fd, lock->stage_leaf,
                               lock->leaf);
 #else
-        exchanged = git_exchange_names_at(
-            lock->dir_fd, lock->stage_leaf, lock->leaf);
+        {
+            /* Honor the fallback-forcing hook here too so the portable
+             * restoration path is exercisable on a filesystem that does
+             * support a native exchange. */
+            bool force_fallback =
+                g_retirement_test_hook &&
+                g_retirement_test_hook(
+                    GIT_RETIREMENT_TEST_FORCE_EXCHANGE_FALLBACK,
+                    lock->path, NULL, NULL);
+
+            exchanged = force_fallback
+                            ? GIT_EXCHANGE_UNSUPPORTED
+                            : git_exchange_names_at(
+                                  lock->dir_fd, lock->stage_leaf, lock->leaf);
+        }
 #endif
         if (exchanged == GIT_EXCHANGE_OK) {
             lock->stage_witness_kind = GIT_STAGE_WITNESS_PUBLISHED;
@@ -12341,11 +12546,29 @@ static int git_scope_lock_reverse_retirement(git_scope_lock_t *lock) {
             lock->stage_created = false;
             lock->detached_original_recovery_required = false;
 #else
-            errno = ENOTSUP;
-            set_system_error(
-                ERR_GIT_CONFIG_FAILED,
-                "Cannot restore the exact original Git retirement generation without an atomic exchange");
-            return -1;
+            /* No native exchange: the tracked stage is the detached original
+             * backup. renameat(2) atomically restores it over the published
+             * destination in one step (no published-absent window). */
+            if (g_retirement_test_hook &&
+                g_retirement_test_hook(
+                    GIT_RETIREMENT_TEST_AFTER_REVERSE_PUBLISHED_UNLINK,
+                    lock->path, lock->stage_leaf, NULL)) {
+                errno = EIO;
+                set_system_error(
+                    ERR_GIT_CONFIG_FAILED,
+                    "Injected interruption before restoring the original Git retirement generation");
+                return -1;
+            }
+            lock->detached_original_recovery_required = true;
+            if (git_scope_lock_restore_detached_original(
+                    lock, lock->stage_leaf, &refreshed_original) != 0) {
+                set_system_error(
+                    ERR_GIT_CONFIG_FAILED,
+                    "Cannot restore the exact original Git retirement generation");
+                return -1;
+            }
+            lock->stage_created = false;
+            lock->detached_original_recovery_required = false;
 #endif
         } else {
             set_system_error(ERR_GIT_CONFIG_FAILED,
@@ -13948,6 +14171,25 @@ static int git_retirement_recovery_reprove_transaction(
         }
         representative =
             transaction->publication_refs[group->representative];
+        if (group->absent_destination) {
+            /* AR-15 M4: an absent destination has no present config file to
+             * re-witness (git_file_at_matches_witness / git_capture_file_snapshot
+             * below both assume a live file). This reprove runs at the verify
+             * stage, before terminal completion settles the group, so the group
+             * is prepared+lock_ready but not yet settled and absent_witness_ready
+             * is not set. Re-prove its ENOENT with the non-settled revalidator,
+             * mirroring the forward terminal-completion pre-settle proof at
+             * git_retirement_transaction_finish_terminal_commit. */
+            if (git_retirement_revalidate_absent_group(
+                    representative, group, false) != 0) {
+                errno = errno ? errno : ESTALE;
+                set_error(
+                    ERR_GIT_CONFIG_FAILED,
+                    "Retirement recovery could not re-prove its absent Git destination");
+                group_valid = false;
+            }
+            goto group_done;
+        }
         if (!git_file_at_matches_witness(
                 group->lock.dir_fd, group->lock.leaf,
                 group->lock.original_fd, &group->lock.original_stat,

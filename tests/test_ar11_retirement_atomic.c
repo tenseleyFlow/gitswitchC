@@ -3033,20 +3033,14 @@ TEST(forced_unsupported_exchange_fallback_preserves_ordered_survivors) {
     CHECK_EQ_INT(stat(fixture.config_path, &before), 0);
     CHECK_EQ_INT(at_read_bytes(fixture.config_path, &original), 0);
     at_install_hook(&fixture, AT_HOOK_FORCE_FALLBACK, NULL);
-#if defined(__FreeBSD__)
+    /* Both the FreeBSD funlinkat/linkat fallback and the portable renameat(2)
+     * fallback (AR-15 M5) publish the retired image over the existing
+     * destination when no native exchange is available. */
     CHECK_EQ_INT(at_retire(&fixture, &cleared), 0);
-#else
-    CHECK_EQ_INT(at_retire(&fixture, &cleared), -1);
-#endif
     CHECK(at_hook_observed);
     at_clear_hook();
-#if defined(__FreeBSD__)
     CHECK_EQ_INT((long)cleared, (long)AT_KEY_COUNT);
     at_check_foreign_survivors(&fixture);
-#else
-    CHECK_EQ_INT((long)cleared, 0);
-    CHECK(at_file_equals_bytes(fixture.config_path, &original));
-#endif
     CHECK_EQ_INT(stat(fixture.config_path, &after), 0);
     CHECK_EQ_INT(before.st_mode & 07777, after.st_mode & 07777);
     CHECK(access(fixture.lock_path, F_OK) != 0 && errno == ENOENT);
@@ -3147,6 +3141,84 @@ TEST(freebsd_reverse_absent_canonical_retries_from_exact_original) {
 #else
     TS_SKIP("persistent-fs",
             "FreeBSD descriptor-conditioned fallback only");
+#endif
+}
+
+/* AR-15 M5: on a filesystem without a native name exchange (NFS/FUSE), the
+ * outer rollback restores the exact original over the published retired image
+ * via the portable atomic renameat(2), instead of failing closed with ENOTSUP. */
+TEST(portable_fallback_reverse_restores_exact_original) {
+#if defined(__FreeBSD__)
+    TS_SKIP("persistent-fs",
+            "portable renameat fallback path is exercised off FreeBSD");
+#else
+    at_fixture_t fixture;
+    at_bytes_t original = {0};
+    const account_t *accounts[1];
+    const publication_record_t *publications[1];
+    git_retirement_transaction_t *transaction = NULL;
+    size_t cleared = 99U;
+
+    CHECK_EQ_INT(at_fixture_init(&fixture, PUBLICATION_SCOPE_GLOBAL,
+                                 true, 0640), 0);
+    CHECK_EQ_INT(at_read_bytes(fixture.config_path, &original), 0);
+    accounts[0] = &fixture.account;
+    publications[0] = &fixture.publication;
+    at_install_hook(&fixture, AT_HOOK_FORCE_FALLBACK, NULL);
+    CHECK_EQ_INT(git_retirement_transaction_prepare(
+                     accounts, publications, 1U, &transaction), 0);
+    CHECK_EQ_INT(git_retirement_transaction_publish(
+                     transaction, &cleared), 0);
+    CHECK_EQ_INT((long)cleared, (long)AT_KEY_COUNT);
+    /* The retired image is published over the existing destination through the
+     * portable fallback; the original is no longer canonical. */
+    CHECK(!at_file_equals_bytes(fixture.config_path, &original));
+    /* Outer rollback restores the exact original through the same fallback. */
+    CHECK_EQ_INT(git_retirement_transaction_abort(transaction), 0);
+    CHECK(at_file_equals_bytes(fixture.config_path, &original));
+    CHECK_EQ_INT(git_retirement_transaction_commit(&transaction), 0);
+    CHECK(transaction == NULL);
+    CHECK_EQ_INT((long)at_count_stage_artifacts(fixture.root), 0);
+    CHECK_EQ_INT((long)at_count_recovery_artifacts(fixture.root), 0);
+    errno = 0;
+    CHECK(access(fixture.lock_path, F_OK) != 0 && errno == ENOENT);
+    at_clear_hook();
+    at_bytes_clear(&original);
+#endif
+}
+
+/* AR-15 M5: the portable fallback fails closed if the atomic replace cannot be
+ * performed — the original stays canonical and no owned artifact leaks. */
+TEST(portable_fallback_link_failure_preserves_original) {
+#if defined(__FreeBSD__)
+    TS_SKIP("persistent-fs",
+            "portable renameat fallback path is exercised off FreeBSD");
+#else
+    at_fixture_t fixture;
+    at_bytes_t original = {0};
+    struct stat before;
+    struct stat after;
+    size_t cleared = 99U;
+
+    CHECK_EQ_INT(at_fixture_init(&fixture, PUBLICATION_SCOPE_GLOBAL,
+                                 true, 0640), 0);
+    CHECK_EQ_INT(stat(fixture.config_path, &before), 0);
+    CHECK_EQ_INT(at_read_bytes(fixture.config_path, &original), 0);
+    at_install_hook(&fixture, AT_HOOK_FAIL_FALLBACK_LINK, NULL);
+    CHECK_EQ_INT(at_retire(&fixture, &cleared), -1);
+    CHECK(at_hook_observed);
+    CHECK_EQ_INT((long)at_hook_attempts, 1);
+    at_clear_hook();
+    CHECK_EQ_INT((long)cleared, 0);
+    /* The atomic replace never ran: the exact original remains canonical. */
+    CHECK(at_file_equals_bytes(fixture.config_path, &original));
+    CHECK_EQ_INT(stat(fixture.config_path, &after), 0);
+    CHECK_EQ_INT(before.st_mode & 07777, after.st_mode & 07777);
+    errno = 0;
+    CHECK(access(fixture.lock_path, F_OK) != 0 && errno == ENOENT);
+    CHECK_EQ_INT((long)at_count_stage_artifacts(fixture.root), 0);
+    CHECK_EQ_INT((long)at_count_recovery_artifacts(fixture.root), 0);
+    at_bytes_clear(&original);
 #endif
 }
 
@@ -5180,6 +5252,8 @@ TEST_MAIN_BEGIN()
     RUN_TEST(freebsd_fallback_link_failure_restores_before_image);
     RUN_TEST(freebsd_fallback_postlink_failure_retains_recovery_authority);
     RUN_TEST(freebsd_reverse_absent_canonical_retries_from_exact_original);
+    RUN_TEST(portable_fallback_reverse_restores_exact_original);
+    RUN_TEST(portable_fallback_link_failure_preserves_original);
     RUN_TEST(unsupported_exchange_fallback_reproves_lock_and_canonical);
     RUN_TEST(transient_owned_cleanup_failure_retries_with_witness);
     RUN_TEST(two_owned_cleanup_failures_recover_on_next_retirement);
