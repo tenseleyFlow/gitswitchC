@@ -50,6 +50,15 @@ typedef struct {
     pid_t socket_peer_pid;
     uid_t socket_peer_uid;
     char executable_path[MAX_PATH_LEN];
+    /* In-process marker only: OpenSSH's agent makes itself nondumpable, so
+     * Linux denies /proc/PID/exe even to the owning user and no
+     * executable-object witness can be captured for a live agent. Records
+     * synthesized from a running process then rest on the kernel-authenticated
+     * socket peer, the argv match, and the stable process generation — the same
+     * authoritative tuple the BSD branches use. Never parsed from or persisted
+     * to a durable sidecar: a stored record always carries a real launch
+     * witness, so this must stay false on every deserialization path. */
+    bool executable_object_unknown;
 } ssh_process_image_t;
 
 typedef struct {

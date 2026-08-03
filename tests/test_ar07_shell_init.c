@@ -347,6 +347,7 @@ static int fixture_setup(shell_fixture_t *fixture) {
         "case ${1-} in\n"
         "    --resume-hint-probe) exec \"$GS_REAL_BIN\" \"$@\" ;;\n"
         "    --resume-check) exit \"${GS_CHECK_RC:-1}\" ;;\n"
+        "    --startup-resume) printf 'resume\\n' >>\"$GS_RESUME_LOG\"; exit 0 ;;\n"
         "    resume) printf 'resume\\n' >>\"$GS_RESUME_LOG\"; exit 0 ;;\n"
         "    fail) exit 23 ;;\n"
         "    switch)\n"
@@ -717,6 +718,8 @@ TEST(generated_snippets_use_only_the_bounded_resume_hint_probe) {
     for (size_t i = 0; i < sizeof(g_shells) / sizeof(g_shells[0]); i++) {
         read_text(g_fixture.snippets[i], contents, sizeof(contents));
         CHECK(strstr(contents, "command gitswitch --resume-hint-probe") != NULL);
+        CHECK(strstr(contents, "command gitswitch --startup-resume") != NULL);
+        CHECK(strstr(contents, "command gitswitch resume >/dev/null") == NULL);
         CHECK(strstr(contents, ".resume-hint") == NULL);
         CHECK(strstr(contents, "read -r __gitswitch_needs") == NULL);
         CHECK(strstr(contents, "read -l __gitswitch_needs") == NULL);

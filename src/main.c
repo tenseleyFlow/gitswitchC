@@ -31,6 +31,7 @@
 #define OPT_NAMES 0x101
 #define OPT_RESUME_CHECK 0x102
 #define OPT_RESUME_HINT_PROBE 0x103
+#define OPT_STARTUP_RESUME 0x104
 
 static const char *const g_supported_shells[] = {
     "bash", "zsh", "fish", "sh", "dash", "ksh"
@@ -991,6 +992,7 @@ int main(int argc, char *argv[]) {
     config_switch_guard_recovery_t *switch_recovery = NULL;
     const char *pending_signal_notice = NULL;
     int config_lock_fd = -1;
+    int startup_resume_lock_fd = -1;
     int opt;
 
     /* AR-12 L14: when invoked with a standard descriptor closed
@@ -1025,6 +1027,7 @@ int main(int argc, char *argv[]) {
     bool legacy_agent_info = false;
     bool resume_check = false;
     bool resume_hint_probe = false;
+    bool startup_resume = false;
     const char *command = NULL;
     const char *arg1 = NULL;
     int operand_count = 0;
@@ -1054,6 +1057,10 @@ int main(int argc, char *argv[]) {
         /* Internal, read-only parser for the login-shell resume decision. It
          * validates the artifact without letting shell code open it directly. */
         {"resume-hint-probe", no_argument, 0, OPT_RESUME_HINT_PROBE},
+        /* Internal shell-startup form of `resume`. Concurrent startup calls
+         * coalesce behind a typed lock; unclassified config-lock contention
+         * remains a silent nonzero result. Explicit `resume` stays diagnostic. */
+        {"startup-resume", no_argument, 0, OPT_STARTUP_RESUME},
         {0, 0, 0, 0}
     };
     
@@ -1066,7 +1073,7 @@ int main(int argc, char *argv[]) {
      * logging. */
     log_level_t initial_log_level = LOG_LEVEL_WARNING;
 #ifdef DEBUG
-    bool quiet_resume_check = false;
+    bool quiet_startup_mode = false;
     bool explicit_logging = false;
 
     initial_log_level = LOG_LEVEL_INFO;
@@ -1077,15 +1084,16 @@ int main(int argc, char *argv[]) {
 
         if (strcmp(argument, "--") == 0) break;
         long_value = preinit_long_option_value(argument, long_options);
-        if (long_value == OPT_RESUME_CHECK) {
-            quiet_resume_check = true;
+        if (long_value == OPT_RESUME_CHECK ||
+            long_value == OPT_STARTUP_RESUME) {
+            quiet_startup_mode = true;
         }
         if (long_value == 'V' || long_value == 'd' ||
             preinit_short_logging_option(argument)) {
             explicit_logging = true;
         }
     }
-    if (quiet_resume_check && !explicit_logging) {
+    if (quiet_startup_mode && !explicit_logging) {
         initial_log_level = LOG_LEVEL_WARNING;
     }
 #endif
@@ -1164,6 +1172,9 @@ int main(int argc, char *argv[]) {
             case OPT_RESUME_HINT_PROBE:
                 resume_hint_probe = true;
                 break;
+            case OPT_STARTUP_RESUME:
+                startup_resume = true;
+                break;
             default:
                 (void)print_usage(argv[0]);
                 free(option_argv);
@@ -1189,9 +1200,12 @@ int main(int argc, char *argv[]) {
     if (!show_help && !show_version) {
         int internal_modes = (legacy_agent_info ? 1 : 0) +
                              (resume_check ? 1 : 0) +
-                             (resume_hint_probe ? 1 : 0);
+                             (resume_hint_probe ? 1 : 0) +
+                             (startup_resume ? 1 : 0);
         const char *internal_name = legacy_agent_info ? "--ssh-agent-info" :
-            (resume_check ? "--resume-check" : "--resume-hint-probe");
+            (resume_check ? "--resume-check" :
+             (resume_hint_probe ? "--resume-hint-probe" :
+                                  "--startup-resume"));
 
         if (internal_modes > 0 && command) {
             fprintf(stderr,
@@ -1202,7 +1216,7 @@ int main(int argc, char *argv[]) {
         }
         if (internal_modes > 1) {
             fprintf(stderr,
-                    "gitswitch: internal shell probes are mutually exclusive\n");
+                    "gitswitch: internal shell modes are mutually exclusive\n");
             error_cleanup();
             return EXIT_FAILURE;
         }
@@ -1233,11 +1247,10 @@ int main(int argc, char *argv[]) {
         return rc == 0 ? EXIT_SUCCESS : EXIT_FAILURE;
     }
 
-    /* The shell readiness probe is plumbing: status alone tells the generated
-     * integration whether to invoke `resume`. Keep expected fail-closed
+    /* Shell-startup plumbing is status-oriented. Keep normal fail-closed
      * observations silent even in DEBUG builds, while preserving telemetry
      * when the caller explicitly requested -V/-d. */
-    if (resume_check && !verbose_requested) {
+    if ((resume_check || startup_resume) && !verbose_requested) {
         set_log_level(LOG_LEVEL_WARNING);
     }
 
@@ -1282,6 +1295,13 @@ int main(int argc, char *argv[]) {
         return rc;
     }
 
+    /* From this point onward startup resume is the ordinary resume operation.
+     * Keep its private flag only for typed coalescing and contention output;
+     * every guard, mutation classification, and restore path remains shared. */
+    if (startup_resume) {
+        command = "resume";
+    }
+
     ctx = calloc(1, sizeof(*ctx));
     if (!ctx) {
         display_error("Could not allocate application context", "%s",
@@ -1293,6 +1313,32 @@ int main(int argc, char *argv[]) {
     g_context_allocations++;
     g_context_allocation_total++;
 #endif
+
+    /* Concurrent terminal fan-out is a known, typed startup transaction. The
+     * first shell performs the restore while later startup calls briefly wait,
+     * then re-run the idempotent resume check before refreshing their own
+     * process environment. The bound avoids hanging every new prompt behind a
+     * PIN/passphrase wait. Ordinary commands never take this lock and retain
+     * the fail-fast config-lock contract below. */
+    if (startup_resume) {
+        startup_resume_lock_fd = config_startup_resume_lock();
+        if (startup_resume_lock_fd < 0) {
+            int lock_errno = errno;
+            bool contended = lock_errno == EWOULDBLOCK;
+#if EAGAIN != EWOULDBLOCK
+            contended = contended || lock_errno == EAGAIN;
+#endif
+            if (contended && !verbose_requested) {
+                exit_code = EXIT_FAILURE;
+                goto cleanup;
+            }
+            display_error("Could not coordinate shell startup resume",
+                          "the startup lock is unavailable; check permissions "
+                          "and try again");
+            exit_code = EXIT_FAILURE;
+            goto cleanup;
+        }
+    }
 
     activation_command = command_activates_account(command, resume_check);
     unrelated_retirement_mutation =
@@ -1370,11 +1416,15 @@ int main(int argc, char *argv[]) {
                 contended = contended || lock_errno == EAGAIN;
 #endif
 
-                /* Contention carries no typed proof of which command owns the
-                 * lock or which account/runtime state it will publish. Resume
-                 * therefore cannot safely treat an unknown holder as having
-                 * completed its work; report the retryable failure immediately
-                 * like every other mutation. */
+                /* The config lock carries no typed proof of which command owns
+                 * it or what state it will publish. Never claim that an unknown
+                 * holder completed this resume. Generated startup treats the
+                 * truthful nonzero as status-only; explicit resume and an
+                 * explicitly verbose startup call retain the diagnostic. */
+                if (contended && startup_resume && !verbose_requested) {
+                    exit_code = EXIT_FAILURE;
+                    goto cleanup;
+                }
                 if (contended) {
                     display_error("Another gitswitch holds the config lock",
                                   "try again after that command finishes");
@@ -2143,6 +2193,9 @@ cleanup:
      * at exit). */
     if (config_lock_fd >= 0) {
         config_write_unlock(config_lock_fd);
+    }
+    if (startup_resume_lock_fd >= 0) {
+        config_startup_resume_unlock(startup_resume_lock_fd);
     }
     if (switch_recovery) {
         secure_zero_memory(switch_recovery, sizeof(*switch_recovery));
@@ -3054,7 +3107,7 @@ static int handle_init_command(const char *shell) {
          * followed by the read-only exact-runtime check, which rejects the
          * wrong key or any extra identity. Interactive-gated so pinentry has a
          * user. The "restoring your
-         * account" notice is printed by `resume` itself (on stderr, past the
+         * account" notice is printed by startup resume itself (on stderr, past the
          * stdout suppression) only when it actually has an account to restore —
          * echoing it here would nag on every shell when there is nothing saved,
          * since a no-op resume never creates the socket the probe looks for. */
@@ -3066,17 +3119,17 @@ static int handle_init_command(const char *shell) {
         printf("            case none\n");
         printf("            case ssh\n");
         printf("                if __gitswitch_ssh_needs_resume\n");
-        printf("                    command gitswitch resume >/dev/null\n");
+        printf("                    command gitswitch --startup-resume >/dev/null\n");
         printf("                end\n");
         if (have_gpg_home) {
             printf("            case gpg\n");
             printf("                if not test -d '%s'; or not command gitswitch --resume-check >/dev/null 2>&1\n",
                    gpg_home);
-            printf("                    command gitswitch resume >/dev/null\n");
+            printf("                    command gitswitch --startup-resume >/dev/null\n");
             printf("                end\n");
         } else {
             printf("            case gpg\n");
-            printf("                command gitswitch resume >/dev/null\n");
+            printf("                command gitswitch --startup-resume >/dev/null\n");
         }
         printf("            case 'ssh gpg'\n");
         printf("                set -l __gitswitch_resume 0\n");
@@ -3091,7 +3144,7 @@ static int handle_init_command(const char *shell) {
             printf("                set __gitswitch_resume 1\n");
         }
         printf("                if test $__gitswitch_resume -eq 1\n");
-        printf("                    command gitswitch resume >/dev/null\n");
+        printf("                    command gitswitch --startup-resume >/dev/null\n");
         printf("                end\n");
         printf("                set -e __gitswitch_resume\n");
         printf("        end\n");
@@ -3128,20 +3181,20 @@ static int handle_init_command(const char *shell) {
          * account's exact single fingerprint by --resume-check. A stale socket
          * or a reachable wrong/extra-key agent therefore cannot suppress the
          * restore. Interactive-gated so pinentry has a user. The notice comes
-         * from `resume` itself (stderr) only when there is an account to
+         * from startup resume itself (stderr) only when there is an account to
          * restore — see the fish branch above for why. */
         printf("case $- in *i*)\n");
         printf("    if __gitswitch_needs=$(command gitswitch --resume-hint-probe 2>/dev/null); then\n");
         printf("        case \"$__gitswitch_needs\" in\n");
         printf("        none) : ;;\n");
         printf("        ssh)\n");
-        printf("            __gitswitch_ssh_needs_resume && command gitswitch resume >/dev/null ;;\n");
+        printf("            __gitswitch_ssh_needs_resume && command gitswitch --startup-resume >/dev/null ;;\n");
         if (have_gpg_home) {
             printf("        gpg)\n");
-            printf("            [ -d '%s' ] && command gitswitch --resume-check >/dev/null 2>&1 || command gitswitch resume >/dev/null ;;\n",
+            printf("            [ -d '%s' ] && command gitswitch --resume-check >/dev/null 2>&1 || command gitswitch --startup-resume >/dev/null ;;\n",
                    gpg_home);
         } else {
-            printf("        gpg) command gitswitch resume >/dev/null ;;\n");
+            printf("        gpg) command gitswitch --startup-resume >/dev/null ;;\n");
         }
         printf("        'ssh gpg')\n");
         printf("            __gitswitch_resume=0\n");
@@ -3151,7 +3204,7 @@ static int handle_init_command(const char *shell) {
         } else {
             printf("            __gitswitch_resume=1\n");
         }
-        printf("            [ \"$__gitswitch_resume\" -eq 0 ] || command gitswitch resume >/dev/null\n");
+        printf("            [ \"$__gitswitch_resume\" -eq 0 ] || command gitswitch --startup-resume >/dev/null\n");
         printf("            unset __gitswitch_resume ;;\n");
         printf("        esac\n");
         printf("    fi\n");

@@ -1058,6 +1058,21 @@ static int generation_matches_record(
     return 0;
 }
 
+static int portable_generation_matches_record(
+    pid_t pid, ssh_process_generation_t *generation) {
+    if (generation_matches_record(pid, generation) != 0) return -1;
+    generation->kind = SSH_PROCESS_GENERATION_DARWIN;
+    return 0;
+}
+
+static int process_image_permission_denied(
+    pid_t pid, ssh_process_image_t *image) {
+    (void)pid;
+    (void)image;
+    errno = EACCES;
+    return -1;
+}
+
 static ssh_process_generation_t g_observed_generation;
 static int g_generation_calls;
 static int g_term_calls;
@@ -2727,26 +2742,35 @@ TEST(generation_inspection_error_never_terminates_or_consumes_tuple) {
 /* AR-15 H2: after an in-place upgrade from a release that wrote bare-PID
  * sidecars, a legacy record names a still-running managed agent. The reachable
  * socket used to make retirement impossible, permanently locking switch and
- * reset. The fix reconstructs a record from the kernel socket peer and runs the
- * standard reap; when it proves OWNED and terminates the agent, the socket goes
- * dead and reset converges with no manual kill. reap_gone models that proven
- * termination by stopping the live agent server exactly when the migration
- * reaps. With the migration reverted, the still-live socket keeps reset at -1,
- * so this test fails closed on the old behavior. */
+ * reset. The fix treats the recorded decimal PID as a candidate, authenticates
+ * the reachable endpoint as same-user, captures the candidate generation, and
+ * runs the standard reap. Its exact argv, generation, socket-peer, and Linux
+ * pidfd checks establish ownership; executable-object identity is additional
+ * evidence when /proc/PID/exe is readable, not a requirement for nondumpable
+ * ssh-agent. When the reap terminates the agent, the socket goes dead and reset
+ * converges with no manual kill. reap_gone models that proven termination by
+ * stopping the live agent server exactly when the migration reaps. With the
+ * migration reverted, the still-live socket keeps reset at -1, so this test
+ * fails closed on the old behavior. */
 TEST(legacy_live_owned_sidecar_is_migrated_and_reset_converges) {
-    static const char legacy[] = "1073741824\n";
+    char legacy[64];
     ssh_fixture_t fixture;
     test_agent_server_t server = {.pid = -1, .trace_fd = -1};
     ssh_reap_fn previous;
 
     CHECK_EQ_INT(make_fixture(&fixture, "gsar15legacymig"), 0);
     if (fixture.dir_fd < 0) return;
-    CHECK_EQ_INT(write_sidecar_bytes(&fixture, legacy,
-                                     sizeof(legacy) - 1U, 0600), 0);
     CHECK_EQ_INT(start_test_agent_server(
                      fixture.socket, TEST_AGENT_IDENTITIES_ONE, &server), 0);
     g_runner_server_pid = server.pid;
     g_runner_server_trace_fd = server.trace_fd;
+    /* AR-16: the record must name the live agent, as a real pre-upgrade
+     * sidecar does. This previously used an invented pid, which only passed
+     * because the migration derived its target from the socket peer instead —
+     * the very defect that made the migration useless against a real agent. */
+    CHECK(snprintf(legacy, sizeof(legacy), "%ld\n", (long)server.pid) > 0);
+    CHECK_EQ_INT(write_sidecar_bytes(&fixture, legacy,
+                                     strlen(legacy), 0600), 0);
 
     previous = ssh_manager_set_reap_fn(reap_gone);
     CHECK_EQ_INT(ssh_manager_reset("work"), 0);
@@ -2763,25 +2787,69 @@ TEST(legacy_live_owned_sidecar_is_migrated_and_reset_converges) {
  * be our agent (the reap returns a non-cleanup outcome) must NOT be signaled,
  * and the reachable socket must keep reset fail-closed. */
 TEST(legacy_live_unprovable_sidecar_stays_fail_closed) {
-    static const char legacy[] = "1073741824\n";
+    char legacy[64];
     ssh_fixture_t fixture;
     test_agent_server_t server = {.pid = -1, .trace_fd = -1};
     ssh_reap_fn previous;
 
     CHECK_EQ_INT(make_fixture(&fixture, "gsar15legacyfc"), 0);
     if (fixture.dir_fd < 0) return;
-    CHECK_EQ_INT(write_sidecar_bytes(&fixture, legacy,
-                                     sizeof(legacy) - 1U, 0600), 0);
     CHECK_EQ_INT(start_test_agent_server(
                      fixture.socket, TEST_AGENT_IDENTITIES_ONE, &server), 0);
     g_runner_server_pid = server.pid;
     g_runner_server_trace_fd = server.trace_fd;
+    /* AR-16: name the live agent so the migration genuinely reaches its reap
+     * and the refusal is the reap's verdict, not an unresolvable pid. */
+    CHECK(snprintf(legacy, sizeof(legacy), "%ld\n", (long)server.pid) > 0);
+    CHECK_EQ_INT(write_sidecar_bytes(&fixture, legacy,
+                                     strlen(legacy), 0600), 0);
 
     previous = ssh_manager_set_reap_fn(reap_replaced);
     CHECK_EQ_INT(ssh_manager_reset("work"), -1);
     ssh_manager_set_reap_fn(previous);
     stop_runner_server();
 
+    CHECK(entry_exists(fixture.sidecar));
+    CHECK(entry_exists(fixture.socket));
+    cleanup_retained_fixture(&fixture);
+    close(fixture.dir_fd);
+}
+
+/* The EACCES/EPERM executable-object downgrade exists only for Linux's
+ * nondumpable ssh-agent /proc/PID/exe behavior. A portable process generation
+ * models the macOS/FreeBSD policy while retaining a platform-neutral injected
+ * image denial: it must never synthesize a valid image or reach the reap, even
+ * when this regression itself runs on Linux. */
+TEST(legacy_live_image_denial_without_linux_provenance_stays_fail_closed) {
+    char legacy[64];
+    ssh_fixture_t fixture;
+    test_agent_server_t server = {.pid = -1, .trace_fd = -1};
+    ssh_reap_test_ops_t ops = {
+        .generation = portable_generation_matches_record,
+        .image = process_image_permission_denied
+    };
+    ssh_reap_test_ops_t previous_ops;
+    ssh_reap_fn previous_reap;
+
+    CHECK_EQ_INT(make_fixture(&fixture, "gsar16legacyportable"), 0);
+    if (fixture.dir_fd < 0) return;
+    CHECK_EQ_INT(start_test_agent_server(
+                     fixture.socket, TEST_AGENT_IDENTITIES_ONE, &server), 0);
+    g_runner_server_pid = server.pid;
+    g_runner_server_trace_fd = server.trace_fd;
+    CHECK(snprintf(legacy, sizeof(legacy), "%ld\n", (long)server.pid) > 0);
+    CHECK_EQ_INT(write_sidecar_bytes(&fixture, legacy,
+                                     strlen(legacy), 0600), 0);
+
+    g_malformed_reap_calls = 0;
+    previous_ops = ssh_manager_set_reap_test_ops(&ops);
+    previous_reap = ssh_manager_set_reap_fn(malformed_reap_must_not_run);
+    CHECK_EQ_INT(ssh_manager_reset("work"), -1);
+    ssh_manager_set_reap_fn(previous_reap);
+    ssh_manager_set_reap_test_ops(&previous_ops);
+
+    CHECK_EQ_INT(g_malformed_reap_calls, 0);
+    CHECK_EQ_INT(kill(server.pid, 0), 0);
     CHECK(entry_exists(fixture.sidecar));
     CHECK(entry_exists(fixture.socket));
     cleanup_retained_fixture(&fixture);
@@ -3366,6 +3434,98 @@ static int wait_process_absent(pid_t pid) {
     }
     errno = ETIMEDOUT;
     return -1;
+}
+#endif
+
+/* AR-16: the AR-15 H2 migration was proven only against a stubbed reap
+ * (ssh_manager_set_reap_fn(reap_gone)), so nothing exercised the production
+ * chain reap_ssh_agent -> pid_is_our_ssh_agent -> inspect_pid_ssh_agent_image.
+ * On Linux that chain always refused: OpenSSH makes its agent nondumpable, so
+ * /proc/PID/exe is EACCES even for the owning user, the image capture failed,
+ * and the migration silently gave up — leaving every upgraded Linux host
+ * permanently wedged behind its live pre-upgrade agent. This drives a REAL
+ * ssh-agent on the managed socket with a legacy bare-PID sidecar through the
+ * REAL reap, which is the only arrangement that can observe that defect. */
+#ifdef __linux__
+TEST(legacy_live_socket_converges_through_the_real_reap) {
+    ssh_fixture_t fixture;
+    struct stat runtime_identity;
+    char marker[80];
+    char socket_arg[160];
+    char output[2048];
+    char legacy_pid[64];
+    const char *argv[6];
+    run_opts_t opts;
+    run_result_t result;
+    char *pid_text;
+    pid_t pid = -1;
+    int marker_created = 0;
+
+    if (!command_exists("ssh-agent")) {
+        TS_SKIP("openssh", "ssh-agent unavailable in trusted PATH");
+    }
+    CHECK_EQ_INT(make_fixture(&fixture, "gsar16legacyreal"), 0);
+    if (fixture.dir_fd < 0) return;
+    CHECK_EQ_INT(fstat(fixture.dir_fd, &runtime_identity), 0);
+    CHECK((size_t)snprintf(marker, sizeof(marker), ".gsp-%jx-%jx",
+                           (uintmax_t)runtime_identity.st_dev,
+                           (uintmax_t)runtime_identity.st_ino) <
+          sizeof(marker));
+    CHECK((size_t)snprintf(socket_arg, sizeof(socket_arg),
+                           "%s/../ssh-agent.work.sock", marker) <
+          sizeof(socket_arg));
+    if (mkdirat(fixture.dir_fd, marker, 0700) == 0) marker_created = 1;
+    CHECK(marker_created);
+    if (!marker_created) {
+        close(fixture.dir_fd);
+        return;
+    }
+
+    argv[0] = "ssh-agent";
+    argv[1] = "-s";
+    argv[2] = "-a";
+    argv[3] = socket_arg;
+    argv[4] = NULL;
+    argv[5] = NULL;
+    memset(&opts, 0, sizeof(opts));
+    memset(&result, 0, sizeof(result));
+    opts.out = output;
+    opts.out_size = sizeof(output);
+    opts.stderr_to_devnull = true;
+    opts.cwd_fd = fixture.dir_fd;
+    opts.use_cwd_fd = true;
+    CHECK_EQ_INT(run_argv(argv, &opts, &result), 0);
+    CHECK_EQ_INT(unlinkat(fixture.dir_fd, marker, AT_REMOVEDIR), 0);
+    marker_created = 0;
+    pid_text = strstr(output, "SSH_AGENT_PID=");
+    CHECK(pid_text != NULL);
+    if (pid_text) {
+        pid = (pid_t)strtol(pid_text + strlen("SSH_AGENT_PID="), NULL, 10);
+    }
+    CHECK(pid > 1);
+    /* The managed socket must be live: a reachable socket is what made the
+     * legacy record unretirable before the migration existed. */
+    CHECK(path_exists(fixture.socket));
+
+    if (pid > 1) {
+        CHECK(snprintf(legacy_pid, sizeof(legacy_pid), "%ld\n",
+                       (long)pid) > 0);
+        CHECK_EQ_INT(write_sidecar_bytes(
+                         &fixture, legacy_pid, strlen(legacy_pid), 0600), 0);
+        CHECK_EQ_INT(setenv("XDG_RUNTIME_DIR", fixture.xdg, 1), 0);
+
+        /* No reap or identity stubs: this is the production chain. */
+        CHECK_EQ_INT(ssh_manager_reset("work"), 0);
+#ifdef __linux__
+        CHECK_EQ_INT(wait_process_absent(pid), 0);
+#endif
+        CHECK(!path_exists(fixture.sidecar));
+        CHECK(!path_exists(fixture.socket));
+    }
+
+    if (marker_created) (void)unlinkat(fixture.dir_fd, marker, AT_REMOVEDIR);
+    stop_process(pid);
+    close(fixture.dir_fd);
 }
 #endif
 
@@ -4381,6 +4541,7 @@ TEST_MAIN_BEGIN()
     RUN_TEST(generation_inspection_error_never_terminates_or_consumes_tuple);
     RUN_TEST(legacy_live_owned_sidecar_is_migrated_and_reset_converges);
     RUN_TEST(legacy_live_unprovable_sidecar_stays_fail_closed);
+    RUN_TEST(legacy_live_image_denial_without_linux_provenance_stays_fail_closed);
     RUN_TEST(legacy_dead_sidecar_is_cleaned_without_reap);
     RUN_TEST(stopped_session_preserves_same_pid_replacement_generation);
     RUN_TEST(gone_record_with_live_replacement_preserves_complete_tuple);
@@ -4397,6 +4558,9 @@ TEST_MAIN_BEGIN()
     RUN_TEST(portable_final_quarantine_substitution_is_not_deleted);
     RUN_TEST(portable_restore_retirement_substitution_is_preserved);
     RUN_TEST(unrelated_live_pid_is_not_signaled);
+#ifdef __linux__
+    RUN_TEST(legacy_live_socket_converges_through_the_real_reap);
+#endif
     RUN_TEST(runtime_root_provenance_prevents_cross_root_reap);
     RUN_TEST(unrecorded_launch_cleanup_keeps_original_captured_generation);
     RUN_TEST(runner_failure_indeterminate_reap_publishes_retry_tuple);
