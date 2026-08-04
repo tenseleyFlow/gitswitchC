@@ -19,6 +19,18 @@ static volatile sig_atomic_t g_post_fork_hook_called;
 static volatile sig_atomic_t g_post_fork_hook_mask_exact;
 static sigset_t g_expected_parent_mask;
 
+/* A checked child setup failure and the parent's group-wide SIGKILL cleanup
+ * race to terminate the reporter.  Both exact wait outcomes preserve the
+ * structured setup error and truthfully describe how the helper ended. */
+static bool setup_failure_wait_status_is_valid(
+    const run_result_t *result, int declared_exit_code) {
+    if (!result) return false;
+    return (result->exit_code == declared_exit_code &&
+            result->term_signal == 0) ||
+           (result->exit_code == -1 &&
+            result->term_signal == SIGKILL);
+}
+
 static bool signal_masks_equal(const sigset_t *left, const sigset_t *right) {
     for (int signal_number = 1; signal_number < NSIG; signal_number++) {
         int left_member = sigismember(left, signal_number);
@@ -484,8 +496,7 @@ static void exercise_malformed_extra_env(const char *entry) {
     error = get_last_error();
 
     CHECK(result.spawned);
-    CHECK_EQ_INT(result.exit_code, 126);
-    CHECK_EQ_INT(result.term_signal, 0);
+    CHECK(setup_failure_wait_status_is_valid(&result, 126));
     CHECK_EQ_INT(returned_errno, EINVAL);
     CHECK_EQ_INT(error->code, ERR_SYSTEM_CALL);
     CHECK_EQ_INT(error->system_errno, EINVAL);

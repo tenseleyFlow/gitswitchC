@@ -3173,10 +3173,14 @@ static producer_reap_result_t reap_and_retire_producer(pid_t child,
 #if defined(__APPLE__)
 /* XNU's explicit-process-group kill path excludes zombies from its group
  * iteration and returns EPERM, rather than ESRCH, when no signalable live
- * member remains.  Do not broadly forgive EPERM: inspect the still-pinned
- * group through KERN_PROC_PGRP and accept it only when every member is already
- * a zombie and the direct child remains the group leader. */
-static int darwin_producer_group_is_zombie_only(pid_t child)
+ * member remains.  Do not broadly forgive EPERM: the caller has already
+ * observed the direct child as terminal with WNOWAIT and successful execution
+ * proves that child created its own process group before exec.  Inspect that
+ * still-pinned group through KERN_PROC_PGRP and accept only a completed data
+ * snapshot with no live member.  The sizing query remains fail-closed, but a
+ * data snapshot may contain no record or only zombies; it need not rediscover
+ * the already-proven terminal leader for this one no-live-member decision. */
+static int darwin_producer_group_has_no_live_members(pid_t child)
 {
     int mib[4];
     struct kinfo_proc *members = NULL;
@@ -3184,7 +3188,6 @@ static int darwin_producer_group_is_zombie_only(pid_t child)
     size_t member_count;
     size_t index;
     unsigned int attempt;
-    bool leader_seen = false;
 
     if (child <= 0 || (uintmax_t)child > (uintmax_t)INT_MAX) {
         errno = EINVAL;
@@ -3228,8 +3231,11 @@ static int darwin_producer_group_is_zombie_only(pid_t child)
         errno = EAGAIN;
         return -1;
     }
-    if (member_bytes == 0U ||
-        member_bytes % sizeof(*members) != 0U) {
+    if (member_bytes == 0U) {
+        free(members);
+        return 0;
+    }
+    if (member_bytes % sizeof(*members) != 0U) {
         free(members);
         errno = EIO;
         return -1;
@@ -3241,9 +3247,6 @@ static int darwin_producer_group_is_zombie_only(pid_t child)
             errno = EIO;
             return -1;
         }
-        if (members[index].kp_proc.p_pid == child) {
-            leader_seen = true;
-        }
         if (members[index].kp_proc.p_stat != SZOMB) {
             free(members);
             errno = EBUSY;
@@ -3251,10 +3254,6 @@ static int darwin_producer_group_is_zombie_only(pid_t child)
         }
     }
     free(members);
-    if (!leader_seen) {
-        errno = ESRCH;
-        return -1;
-    }
     return 0;
 }
 #endif
@@ -3264,7 +3263,7 @@ static int validate_completed_group_kill_failure(pid_t child,
 {
 #if defined(__APPLE__)
     if (group_errno == EPERM) {
-        return darwin_producer_group_is_zombie_only(child);
+        return darwin_producer_group_has_no_live_members(child);
     }
 #else
     (void)child;

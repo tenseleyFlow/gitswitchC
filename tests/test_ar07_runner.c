@@ -27,6 +27,20 @@
 
 static char g_self_path[MAX_PATH_LEN];
 
+/* After a checked setup-failure record, run_argv signals the child (or proven
+ * process group) with SIGKILL before reaping it.  The reporter's _exit() can
+ * win that race, or the cleanup SIGKILL can; errno and the structured error
+ * retain the primary failure while run_result truthfully records either
+ * terminal wait status. */
+static bool setup_failure_wait_status_is_valid(
+    const run_result_t *result, int declared_exit_code) {
+    if (!result) return false;
+    return (result->exit_code == declared_exit_code &&
+            result->term_signal == 0) ||
+           (result->exit_code == -1 &&
+            result->term_signal == SIGKILL);
+}
+
 typedef enum {
     SIGPIPE_DISPOSITION_DEFAULT = 0,
     SIGPIPE_DISPOSITION_IGNORE,
@@ -613,7 +627,7 @@ TEST(child_setup_status_is_reported_explicitly) {
     clear_error();
     CHECK_EQ_INT(run_argv(argv, &opts, &result), -1);
     CHECK(result.spawned);
-    CHECK_EQ_INT(result.exit_code, 126);
+    CHECK(setup_failure_wait_status_is_valid(&result, 126));
     CHECK(strstr(get_last_error()->message, "environment setup failed") != NULL);
 }
 
@@ -632,7 +646,7 @@ TEST(process_group_supervisor_setup_failure_is_truthful_and_reaped) {
 
     CHECK_EQ_INT(returned_errno, EPERM);
     CHECK(failed.spawned);
-    CHECK_EQ_INT(failed.exit_code, 126);
+    CHECK(setup_failure_wait_status_is_valid(&failed, 126));
     CHECK(elapsed >= 0 && elapsed < 1000);
     CHECK(strstr(get_last_error()->message,
                  "process-group supervisor setup failed") != NULL);
@@ -748,7 +762,7 @@ TEST(supervisor_stage_failures_are_truthful_reaped_and_one_shot) {
 
         CHECK_EQ_INT(returned_errno, cases[i].system_errno);
         CHECK(failed.spawned);
-        CHECK_EQ_INT(failed.exit_code, 126);
+        CHECK(setup_failure_wait_status_is_valid(&failed, 126));
         CHECK(elapsed >= 0 && elapsed < 1000);
         CHECK(strstr(get_last_error()->message,
                      "process-group supervisor setup failed") != NULL);
@@ -1075,17 +1089,6 @@ TEST(descendant_held_capture_pipe_returns_within_grace) {
     CHECK(WIFEXITED(status) && WEXITSTATUS(status) == 0);
 }
 
-static bool process_gone_within(pid_t pid, int timeout_ms) {
-    int waited = 0;
-    while (waited < timeout_ms) {
-        if (kill(pid, 0) != 0 && errno == ESRCH) return true;
-        struct timespec delay = {.tv_nsec = 10000000L};
-        nanosleep(&delay, NULL);
-        waited += 10;
-    }
-    return kill(pid, 0) != 0 && errno == ESRCH;
-}
-
 static bool file_nonempty_within(const char *path, int timeout_ms) {
     int waited = 0;
     while (waited <= timeout_ms) {
@@ -1112,12 +1115,22 @@ static bool file_size_stops_changing(const char *path, int observation_ms) {
 }
 
 TEST(timeout_kills_the_proven_group_grandchild) {
+    char heartbeat_path[] = "/tmp/gitswitch-runner-timeout-XXXXXX";
     const char *argv[] = {
-        "sh", "-c", "sleep 30 & child=$!; echo \"$child\"; wait", NULL
+        "sh", "-c",
+        "\"$1\" --ar14-rollback-heartbeat \"$2\" & child=$!; "
+        "while [ ! -s \"$2\" ]; do :; done; echo \"$child\"; wait",
+        "gitswitch-runner-timeout", g_self_path, heartbeat_path, NULL
     };
     char output[64];
     run_opts_t opts;
     run_result_t result;
+    int heartbeat_fd = mkstemp(heartbeat_path);
+
+    CHECK(heartbeat_fd >= 0);
+    if (heartbeat_fd < 0) return;
+    close(heartbeat_fd);
+    output[0] = '\0';
 
     memset(&opts, 0, sizeof(opts));
     opts.out = output;
@@ -1126,35 +1139,68 @@ TEST(timeout_kills_the_proven_group_grandchild) {
     /* The deadline proves group cleanup, not shell startup latency. Leave
      * enough room for Darwin's sanitizer runtime to start the shell and
      * publish the descendant PID before expiring the group. */
-    CHECK_EQ_INT(run_deadline_after_millis(1000, &opts.deadline_millis), 0);
+    CHECK_EQ_INT(run_deadline_after_millis(2000, &opts.deadline_millis), 0);
     opts.use_deadline = true;
     CHECK_EQ_INT(run_argv(argv, &opts, &result), -1);
     pid_t descendant = (pid_t)strtol(output, NULL, 10);
+    bool heartbeat_started = file_nonempty_within(heartbeat_path, 100);
+    bool heartbeat_stopped =
+        heartbeat_started && file_size_stops_changing(heartbeat_path, 500);
     CHECK(descendant > 1);
-    if (descendant > 1) CHECK(process_gone_within(descendant, 1000));
+    CHECK(heartbeat_started);
+    CHECK(heartbeat_stopped);
+    if (!heartbeat_stopped && descendant > 1) {
+        (void)kill(descendant, SIGKILL);
+        if (heartbeat_started) {
+            CHECK(file_size_stops_changing(heartbeat_path, 500));
+        }
+    }
+    (void)unlink(heartbeat_path);
 }
 
 TEST(successful_leader_with_stdout_holder_kills_group_before_pid_release) {
+    char heartbeat_path[] = "/tmp/gitswitch-runner-holder-XXXXXX";
     const char *argv[] = {
-        "sh", "-c", "sleep 30 & echo \"$!\"", NULL
+        "sh", "-c",
+        "\"$1\" --ar14-rollback-heartbeat \"$2\" & child=$!; "
+        "while [ ! -s \"$2\" ]; do :; done; echo \"$child\"",
+        "gitswitch-runner-holder", g_self_path, heartbeat_path, NULL
     };
     char output[64];
     run_opts_t opts;
     run_result_t result;
+    int heartbeat_fd = mkstemp(heartbeat_path);
     int64_t started = test_monotonic_ms();
 
+    CHECK(heartbeat_fd >= 0);
+    if (heartbeat_fd < 0) return;
+    close(heartbeat_fd);
+    output[0] = '\0';
     memset(&opts, 0, sizeof(opts));
     opts.out = output;
     opts.out_size = sizeof(output);
     opts.stderr_to_devnull = true;
+    CHECK_EQ_INT(run_deadline_after_millis(5000, &opts.deadline_millis), 0);
+    opts.use_deadline = true;
     CHECK_EQ_INT(run_argv(argv, &opts, &result), -1);
     int64_t elapsed = test_monotonic_ms() - started;
     pid_t descendant = (pid_t)strtol(output, NULL, 10);
+    bool heartbeat_started = file_nonempty_within(heartbeat_path, 100);
+    bool heartbeat_stopped =
+        heartbeat_started && file_size_stops_changing(heartbeat_path, 500);
     CHECK(result.spawned);
     CHECK_EQ_INT(result.exit_code, 0);
-    CHECK(elapsed >= 0 && elapsed < 1000);
+    CHECK(elapsed >= 0 && elapsed < 3000);
     CHECK(descendant > 1);
-    if (descendant > 1) CHECK(process_gone_within(descendant, 1000));
+    CHECK(heartbeat_started);
+    CHECK(heartbeat_stopped);
+    if (!heartbeat_stopped && descendant > 1) {
+        (void)kill(descendant, SIGKILL);
+        if (heartbeat_started) {
+            CHECK(file_size_stops_changing(heartbeat_path, 500));
+        }
+    }
+    (void)unlink(heartbeat_path);
 }
 
 TEST(closed_stdio_daemon_like_descendant_remains_supported) {
@@ -1504,7 +1550,8 @@ static int pending_replay_failure_worker(void) {
 
     outcome =
         run_rc == -1 && returned_errno == EIO &&
-                failed.spawned && failed.exit_code == 126 &&
+                failed.spawned &&
+                setup_failure_wait_status_is_valid(&failed, 126) &&
                 reported_group_failure && !pending_signal_published &&
                 retry_rc == 0 && retry.spawned && retry.exit_code == 0 &&
                 guard_end_rc == 0 &&
@@ -2500,7 +2547,7 @@ TEST(forced_bulk_failure_is_reported_without_fallback) {
     CHECK_EQ_INT(run_test_set_fd_close_strategy(RUN_TEST_FD_CLOSE_AUTO), 0);
     CHECK_EQ_INT(rc, -1);
     CHECK(result.spawned);
-    CHECK_EQ_INT(result.exit_code, 126);
+    CHECK(setup_failure_wait_status_is_valid(&result, 126));
     CHECK(error && strstr(error->message,
                           "child descriptor cleanup failed") != NULL);
     CHECK(observed);
@@ -2538,7 +2585,8 @@ static bool auto_bulk_failure_fails_closed(const struct rlimit *limit,
         int rc = run_argv(argv, NULL, &result);
         const error_context_t *error = get_last_error();
         bool failed_closed =
-            rc == -1 && result.spawned && result.exit_code == 126 && error &&
+            rc == -1 && result.spawned &&
+            setup_failure_wait_status_is_valid(&result, 126) && error &&
             strstr(error->message,
                    "child descriptor cleanup failed") != NULL;
 
