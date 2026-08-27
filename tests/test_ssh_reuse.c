@@ -762,6 +762,73 @@ static int fake_quoting_agent_runner(const char *const argv[],
     return 0;
 }
 
+/* AR-15 M6: production launches every agent with a provenance-relative
+ * "-a .gsp-<dev>-<ino>/../ssh-agent.<name>.sock" argument, but the reuse fast
+ * path verified the recorded sidecar PID with pid_is_our_ssh_agent(...,-1) --
+ * no runtime directory descriptor -- so the provenance argument could never
+ * be requalified and OUR OWN agent was classed UNRELATED. Reuse then adopted
+ * it explicitly unowned (agent_pid=-1), and no later stop or switch-away
+ * could ever signal it: key-holding agents accumulated. A second activation
+ * must recover full ownership of the agent the first one launched. */
+TEST(reuse_recovers_ownership_of_provenance_launched_agent) {
+    char sock[256];
+    ssh_config_t first;
+    ssh_config_t second;
+    account_t acct;
+    command_runner_fn prev;
+    pid_t launched;
+    int rc;
+
+    CHECK_EQ_INT(make_xdg_runtime_dir(), 0);
+    setenv("XDG_RUNTIME_DIR", g_xdg, 1);
+    snprintf(sock, sizeof(sock), "%s/gitswitch-ssh/ssh-agent.work.sock",
+             g_xdg);
+    CHECK_EQ_INT(make_account(&acct, "keyA"), 0);
+
+    /* First activation: the real daemon, launched exactly as production
+     * launches it (provenance-relative -a), sidecar written by production. */
+    memset(&first, 0, sizeof(first));
+    first.mode = SSH_AGENT_ISOLATED;
+    first.agent_pid = -1;
+    prev = run_set_runner(fake_quoting_agent_runner);
+    rc = ssh_start_isolated_agent(&first, &acct);
+    run_set_runner(prev);
+    CHECK_EQ_INT(rc, 0);
+    CHECK(first.agent_owned);
+    launched = first.agent_pid;
+    CHECK(launched > 1);
+    CHECK(path_exists(sock));
+
+    /* Second activation (a later shell): must reuse AND recover ownership. */
+    memset(&second, 0, sizeof(second));
+    second.mode = SSH_AGENT_ISOLATED;
+    second.agent_pid = -1;
+    prev = run_set_runner(fake_quoting_agent_runner);
+    rc = ssh_start_isolated_agent(&second, &acct);
+    run_set_runner(prev);
+    CHECK_EQ_INT(rc, 0);
+    CHECK(second.reused_existing_agent);
+    CHECK(second.agent_owned);
+    CHECK_EQ_INT((long)second.agent_pid, (long)launched);
+    CHECK(path_exists(sock));
+
+    /* The payoff: recovered ownership means cleanup can actually signal
+     * and reap the agent again, instead of leaking a key-holding process. */
+    CHECK_EQ_INT(ssh_manager_cleanup(&second), 0);
+    for (int attempts = 0; attempts < 100 && kill(launched, 0) == 0;
+         attempts++) {
+        struct timespec delay = {.tv_sec = 0, .tv_nsec = 10000000L};
+        nanosleep(&delay, NULL);
+    }
+    errno = 0;
+    CHECK(kill(launched, 0) != 0 && errno == ESRCH);
+
+    /* Never leak the real agent even if an assertion above failed. */
+    if (launched > 1 && kill(launched, 0) == 0) {
+        (void)kill(launched, SIGKILL);
+    }
+}
+
 TEST(agent_output_quoted_auth_sock_preserves_pinned_path) {
     char sock[256];
     ssh_config_t cfg;
@@ -1770,6 +1837,7 @@ TEST_MAIN_BEGIN()
     RUN_TEST(reuse_failure_preserves_only_reproven_target_key_truth);
     RUN_TEST(ssh_fingerprint_reuse_rejects_different_key);
     RUN_TEST(ssh_fingerprint_reuse_rejects_same_fingerprint_certificate);
+    RUN_TEST(reuse_recovers_ownership_of_provenance_launched_agent);
     RUN_TEST(agent_output_quoted_auth_sock_preserves_pinned_path);
     RUN_TEST(
         isolated_activation_retains_generation_between_fingerprint_and_load);
