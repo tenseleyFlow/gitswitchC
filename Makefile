@@ -1924,6 +1924,7 @@ test:
 	@exit 1
 else
 test: $(BINDIR)/$(TARGET) $(TEST_TARGETS)
+	@sh $(TESTDIR)/test_runner_mode_policy.sh "$(CURDIR)"
 	@echo "Running tests..."
 	@GITSWITCH_BIN="$(abspath $(BINDIR)/$(TARGET))"; \
 	export GITSWITCH_BIN; \
@@ -1939,12 +1940,18 @@ endif
 # ShellCheck is intentionally a separate, fail-closed QA gate instead of an
 # ordinary `make test` prerequisite: builds remain package-independent while
 # CI and release reviewers can require every dialect parser explicitly.
-.PHONY: shell-static-test ci-policy-test public-api-coverage-test
+.PHONY: shell-static-test ci-policy-test public-api-coverage-test runner-mode-policy-test
 shell-static-test:
 	@sh tests/test_shell_assets.sh "$(CURDIR)"
 
 ci-policy-test:
 	@sh tests/test_ci_policy.sh "$(CURDIR)"
+
+# AR-17: freeze the count of production sites that branch on the test-runner
+# identity (run_uses_default_runner). Runs inside `make test` so it is
+# fail-closed on every CI platform; see tests/test_runner_mode_policy.sh.
+runner-mode-policy-test:
+	@sh $(TESTDIR)/test_runner_mode_policy.sh "$(CURDIR)"
 
 public-api-coverage-test:
 	@PUBLIC_API_CC="$(CC)" sh $(TESTDIR)/test_public_api_coverage.sh "$(CURDIR)"
