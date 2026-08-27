@@ -2482,6 +2482,39 @@ static command_result_t handle_remove_command(gitswitch_ctx_t *ctx,
         int removal_errno = errno;
 
         result.failure_kind = COMMAND_FAILURE_REMOVE;
+        /* AR-15 L37: an installed-but-uncertain remove has already deleted
+         * its live account, so the natural retry -- the same name-form
+         * command the user just ran -- resolves nothing and used to report
+         * only "Account not found" while the durable marker kept every
+         * mutating command blocked. The sole recovery handle is the marker's
+         * numeric account ID, which nothing surfaced. When the selector is
+         * unresolvable and a REMOVE marker is active, name that ID and the
+         * exact command that settles it. */
+        if (removal_error.code == ERR_ACCOUNT_NOT_FOUND) {
+            config_retirement_recovery_t recovery;
+
+            memset(&recovery, 0, sizeof(recovery));
+            if (config_retirement_guard_recovery_probe(
+                    ctx->config.config_path, &recovery) == 0 &&
+                recovery.valid &&
+                recovery.kind == CONFIG_RETIREMENT_REMOVE &&
+                recovery.owner_count == 1U) {
+                error_context_t lockout;
+
+                errno = EBUSY;
+                set_error(
+                    ERR_CONFIG_INVALID,
+                    "An interrupted removal of account ID %u is still recorded; "
+                    "its account is already gone, so it cannot be selected by "
+                    "name. Run `gitswitch remove %u` to complete it",
+                    recovery.owners[0].account_id,
+                    recovery.owners[0].account_id);
+                lockout = *get_last_error();
+                (void)error_accumulator_add(
+                    &result.failure_errors,
+                    "interrupted removal recovery", &lockout);
+            }
+        }
         errno = removal_errno;
         (void)error_accumulator_add(&result.failure_errors,
                                     "account removal", &removal_error);
@@ -3445,6 +3478,60 @@ static bool retirement_guard_blocks_activation(const gitswitch_ctx_t *ctx) {
         return true;
     }
     if (blocked) {
+        config_retirement_recovery_t recovery;
+
+        /* AR-15 L2: the lockout used to say only "inspect and reconcile the
+         * exact retirement marker" -- naming no account and no command, so a
+         * blocked user had no discoverable way out. When the marker decodes,
+         * enumerate its owner(s) and the command that settles it. REMOVE
+         * recovery needs the recorded numeric ID (the account is already
+         * gone); RESET re-adopts its own marker on a natural retry. A marker
+         * that does not decode stays fail-closed with the generic text. */
+        memset(&recovery, 0, sizeof(recovery));
+        errno = EBUSY;
+        if (config_retirement_guard_recovery_probe(
+                ctx->config.config_path, &recovery) == 0 &&
+            recovery.valid && recovery.owner_count > 0U &&
+            recovery.owner_count <= MAX_ACCOUNTS) {
+            char owners[MAX_ACCOUNTS * 12U];
+            size_t used = 0U;
+
+            owners[0] = '\0';
+            for (size_t i = 0U; i < recovery.owner_count; i++) {
+                int written = snprintf(
+                    owners + used, sizeof(owners) - used, "%s%u",
+                    i == 0U ? "" : ", ",
+                    recovery.owners[i].account_id);
+                if (written < 0 ||
+                    (size_t)written >= sizeof(owners) - used) {
+                    break;
+                }
+                used += (size_t)written;
+            }
+            errno = EBUSY;
+            if (recovery.kind == CONFIG_RETIREMENT_REMOVE &&
+                recovery.owner_count == 1U) {
+                set_error(
+                    ERR_CONFIG_INVALID,
+                    "An interrupted removal of account ID %s is still "
+                    "recorded; run `gitswitch remove %s` to complete it",
+                    owners, owners);
+            } else if (recovery.kind == CONFIG_RETIREMENT_RESET) {
+                set_error(
+                    ERR_CONFIG_INVALID,
+                    "An interrupted reset of account ID%s %s is still "
+                    "recorded; rerun `gitswitch reset%s` to complete it",
+                    recovery.owner_count > 1U ? "s" : "", owners,
+                    recovery.owner_count > 1U ? " --all" : "");
+            } else {
+                set_error(
+                    ERR_CONFIG_INVALID,
+                    "An interrupted retirement of account ID%s %s is still "
+                    "recorded and must be completed before other changes",
+                    recovery.owner_count > 1U ? "s" : "", owners);
+            }
+            return true;
+        }
         errno = EBUSY;
         set_error(
             ERR_CONFIG_INVALID,

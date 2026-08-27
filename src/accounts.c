@@ -4559,8 +4559,15 @@ int accounts_remove_recover_incomplete(gitswitch_ctx_t *ctx,
         errno = ESTALE;
         set_error(
             ERR_GIT_CONFIG_FAILED,
-            "Cannot recover incomplete v1 REMOVE marker for account ID %u because its SSH alias obligation is unknown; restore the original account and retry removal, or resolve the marker manually",
-            requested_id);
+            "Cannot automatically complete the interrupted removal of "
+            "account ID %u: it was recorded by a pre-1.9 release whose "
+            "marker does not say whether an SSH host alias was left behind. "
+            "Its account is already gone and this marker blocks add/edit "
+            "until it is cleared. To finish by hand: check ~/.ssh/config "
+            "for a leftover gitswitch-managed alias block and remove it, "
+            "then delete %s and rerun `gitswitch remove %u` to settle the "
+            "Git destinations",
+            requested_id, ctx->config.config_path, requested_id);
         matching_absent_owner = true;
         goto done;
     }
