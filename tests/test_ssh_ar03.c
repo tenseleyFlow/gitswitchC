@@ -1303,7 +1303,17 @@ TEST(reset_reaps_real_recorded_agent) {
     }
 
     clock_gettime(CLOCK_MONOTONIC, &t0);
-    CHECK_EQ_INT(ssh_manager_reset("work"), 0);
+    {
+        int reset_rc = ssh_manager_reset("work");
+
+        if (reset_rc != 0) {
+            /* Surface the exact refusal: a platform-specific failure here is
+             * the whole point of running this test off Linux. */
+            fprintf(stderr, "  (diag: reset refused: %s)\n",
+                    get_last_error()->message);
+        }
+        CHECK_EQ_INT(reset_rc, 0);
+    }
     clock_gettime(CLOCK_MONOTONIC, &t1);
     ms = (t1.tv_sec - t0.tv_sec) * 1000 + (t1.tv_nsec - t0.tv_nsec) / 1000000;
     /* L19 evidence (informational, not asserted: timing thresholds flake
