@@ -1370,6 +1370,68 @@ TEST(reset_reaps_real_recorded_agent) {
  * requires to be absolute. This drives the real function against a real,
  * dumpable process (ourselves) on every platform, so the Linux, Darwin and
  * FreeBSD branches all get exercised by CI instead of none of them. */
+/* AR-17: reproduce on every platform the identity failure macOS CI exposed.
+ * macOS resolves /tmp to /private/tmp, so an agent launched with a legacy
+ * absolute "-a /tmp/<root>/x.sock" was compared byte-for-byte against the
+ * resolved "/private/tmp/<root>/x.sock" and classed UNRELATED: a live,
+ * exactly-ours agent that reset could then never retire. A symlinked runtime
+ * root recreates the same two spellings of one socket on Linux and FreeBSD,
+ * so the fix (canonical-path comparison) is revert-provable in all of CI. */
+TEST(legacy_absolute_socket_arg_matches_through_symlinked_root) {
+    char real_dir[128], alias_root[128], alias_dir[256];
+    char sock_alias[512], pidp[256], out[2048];
+    run_opts_t opts;
+    run_result_t res;
+    char *p;
+    pid_t pid;
+
+    if (!command_exists("ssh-agent")) {
+        TS_SKIP("openssh", "ssh-agent unavailable in trusted PATH");
+    }
+
+    /* Real runtime root, and a symlink that aliases it. */
+    CHECK_EQ_INT(make_xdg_agent_dir(real_dir, sizeof(real_dir)), 0);
+    snprintf(alias_root, sizeof(alias_root), "%s-alias", g_xdg);
+    CHECK_EQ_INT(symlink(g_xdg, alias_root), 0);
+    snprintf(alias_dir, sizeof(alias_dir), "%s/gitswitch-ssh", alias_root);
+    snprintf(sock_alias, sizeof(sock_alias), "%s/ssh-agent.work.sock",
+             alias_dir);
+    snprintf(pidp, sizeof(pidp), "%s/ssh-agent.work.pid", real_dir);
+
+    /* Launch through the ALIAS spelling; reset resolves the REAL one. */
+    const char *argv[] = { "ssh-agent", "-s", "-a", sock_alias, NULL };
+    memset(&opts, 0, sizeof(opts));
+    opts.out = out;
+    opts.out_size = sizeof(out);
+    opts.stderr_to_devnull = true;
+    CHECK_EQ_INT(run_argv(argv, &opts, &res), 0);
+    p = strstr(out, "SSH_AGENT_PID=");
+    CHECK(p != NULL);
+    if (!p) return;
+    pid = (pid_t)atol(p + strlen("SSH_AGENT_PID="));
+    CHECK(pid > 1);
+
+    CHECK_EQ_INT(write_live_agent_record(
+                     real_dir, "ssh-agent.work.pid", pid), 0);
+
+    {
+        int reset_rc = ssh_manager_reset("work");
+
+        if (reset_rc != 0) {
+            fprintf(stderr, "  (diag: reset refused: %s)\n",
+                    get_last_error()->message);
+        }
+        CHECK_EQ_INT(reset_rc, 0);
+    }
+    /* Retired: the agent must not still own the socket. */
+    errno = 0;
+    CHECK(access(sock_alias, F_OK) != 0);
+
+    if (kill(pid, 0) == 0) kill(pid, SIGKILL);
+    (void)unlink(pidp);
+    (void)unlink(alias_root);
+}
+
 TEST(process_image_capture_populates_absolute_path_for_self) {
     ssh_process_image_t image;
 
@@ -1584,6 +1646,7 @@ TEST_MAIN_BEGIN()
      * the process-identity code that runs natively there. Every helper it
      * needs is portable, so run it everywhere. */
     RUN_TEST(reset_reaps_real_recorded_agent);
+    RUN_TEST(legacy_absolute_socket_arg_matches_through_symlinked_root);
     RUN_TEST(process_image_capture_populates_absolute_path_for_self);
     RUN_TEST(process_image_capture_rejects_invalid_target);
     RUN_TEST(reset_refuses_unsafe_socket_dir);
