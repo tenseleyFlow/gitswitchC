@@ -667,6 +667,26 @@ static ssh_process_outcome_t socket_argument_outcome(
          * it. Retain its record rather than guessing. */
         return SSH_PROCESS_INDETERMINATE;
     }
+    /* AR-17: a legacy absolute argument may name the same socket through a
+     * different spelling of its directory. macOS is the canonical case: /tmp
+     * is a symlink to /private/tmp, so an agent launched with
+     * "-a /tmp/<root>/x.sock" was compared byte-for-byte against the
+     * resolved "/private/tmp/<root>/x.sock" and classed UNRELATED -- a live,
+     * exactly-ours agent that could then never be re-identified or retired.
+     * Resolve both spellings and compare the canonical paths. This can only
+     * widen OWNED to a name that resolves to the identical file; it never
+     * credits a different socket, and the provenance-relative launch that
+     * production uses is unaffected (it is matched by inode below). */
+    if (actual[0] == '/' && expected[0] == '/') {
+        char actual_resolved[PATH_MAX];
+        char expected_resolved[PATH_MAX];
+
+        if (realpath(actual, actual_resolved) &&
+            realpath(expected, expected_resolved) &&
+            strcmp(actual_resolved, expected_resolved) == 0) {
+            return SSH_PROCESS_OWNED;
+        }
+    }
     if (runtime_dir_fd >= 0 &&
         build_provenance_socket_arg(runtime_dir_fd, leaf, qualified,
                                     sizeof(qualified), NULL, 0) == 0 &&
@@ -12114,6 +12134,11 @@ int ssh_manager_test_write_pid_sidecar(int dir_fd, const char *name,
 int ssh_manager_test_capture_process_generation(
     pid_t pid, ssh_process_generation_t *generation) {
     return capture_process_generation(pid, generation);
+}
+
+int ssh_manager_test_capture_process_image(
+    pid_t pid, ssh_process_image_t *image) {
+    return inspect_process_image_real(pid, image);
 }
 
 /* Re-prove an entry immediately before removing its name. POSIX has no

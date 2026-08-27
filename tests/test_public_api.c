@@ -464,6 +464,7 @@ TEST(all_retained_public_apis_compile_and_link) {
     REQUIRE_PUBLIC_API(ssh_manager_test_socket_has_key);
     REQUIRE_PUBLIC_API(ssh_manager_test_write_pid_sidecar);
     REQUIRE_PUBLIC_API(ssh_manager_test_capture_process_generation);
+    REQUIRE_PUBLIC_API(ssh_manager_test_capture_process_image);
     REQUIRE_PUBLIC_API(ssh_remove_host_alias);
     REQUIRE_PUBLIC_API(ssh_remove_host_alias_result);
     REQUIRE_PUBLIC_API(ssh_start_isolated_agent);

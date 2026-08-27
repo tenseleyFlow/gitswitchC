@@ -181,7 +181,6 @@ static int make_xdg_agent_dir(char *dir_out, size_t size) {
     return mkdir(dir_out, 0700);
 }
 
-#if defined(__linux__)
 static int write_live_agent_record(const char *dir, const char *name,
                                    pid_t pid) {
     ssh_agent_record_t record = {.pid = pid};
@@ -198,7 +197,6 @@ static int write_live_agent_record(const char *dir, const char *name,
     if (close(dir_fd) != 0) rc = -1;
     return rc;
 }
-#endif
 
 static int make_account(account_t *a, const char *key_basename) {
     static const char private_prefix[] =
@@ -1229,29 +1227,37 @@ TEST(legacy_v1_record_never_authorizes_signaling) {
     (void)unlink(sock);
 }
 
+#endif
+
 /* Every prior test approaches reap_ssh_agent from the refusal side (bystander
  * PID, above-pid_max PID, no sidecar). This drives the positive path end to
  * end: real ssh-agent, real sidecar, ssh_manager_reset — the agent must be
- * verified (comm + socket argv via /proc, hence Linux-gated), signaled, and
+ * verified (comm + socket argv through the platform process-info API:
+ * /proc on Linux, KERN_PROCARGS2 on Darwin, KERN_PROC_ARGS on FreeBSD),
+ * signaled, and
  * confirmed dead, with sidecar and socket removed. An always-refuse
  * regression in pid_is_our_ssh_agent fails this test instead of shipping
  * green while leaking live key-holding agents. */
 TEST(reset_reaps_real_recorded_agent) {
-    char dir[128], sock[256], pidp[256], out[2048];
+    char dir[128], sock[256], pidp[256], keyp[256], out[2048];
     run_opts_t opts;
     run_result_t res;
     struct timespec t0, t1;
     long ms;
     char *p;
     pid_t pid;
+    int dir_fd;
 
-    if (!command_exists("ssh-agent")) {
-        TS_SKIP("openssh", "ssh-agent unavailable in trusted PATH");
+    if (!command_exists("ssh-agent") || !command_exists("ssh-add") ||
+        !command_exists("ssh-keygen")) {
+        TS_SKIP("openssh",
+                "ssh-agent, ssh-add, and ssh-keygen are required");
     }
 
     CHECK_EQ_INT(make_xdg_agent_dir(dir, sizeof(dir)), 0);
     snprintf(sock, sizeof(sock), "%s/ssh-agent.work.sock", dir);
     snprintf(pidp, sizeof(pidp), "%s/ssh-agent.work.pid", dir);
+    snprintf(keyp, sizeof(keyp), "%s/reap-key", dir);
 
     const char *argv[] = { "ssh-agent", "-s", "-a", sock, NULL };
     memset(&opts, 0, sizeof(opts));
@@ -1271,17 +1277,67 @@ TEST(reset_reaps_real_recorded_agent) {
                      dir, "ssh-agent.work.pid", pid),
                  0);
 
+    /* AR-17: load a REAL key so the retirement guarantee is observable.
+     * Without one, "zero identities after reset" holds trivially and the
+     * assertion proves nothing. The oracle below matches by fingerprint over
+     * the live agent protocol, on every platform. */
+    {
+        const char *keygen_argv[] = {
+            "ssh-keygen", "-q", "-t", "ed25519", "-N", "", "-f", keyp, NULL
+        };
+        const char *add_argv[] = { "ssh-add", "-q", keyp, NULL };
+        run_opts_t tool_opts;
+        run_result_t tool_res;
+
+        memset(&tool_opts, 0, sizeof(tool_opts));
+        tool_opts.stderr_to_devnull = true;
+        CHECK_EQ_INT(run_argv(keygen_argv, &tool_opts, &tool_res), 0);
+        CHECK_EQ_INT(setenv("SSH_AUTH_SOCK", sock, 1), 0);
+        CHECK_EQ_INT(run_argv(add_argv, &tool_opts, &tool_res), 0);
+        (void)unsetenv("SSH_AUTH_SOCK");
+    }
+    dir_fd = open(dir, O_RDONLY | O_DIRECTORY | O_CLOEXEC);
+    CHECK(dir_fd >= 0);
+    if (dir_fd >= 0) {
+        CHECK(ssh_manager_test_socket_has_key(dir_fd, sock, keyp));
+    }
+
     clock_gettime(CLOCK_MONOTONIC, &t0);
-    CHECK_EQ_INT(ssh_manager_reset("work"), 0);
+    {
+        int reset_rc = ssh_manager_reset("work");
+
+        if (reset_rc != 0) {
+            /* Surface the exact refusal: a platform-specific failure here is
+             * the whole point of running this test off Linux. */
+            fprintf(stderr, "  (diag: reset refused: %s)\n",
+                    get_last_error()->message);
+        }
+        CHECK_EQ_INT(reset_rc, 0);
+    }
     clock_gettime(CLOCK_MONOTONIC, &t1);
     ms = (t1.tv_sec - t0.tv_sec) * 1000 + (t1.tv_nsec - t0.tv_nsec) / 1000000;
     /* L19 evidence (informational, not asserted: timing thresholds flake
      * under CI load): the fixed 50ms post-SIGTERM poll used to floor this. */
     fprintf(stderr, "  (info: real-agent reap took %ld ms)\n", ms);
 
-    /* A readable pidfd proves process exit before the parent namespace has
-     * necessarily reaped the zombie, so kill(pid, 0) can briefly succeed even
-     * though reset already has conclusive instance-level death evidence. */
+    /* The cross-platform guarantee: the managed key is gone from the live
+     * agent. On Linux the reap signals the process via pidfd; on Darwin and
+     * FreeBSD there is no pidfd, the reap is INDETERMINATE by design, and
+     * reset instead retires the recorded endpoint over the agent protocol
+     * (REMOVE_ALL, then confirmed zero identities). Either way, no key may
+     * survive a successful reset. */
+    if (dir_fd >= 0) {
+        bool key_survives = kill(pid, 0) == 0 &&
+                            ssh_manager_test_socket_has_key(dir_fd, sock, keyp);
+        CHECK(!key_survives);
+        close(dir_fd);
+    }
+
+#if defined(__linux__)
+    /* Linux additionally proves instance-level death. A readable pidfd proves
+     * process exit before the parent namespace has necessarily reaped the
+     * zombie, so kill(pid, 0) can briefly succeed even though reset already
+     * has conclusive death evidence. */
     for (int attempts = 0; attempts < 100 && kill(pid, 0) == 0; attempts++) {
         struct timespec delay = {.tv_sec = 0, .tv_nsec = 10000000L};
         nanosleep(&delay, NULL);
@@ -1291,14 +1347,117 @@ TEST(reset_reaps_real_recorded_agent) {
     CHECK_EQ_INT(errno, ESRCH);
     CHECK(!path_exists(pidp));      /* sidecar dropped once confirmed gone */
     CHECK(!path_exists(sock));
+#endif
 
     if (kill(pid, 0) == 0) {
         kill(pid, SIGKILL); /* never leak a real agent on test failure */
     }
+    (void)unlink(keyp);
+    {
+        char pubp[300];
+        snprintf(pubp, sizeof(pubp), "%s.pub", keyp);
+        (void)unlink(pubp);
+    }
 }
-#endif
 
 /* ---- L6: /tmp socket base hardening --------------------------------------- */
+
+/* AR-17 test integrity: production image capture had ZERO real-path coverage.
+ * Every test that reached it replaced `.image` with a stub, and the one test
+ * that ran it for real discarded the result through a stubbed reap. That is
+ * exactly how AR-16 shipped a Linux legacy migration that could never succeed:
+ * the Linux branch never populated `executable_path`, which the identity gate
+ * requires to be absolute. This drives the real function against a real,
+ * dumpable process (ourselves) on every platform, so the Linux, Darwin and
+ * FreeBSD branches all get exercised by CI instead of none of them. */
+/* AR-17: reproduce on every platform the identity failure macOS CI exposed.
+ * macOS resolves /tmp to /private/tmp, so an agent launched with a legacy
+ * absolute "-a /tmp/<root>/x.sock" was compared byte-for-byte against the
+ * resolved "/private/tmp/<root>/x.sock" and classed UNRELATED: a live,
+ * exactly-ours agent that reset could then never retire. A symlinked runtime
+ * root recreates the same two spellings of one socket on Linux and FreeBSD,
+ * so the fix (canonical-path comparison) is revert-provable in all of CI. */
+TEST(legacy_absolute_socket_arg_matches_through_symlinked_root) {
+    char real_dir[128], alias_root[128], alias_dir[256];
+    char sock_alias[512], pidp[256], out[2048];
+    run_opts_t opts;
+    run_result_t res;
+    char *p;
+    pid_t pid;
+
+    if (!command_exists("ssh-agent")) {
+        TS_SKIP("openssh", "ssh-agent unavailable in trusted PATH");
+    }
+
+    /* Real runtime root, and a symlink that aliases it. */
+    CHECK_EQ_INT(make_xdg_agent_dir(real_dir, sizeof(real_dir)), 0);
+    snprintf(alias_root, sizeof(alias_root), "%s-alias", g_xdg);
+    CHECK_EQ_INT(symlink(g_xdg, alias_root), 0);
+    snprintf(alias_dir, sizeof(alias_dir), "%s/gitswitch-ssh", alias_root);
+    snprintf(sock_alias, sizeof(sock_alias), "%s/ssh-agent.work.sock",
+             alias_dir);
+    snprintf(pidp, sizeof(pidp), "%s/ssh-agent.work.pid", real_dir);
+
+    /* Launch through the ALIAS spelling; reset resolves the REAL one. */
+    const char *argv[] = { "ssh-agent", "-s", "-a", sock_alias, NULL };
+    memset(&opts, 0, sizeof(opts));
+    opts.out = out;
+    opts.out_size = sizeof(out);
+    opts.stderr_to_devnull = true;
+    CHECK_EQ_INT(run_argv(argv, &opts, &res), 0);
+    p = strstr(out, "SSH_AGENT_PID=");
+    CHECK(p != NULL);
+    if (!p) return;
+    pid = (pid_t)atol(p + strlen("SSH_AGENT_PID="));
+    CHECK(pid > 1);
+
+    CHECK_EQ_INT(write_live_agent_record(
+                     real_dir, "ssh-agent.work.pid", pid), 0);
+
+    {
+        int reset_rc = ssh_manager_reset("work");
+
+        if (reset_rc != 0) {
+            fprintf(stderr, "  (diag: reset refused: %s)\n",
+                    get_last_error()->message);
+        }
+        CHECK_EQ_INT(reset_rc, 0);
+    }
+    /* Retired: the agent must not still own the socket. */
+    errno = 0;
+    CHECK(access(sock_alias, F_OK) != 0);
+
+    if (kill(pid, 0) == 0) kill(pid, SIGKILL);
+    (void)unlink(pidp);
+    (void)unlink(alias_root);
+}
+
+TEST(process_image_capture_populates_absolute_path_for_self) {
+    ssh_process_image_t image;
+
+    memset(&image, 0xA5, sizeof(image));
+    CHECK_EQ_INT(ssh_manager_test_capture_process_image(getpid(), &image), 0);
+    CHECK(image.valid);
+    CHECK_EQ_INT((long)image.effective_uid, (long)geteuid());
+    /* The gate in inspect_pid_ssh_agent_image rejects anything whose path is
+     * not absolute, so an empty path here is a silent identity failure. */
+    CHECK(image.executable_path[0] == '/');
+    CHECK(image.executable_identity.st_ino != 0);
+    CHECK(S_ISREG(image.executable_identity.st_mode));
+    /* Capture is live inspection, never a durable launch witness, so it must
+     * not claim the in-process nondumpable marker. */
+    CHECK(!image.executable_object_unknown);
+}
+
+/* Invalid targets must fail closed rather than report a usable image. */
+TEST(process_image_capture_rejects_invalid_target) {
+    ssh_process_image_t image;
+
+    memset(&image, 0, sizeof(image));
+    CHECK_EQ_INT(ssh_manager_test_capture_process_image(0, &image), -1);
+    CHECK_EQ_INT(ssh_manager_test_capture_process_image(1, &image), -1);
+    CHECK_EQ_INT(ssh_manager_test_capture_process_image(getpid(), NULL), -1);
+}
 
 TEST(reset_refuses_unsafe_socket_dir) {
     char dir[192], real[192], pidfile[256];
@@ -1481,8 +1640,15 @@ TEST_MAIN_BEGIN()
     RUN_TEST(v2_record_rejects_unterminated_executable_path);
     RUN_TEST(v2_record_rejects_fully_shaped_numeric_overflow);
     RUN_TEST(legacy_v1_record_never_authorizes_signaling);
-    RUN_TEST(reset_reaps_real_recorded_agent);
 #endif
+    /* AR-17: the only real-path exercise of reap_ssh_agent ->
+     * pid_is_our_ssh_agent was Linux-gated, so macOS and FreeBSD CI never ran
+     * the process-identity code that runs natively there. Every helper it
+     * needs is portable, so run it everywhere. */
+    RUN_TEST(reset_reaps_real_recorded_agent);
+    RUN_TEST(legacy_absolute_socket_arg_matches_through_symlinked_root);
+    RUN_TEST(process_image_capture_populates_absolute_path_for_self);
+    RUN_TEST(process_image_capture_rejects_invalid_target);
     RUN_TEST(reset_refuses_unsafe_socket_dir);
     RUN_TEST(host_alias_preserves_user_stanzas_around_managed_block);
     RUN_TEST(host_alias_malformed_block_fails_without_rewrite);
