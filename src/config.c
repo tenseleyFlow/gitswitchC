@@ -7597,22 +7597,53 @@ static bool config_switch_same_destination_authority(
                  &observed->repository)));
 }
 
-static bool config_switch_same_destinations_authority(
+/* AR-17: adoption completes the RECORDED transaction, so the recorded
+ * destination set is authoritative and the ambient recomputation is only
+ * evidence. The observed set is cwd-dependent: a global-scope snapshot adds a
+ * local destination whenever the process merely sits inside any repository
+ * (git_ops local_also = git_is_repository()). Requiring the two sets to be
+ * identical made recovery depend on where the retry happened to run: a fence
+ * recorded at login (no repository, one destination) could never be adopted
+ * by `gitswitch resume` from inside a repository (two observed). Match every
+ * recorded destination anywhere in the observed set with the same authority
+ * proof, then adopt exactly the recorded set in recorded order, discarding
+ * ambient extras; the serialized model must still be byte-identical to the
+ * durable marker, which only the recorded set can be. A recorded destination
+ * with no authoritative observed match keeps adoption fail-closed. */
+static bool config_switch_adopt_recorded_destinations(
     const publication_record_t *recorded, size_t recorded_count,
-    const publication_record_t *observed, size_t observed_count) {
-    if (!recorded || !observed || recorded_count != observed_count ||
+    publication_record_t *observed, size_t *observed_count,
+    size_t *unmatched_out) {
+    publication_record_t matched[CONFIG_SWITCH_DESTINATION_MAX];
+
+    if (unmatched_out) *unmatched_out = 0U;
+    if (!recorded || !observed || !observed_count ||
         recorded_count == 0U ||
-        recorded_count > CONFIG_SWITCH_DESTINATION_MAX) {
+        recorded_count > CONFIG_SWITCH_DESTINATION_MAX ||
+        *observed_count == 0U ||
+        *observed_count > CONFIG_SWITCH_DESTINATION_MAX) {
         return false;
     }
     for (size_t i = 0U; i < recorded_count; i++) {
-        if (!config_switch_same_destination_authority(
-                &recorded[i], &observed[i])) {
+        size_t j;
+
+        for (j = 0U; j < *observed_count; j++) {
+            if (config_switch_same_destination_authority(
+                    &recorded[i], &observed[j])) {
+                matched[i] = observed[j];
+                break;
+            }
+        }
+        if (j == *observed_count) {
+            if (unmatched_out) *unmatched_out = i;
             return false;
         }
     }
+    memcpy(observed, matched, recorded_count * sizeof(matched[0]));
+    *observed_count = recorded_count;
     return true;
 }
+
 
 static bool config_switch_same_directory_stat_authority(
     const struct stat *before, const struct stat *after) {
@@ -10400,15 +10431,32 @@ int config_switch_guard_install_or_adopt(
     }
 
     if (!snapshot->marker_absent) {
-        if (!config_switch_same_destinations_authority(
+        size_t unmatched = 0U;
+
+        if (!config_switch_adopt_recorded_destinations(
                 snapshot->marker_model.destinations,
                 snapshot->marker_model.destination_count,
                 expected->destinations,
-                expected->destination_count)) {
+                &expected->destination_count,
+                &unmatched)) {
+            const publication_record_t *missing =
+                unmatched < snapshot->marker_model.destination_count
+                    ? &snapshot->marker_model.destinations[unmatched]
+                    : NULL;
+
             errno = EBUSY;
-            set_error(
-                ERR_CONFIG_INVALID,
-                "Switch recovery destinations no longer name the recorded Git namespaces");
+            if (missing && missing->repository_path[0] != '\0') {
+                set_error(
+                    ERR_CONFIG_INVALID,
+                    "The interrupted switch also recorded the repository at "
+                    "%s; rerun `gitswitch resume` from inside that "
+                    "repository to complete it",
+                    missing->repository_path);
+            } else {
+                set_error(
+                    ERR_CONFIG_INVALID,
+                    "Switch recovery destinations no longer name the recorded Git namespaces");
+            }
             goto install_done;
         }
         /* The current probe proves stable destination authority. Preserve the

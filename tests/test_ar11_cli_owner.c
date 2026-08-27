@@ -3609,6 +3609,127 @@ TEST(restart_resume_converges_after_active_state_restore_conflict) {
     CHECK(!config_dir_has_temporary(fixture.config_dir));
 }
 
+/* AR-17: reproduction of a field failure. An interrupted switch at login
+ * (cwd = $HOME, not a repository) records a global-scope fence with ONE
+ * destination. The user's later `gitswitch resume` runs from inside some git
+ * repository -- any repository -- and git_config_snapshot then exports TWO
+ * destinations, because local_also is set purely by git_is_repository().
+ * config_switch_same_destinations_authority refuses on the count mismatch
+ * with "Switch recovery destinations no longer name the recorded Git
+ * namespaces", so recovery depends on the ambient cwd of the retry: the one
+ * command allowed to adopt the marker fails from exactly the place a
+ * developer usually is. Adoption must reconcile against the RECORDED
+ * destination set, not require the ambient recomputation to match it. */
+TEST(switch_fence_recorded_outside_repo_adopts_from_inside_repo) {
+    cli_owner_fixture_t fixture;
+    char repo[PATH_MAX];
+    char resume_output[PATH_MAX];
+    char output[16384];
+    char hint[256];
+    struct stat fence;
+    int status;
+
+    CHECK_EQ_INT(h1_fixture_setup(&fixture), 0);
+
+    /* Interrupted switch with a NON-repository cwd: fence records exactly
+     * the global destination. */
+    status = run_h1_switch_case_at(
+        &fixture, fixture.root, "work",
+        replace_h1_with_third_image_and_fail_sync, false);
+    CHECK(status >= 0);
+    if (status >= 0) {
+        CHECK(WIFEXITED(status));
+        if (WIFEXITED(status)) CHECK_EQ_INT(WEXITSTATUS(status), 0);
+    }
+    CHECK_EQ_INT(lstat(fixture.switch_fence, &fence), 0);
+
+    /* The ambient repository the user happens to be in at retry time. */
+    CHECK((size_t)snprintf(repo, sizeof(repo), "%s/ambient-repo",
+                           fixture.root) < sizeof(repo));
+    CHECK_EQ_INT(mkdir(repo, 0700), 0);
+    {
+        const char *init_argv[] = { "git", "init", "--quiet", NULL };
+        CHECK_EQ_INT(run_h1_git_at(&fixture, repo, init_argv), 0);
+    }
+
+    /* Explicit resume from inside that repository must adopt the fence. */
+    status = run_h1_resume_case_at(&fixture, repo, "resume-in-repo");
+    if ((size_t)snprintf(resume_output, sizeof(resume_output),
+                         "%s/resume-in-repo", fixture.root) <
+            sizeof(resume_output) &&
+        read_text(resume_output, output, sizeof(output)) > 0 &&
+        (status < 0 || !WIFEXITED(status) || WEXITSTATUS(status) != 0)) {
+        fprintf(stderr, "in-repo fenced resume output:\n%s\n", output);
+    }
+    CHECK(status >= 0);
+    if (status >= 0) {
+        CHECK(WIFEXITED(status));
+        if (WIFEXITED(status)) CHECK_EQ_INT(WEXITSTATUS(status), 0);
+    }
+    CHECK(read_text(fixture.hint, hint, sizeof(hint)) > 0);
+    CHECK(strncmp(hint, "none\nactive=work\n",
+                  strlen("none\nactive=work\n")) == 0);
+    errno = 0;
+    CHECK(lstat(fixture.switch_fence, &fence) != 0 && errno == ENOENT);
+}
+
+/* AR-17 complement: a fence recorded INSIDE a repository names that
+ * repository's local (and worktree) destinations. A resume elsewhere cannot
+ * reach them, so adoption must stay fail-closed -- but the refusal must name
+ * the recorded repository and the exact retry, not the old generic text. A
+ * follow-up resume from inside the repository must then adopt the complete
+ * recorded set. */
+TEST(switch_fence_recorded_inside_repo_directs_resume_to_that_repo) {
+    cli_owner_fixture_t fixture;
+    char repo[PATH_MAX];
+    char resume_output[PATH_MAX];
+    char output[16384];
+    struct stat fence;
+    int status;
+
+    CHECK_EQ_INT(h1_fixture_setup(&fixture), 0);
+    CHECK((size_t)snprintf(repo, sizeof(repo), "%s/origin-repo",
+                           fixture.root) < sizeof(repo));
+    CHECK_EQ_INT(h1_repo_setup(&fixture, repo, "origin"), 0);
+
+    status = run_h1_switch_case_at(
+        &fixture, repo, "work",
+        replace_h1_with_third_image_and_fail_sync, false);
+    CHECK(status >= 0);
+    if (status >= 0) {
+        CHECK(WIFEXITED(status));
+        if (WIFEXITED(status)) CHECK_EQ_INT(WEXITSTATUS(status), 0);
+    }
+    CHECK_EQ_INT(lstat(fixture.switch_fence, &fence), 0);
+
+    /* Resume from a non-repository cwd: refuse, and say where to go. */
+    status = run_h1_resume_case_at(&fixture, fixture.root,
+                                   "resume-outside-repo");
+    CHECK(status >= 0);
+    if (status >= 0) {
+        CHECK(WIFEXITED(status));
+        if (WIFEXITED(status)) CHECK(WEXITSTATUS(status) != 0);
+    }
+    CHECK((size_t)snprintf(resume_output, sizeof(resume_output),
+                           "%s/resume-outside-repo", fixture.root) <
+          sizeof(resume_output));
+    CHECK(read_text(resume_output, output, sizeof(output)) > 0);
+    CHECK(strstr(output, "rerun `gitswitch resume` from inside that "
+                         "repository") != NULL);
+    CHECK(strstr(output, "origin-repo") != NULL);
+    CHECK_EQ_INT(lstat(fixture.switch_fence, &fence), 0);
+
+    /* From inside the recorded repository the complete set adopts. */
+    status = run_h1_resume_case_at(&fixture, repo, "resume-inside-repo");
+    CHECK(status >= 0);
+    if (status >= 0) {
+        CHECK(WIFEXITED(status));
+        if (WIFEXITED(status)) CHECK_EQ_INT(WEXITSTATUS(status), 0);
+    }
+    errno = 0;
+    CHECK(lstat(fixture.switch_fence, &fence) != 0 && errno == ENOENT);
+}
+
 TEST(unresolved_switch_fence_survives_restart_and_resume_reconciles_forward) {
     cli_owner_fixture_t fixture;
     char gitconfig[4096];
@@ -7535,6 +7656,8 @@ TEST_MAIN_BEGIN()
     RUN_TEST(persistent_runtime_lock_retains_then_settles_before_next_entry);
     RUN_TEST(persistence_and_abort_failures_keep_first_context_and_causal_order);
     RUN_TEST(restart_resume_converges_after_active_state_restore_conflict);
+    RUN_TEST(switch_fence_recorded_outside_repo_adopts_from_inside_repo);
+    RUN_TEST(switch_fence_recorded_inside_repo_directs_resume_to_that_repo);
     RUN_TEST(unresolved_switch_fence_survives_restart_and_resume_reconciles_forward);
     RUN_TEST(restart_resume_reconstructs_enabled_ssh_identity);
     RUN_TEST(durable_gpg_publication_stop_is_reconciled_by_fresh_resume);
