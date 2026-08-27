@@ -1239,21 +1239,25 @@ TEST(legacy_v1_record_never_authorizes_signaling) {
  * regression in pid_is_our_ssh_agent fails this test instead of shipping
  * green while leaking live key-holding agents. */
 TEST(reset_reaps_real_recorded_agent) {
-    char dir[128], sock[256], pidp[256], out[2048];
+    char dir[128], sock[256], pidp[256], keyp[256], out[2048];
     run_opts_t opts;
     run_result_t res;
     struct timespec t0, t1;
     long ms;
     char *p;
     pid_t pid;
+    int dir_fd;
 
-    if (!command_exists("ssh-agent")) {
-        TS_SKIP("openssh", "ssh-agent unavailable in trusted PATH");
+    if (!command_exists("ssh-agent") || !command_exists("ssh-add") ||
+        !command_exists("ssh-keygen")) {
+        TS_SKIP("openssh",
+                "ssh-agent, ssh-add, and ssh-keygen are required");
     }
 
     CHECK_EQ_INT(make_xdg_agent_dir(dir, sizeof(dir)), 0);
     snprintf(sock, sizeof(sock), "%s/ssh-agent.work.sock", dir);
     snprintf(pidp, sizeof(pidp), "%s/ssh-agent.work.pid", dir);
+    snprintf(keyp, sizeof(keyp), "%s/reap-key", dir);
 
     const char *argv[] = { "ssh-agent", "-s", "-a", sock, NULL };
     memset(&opts, 0, sizeof(opts));
@@ -1273,6 +1277,31 @@ TEST(reset_reaps_real_recorded_agent) {
                      dir, "ssh-agent.work.pid", pid),
                  0);
 
+    /* AR-17: load a REAL key so the retirement guarantee is observable.
+     * Without one, "zero identities after reset" holds trivially and the
+     * assertion proves nothing. The oracle below matches by fingerprint over
+     * the live agent protocol, on every platform. */
+    {
+        const char *keygen_argv[] = {
+            "ssh-keygen", "-q", "-t", "ed25519", "-N", "", "-f", keyp, NULL
+        };
+        const char *add_argv[] = { "ssh-add", "-q", keyp, NULL };
+        run_opts_t tool_opts;
+        run_result_t tool_res;
+
+        memset(&tool_opts, 0, sizeof(tool_opts));
+        tool_opts.stderr_to_devnull = true;
+        CHECK_EQ_INT(run_argv(keygen_argv, &tool_opts, &tool_res), 0);
+        CHECK_EQ_INT(setenv("SSH_AUTH_SOCK", sock, 1), 0);
+        CHECK_EQ_INT(run_argv(add_argv, &tool_opts, &tool_res), 0);
+        (void)unsetenv("SSH_AUTH_SOCK");
+    }
+    dir_fd = open(dir, O_RDONLY | O_DIRECTORY | O_CLOEXEC);
+    CHECK(dir_fd >= 0);
+    if (dir_fd >= 0) {
+        CHECK(ssh_manager_test_socket_has_key(dir_fd, sock, keyp));
+    }
+
     clock_gettime(CLOCK_MONOTONIC, &t0);
     CHECK_EQ_INT(ssh_manager_reset("work"), 0);
     clock_gettime(CLOCK_MONOTONIC, &t1);
@@ -1281,9 +1310,24 @@ TEST(reset_reaps_real_recorded_agent) {
      * under CI load): the fixed 50ms post-SIGTERM poll used to floor this. */
     fprintf(stderr, "  (info: real-agent reap took %ld ms)\n", ms);
 
-    /* A readable pidfd proves process exit before the parent namespace has
-     * necessarily reaped the zombie, so kill(pid, 0) can briefly succeed even
-     * though reset already has conclusive instance-level death evidence. */
+    /* The cross-platform guarantee: the managed key is gone from the live
+     * agent. On Linux the reap signals the process via pidfd; on Darwin and
+     * FreeBSD there is no pidfd, the reap is INDETERMINATE by design, and
+     * reset instead retires the recorded endpoint over the agent protocol
+     * (REMOVE_ALL, then confirmed zero identities). Either way, no key may
+     * survive a successful reset. */
+    if (dir_fd >= 0) {
+        bool key_survives = kill(pid, 0) == 0 &&
+                            ssh_manager_test_socket_has_key(dir_fd, sock, keyp);
+        CHECK(!key_survives);
+        close(dir_fd);
+    }
+
+#if defined(__linux__)
+    /* Linux additionally proves instance-level death. A readable pidfd proves
+     * process exit before the parent namespace has necessarily reaped the
+     * zombie, so kill(pid, 0) can briefly succeed even though reset already
+     * has conclusive death evidence. */
     for (int attempts = 0; attempts < 100 && kill(pid, 0) == 0; attempts++) {
         struct timespec delay = {.tv_sec = 0, .tv_nsec = 10000000L};
         nanosleep(&delay, NULL);
@@ -1293,9 +1337,16 @@ TEST(reset_reaps_real_recorded_agent) {
     CHECK_EQ_INT(errno, ESRCH);
     CHECK(!path_exists(pidp));      /* sidecar dropped once confirmed gone */
     CHECK(!path_exists(sock));
+#endif
 
     if (kill(pid, 0) == 0) {
         kill(pid, SIGKILL); /* never leak a real agent on test failure */
+    }
+    (void)unlink(keyp);
+    {
+        char pubp[300];
+        snprintf(pubp, sizeof(pubp), "%s.pub", keyp);
+        (void)unlink(pubp);
     }
 }
 
