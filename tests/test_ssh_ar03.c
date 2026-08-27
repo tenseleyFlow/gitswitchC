@@ -1300,6 +1300,41 @@ TEST(reset_reaps_real_recorded_agent) {
 
 /* ---- L6: /tmp socket base hardening --------------------------------------- */
 
+/* AR-17 test integrity: production image capture had ZERO real-path coverage.
+ * Every test that reached it replaced `.image` with a stub, and the one test
+ * that ran it for real discarded the result through a stubbed reap. That is
+ * exactly how AR-16 shipped a Linux legacy migration that could never succeed:
+ * the Linux branch never populated `executable_path`, which the identity gate
+ * requires to be absolute. This drives the real function against a real,
+ * dumpable process (ourselves) on every platform, so the Linux, Darwin and
+ * FreeBSD branches all get exercised by CI instead of none of them. */
+TEST(process_image_capture_populates_absolute_path_for_self) {
+    ssh_process_image_t image;
+
+    memset(&image, 0xA5, sizeof(image));
+    CHECK_EQ_INT(ssh_manager_test_capture_process_image(getpid(), &image), 0);
+    CHECK(image.valid);
+    CHECK_EQ_INT((long)image.effective_uid, (long)geteuid());
+    /* The gate in inspect_pid_ssh_agent_image rejects anything whose path is
+     * not absolute, so an empty path here is a silent identity failure. */
+    CHECK(image.executable_path[0] == '/');
+    CHECK(image.executable_identity.st_ino != 0);
+    CHECK(S_ISREG(image.executable_identity.st_mode));
+    /* Capture is live inspection, never a durable launch witness, so it must
+     * not claim the in-process nondumpable marker. */
+    CHECK(!image.executable_object_unknown);
+}
+
+/* Invalid targets must fail closed rather than report a usable image. */
+TEST(process_image_capture_rejects_invalid_target) {
+    ssh_process_image_t image;
+
+    memset(&image, 0, sizeof(image));
+    CHECK_EQ_INT(ssh_manager_test_capture_process_image(0, &image), -1);
+    CHECK_EQ_INT(ssh_manager_test_capture_process_image(1, &image), -1);
+    CHECK_EQ_INT(ssh_manager_test_capture_process_image(getpid(), NULL), -1);
+}
+
 TEST(reset_refuses_unsafe_socket_dir) {
     char dir[192], real[192], pidfile[256];
     FILE *pf;
@@ -1483,6 +1518,8 @@ TEST_MAIN_BEGIN()
     RUN_TEST(legacy_v1_record_never_authorizes_signaling);
     RUN_TEST(reset_reaps_real_recorded_agent);
 #endif
+    RUN_TEST(process_image_capture_populates_absolute_path_for_self);
+    RUN_TEST(process_image_capture_rejects_invalid_target);
     RUN_TEST(reset_refuses_unsafe_socket_dir);
     RUN_TEST(host_alias_preserves_user_stanzas_around_managed_block);
     RUN_TEST(host_alias_malformed_block_fails_without_rewrite);

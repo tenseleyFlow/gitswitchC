@@ -318,6 +318,12 @@ int ssh_manager_test_write_pid_sidecar(int dir_fd, const char *name,
                                        const ssh_agent_record_t *record);
 int ssh_manager_test_capture_process_generation(
     pid_t pid, ssh_process_generation_t *generation);
+/* Capture a live process image through the exact production path. Exported so
+ * a test can observe what production really records for a real agent instead
+ * of asserting against a hand-built stub: the AR-16 Linux legacy-migration
+ * defect survived every audit precisely because no test ever ran this. */
+int ssh_manager_test_capture_process_image(
+    pid_t pid, ssh_process_image_t *image);
 int ssh_manager_test_publish_current_link(int dir_fd, const char *target);
 int ssh_manager_test_cleanup_current_link(int dir_fd);
 int ssh_manager_test_probe_socket(const char *path, bool *reachable);

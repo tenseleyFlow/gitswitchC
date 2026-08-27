@@ -12116,6 +12116,11 @@ int ssh_manager_test_capture_process_generation(
     return capture_process_generation(pid, generation);
 }
 
+int ssh_manager_test_capture_process_image(
+    pid_t pid, ssh_process_image_t *image) {
+    return inspect_process_image_real(pid, image);
+}
+
 /* Re-prove an entry immediately before removing its name. POSIX has no
  * unlink-by-inode operation, so this is the narrowest fail-closed boundary:
  * the caller's captured identity must still own the name after every
