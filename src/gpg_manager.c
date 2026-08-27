@@ -2057,13 +2057,17 @@ static void gpg_encode_generation_bytes(const unsigned char bytes[33],
     token[output] = '\0';
 }
 
-static bool gpg_valid_generation_token(const char *token) {
-    unsigned char bytes[33];
+/* Decode one canonical 44-character generation token into its 33 raw bytes
+ * (kind, boot_hi, boot_lo, start_hi, start_lo, big-endian). Canonicality is
+ * proven by re-encoding: a token that is not byte-identical to the canonical
+ * encoding of its own decode is rejected. */
+static bool gpg_decode_generation_token(const char *token,
+                                        unsigned char bytes[33]) {
     char canonical[45];
     size_t input = 0U;
     size_t output = 0U;
 
-    if (!token) return false;
+    if (!token || strnlen(token, 44U) < 44U) return false;
     while (input < 44U) {
         int a = gpg_base64url_value((unsigned char)token[input++]);
         int b = gpg_base64url_value((unsigned char)token[input++]);
@@ -2077,7 +2081,7 @@ static bool gpg_valid_generation_token(const char *token) {
         bytes[output++] = (unsigned char)(value >> 8U);
         bytes[output++] = (unsigned char)value;
     }
-    if (output != sizeof(bytes) ||
+    if (output != 33U ||
         bytes[0] < 1U || bytes[0] > 3U ||
         (gpg_load_u64_be(bytes + 1U) |
          gpg_load_u64_be(bytes + 9U)) == 0U ||
@@ -2088,6 +2092,38 @@ static bool gpg_valid_generation_token(const char *token) {
     gpg_encode_generation_bytes(bytes, canonical);
     return memcmp(token, canonical, 44U) == 0;
 }
+
+static bool gpg_valid_generation_token(const char *token) {
+    unsigned char bytes[33];
+
+    return gpg_decode_generation_token(token, bytes);
+}
+
+/* AR-15 M1: decide whether two generation tokens name the same live process.
+ * Byte equality does; so does a difference confined to the boot half for the
+ * Darwin (2) and FreeBSD (3) kinds, whose kern.boottime is recomputed on
+ * every wall-clock step while the recorded fork time never is. Comparing
+ * encoded tokens byte-for-byte declared the recorded owner dead after any
+ * clock step, lifting the liveness refusal that protects a live process's
+ * recovery state. Linux's boot half is the stable kernel boot_id, so any
+ * difference there remains a different generation. */
+static bool gpg_generation_tokens_same_process(const char *recorded,
+                                               const char *observed) {
+    unsigned char left[33];
+    unsigned char right[33];
+
+    if (!gpg_decode_generation_token(recorded, left) ||
+        !gpg_decode_generation_token(observed, right)) {
+        return false;
+    }
+    if (memcmp(left, right, 33U) == 0) return true;
+    if (left[0] != right[0] ||
+        (left[0] != 2U && left[0] != 3U)) {
+        return false;
+    }
+    return memcmp(left + 17U, right + 17U, 16U) == 0;
+}
+
 
 static int gpg_encode_process_generation(
     const gpg_process_generation_t *generation, char *token, size_t size) {
@@ -2107,6 +2143,25 @@ static int gpg_encode_process_generation(
     gpg_encode_generation_bytes(bytes, token);
     return 0;
 }
+bool gpg_manager_test_generation_tokens_same_process(const char *left,
+                                                     const char *right) {
+    return gpg_generation_tokens_same_process(left, right);
+}
+
+int gpg_manager_test_encode_process_generation(
+    uint8_t kind, uint64_t boot_hi, uint64_t boot_lo,
+    uint64_t start_hi, uint64_t start_lo, char *token, size_t size) {
+    gpg_process_generation_t generation;
+
+    memset(&generation, 0, sizeof(generation));
+    generation.kind = kind;
+    generation.boot_hi = boot_hi;
+    generation.boot_lo = boot_lo;
+    generation.start_hi = start_hi;
+    generation.start_lo = start_lo;
+    return gpg_encode_process_generation(&generation, token, size);
+}
+
 
 #ifdef __linux__
 static int gpg_read_process_file(const char *path, char *buffer, size_t size,
@@ -2546,7 +2601,7 @@ static int gpg_private_name_owner_is_live(const char *name,
     errno = 0;
     if (gpg_capture_process_generation_token(pid, observed,
                                              sizeof(observed)) == 0) {
-        *live = strncmp(recorded, observed, 44U) == 0;
+        *live = gpg_generation_tokens_same_process(recorded, observed);
         return 0;
     }
     if (errno == ENOENT || errno == ESRCH) return 0;

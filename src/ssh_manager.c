@@ -1852,13 +1852,31 @@ static bool ssh_process_generation_valid(
 static bool ssh_process_generation_equal(
     const ssh_process_generation_t *left,
     const ssh_process_generation_t *right) {
-    return ssh_process_generation_valid(left) &&
-           ssh_process_generation_valid(right) &&
-           left->kind == right->kind &&
-           left->boot_hi == right->boot_hi &&
-           left->boot_lo == right->boot_lo &&
-           left->start_hi == right->start_hi &&
-           left->start_lo == right->start_lo;
+    if (!ssh_process_generation_valid(left) ||
+        !ssh_process_generation_valid(right) ||
+        left->kind != right->kind ||
+        left->start_hi != right->start_hi ||
+        left->start_lo != right->start_lo) {
+        return false;
+    }
+    if (left->boot_hi == right->boot_hi &&
+        left->boot_lo == right->boot_lo) {
+        return true;
+    }
+    /* AR-15 M1: on Darwin and FreeBSD the boot half is kern.boottime, which
+     * the kernel RECOMPUTES as (now - uptime) on every wall-clock step (NTP
+     * step, manual date change, VM resume). The recorded process start time
+     * (p_starttime / ki_start) is written once at fork and never restated.
+     * Requiring the boot halves to match therefore classified the SAME live
+     * process as REPLACED after any clock step, wedging every recovery path
+     * that needs an OWNED generation. The microsecond-exact start plus the
+     * matching kind remain the anti-PID-reuse proof (a recycled PID gets a
+     * new fork timestamp), and every consumer layers socket-peer, argv, and
+     * uid/executable proofs on top. Linux's boot half is the kernel's stable
+     * boot_id UUID -- a difference there is a real reboot and must remain a
+     * replacement, so boot drift is tolerated for the BSD kinds only. */
+    return left->kind == SSH_PROCESS_GENERATION_DARWIN ||
+           left->kind == SSH_PROCESS_GENERATION_FREEBSD;
 }
 
 static int parse_fixed_hex_u64(const char *text, size_t length,
@@ -12139,6 +12157,12 @@ int ssh_manager_test_capture_process_generation(
 int ssh_manager_test_capture_process_image(
     pid_t pid, ssh_process_image_t *image) {
     return inspect_process_image_real(pid, image);
+}
+
+bool ssh_manager_test_same_process_generation(
+    const ssh_process_generation_t *left,
+    const ssh_process_generation_t *right) {
+    return ssh_process_generation_equal(left, right);
 }
 
 /* Re-prove an entry immediately before removing its name. POSIX has no
