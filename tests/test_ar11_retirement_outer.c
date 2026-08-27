@@ -5134,6 +5134,50 @@ TEST(remove_uncertain_install_recovers_when_destination_absent) {
     m18_fixture_cleanup(&fixture);
 }
 
+/* AR-15 L37: an installed-but-uncertain remove has already deleted its live
+ * account, so the user's natural retry -- `gitswitch remove work`, the same
+ * command they just ran -- can no longer resolve the name. It used to print
+ * "Account not found" and nothing else, while the durable marker kept every
+ * mutating command blocked. The only recovery handle is the marker's numeric
+ * account ID, which nothing ever told the user. The lockout diagnostic must
+ * name the recorded ID and the exact command that settles it. */
+TEST(remove_retry_by_name_names_the_recovery_command) {
+    m18_fixture_t fixture;
+    m18_bytes_t output = {0};
+    bool observed = false;
+    int status;
+
+    CHECK_EQ_INT(m18_fixture_setup(&fixture), 0);
+
+    status = m18_run_cli(
+        &fixture, M18_COMMAND_REMOVE, M18_FAULT_ONCE,
+        CONFIG_IO_DOCUMENT_BEFORE_DIR_SYNC, &observed);
+    CHECK(WIFEXITED(status));
+    if (WIFEXITED(status)) {
+        CHECK_EQ_INT(WEXITSTATUS(status), EXIT_FAILURE);
+    }
+    CHECK(observed);
+    CHECK(m18_guard_is_private_and_blocking(&fixture, "remove"));
+
+    /* The natural retry: the same name-form command the user just ran. */
+    status = m18_run_cli(
+        &fixture, M18_COMMAND_REMOVE, M18_FAULT_NONE,
+        CONFIG_IO_DEFAULT_AFTER_TEMP, NULL);
+    CHECK(WIFEXITED(status));
+    if (WIFEXITED(status)) {
+        CHECK_EQ_INT(WEXITSTATUS(status), EXIT_FAILURE);
+    }
+    /* Still blocked: a name retry must never silently settle the marker. */
+    CHECK(m18_guard_is_private_and_blocking(&fixture, "remove"));
+    CHECK_EQ_INT(m18_read_bytes(fixture.output_path, &output), 0);
+    /* The diagnostic must hand the user the exact recovery handle. */
+    CHECK(m18_output_contains(&output, "account ID 1"));
+    CHECK(m18_output_contains(&output, "gitswitch remove 1"));
+
+    m18_bytes_clear(&output);
+    m18_fixture_cleanup(&fixture);
+}
+
 TEST(recovery_terminal_verify_follows_final_prepared_guard_reads) {
     m18_fixture_t fixture;
     m18_bytes_t marker = {0};
@@ -7595,6 +7639,7 @@ TEST_MAIN_BEGIN()
     RUN_TEST(remove_save_boundary_matrix_preserves_outer_coherence);
     RUN_TEST(remove_uncertain_install_recovers_in_fresh_process);
     RUN_TEST(remove_uncertain_install_recovers_when_destination_absent);
+    RUN_TEST(remove_retry_by_name_names_the_recovery_command);
     RUN_TEST(recovery_terminal_verify_follows_final_prepared_guard_reads);
     RUN_TEST(recovery_post_guard_cleanup_failure_is_success_and_self_heals);
     RUN_TEST(remove_recovery_reconciles_interrupted_completion_stage);

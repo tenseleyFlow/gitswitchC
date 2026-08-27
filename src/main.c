@@ -2482,6 +2482,39 @@ static command_result_t handle_remove_command(gitswitch_ctx_t *ctx,
         int removal_errno = errno;
 
         result.failure_kind = COMMAND_FAILURE_REMOVE;
+        /* AR-15 L37: an installed-but-uncertain remove has already deleted
+         * its live account, so the natural retry -- the same name-form
+         * command the user just ran -- resolves nothing and used to report
+         * only "Account not found" while the durable marker kept every
+         * mutating command blocked. The sole recovery handle is the marker's
+         * numeric account ID, which nothing surfaced. When the selector is
+         * unresolvable and a REMOVE marker is active, name that ID and the
+         * exact command that settles it. */
+        if (removal_error.code == ERR_ACCOUNT_NOT_FOUND) {
+            config_retirement_recovery_t recovery;
+
+            memset(&recovery, 0, sizeof(recovery));
+            if (config_retirement_guard_recovery_probe(
+                    ctx->config.config_path, &recovery) == 0 &&
+                recovery.valid &&
+                recovery.kind == CONFIG_RETIREMENT_REMOVE &&
+                recovery.owner_count == 1U) {
+                error_context_t lockout;
+
+                errno = EBUSY;
+                set_error(
+                    ERR_CONFIG_INVALID,
+                    "An interrupted removal of account ID %u is still recorded; "
+                    "its account is already gone, so it cannot be selected by "
+                    "name. Run `gitswitch remove %u` to complete it",
+                    recovery.owners[0].account_id,
+                    recovery.owners[0].account_id);
+                lockout = *get_last_error();
+                (void)error_accumulator_add(
+                    &result.failure_errors,
+                    "interrupted removal recovery", &lockout);
+            }
+        }
         errno = removal_errno;
         (void)error_accumulator_add(&result.failure_errors,
                                     "account removal", &removal_error);
