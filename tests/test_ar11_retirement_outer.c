@@ -4923,6 +4923,9 @@ static void m18_exercise_uncertain_install(
                    m18_output_contains(
                        &output,
                        "Cannot resume while Git retirement is incomplete"));
+    /* AR-15 L2: the lockout names the recorded owner ID. */
+    M18_CASE_CHECK(case_name,
+                   m18_output_contains(&output, "account ID 1"));
 
     m18_bytes_clear(&accounts_before);
     m18_bytes_clear(&accounts_after_failure);
@@ -5174,6 +5177,73 @@ TEST(remove_retry_by_name_names_the_recovery_command) {
     CHECK(m18_output_contains(&output, "account ID 1"));
     CHECK(m18_output_contains(&output, "gitswitch remove 1"));
 
+    m18_bytes_clear(&output);
+    m18_fixture_cleanup(&fixture);
+}
+
+/* AR-15 L3: a REMOVE marker written by a pre-1.9 release (v1 header, no SSH
+ * alias obligation) cannot be completed automatically. The recovery error
+ * used to say "restore the original account and retry removal" -- impossible,
+ * because the same marker blocks `add`. The guidance must be followable: name
+ * what is unknown, what is blocked, and the manual steps that actually clear
+ * it. A v1 marker is produced by downgrading a real v2 marker's header and
+ * dropping the v2-only obligation line, which is exactly the on-disk shape an
+ * upgraded install carries forward. */
+TEST(remove_v1_marker_recovery_guidance_is_followable) {
+    m18_fixture_t fixture;
+    m18_bytes_t marker = {0};
+    m18_bytes_t output = {0};
+    bool observed = false;
+    int status;
+
+    CHECK_EQ_INT(m18_fixture_setup(&fixture), 0);
+
+    status = m18_run_cli(
+        &fixture, M18_COMMAND_REMOVE_NUMERIC, M18_FAULT_ONCE,
+        CONFIG_IO_DOCUMENT_BEFORE_DIR_SYNC, &observed);
+    CHECK(WIFEXITED(status));
+    if (WIFEXITED(status)) CHECK_EQ_INT(WEXITSTATUS(status), EXIT_FAILURE);
+    CHECK(observed);
+    CHECK(m18_guard_is_private_and_blocking(&fixture, "remove"));
+
+    /* Downgrade the real marker to the legacy v1 shape. */
+    CHECK_EQ_INT(m18_read_bytes(fixture.guard_path, &marker), 0);
+    {
+        char v1[1024];
+        const char *text = (const char *)marker.data;
+        const char *body = strchr(text, '\n');
+        const char *obligation = strstr(text, "ssh_obligation=");
+        size_t body_length;
+
+        CHECK(body != NULL && obligation != NULL);
+        if (body && obligation) {
+            body++;
+            body_length = (size_t)(obligation - body);
+            CHECK((size_t)snprintf(v1, sizeof(v1),
+                                   "gitswitch-retirement-incomplete-v1\n%.*s",
+                                   (int)body_length, body) < sizeof(v1));
+            CHECK_EQ_INT(m18_write_file(fixture.guard_path, v1,
+                                        strlen(v1), 0600), 0);
+        }
+    }
+    CHECK(m18_guard_is_private_and_blocking(&fixture, "remove"));
+
+    status = m18_run_cli(
+        &fixture, M18_COMMAND_REMOVE_NUMERIC, M18_FAULT_NONE,
+        CONFIG_IO_DEFAULT_AFTER_TEMP, NULL);
+    CHECK(WIFEXITED(status));
+    if (WIFEXITED(status)) CHECK_EQ_INT(WEXITSTATUS(status), EXIT_FAILURE);
+    /* Never silently settle a marker whose alias obligation is unknown. */
+    CHECK(m18_guard_is_private_and_blocking(&fixture, "remove"));
+    CHECK_EQ_INT(m18_read_bytes(fixture.output_path, &output), 0);
+    CHECK(m18_output_contains(&output, "pre-1.9"));
+    CHECK(m18_output_contains(&output, "~/.ssh/config"));
+    CHECK(m18_output_contains(&output, "blocks add/edit"));
+    CHECK(m18_output_contains(&output, "gitswitch remove 1"));
+    /* The old, impossible instruction must be gone. */
+    CHECK(!m18_output_contains(&output, "restore the original account"));
+
+    m18_bytes_clear(&marker);
     m18_bytes_clear(&output);
     m18_fixture_cleanup(&fixture);
 }
@@ -6388,8 +6458,11 @@ TEST(v1_remove_recovery_remains_blocked_when_alias_obligation_is_unknown) {
     CHECK(m18_guard_is_private_and_blocking(&fixture, "remove"));
     CHECK(m18_completion_absent(&fixture));
     CHECK_EQ_INT(m18_read_bytes(fixture.output_path, &output), 0);
+    /* AR-15 L3: the refusal must explain WHY (the pre-1.9 marker cannot say
+     * whether an SSH alias was left behind), not merely that it refused. */
+    CHECK(m18_output_contains(&output, "pre-1.9"));
     CHECK(m18_output_contains(
-        &output, "SSH alias obligation is unknown"));
+        &output, "does not say whether an SSH host alias was left behind"));
 
     m18_bytes_clear(&accounts);
     m18_bytes_clear(&state);
@@ -7138,6 +7211,10 @@ TEST(reset_persistent_preinstall_fault_retains_guard_and_blocks_switch) {
     CHECK_EQ_INT(m18_read_bytes(fixture.output_path, &output), 0);
     CHECK(m18_output_contains(
         &output, "Cannot switch accounts while Git retirement is incomplete"));
+    /* AR-15 L2: the lockout must name the recorded owner and the command that
+     * settles it, not merely tell the user to "inspect the marker". */
+    CHECK(m18_output_contains(&output, "account ID 1"));
+    CHECK(m18_output_contains(&output, "gitswitch reset"));
 
     m18_bytes_clear(&accounts_before);
     m18_bytes_clear(&state_before);
@@ -7640,6 +7717,7 @@ TEST_MAIN_BEGIN()
     RUN_TEST(remove_uncertain_install_recovers_in_fresh_process);
     RUN_TEST(remove_uncertain_install_recovers_when_destination_absent);
     RUN_TEST(remove_retry_by_name_names_the_recovery_command);
+    RUN_TEST(remove_v1_marker_recovery_guidance_is_followable);
     RUN_TEST(recovery_terminal_verify_follows_final_prepared_guard_reads);
     RUN_TEST(recovery_post_guard_cleanup_failure_is_success_and_self_heals);
     RUN_TEST(remove_recovery_reconciles_interrupted_completion_stage);
