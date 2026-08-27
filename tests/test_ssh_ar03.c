@@ -181,7 +181,6 @@ static int make_xdg_agent_dir(char *dir_out, size_t size) {
     return mkdir(dir_out, 0700);
 }
 
-#if defined(__linux__)
 static int write_live_agent_record(const char *dir, const char *name,
                                    pid_t pid) {
     ssh_agent_record_t record = {.pid = pid};
@@ -198,7 +197,6 @@ static int write_live_agent_record(const char *dir, const char *name,
     if (close(dir_fd) != 0) rc = -1;
     return rc;
 }
-#endif
 
 static int make_account(account_t *a, const char *key_basename) {
     static const char private_prefix[] =
@@ -1229,10 +1227,14 @@ TEST(legacy_v1_record_never_authorizes_signaling) {
     (void)unlink(sock);
 }
 
+#endif
+
 /* Every prior test approaches reap_ssh_agent from the refusal side (bystander
  * PID, above-pid_max PID, no sidecar). This drives the positive path end to
  * end: real ssh-agent, real sidecar, ssh_manager_reset — the agent must be
- * verified (comm + socket argv via /proc, hence Linux-gated), signaled, and
+ * verified (comm + socket argv through the platform process-info API:
+ * /proc on Linux, KERN_PROCARGS2 on Darwin, KERN_PROC_ARGS on FreeBSD),
+ * signaled, and
  * confirmed dead, with sidecar and socket removed. An always-refuse
  * regression in pid_is_our_ssh_agent fails this test instead of shipping
  * green while leaking live key-holding agents. */
@@ -1296,7 +1298,6 @@ TEST(reset_reaps_real_recorded_agent) {
         kill(pid, SIGKILL); /* never leak a real agent on test failure */
     }
 }
-#endif
 
 /* ---- L6: /tmp socket base hardening --------------------------------------- */
 
@@ -1516,8 +1517,12 @@ TEST_MAIN_BEGIN()
     RUN_TEST(v2_record_rejects_unterminated_executable_path);
     RUN_TEST(v2_record_rejects_fully_shaped_numeric_overflow);
     RUN_TEST(legacy_v1_record_never_authorizes_signaling);
-    RUN_TEST(reset_reaps_real_recorded_agent);
 #endif
+    /* AR-17: the only real-path exercise of reap_ssh_agent ->
+     * pid_is_our_ssh_agent was Linux-gated, so macOS and FreeBSD CI never ran
+     * the process-identity code that runs natively there. Every helper it
+     * needs is portable, so run it everywhere. */
+    RUN_TEST(reset_reaps_real_recorded_agent);
     RUN_TEST(process_image_capture_populates_absolute_path_for_self);
     RUN_TEST(process_image_capture_rejects_invalid_target);
     RUN_TEST(reset_refuses_unsafe_socket_dir);
