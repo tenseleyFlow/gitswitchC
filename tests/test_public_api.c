@@ -243,6 +243,8 @@ TEST(all_retained_public_apis_compile_and_link) {
     REQUIRE_PUBLIC_API(git_test_config);
     REQUIRE_PUBLIC_API(git_unset_config_value);
     REQUIRE_PUBLIC_API(gpg_configure_git_signing);
+    REQUIRE_PUBLIC_API(gpg_manager_test_generation_tokens_same_process);
+    REQUIRE_PUBLIC_API(gpg_manager_test_encode_process_generation);
     REQUIRE_PUBLIC_API(gpg_create_isolated_home);
     REQUIRE_PUBLIC_API(gpg_manager_cleanup);
     REQUIRE_PUBLIC_API(gpg_manager_current_is_live_for_account);
@@ -465,6 +467,7 @@ TEST(all_retained_public_apis_compile_and_link) {
     REQUIRE_PUBLIC_API(ssh_manager_test_write_pid_sidecar);
     REQUIRE_PUBLIC_API(ssh_manager_test_capture_process_generation);
     REQUIRE_PUBLIC_API(ssh_manager_test_capture_process_image);
+    REQUIRE_PUBLIC_API(ssh_manager_test_same_process_generation);
     REQUIRE_PUBLIC_API(ssh_remove_host_alias);
     REQUIRE_PUBLIC_API(ssh_remove_host_alias_result);
     REQUIRE_PUBLIC_API(ssh_start_isolated_agent);

@@ -463,6 +463,68 @@ static int arm_plan_revalidation_scan_failure(int base_fd) {
     return 0;
 }
 
+/* AR-15 M1: the recorded-owner liveness comparison must decode generation
+ * tokens and tolerate a boot-half step for the BSD kinds (kern.boottime is
+ * recomputed on every wall-clock step; the recorded fork time is not).
+ * Byte-comparing encoded tokens declared the recorded owner dead after any
+ * step, lifting the refusal that protects a live process's recovery state.
+ * A shifted start stays a different process, and the Linux kind's stable
+ * boot_id never tolerates drift. */
+TEST(generation_token_liveness_tolerates_bsd_boot_step_only) {
+    char recorded[64];
+    char observed[64];
+
+    /* Darwin (kind 2): exact tokens match. */
+    CHECK_EQ_INT(gpg_manager_test_encode_process_generation(
+                     2U, 1700000000U, 123456U, 1700000100U, 654321U,
+                     recorded, sizeof(recorded)), 0);
+    CHECK(gpg_manager_test_generation_tokens_same_process(
+        recorded, recorded));
+
+    /* Darwin: boot-only drift is the same live process. */
+    CHECK_EQ_INT(gpg_manager_test_encode_process_generation(
+                     2U, 1700003600U, 999999U, 1700000100U, 654321U,
+                     observed, sizeof(observed)), 0);
+    CHECK(gpg_manager_test_generation_tokens_same_process(
+        recorded, observed));
+
+    /* FreeBSD (kind 3): same tolerance. */
+    CHECK_EQ_INT(gpg_manager_test_encode_process_generation(
+                     3U, 1700000000U, 123456U, 1700000100U, 654321U,
+                     recorded, sizeof(recorded)), 0);
+    CHECK_EQ_INT(gpg_manager_test_encode_process_generation(
+                     3U, 1700000001U, 123456U, 1700000100U, 654321U,
+                     observed, sizeof(observed)), 0);
+    CHECK(gpg_manager_test_generation_tokens_same_process(
+        recorded, observed));
+
+    /* A shifted start is a different process even with matching boot. */
+    CHECK_EQ_INT(gpg_manager_test_encode_process_generation(
+                     3U, 1700000000U, 123456U, 1700000100U, 654322U,
+                     observed, sizeof(observed)), 0);
+    CHECK(!gpg_manager_test_generation_tokens_same_process(
+        recorded, observed));
+
+    /* Linux (kind 1): boot drift is a real reboot, never tolerated. */
+    CHECK_EQ_INT(gpg_manager_test_encode_process_generation(
+                     1U, 1700000000U, 123456U, 0U, 654321U,
+                     recorded, sizeof(recorded)), 0);
+    CHECK_EQ_INT(gpg_manager_test_encode_process_generation(
+                     1U, 1700000000U, 123457U, 0U, 654321U,
+                     observed, sizeof(observed)), 0);
+    CHECK(!gpg_manager_test_generation_tokens_same_process(
+        recorded, observed));
+
+    /* Kind mismatch and malformed tokens never match. */
+    CHECK_EQ_INT(gpg_manager_test_encode_process_generation(
+                     2U, 1700000000U, 123456U, 0U, 654321U,
+                     observed, sizeof(observed)), 0);
+    CHECK(!gpg_manager_test_generation_tokens_same_process(
+        recorded, observed));
+    CHECK(!gpg_manager_test_generation_tokens_same_process(
+        recorded, "not-a-token"));
+}
+
 TEST(gpg_manager_reset_rejects_empty_selector_without_mutation) {
     char xdg[128], base[256], work[512], other[512];
     char work_marker[1024], other_marker[1024], current[512], lock_path[512];
@@ -1810,6 +1872,7 @@ TEST_MAIN_BEGIN()
                 "HARNESS FAIL: cannot install trusted GnuPG fixture\n");
         return 1;
     }
+    RUN_TEST(generation_token_liveness_tolerates_bsd_boot_step_only);
     RUN_TEST(gpg_manager_reset_rejects_empty_selector_without_mutation);
     RUN_TEST(gpg_manager_reset_rejects_traversal);
     RUN_TEST(gpg_manager_reset_refuses_symlinked_base);

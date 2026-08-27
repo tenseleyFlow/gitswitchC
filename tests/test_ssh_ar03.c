@@ -1432,6 +1432,69 @@ TEST(legacy_absolute_socket_arg_matches_through_symlinked_root) {
     (void)unlink(alias_root);
 }
 
+/* AR-15 M1: the process-generation identity must tolerate a wall-clock step
+ * on the BSD kinds and nowhere else. kern.boottime is recomputed as
+ * (now - uptime) on every step, while the kernel's recorded fork time never
+ * is -- so after a step the SAME live agent re-captures with a shifted boot
+ * half and an identical start. Requiring boot equality classified it
+ * REPLACED and wedged every recovery needing an OWNED generation. A shifted
+ * START stays a replacement (that is the PID-reuse signal), and Linux's
+ * boot half is the stable kernel boot_id, so any drift there stays a real
+ * reboot. */
+TEST(process_generation_tolerates_bsd_boot_step_only) {
+    ssh_process_generation_t base = {
+        .kind = SSH_PROCESS_GENERATION_DARWIN,
+        .boot_hi = 1700000000U, .boot_lo = 123456U,
+        .start_hi = 1700000100U, .start_lo = 654321U
+    };
+    ssh_process_generation_t other;
+
+    /* Exact match is itself. */
+    CHECK(ssh_manager_test_same_process_generation(&base, &base));
+
+    /* Darwin: boot-only drift is the same process. */
+    other = base;
+    other.boot_hi += 3600U;
+    other.boot_lo = 999999U;
+    CHECK(ssh_manager_test_same_process_generation(&base, &other));
+
+    /* FreeBSD: same tolerance. */
+    other = base;
+    base.kind = SSH_PROCESS_GENERATION_FREEBSD;
+    other.kind = SSH_PROCESS_GENERATION_FREEBSD;
+    other.boot_lo = base.boot_lo + 1U;
+    CHECK(ssh_manager_test_same_process_generation(&base, &other));
+    base.kind = SSH_PROCESS_GENERATION_DARWIN;
+
+    /* A shifted start is a replacement even with matching boot. */
+    other = base;
+    other.start_lo++;
+    CHECK(!ssh_manager_test_same_process_generation(&base, &other));
+
+    /* Boot AND start shifted: replacement. */
+    other = base;
+    other.boot_hi += 1U;
+    other.start_lo += 1U;
+    CHECK(!ssh_manager_test_same_process_generation(&base, &other));
+
+    /* Linux: boot drift is a real reboot, never tolerated. */
+    base.kind = SSH_PROCESS_GENERATION_LINUX;
+    other = base;
+    other.boot_lo++;
+    CHECK(!ssh_manager_test_same_process_generation(&base, &other));
+
+    /* Kind mismatch never matches. */
+    other = base;
+    other.kind = SSH_PROCESS_GENERATION_DARWIN;
+    CHECK(!ssh_manager_test_same_process_generation(&base, &other));
+
+    /* Invalid (zero start) never matches anything. */
+    other = base;
+    other.start_hi = 0U;
+    other.start_lo = 0U;
+    CHECK(!ssh_manager_test_same_process_generation(&other, &other));
+}
+
 TEST(process_image_capture_populates_absolute_path_for_self) {
     ssh_process_image_t image;
 
@@ -1647,6 +1710,7 @@ TEST_MAIN_BEGIN()
      * needs is portable, so run it everywhere. */
     RUN_TEST(reset_reaps_real_recorded_agent);
     RUN_TEST(legacy_absolute_socket_arg_matches_through_symlinked_root);
+    RUN_TEST(process_generation_tolerates_bsd_boot_step_only);
     RUN_TEST(process_image_capture_populates_absolute_path_for_self);
     RUN_TEST(process_image_capture_rejects_invalid_target);
     RUN_TEST(reset_refuses_unsafe_socket_dir);

@@ -324,6 +324,12 @@ int ssh_manager_test_capture_process_generation(
  * defect survived every audit precisely because no test ever ran this. */
 int ssh_manager_test_capture_process_image(
     pid_t pid, ssh_process_image_t *image);
+/* The production process-generation identity through the exact comparator
+ * every OWNED/REPLACED verdict rests on. Exported so tests can pin its
+ * step-tolerance contract per platform kind (AR-15 M1). */
+bool ssh_manager_test_same_process_generation(
+    const ssh_process_generation_t *left,
+    const ssh_process_generation_t *right);
 int ssh_manager_test_publish_current_link(int dir_fd, const char *target);
 int ssh_manager_test_cleanup_current_link(int dir_fd);
 int ssh_manager_test_probe_socket(const char *path, bool *reachable);

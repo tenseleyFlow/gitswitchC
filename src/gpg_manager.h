@@ -74,6 +74,14 @@ typedef struct {
     bool runtime_restore_pending;
 } gpg_config_t;
 
+/* AR-15 M1 test seams: the production generation-token liveness comparison
+ * and its encoder, so tests can pin the per-kind step-tolerance contract. */
+bool gpg_manager_test_generation_tokens_same_process(const char *left,
+                                                     const char *right);
+int gpg_manager_test_encode_process_generation(
+    uint8_t kind, uint64_t boot_hi, uint64_t boot_lo,
+    uint64_t start_hi, uint64_t start_lo, char *token, size_t size);
+
 /* Narrow dependency seams for deterministic filesystem-race/error tests. The
  * defaults are libc readdir() and no pre-open callback, respectively. */
 typedef struct dirent *(*gpg_readdir_fn)(DIR *dir);
