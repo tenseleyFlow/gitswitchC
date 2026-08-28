@@ -812,9 +812,15 @@ TEST(reuse_recovers_ownership_of_provenance_launched_agent) {
     CHECK_EQ_INT((long)second.agent_pid, (long)launched);
     CHECK(path_exists(sock));
 
-    /* The payoff: recovered ownership means cleanup can actually signal
-     * and reap the agent again, instead of leaking a key-holding process. */
+    /* The payoff: recovered ownership means cleanup can act on the agent
+     * again instead of leaking it. On Linux the reap signals via pidfd and
+     * the process must be gone. Darwin and FreeBSD have no pidfd: the reap is
+     * INDETERMINATE by design and cleanup retires the recorded endpoint over
+     * the agent protocol instead, so the process legitimately survives
+     * key-less there -- asserting its death here re-encodes the same
+     * Linux-only model the AR-17 reap test had to shed. */
     CHECK_EQ_INT(ssh_manager_cleanup(&second), 0);
+#if defined(__linux__)
     for (int attempts = 0; attempts < 100 && kill(launched, 0) == 0;
          attempts++) {
         struct timespec delay = {.tv_sec = 0, .tv_nsec = 10000000L};
@@ -822,8 +828,10 @@ TEST(reuse_recovers_ownership_of_provenance_launched_agent) {
     }
     errno = 0;
     CHECK(kill(launched, 0) != 0 && errno == ESRCH);
+#endif
 
-    /* Never leak the real agent even if an assertion above failed. */
+    /* Never leak the real agent even if an assertion above failed (and on
+     * the BSDs it survives cleanup by design). */
     if (launched > 1 && kill(launched, 0) == 0) {
         (void)kill(launched, SIGKILL);
     }
