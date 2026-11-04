@@ -163,6 +163,17 @@ static int write_binary_file(const char *path, const unsigned char *contents,
     return chmod(path, mode);
 }
 
+#if defined(__APPLE__) && defined(__has_feature)
+#if __has_feature(address_sanitizer)
+/* AR-18 Darwin diagnostics: the pre-exec child has no stderr, so route the
+ * sanitizer's report of a fault in it to a file the failing test can dump. */
+const char *__asan_default_options(void);
+const char *__asan_default_options(void) {
+    return "log_path=/tmp/gsw-asan-ar08,abort_on_error=0,handle_segv=1,handle_sigbus=1";
+}
+#endif
+#endif
+
 static int run_command(const char *const argv[], char *output,
                        size_t output_size, bool merge_stderr,
                        run_result_t *result) {
@@ -1976,9 +1987,11 @@ TEST(direct_worktree_extension_false_ignores_later_included_true) {
             }
             /* The crash report of the killed pre-exec child names the
              * exception (guarded descriptor, stack fault, ...). */
+            (void)!system("for f in /tmp/gsw-asan-ar08.*; do [ -e \"$f\" ] || continue; "
+                          "echo \"asan: $f\" 1>&2; head -60 \"$f\" | sed 's/^/asan: /' 1>&2; done");
             (void)!system(
                 "d=\"$HOME/Library/Logs/DiagnosticReports\"; f=; "
-                "for i in 1 2 3 4 5 6 7 8 9 10 11 12 13 14 15; do "
+                "for i in $(seq 1 45); do "
                 "f=$(ls -t \"$d\"/test_ar08_git_transaction-*.ips 2>/dev/null | head -1); "
                 "[ -n \"$f\" ] && break; sleep 2; done; "
                 "if [ -z \"$f\" ]; then echo 'crash: no report' 1>&2; exit 0; fi; "
