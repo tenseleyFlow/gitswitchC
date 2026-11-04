@@ -5695,8 +5695,33 @@ static int run_argv_real_impl(
         group_proven = true;
     }
     close(group_ready_pipe[0]);
-    if (!group_proven || runner_tty_prepare(&tty_state) != 0 ||
-        runner_tty_transfer(&tty_state, pid) != 0) {
+    int tty_prepare_rc = 0;
+    int tty_prepare_errno = 0;
+    int tty_transfer_rc = 0;
+    int tty_transfer_errno = 0;
+    if (group_proven) {
+        errno = 0;
+        tty_prepare_rc = runner_tty_prepare(&tty_state);
+        tty_prepare_errno = errno;
+        if (tty_prepare_rc == 0) {
+            errno = 0;
+            tty_transfer_rc = runner_tty_transfer(&tty_state, pid);
+            tty_transfer_errno = errno;
+        }
+    }
+    if (!group_proven || tty_prepare_rc != 0 || tty_transfer_rc != 0) {
+#ifdef GITSWITCH_TESTING
+        /* AR-18: name the exact pre-exec failure for the suites; the
+         * production runner reports it through the result and errno only. */
+        fprintf(stderr,
+                "runner early failure: group_proven=%d ready_rc=%d "
+                "ready_errno=%d early_rc=%d early_stage=%d early_errno=%d "
+                "tty_prepare=%d/%d tty_transfer=%d/%d\n",
+                group_proven ? 1 : 0, group_ready_rc, group_ready_errno,
+                early_group_failure_rc, (int)early_group_failure.stage,
+                early_group_failure.system_errno, tty_prepare_rc,
+                tty_prepare_errno, tty_transfer_rc, tty_transfer_errno);
+#endif
         bool silent_pre_ready_failure =
             group_ready_rc != 0 && group_ready_errno == EPIPE &&
             early_group_failure_rc == 0;
