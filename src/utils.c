@@ -5700,15 +5700,15 @@ static int run_argv_real_impl(
     int tty_transfer_rc = 0;
     int tty_transfer_errno = 0;
     if (group_proven) {
-        errno = 0;
         tty_prepare_rc = runner_tty_prepare(&tty_state);
-        tty_prepare_errno = errno;
+        if (tty_prepare_rc != 0) tty_prepare_errno = errno;
         if (tty_prepare_rc == 0) {
-            errno = 0;
             tty_transfer_rc = runner_tty_transfer(&tty_state, pid);
-            tty_transfer_errno = errno;
+            if (tty_transfer_rc != 0) tty_transfer_errno = errno;
         }
     }
+    (void)tty_prepare_errno;
+    (void)tty_transfer_errno;
     if (!group_proven || tty_prepare_rc != 0 || tty_transfer_rc != 0) {
 #ifdef GITSWITCH_TESTING
         /* AR-18: name the exact pre-exec failure for the suites; the
