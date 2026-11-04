@@ -1960,6 +1960,10 @@ TEST(direct_worktree_extension_false_ignores_later_included_true) {
                                "%s/runner-trace.log", fixture.base) <
               sizeof(trace_path));
         (void)setenv("GITSWITCH_RUNNER_TRACE", trace_path, 1);
+        /* Darwin diagnostics: which descriptors does the parent hold here? */
+        (void)!system("ls -l /dev/fd/ 2>/dev/null | sed 's/^/fds-before: /' 1>&2; "
+                      "for fd in /dev/fd/*; do n=${fd##*/}; [ \"$n\" -gt 2 ] 2>/dev/null || continue; "
+                      "echo \"fdinfo-before: $n $(lsof -p $PPID -a -d $n -Fn 2>/dev/null | tail -1)\" 1>&2; done");
         if (git_config_seal() != 0) {
             FILE *trace = fopen(trace_path, "r");
             char line[512];
