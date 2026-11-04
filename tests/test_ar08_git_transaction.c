@@ -1976,12 +1976,28 @@ TEST(direct_worktree_extension_false_ignores_later_included_true) {
             }
             /* The crash report of the killed pre-exec child names the
              * exception (guarded descriptor, stack fault, ...). */
-            (void)!system("sleep 12; for d in \"$HOME\"/Library/Logs/DiagnosticReports /Library/Logs/DiagnosticReports; do "
-                          "ls -t \"$d\" 2>/dev/null | head -5 | sed \"s|^|reports: $d/|\" 1>&2; done; "
-                          "f=$(ls -t \"$HOME\"/Library/Logs/DiagnosticReports/test_ar08* /Library/Logs/DiagnosticReports/test_ar08* 2>/dev/null | head -1); "
-                          "if [ -n \"$f\" ]; then echo \"crash: $f\" 1>&2; "
-                          "head -c 12000 \"$f\" | tr ',' '\\n' | grep -i -E 'exception|termination|signal|guard|faultingThread|\"type\"|codes|reason|symbol|imageOffset' | head -60 | sed 's/^/crash: /' 1>&2; fi; "
-                          "log show --last 3m --style compact --predicate 'process == \"ReportCrash\" OR eventMessage CONTAINS \"EXC_\" OR eventMessage CONTAINS \"guard\"' 2>/dev/null | grep -v 'com.apple.' | tail -30 | sed 's/^/rc: /' 1>&2");
+            (void)!system(
+                "d=\"$HOME/Library/Logs/DiagnosticReports\"; f=; "
+                "for i in 1 2 3 4 5 6 7 8 9 10 11 12 13 14 15; do "
+                "f=$(ls -t \"$d\"/test_ar08_git_transaction-*.ips 2>/dev/null | head -1); "
+                "[ -n \"$f\" ] && break; sleep 2; done; "
+                "if [ -z \"$f\" ]; then echo 'crash: no report' 1>&2; exit 0; fi; "
+                "echo \"crash: $f\" 1>&2; "
+                "python3 - \"$f\" 1>&2 <<'PY'\n"
+                "import json,sys\n"
+                "raw=open(sys.argv[1]).read().split('\\n',1)\n"
+                "body=json.loads(raw[1])\n"
+                "for k in ('exception','termination','asi','vmRegionInfo','faultingThread','isCorpse','procName','parentProc','parentPid'):\n"
+                "    if k in body: print('crash:',k,'=',json.dumps(body[k])[:400])\n"
+                "imgs=body.get('usedImages',[])\n"
+                "ft=body.get('faultingThread',0)\n"
+                "th=body.get('threads',[])\n"
+                "if th:\n"
+                "    t=th[ft] if ft < len(th) else th[0]\n"
+                "    for fr in t.get('frames',[])[:14]:\n"
+                "        idx=fr.get('imageIndex',-1); name=imgs[idx].get('name','?') if 0<=idx<len(imgs) else '?'\n"
+                "        print('crash: frame', name, fr.get('symbol','?'), '+', fr.get('symbolLocation','?'), 'off', fr.get('imageOffset','?'))\n"
+                "PY\n");
             /* The unified log records kernel-originated kills with their
              * reason (exec policy, resource exception, jetsam, AMFI). */
             (void)!system("log show --last 3m --style compact --predicate "
