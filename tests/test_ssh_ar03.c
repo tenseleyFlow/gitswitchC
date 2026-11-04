@@ -1479,6 +1479,11 @@ TEST(replaced_generation_retires_dead_socket_but_keeps_live_socket) {
     CHECK_EQ_INT(ssh_manager_test_capture_process_generation(
                      getpid(), &record.generation), 0);
     record.generation.start_lo++;
+    /* Capture this process's own image rather than letting the seam look up
+     * an ssh-agent launch witness, which is outside the trusted PATH on the
+     * macOS runners. */
+    CHECK_EQ_INT(ssh_manager_test_capture_process_image(getpid(),
+                                                        &record.image), 0);
     record.image.socket_peer_pid = getpid();
     record.image.socket_peer_uid = geteuid();
     dir_fd = open(dir, O_RDONLY | O_DIRECTORY | O_CLOEXEC);
