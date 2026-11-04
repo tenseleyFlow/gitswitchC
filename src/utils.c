@@ -3970,11 +3970,20 @@ static int runner_tty_restore(runner_tty_state_t *state) {
     return 0;
 }
 
-static void runner_signal_child(pid_t pid, bool group_proven,
-                                int signal_number) {
+static void runner_signal_child_at(pid_t pid, bool group_proven,
+                                   int signal_number, int line) {
     if (pid <= 0) return;
+#ifdef GITSWITCH_TESTING
+    if (getenv("GITSWITCH_RUNNER_TRACE")) fprintf(stderr,
+            "runner signal: sig=%d pid=%ld group=%d from utils.c:%d errno=%d\n",
+            signal_number, (long)pid, group_proven ? 1 : 0, line, errno);
+#else
+    (void)line;
+#endif
     (void)kill(group_proven ? -pid : pid, signal_number);
 }
+#define runner_signal_child(pid, group_proven, signal_number) \
+    runner_signal_child_at((pid), (group_proven), (signal_number), __LINE__)
 
 static void runner_accept_group_relay(pid_t pid, bool group_proven,
                                       int signal_number) {
@@ -4146,6 +4155,9 @@ static int runner_replay_pending_group_signals(
                 return -1;
             }
             (void)kill(worker, SIGCONT);
+#ifdef GITSWITCH_TESTING
+    if (getenv("GITSWITCH_RUNNER_TRACE")) fprintf(stderr, "supervisor kill at utils.c:%d errno=%d\n", __LINE__, errno);
+#endif
             if (kill(worker, SIGKILL) != 0) return -1;
             *worker_killed = true;
             continue;
@@ -4167,12 +4179,21 @@ static void runner_kill_and_reap_worker(pid_t worker,
 
     if (!relay_set ||
         sigprocmask(SIG_BLOCK, relay_set, &previous_mask) != 0) {
-        (void)kill(worker, SIGKILL);
+#ifdef GITSWITCH_TESTING
+    if (getenv("GITSWITCH_RUNNER_TRACE")) fprintf(stderr, "supervisor kill at utils.c:%d errno=%d\n", __LINE__, errno);
+#endif
+    #ifdef GITSWITCH_TESTING
+    if (getenv("GITSWITCH_RUNNER_TRACE")) fprintf(stderr, "supervisor kill at utils.c:%d errno=%d\n", __LINE__, errno);
+#endif
+    (void)kill(worker, SIGKILL);
         do {
             waited = waitpid(worker, NULL, 0);
         } while (waited < 0 && errno == EINTR);
         return;
     }
+#ifdef GITSWITCH_TESTING
+    if (getenv("GITSWITCH_RUNNER_TRACE")) fprintf(stderr, "supervisor kill at utils.c:%d errno=%d\n", __LINE__, errno);
+#endif
     (void)kill(worker, SIGKILL);
     do {
         waited = waitpid(worker, NULL, 0);
@@ -4193,6 +4214,9 @@ static void runner_supervisor_exit_for_status(pid_t child, int status) {
         }
         (void)raise(signal_number);
     }
+#ifdef GITSWITCH_TESTING
+    if (getenv("GITSWITCH_RUNNER_TRACE")) fprintf(stderr, "supervisor kill at utils.c:%d errno=%d\n", __LINE__, errno);
+#endif
     (void)kill(child, SIGKILL);
     _exit(127);
 }
