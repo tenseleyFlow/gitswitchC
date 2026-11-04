@@ -58,7 +58,8 @@ typedef enum {
     GIT_RETIREMENT_TEST_AFTER_STABLE_WITNESS_CLOSE,
     GIT_RETIREMENT_TEST_AFTER_RESTORED_WITNESS_READ,
     GIT_RETIREMENT_TEST_AFTER_FINAL_RESTORED_WITNESS_READ,
-    GIT_RETIREMENT_TEST_BEFORE_CLEANUP_RECLAIM
+    GIT_RETIREMENT_TEST_BEFORE_CLEANUP_RECLAIM,
+    GIT_RETIREMENT_TEST_FORCE_NOREPLACE_FALLBACK
 } git_retirement_test_stage_t;
 typedef bool (*git_retirement_test_hook_fn)(
     git_retirement_test_stage_t stage, const char *path,
@@ -162,6 +163,8 @@ typedef enum {
     AT_HOOK_FAIL_FALLBACK_LINK,
     AT_HOOK_FAIL_AFTER_FALLBACK_LINK,
     AT_HOOK_SKIP_CLEANUP_RECLAIM,
+    AT_HOOK_FORCE_NOREPLACE_FALLBACK,
+    AT_HOOK_FORCE_FALLBACK_FAIL_STAGE_UNLINK_TWICE,
     AT_HOOK_FAIL_AFTER_REVERSE_UNLINK,
     AT_HOOK_EXIT_AFTER_TERMINAL_AUTHORITY_SYNC,
     AT_HOOK_EXIT_AFTER_TERMINAL_CANONICAL_SYNC,
@@ -1475,6 +1478,29 @@ static bool at_retirement_hook(git_retirement_test_stage_t stage,
         at_hook_attempts++;
         at_hook_observed = true;
         return true;
+    }
+    if (at_hook_mode == AT_HOOK_FORCE_NOREPLACE_FALLBACK &&
+        stage == GIT_RETIREMENT_TEST_FORCE_NOREPLACE_FALLBACK) {
+        /* Model a filesystem whose rename rejects flags: every no-replace
+         * move takes the portable linkat path (AR-18 M2/M4). */
+        at_hook_attempts++;
+        at_hook_observed = true;
+        return true;
+    }
+    if (at_hook_mode == AT_HOOK_FORCE_FALLBACK_FAIL_STAGE_UNLINK_TWICE) {
+        if (stage == GIT_RETIREMENT_TEST_FORCE_EXCHANGE_FALLBACK) {
+            return true;
+        }
+        if (stage == GIT_RETIREMENT_TEST_CLEANUP_UNLINK && value &&
+            strcmp(value, "staging file") == 0) {
+            at_hook_attempts++;
+            if (at_hook_attempts <= 2U) {
+                at_hook_observed = true;
+                errno = EIO;
+                return true;
+            }
+        }
+        return false;
     }
     if ((at_hook_mode == AT_HOOK_FAIL_TARGET_PRELOCK ||
          at_hook_mode == AT_HOOK_FAIL_TARGET_PRELOCK_AND_CLEANUP) &&
@@ -5257,11 +5283,82 @@ TEST(cleanup_arena_stragglers_are_swept_before_the_next_mutation) {
     CHECK_EQ_INT((long)at_count_cleanup_artifacts(fixture.root), 0);
 }
 
+/* AR-18 M2/M4: on a filesystem that rejects rename flags every no-replace
+ * move (arena quarantine, settled move, lock release) takes the portable
+ * linkat path and the retirement still completes with a transient arena. */
+TEST(forced_unsupported_noreplace_fallback_retires_cleanly) {
+    at_fixture_t fixture;
+    size_t cleared = 99U;
+
+    CHECK_EQ_INT(at_fixture_init(&fixture, PUBLICATION_SCOPE_GLOBAL, true,
+                                 0640), 0);
+    at_install_hook(&fixture, AT_HOOK_FORCE_NOREPLACE_FALLBACK, NULL);
+    CHECK_EQ_INT(at_retire(&fixture, &cleared), 0);
+#if !defined(__FreeBSD__)
+    CHECK(at_hook_observed);
+#endif
+    at_clear_hook();
+    CHECK_EQ_INT((long)cleared, (long)AT_KEY_COUNT);
+    at_check_foreign_survivors(&fixture);
+    errno = 0;
+    CHECK(access(fixture.lock_path, F_OK) != 0 && errno == ENOENT);
+    CHECK_EQ_INT((long)at_count_stage_artifacts(fixture.root), 0);
+    CHECK_EQ_INT((long)at_count_recovery_artifacts(fixture.root), 0);
+    CHECK_EQ_INT((long)at_count_cleanup_artifacts(fixture.root), 0);
+}
+
+/* AR-18 M5: when the portable publication fallback's detached-original
+ * backup cannot be cleaned up, the recovery marker that tracks it must be
+ * persistable (its "<pid>-o<n>" leaf used to be rejected by the marker
+ * validator, leaving an empty canonical lock nothing could recover), and the
+ * next retirement must self-heal. */
+TEST(forced_fallback_cleanup_failure_persists_marker_and_self_heals) {
+#if defined(__FreeBSD__)
+    TS_SKIP("persistent-fs",
+            "portable renameat fallback path is exercised off FreeBSD");
+#else
+    at_fixture_t fixture;
+    struct stat lock_stat;
+    size_t cleared = 99U;
+
+    CHECK_EQ_INT(at_fixture_init(&fixture, PUBLICATION_SCOPE_GLOBAL, false,
+                                 0640), 0);
+    at_install_hook(&fixture, AT_HOOK_FORCE_FALLBACK_FAIL_STAGE_UNLINK_TWICE,
+                    NULL);
+    clear_error();
+    CHECK_EQ_INT(at_retire(&fixture, &cleared), -1);
+    CHECK(at_hook_observed);
+    at_clear_hook();
+    /* The publication itself succeeded; only the owned-name cleanup was
+     * refused, so the canonical lock must now be a complete, non-empty
+     * recovery marker rather than the empty lock. */
+    at_check_owned_absent(&fixture);
+    CHECK_EQ_INT(stat(fixture.lock_path, &lock_stat), 0);
+    CHECK(lock_stat.st_size > 0);
+    /* Git itself cannot rewrite the config while the marker occupies the
+     * lock name, so the next retirement runs against the already-cleared
+     * destination: it must recover the marker, retire the tracked backup
+     * and release the lock name. */
+    cleared = 99U;
+    clear_error();
+    CHECK_EQ_INT(at_retire(&fixture, &cleared), 0);
+    CHECK_EQ_INT((long)cleared, 0);
+    at_check_owned_absent(&fixture);
+    errno = 0;
+    CHECK(access(fixture.lock_path, F_OK) != 0 && errno == ENOENT);
+    CHECK_EQ_INT((long)at_count_stage_artifacts(fixture.root), 0);
+    CHECK_EQ_INT((long)at_count_recovery_artifacts(fixture.root), 0);
+    CHECK_EQ_INT((long)at_count_cleanup_artifacts(fixture.root), 0);
+#endif
+}
+
 TEST_MAIN_BEGIN()
     error_init(LOG_LEVEL_WARNING, NULL);
     RUN_TEST(global_exact_retirement_preserves_ordered_foreign_values);
     RUN_TEST(clean_mixed_retirement_leaves_no_cleanup_arena_residue);
     RUN_TEST(cleanup_arena_stragglers_are_swept_before_the_next_mutation);
+    RUN_TEST(forced_unsupported_noreplace_fallback_retires_cleanly);
+    RUN_TEST(forced_fallback_cleanup_failure_persists_marker_and_self_heals);
     RUN_TEST(local_exact_retirement_preserves_ordered_foreign_values);
     RUN_TEST(worktree_exact_retirement_preserves_ordered_foreign_values);
     RUN_TEST(duplicate_identical_owned_value_conflicts_without_mutation);

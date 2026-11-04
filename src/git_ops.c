@@ -322,7 +322,8 @@ typedef enum {
     GIT_RETIREMENT_TEST_AFTER_STABLE_WITNESS_CLOSE,
     GIT_RETIREMENT_TEST_AFTER_RESTORED_WITNESS_READ,
     GIT_RETIREMENT_TEST_AFTER_FINAL_RESTORED_WITNESS_READ,
-    GIT_RETIREMENT_TEST_BEFORE_CLEANUP_RECLAIM
+    GIT_RETIREMENT_TEST_BEFORE_CLEANUP_RECLAIM,
+    GIT_RETIREMENT_TEST_FORCE_NOREPLACE_FALLBACK
 } git_retirement_test_stage_t;
 typedef bool (*git_retirement_test_hook_fn)(
     git_retirement_test_stage_t stage, const char *path,
@@ -2753,7 +2754,12 @@ static bool git_recovery_stage_leaf_valid(const char *leaf) {
 #endif
     if (!isdigit(*cursor)) return false;
     while (isdigit(*cursor)) cursor++;
-    if (*cursor++ != '-' || !isdigit(*cursor)) return false;
+    if (*cursor++ != '-') return false;
+    /* The portable publication fallback names its detached-original backup
+     * "<pid>-o<n>"; recovery must be able to persist and replay a marker
+     * that tracks it (AR-18 M5). */
+    if (*cursor == 'o') cursor++;
+    if (!isdigit(*cursor)) return false;
     while (isdigit(*cursor)) cursor++;
     return *cursor == '\0';
 }
@@ -3312,8 +3318,64 @@ typedef enum {
  * Cleanup uses this as a compare-after-move primitive on platforms without
  * FreeBSD's descriptor-conditioned funlinkat(2). */
 #if !defined(__FreeBSD__)
+/* Portable no-replace move for filesystems whose rename rejects flags (NFS,
+ * CIFS, sshfs and other FUSE daemons without rename2, ecryptfs, 9p): linkat(2)
+ * is itself atomic and no-replace, and the source name is unlinked only while
+ * its identity still equals the linked inode. If that unlink fails the fresh
+ * link is removed again by identity so the namespace is left unchanged, and
+ * the caller sees a plain error (AR-18 M2/M4). */
+static git_noreplace_move_result_t git_rename_noreplace_portable_at(
+    int dir_fd, const char *source, const char *destination) {
+    struct stat pinned;
+    struct stat linked;
+    struct stat current;
+    int saved_errno;
+
+    if (fstatat(dir_fd, source, &pinned, AT_SYMLINK_NOFOLLOW) != 0) {
+        return GIT_NOREPLACE_MOVE_ERROR;
+    }
+    if (linkat(dir_fd, source, dir_fd, destination, 0) != 0) {
+        return GIT_NOREPLACE_MOVE_ERROR;
+    }
+    if (fstatat(dir_fd, destination, &linked, AT_SYMLINK_NOFOLLOW) != 0 ||
+        linked.st_dev != pinned.st_dev || linked.st_ino != pinned.st_ino) {
+        saved_errno = errno ? errno : ESTALE;
+        /* Never remove a foreign occupant: only the alias of the pinned
+         * source is taken back. */
+        if (fstatat(dir_fd, destination, &linked,
+                    AT_SYMLINK_NOFOLLOW) == 0 &&
+            linked.st_dev == pinned.st_dev &&
+            linked.st_ino == pinned.st_ino) {
+            (void)unlinkat(dir_fd, destination, 0);
+        }
+        errno = saved_errno;
+        return GIT_NOREPLACE_MOVE_ERROR;
+    }
+    if (fstatat(dir_fd, source, &current, AT_SYMLINK_NOFOLLOW) != 0 ||
+        current.st_dev != pinned.st_dev || current.st_ino != pinned.st_ino ||
+        unlinkat(dir_fd, source, 0) != 0) {
+        saved_errno = errno ? errno : ESTALE;
+        if (fstatat(dir_fd, destination, &linked,
+                    AT_SYMLINK_NOFOLLOW) == 0 &&
+            linked.st_dev == pinned.st_dev &&
+            linked.st_ino == pinned.st_ino) {
+            (void)unlinkat(dir_fd, destination, 0);
+        }
+        errno = saved_errno;
+        return GIT_NOREPLACE_MOVE_ERROR;
+    }
+    return GIT_NOREPLACE_MOVE_OK;
+}
+
 static git_noreplace_move_result_t git_rename_noreplace_at(
     int dir_fd, const char *source, const char *destination) {
+    if (g_retirement_test_hook &&
+        g_retirement_test_hook(
+            GIT_RETIREMENT_TEST_FORCE_NOREPLACE_FALLBACK,
+            NULL, source, destination)) {
+        return git_rename_noreplace_portable_at(
+            dir_fd, source, destination);
+    }
 #if defined(__linux__) && defined(SYS_renameat2)
 #ifndef RENAME_NOREPLACE
 #define RENAME_NOREPLACE (1U)
@@ -3324,7 +3386,8 @@ static git_noreplace_move_result_t git_rename_noreplace_at(
     }
     if (errno == ENOSYS || errno == EINVAL || errno == ENOTSUP ||
         errno == EOPNOTSUPP) {
-        return GIT_NOREPLACE_MOVE_UNSUPPORTED;
+        return git_rename_noreplace_portable_at(
+            dir_fd, source, destination);
     }
     return GIT_NOREPLACE_MOVE_ERROR;
 #elif defined(__APPLE__) && defined(RENAME_EXCL)
@@ -3334,15 +3397,12 @@ static git_noreplace_move_result_t git_rename_noreplace_at(
     }
     if (errno == EINVAL || errno == ENOTSUP ||
         errno == EOPNOTSUPP) {
-        return GIT_NOREPLACE_MOVE_UNSUPPORTED;
+        return git_rename_noreplace_portable_at(
+            dir_fd, source, destination);
     }
     return GIT_NOREPLACE_MOVE_ERROR;
 #else
-    (void)dir_fd;
-    (void)source;
-    (void)destination;
-    errno = ENOTSUP;
-    return GIT_NOREPLACE_MOVE_UNSUPPORTED;
+    return git_rename_noreplace_portable_at(dir_fd, source, destination);
 #endif
 }
 #endif
@@ -6176,12 +6236,25 @@ static int git_scope_lock_preserve_fallback_original(
                 return 0;
             }
             {
+                /* The backup name was created by this process an instant
+                 * ago and nobody else knows it, so whatever inode it links
+                 * is ours to remove: witness the backup itself (as the
+                 * FreeBSD twin does) rather than original_fd, whose stat may
+                 * be unset or describe a raced-away inode (AR-18 P8). */
                 int saved_errno = errno ? errno : EAGAIN;
+                int backup_fd = openat(
+                    lock->dir_fd, backup_leaf,
+                    O_RDONLY | O_CLOEXEC | O_NOFOLLOW);
+                struct stat backup_stat;
 
-                (void)git_scope_lock_cleanup_name(
-                    lock, backup_leaf, "unproven fallback original backup",
-                    lock->original_fd, linked_original, lock->original_data,
-                    lock->original_length, true, false);
+                if (backup_fd >= 0 &&
+                    fstat(backup_fd, &backup_stat) == 0) {
+                    (void)git_scope_lock_cleanup_name(
+                        lock, backup_leaf,
+                        "unproven fallback original backup", backup_fd,
+                        &backup_stat, NULL, 0U, true, false);
+                }
+                if (backup_fd >= 0) (void)close(backup_fd);
                 errno = saved_errno;
             }
             break;
@@ -6584,7 +6657,13 @@ static int git_scope_lock_publish(git_scope_lock_t *lock,
          * hardlink, then atomically replace the destination with the prepared
          * image via renameat(2). The replace is atomic, so the canonical name
          * is a complete config at every instant (no leaf-absent window), and
-         * the detached original survives under the backup for reverse/abort. */
+         * the detached original survives under the backup for reverse/abort.
+         * Trade-off (AR-18 P9): unlike the exchange and no-replace paths,
+         * plain renameat has no identity check, so a non-cooperative writer
+         * that swaps the destination between the proof just above and the
+         * rename has its file replaced without classification; the backup
+         * links the proven original, not the raced one. Flag-less
+         * filesystems offer no primitive that closes this window. */
         bool force_publish_failure =
             retirement_exact && g_retirement_test_hook &&
             g_retirement_test_hook(
@@ -6610,7 +6689,7 @@ static int git_scope_lock_publish(git_scope_lock_t *lock,
             errno = saved_errno;
             set_system_error(
                 ERR_GIT_CONFIG_FAILED,
-                "Cannot publish prepared Git rollback image without overwriting a raced replacement: %s",
+                "Cannot publish prepared Git rollback image over the destination (portable fallback): %s",
                 lock->path);
             return -1;
         }
@@ -7162,35 +7241,41 @@ static void git_finalization_lock_dispose(
 static git_finalization_publish_result_t
 git_finalization_publish_noreplace(
     int directory_fd, const char *source, const char *destination) {
-#if defined(__linux__) && defined(SYS_renameat2)
-#ifndef RENAME_NOREPLACE
-#define RENAME_NOREPLACE (1U)
-#endif
-    if (syscall(SYS_renameat2, directory_fd, source, directory_fd,
-                destination, RENAME_NOREPLACE) == 0) {
-        return GIT_FINALIZATION_PUBLISH_MOVED;
+#if !defined(__FreeBSD__)
+    /* The no-replace move primitive already falls back to a portable
+     * linkat-then-identity-unlink sequence when the filesystem rejects
+     * rename flags, so off FreeBSD the certificate is always published as a
+     * single-link move. A two-link publication can never be completed here
+     * (the private alias is retired by quarantine rename, which needs the
+     * same unsupported flag and never lowers the link count), so it is not
+     * attempted (AR-18 M4). */
+    {
+        git_noreplace_move_result_t moved;
+
+        if (g_finalization_test_hook &&
+            g_finalization_test_hook(
+                GIT_FINALIZATION_TEST_FORCE_NOREPLACE_FALLBACK,
+                directory_fd, destination)) {
+            moved = git_rename_noreplace_portable_at(
+                directory_fd, source, destination);
+        } else {
+            moved = git_rename_noreplace_at(
+                directory_fd, source, destination);
+        }
+        return moved == GIT_NOREPLACE_MOVE_OK
+                   ? GIT_FINALIZATION_PUBLISH_MOVED
+                   : GIT_FINALIZATION_PUBLISH_ERROR;
     }
-    if (errno != ENOSYS && errno != EINVAL && errno != ENOTSUP &&
-        errno != EOPNOTSUPP) {
-        return GIT_FINALIZATION_PUBLISH_ERROR;
-    }
-#elif defined(__APPLE__) && defined(RENAME_EXCL)
-    if (renameatx_np(directory_fd, source, directory_fd, destination,
-                     RENAME_EXCL) == 0) {
-        return GIT_FINALIZATION_PUBLISH_MOVED;
-    }
-    if (errno != EINVAL && errno != ENOTSUP &&
-        errno != EOPNOTSUPP) {
-        return GIT_FINALIZATION_PUBLISH_ERROR;
-    }
-#endif
+#else
     /* linkat() is itself atomic and no-replace. The complete marker is
      * recoverable during the short two-link interval; recovery accepts only
-     * the exact generated private alias plus the canonical name. */
+     * the exact generated private alias plus the canonical name, and
+     * funlinkat(2) retires the alias by descriptor afterwards. */
     if (linkat(directory_fd, source, directory_fd, destination, 0) != 0) {
         return GIT_FINALIZATION_PUBLISH_ERROR;
     }
     return GIT_FINALIZATION_PUBLISH_LINKED;
+#endif
 }
 
 static int git_finalization_refresh_canonical(
