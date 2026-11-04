@@ -432,11 +432,43 @@ TEST(unknown_and_malformed_options_fail_before_context_allocation) {
     unknown_result = invoke_cli(&fixture, 2, unknown_argv);
     malformed_result = invoke_cli(&fixture, 2, malformed_argv);
     CHECK_EQ_INT(unknown_result.status, EXIT_FAILURE);
-    CHECK(strstr(unknown_result.stdout_text, "Usage: gitswitch") != NULL);
+    /* AR-18 L36: the usage block that explains a rejected option is part of
+     * the failure and goes to stderr; stdout stays clean for `eval`. */
+    CHECK(strstr(unknown_result.stderr_text, "Usage: gitswitch") != NULL);
+    CHECK(strstr(unknown_result.stdout_text, "Usage: gitswitch") == NULL);
     check_clean_return(&unknown_result, 0);
     CHECK_EQ_INT(malformed_result.status, EXIT_FAILURE);
-    CHECK(strstr(malformed_result.stdout_text, "Usage: gitswitch") != NULL);
+    CHECK(strstr(malformed_result.stderr_text, "Usage: gitswitch") != NULL);
+    CHECK(strstr(malformed_result.stdout_text, "Usage: gitswitch") == NULL);
     check_clean_return(&malformed_result, 0);
+}
+
+/* AR-18 L37: an empty selector is refused by the arity grammar before any
+ * configuration directory, lock, or handler is touched, with a usage line
+ * instead of an internal function name. */
+TEST(empty_selectors_are_refused_before_initialization) {
+    cli_fixture_t fixture;
+    char program[] = "gitswitch";
+    char empty[] = "";
+    char switch_command[] = "switch";
+    char *implicit_argv[] = { program, empty, NULL };
+    char *switch_argv[] = { program, switch_command, empty, NULL };
+    cli_result_t implicit_result;
+    cli_result_t switch_result;
+
+    CHECK_EQ_INT(fixture_setup(&fixture), 0);
+    implicit_result = invoke_cli(&fixture, 2, implicit_argv);
+    switch_result = invoke_cli(&fixture, 3, switch_argv);
+    CHECK_EQ_INT(implicit_result.status, EXIT_FAILURE);
+    CHECK(strstr(implicit_result.stderr_text,
+                 "account selector must not be empty") != NULL);
+    CHECK(strstr(implicit_result.stderr_text, "Usage: gitswitch") != NULL);
+    CHECK(strstr(implicit_result.stderr_text, "()") == NULL);
+    check_clean_return(&implicit_result, 0);
+    CHECK_EQ_INT(switch_result.status, EXIT_FAILURE);
+    CHECK(strstr(switch_result.stderr_text,
+                 "switch account selector must not be empty") != NULL);
+    check_clean_return(&switch_result, 0);
 }
 
 TEST(each_command_family_rejects_invalid_arity_before_context_allocation) {
@@ -924,6 +956,7 @@ int main(void) {
     RUN_TEST(
         informational_options_ignore_scope_conflicts_but_commands_reject_them);
     RUN_TEST(unknown_and_malformed_options_fail_before_context_allocation);
+    RUN_TEST(empty_selectors_are_refused_before_initialization);
     RUN_TEST(each_command_family_rejects_invalid_arity_before_context_allocation);
     RUN_TEST(internal_probes_reject_operands_and_mutual_exclusion);
     RUN_TEST(informational_modes_take_precedence_without_running_internal_probes);

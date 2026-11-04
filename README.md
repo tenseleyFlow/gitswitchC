@@ -17,13 +17,13 @@ Commands:
   config               Show configuration file information
   init <shell>         Emit shell integration (bash|zsh|fish|sh|dash|ksh)
   resume               Restore saved boot-volatile SSH/GPG state (never rewrites Git config)
-  reset [account]      Kill agents and delete isolated GPG/SSH state (all, or one)
+  reset [account]      Retire isolated GPG/SSH state and the Git identity it published (all, or one)
   switch <account>     Switch to specified account
   <account>            Switch to specified account
 
 Options:
   --global, -g         Use global git scope
-  --local, -l          Use local git scope (default)
+  --local, -l          Use local git scope (default unless the account sets preferred_scope)
   --dry-run, -n        Show what would be done without executing
   --yes, -y            Assume 'yes' to confirmation prompts (add/edit/remove/reset)
   --names              With 'list': print only account names (one per line)

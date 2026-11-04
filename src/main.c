@@ -67,58 +67,69 @@ static int finish_stdout_output(void) {
     return flush_result == 0 && !ferror(stdout) ? 0 : -1;
 }
 
-static int print_usage(const char *prog_name) {
-    printf("Usage: %s [OPTIONS] [COMMAND] [ARGS]\n", prog_name);
-    printf("\nComplete Git Identity Management\n");
-    printf("Safe git identity switching with actual git configuration management\n");
-    printf("\nCommands:\n");
-    printf("  add                  Add new account interactively\n");
-    printf("  edit <account>       Edit an existing account interactively\n");
-    printf("  list, ls             List all configured accounts\n");
-    printf("  remove, rm, delete <account>  Remove specified account\n");
-    printf("  status               Show current account status\n");
-    printf("  doctor, health       Run local configuration/key readiness checks\n");
-    printf("  config               Show configuration file information\n");
-    printf("  init <shell>         Emit shell integration (");
-    print_supported_shells(stdout, "|");
-    printf(")\n");
-    printf("  resume               Restore saved SSH/GPG state, or reconcile an incomplete switch\n");
-    printf("  reset [account]      Retire isolated GPG/SSH state (all, or one)\n");
-    printf("  switch <account>     Switch to specified account\n");
-    printf("  <account>            Switch to specified account\n");
-    printf("\nOptions:\n");
-    printf("  --global, -g         Use global git scope\n");
-    printf("  --local, -l          Use local git scope (default)\n");
-    printf("  --dry-run, -n        Show what would be done without executing\n");
-    printf("  --yes, -y            Assume 'yes' to confirmation prompts "
+/* AR-18 L40: the POSIX snippet is also sourced by zsh, whose
+ * warn_create_global option reports every global a function assigns. The
+ * helper functions deliberately keep their state in globals (the saved and
+ * managed socket names must outlive each call), so make that explicit for
+ * zsh alone; every other shell sees a false test and never runs setopt. */
+#define GITSWITCH_SNIPPET_ZSH_LOCAL_GLOBALS \
+    "if [ -n \"${ZSH_VERSION-}\" ]; then setopt localoptions nowarncreateglobal; fi"
+
+/* AR-18 L36: --help goes to stdout; the usage block that follows a
+ * rejected option goes to stderr with the failure it explains. */
+static int print_usage(FILE *out, const char *prog_name) {
+    fprintf(out, "Usage: %s [OPTIONS] [COMMAND] [ARGS]\n", prog_name);
+    fprintf(out, "\nComplete Git Identity Management\n");
+    fprintf(out, "Safe git identity switching with actual git configuration management\n");
+    fprintf(out, "\nCommands:\n");
+    fprintf(out, "  add                  Add new account interactively\n");
+    fprintf(out, "  edit <account>       Edit an existing account interactively\n");
+    fprintf(out, "  list, ls             List all configured accounts\n");
+    fprintf(out, "  remove, rm, delete <account>  Remove specified account\n");
+    fprintf(out, "  status               Show current account status\n");
+    fprintf(out, "  doctor, health       Run local configuration/key readiness checks\n");
+    fprintf(out, "  config               Show configuration file information\n");
+    fprintf(out, "  init <shell>         Emit shell integration (");
+    print_supported_shells(out, "|");
+    fprintf(out, ")\n");
+    fprintf(out, "  resume               Restore saved SSH/GPG state, or reconcile an incomplete switch\n");
+    fprintf(out, "  reset [account]      Retire isolated GPG/SSH state and the Git identity it published (all, or one)\n");
+    fprintf(out, "  switch <account>     Switch to specified account\n");
+    fprintf(out, "  <account>            Switch to specified account\n");
+    fprintf(out, "\nOptions:\n");
+    fprintf(out, "  --global, -g         Use global git scope\n");
+    fprintf(out, "  --local, -l          Use local git scope (default unless the account sets preferred_scope)\n");
+    fprintf(out, "  --dry-run, -n        Show what would be done without executing\n");
+    fprintf(out, "  --yes, -y            Assume 'yes' to confirmation prompts "
            "(add/edit/remove/reset)\n");
-    printf("  --names              With 'list': print only account names (one per line)\n");
-    printf("  --verbose, -V        Enable verbose output\n");
-    printf("  --debug, -d          Enable debug logging\n");
-    printf("  --color, -c          Force color output\n");
-    printf("  --no-color, -C       Disable color output\n");
-    printf("  --help, -h           Show this help message\n");
-    printf("  --version, -v        Show version information\n");
-    printf("\nExamples:\n");
-    printf("  %s add                    # Add new account interactively\n", prog_name);
-    printf("  %s edit work              # Edit the 'work' account\n", prog_name);
-    printf("  %s list                   # List all accounts\n", prog_name);
-    printf("  %s list --names           # Print just account names (for scripts/completion)\n", prog_name);
-    printf("  %s 1                      # Switch to account ID 1\n", prog_name);
-    printf("  %s work                   # Switch to account matching 'work'\n", prog_name);
-    printf("  %s remove 2 --yes         # Remove account ID 2 without confirmation\n", prog_name);
-    printf("  %s doctor                 # Run local readiness checks\n", prog_name);
-    printf("\nKey Features:\n");
-    printf("- Secure TOML configuration management\n");
-    printf("- Interactive account creation with validation\n");
-    printf("- Local account configuration and key readiness checks\n");
-    printf("- SSH/GPG key validation and security checks\n");
-    printf("- Atomic configuration file operations\n");
-    printf("- Safe file permission handling\n");
-    printf("- Actual git configuration switching\n");
-    printf("- Repository detection and scope management\n");
-    printf("- Git configuration validation and testing\n");
-    return finish_stdout_output();
+    fprintf(out, "  --names              With 'list': print only account names (one per line)\n");
+    fprintf(out, "  --verbose, -V        Enable verbose output\n");
+    fprintf(out, "  --debug, -d          Enable debug logging\n");
+    fprintf(out, "  --color, -c          Force color output\n");
+    fprintf(out, "  --no-color, -C       Disable color output\n");
+    fprintf(out, "  --help, -h           Show this help message\n");
+    fprintf(out, "  --version, -v        Show version information\n");
+    fprintf(out, "\nExamples:\n");
+    fprintf(out, "  %s add                    # Add new account interactively\n", prog_name);
+    fprintf(out, "  %s edit work              # Edit the 'work' account\n", prog_name);
+    fprintf(out, "  %s list                   # List all accounts\n", prog_name);
+    fprintf(out, "  %s list --names           # Print just account names (for scripts/completion)\n", prog_name);
+    fprintf(out, "  %s 1                      # Switch to account ID 1\n", prog_name);
+    fprintf(out, "  %s work                   # Switch to account matching 'work'\n", prog_name);
+    fprintf(out, "  %s remove 2 --yes         # Remove account ID 2 without confirmation\n", prog_name);
+    fprintf(out, "  %s doctor                 # Run local readiness checks\n", prog_name);
+    fprintf(out, "\nKey Features:\n");
+    fprintf(out, "- Secure TOML configuration management\n");
+    fprintf(out, "- Interactive account creation with validation\n");
+    fprintf(out, "- Local account configuration and key readiness checks\n");
+    fprintf(out, "- SSH/GPG key validation and security checks\n");
+    fprintf(out, "- Atomic configuration file operations\n");
+    fprintf(out, "- Safe file permission handling\n");
+    fprintf(out, "- Actual git configuration switching\n");
+    fprintf(out, "- Repository detection and scope management\n");
+    fprintf(out, "- Git configuration validation and testing\n");
+    if (out == stdout) return finish_stdout_output();
+    return fflush(out) == 0 && !ferror(out) ? 0 : -1;
 }
 static int print_version(void) {
     printf("%s %s (%s)\n", GITSWITCH_NAME, GITSWITCH_VERSION, GITSWITCH_COMMIT);
@@ -771,6 +782,11 @@ static int validate_command_arity(const char *command, int operand_count,
     if (!command) {
         return operand_count == 0 ? 0 : -1;
     }
+    if (command[0] == '\0') {
+        fprintf(stderr, "gitswitch: account selector must not be empty\n");
+        fprintf(stderr, "Usage: gitswitch <account>\n");
+        return -1;
+    }
 
     if (strcmp(command, "edit") == 0) {
         min_operands = max_operands = 1;
@@ -803,11 +819,15 @@ static int validate_command_arity(const char *command, int operand_count,
     }
 
     if (operand_count >= min_operands && operand_count <= max_operands) {
-        if (strcmp(command, "reset") == 0 && operand_count == 1 &&
+        /* AR-18 L37: an empty selector used to pass arity and reach config
+         * initialization (creating the directory and lock) before failing
+         * with an internal function name; refuse it here for every form. */
+        if (operand_count == 1 &&
             (!first_operand || first_operand[0] == '\0')) {
             fprintf(stderr,
-                    "gitswitch: reset account selector must not be empty\n");
-            fprintf(stderr, "Usage: gitswitch reset [account]\n");
+                    "gitswitch: %s account selector must not be empty\n",
+                    command);
+            fprintf(stderr, "Usage: %s\n", usage);
             return -1;
         }
         return 0;
@@ -1176,7 +1196,7 @@ int main(int argc, char *argv[]) {
                 startup_resume = true;
                 break;
             default:
-                (void)print_usage(argv[0]);
+                (void)print_usage(stderr, argv[0]);
                 free(option_argv);
                 error_cleanup();
                 return EXIT_FAILURE;
@@ -1262,7 +1282,7 @@ int main(int argc, char *argv[]) {
     }
     
     if (show_help) {
-        int rc = print_usage(argv[0]);
+        int rc = print_usage(stdout, argv[0]);
         error_cleanup();
         return rc == 0 ? EXIT_SUCCESS : EXIT_FAILURE;
     }
@@ -1333,8 +1353,11 @@ int main(int argc, char *argv[]) {
                 goto cleanup;
             }
             display_error("Could not coordinate shell startup resume",
-                          "the startup lock is unavailable; check permissions "
-                          "and try again");
+                          contended
+                              ? "another gitswitch is already coordinating "
+                                "this login's resume; retry in a moment"
+                              : "the startup lock could not be created; check "
+                                "permissions and try again");
             exit_code = EXIT_FAILURE;
             goto cleanup;
         }
@@ -2811,6 +2834,7 @@ static int finish_snippet_emit(void) {
 static void emit_posix_refresh(const char *sock_path, const char *gpg_home,
                                bool have_gpg_home) {
     printf("__gitswitch_refresh() {\n");
+    printf("    %s\n", GITSWITCH_SNIPPET_ZSH_LOCAL_GLOBALS);
     printf("    __gitswitch_next_auth_sock='%s'\n", sock_path);
     printf("    if [ -S \"$__gitswitch_next_auth_sock\" ]; then\n");
     printf("        if [ \"${__gitswitch_managed_auth_sock+x}\" != x ]; then\n");
@@ -2902,6 +2926,7 @@ static void emit_posix_refresh(const char *sock_path, const char *gpg_home,
     printf("    return 0\n");
     printf("}\n");
     printf("__gitswitch_command_updates_runtime() {\n");
+    printf("    %s\n", GITSWITCH_SNIPPET_ZSH_LOCAL_GLOBALS);
     printf("    __gitswitch_runtime_command=\n");
     printf("    __gitswitch_after_dashdash=0\n");
     printf("    for __gitswitch_arg do\n");
@@ -3125,7 +3150,6 @@ static int handle_init_command(const char *shell) {
         }
         have_gpg_home = fish_gpg;
         printf("# gitswitch shell integration (fish)\n");
-        printf("set -l __gitswitch_auth_sock '%s'\n", sock_path);
         printf("function __gitswitch_ssh_needs_resume\n");
         printf("    command gitswitch --resume-check >/dev/null 2>&1\n");
         printf("    test $status -ne 0\n");
@@ -3191,14 +3215,13 @@ static int handle_init_command(const char *shell) {
         printf("    end\n");
         printf("    return $__gitswitch_status\n");
         printf("end\n");
-        printf("set -e __gitswitch_auth_sock\n");
         return finish_snippet_emit();
     }
 
     {
         printf("# gitswitch shell integration (%s)\n", shell);
-        printf("__gitswitch_auth_sock='%s'\n", sock_path);
         printf("__gitswitch_ssh_needs_resume() {\n");
+        printf("    %s\n", GITSWITCH_SNIPPET_ZSH_LOCAL_GLOBALS);
         printf("    command gitswitch --resume-check >/dev/null 2>&1\n");
         printf("    [ $? -ne 0 ]\n");
         printf("}\n");
@@ -3240,11 +3263,11 @@ static int handle_init_command(const char *shell) {
         emit_posix_refresh(sock_path, gpg_home, have_gpg_home);
         printf("__gitswitch_refresh\n");
         printf("gitswitch() {\n");
+        printf("    %s\n", GITSWITCH_SNIPPET_ZSH_LOCAL_GLOBALS);
         printf("    command gitswitch \"$@\" || return $?\n");
         printf("    __gitswitch_command_updates_runtime \"$@\" || return 0\n");
         printf("    __gitswitch_refresh\n");
         printf("}\n");
-        printf("unset __gitswitch_auth_sock\n");
         return finish_snippet_emit();
     }
 
@@ -3700,8 +3723,18 @@ static int handle_resume_command(gitswitch_ctx_t *ctx) {
      * otherwise see this notice before every prompt. Printed ahead of the
      * switch so it explains the GPG PIN prompt that may follow (pinentry
      * draws on the TTY directly). */
-    fprintf(stderr,
-            "gitswitch: restoring your last account (you may be prompted for your GPG PIN)...\n");
+    {
+        /* AR-18 L42: promise the pinentry prompt only when the account being
+         * restored has a signing key; an SSH-only account never shows one. */
+        const account_t *resuming =
+            config_find_account_exact(ctx, ctx->config.active_account);
+        bool resuming_gpg = resuming && resuming->gpg_enabled &&
+                            resuming->gpg_key_id[0] != '\0';
+
+        fprintf(stderr, resuming_gpg
+                            ? "gitswitch: restoring your last account (you may be prompted for your GPG PIN)...\n"
+                            : "gitswitch: restoring your last account...\n");
+    }
 
     if (accounts_switch(ctx, ctx->config.active_account) != 0) {
         /* Emitted to stderr (not the suppressed stdout) so a failed login-time
@@ -3771,11 +3804,13 @@ static command_result_t handle_reset_command(gitswitch_ctx_t *ctx,
     if (ctx->config.dry_run) {
         display_info("DRY RUN MODE - No actual changes will be made");
         if (target) {
-            printf("Would retire the SSH/GPG agent state and delete the isolated GPG home for\n"
-                   "'%s', removing its on-disk secret-key copy.\n", target);
+            printf("Would retire the SSH/GPG agent state, delete the isolated GPG home for\n"
+                   "'%s' (removing its on-disk secret-key copy), and clear the Git identity\n"
+                   "it published.\n", target);
         } else {
-            printf("Would retire ALL gitswitch SSH/GPG agent state and delete ALL isolated GPG\n"
-                   "homes, removing every on-disk secret-key copy.\n");
+            printf("Would retire ALL gitswitch SSH/GPG agent state, delete ALL isolated GPG\n"
+                   "homes (removing every on-disk secret-key copy), and clear every Git\n"
+                   "identity they published.\n");
         }
         if ((!target || (active_account &&
                          active_account == target_account)) &&
@@ -3801,14 +3836,16 @@ static command_result_t handle_reset_command(gitswitch_ctx_t *ctx,
         if (target) {
             prompt_length = snprintf(
                 confirmation_prompt, sizeof(confirmation_prompt),
-                "This retires the SSH/GPG agent state and deletes the isolated GPG home for\n"
-                "'%s', removing its on-disk secret-key copy.\n"
+                "This retires the SSH/GPG agent state, deletes the isolated GPG home for\n"
+                "'%s' (removing its on-disk secret-key copy), and clears the Git identity\n"
+                "it published.\n"
                 "Type 'yes' to continue: ", target);
         } else {
             prompt_length = snprintf(
                 confirmation_prompt, sizeof(confirmation_prompt),
-                "This retires ALL gitswitch SSH/GPG agent state and deletes ALL isolated GPG\n"
-                "homes, removing every on-disk secret-key copy.\n"
+                "This retires ALL gitswitch SSH/GPG agent state, deletes ALL isolated GPG\n"
+                "homes (removing every on-disk secret-key copy), and clears every Git\n"
+                "identity they published.\n"
                 "Type 'yes' to continue: ");
         }
         if (prompt_length < 0 ||

@@ -192,7 +192,9 @@ TEST(init_succeeds_and_emits_full_snippet) {
      * probe (esac) and the SSH_AUTH_SOCK wiring must be present. */
     slurp(out_path, out, sizeof(out));
     CHECK(strstr(out, "esac") != NULL);
-    CHECK(strstr(out, "unset __gitswitch_auth_sock") != NULL);
+    CHECK(strstr(out, "__gitswitch_refresh\n") != NULL);
+    /* AR-18 L41: the snippet no longer assigns a variable nothing reads. */
+    CHECK(strstr(out, "__gitswitch_auth_sock") == NULL);
     remove_tree(rt);
 }
 
@@ -1105,7 +1107,9 @@ TEST(startup_resume_metadata_failure_remains_visible) {
     CHECK(rc > 0 && rc < 126);
     CHECK(strstr(slurp(out_path, out, sizeof(out)),
                  "Could not coordinate shell startup resume") != NULL);
-    CHECK(strstr(out, "startup lock is unavailable") != NULL);
+    /* AR-18 L39: a lock that cannot be created is a permissions problem; a
+     * held lock (contention) is reported as another gitswitch starting up. */
+    CHECK(strstr(out, "startup lock could not be created") != NULL);
 
     remove_tree(home);
     remove_tree(rt);
