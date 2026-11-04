@@ -5697,9 +5697,9 @@ static int run_argv_real_impl(
     (void)tty_transfer_errno;
     if (!group_proven || tty_prepare_rc != 0 || tty_transfer_rc != 0) {
 #ifdef GITSWITCH_TESTING
-        /* AR-18: name the exact pre-exec failure for the suites; the
-         * production runner reports it through the result and errno only. */
-        fprintf(stderr,
+        /* AR-18: name the exact pre-exec failure for a suite that opts in;
+         * the production runner reports it through the result and errno. */
+        if (getenv("GITSWITCH_RUNNER_TRACE")) fprintf(stderr,
                 "runner early failure: group_proven=%d ready_rc=%d "
                 "ready_errno=%d early_rc=%d early_stage=%d early_errno=%d "
                 "tty_prepare=%d/%d tty_transfer=%d/%d\n",
