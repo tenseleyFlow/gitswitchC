@@ -6462,14 +6462,12 @@ int config_retirement_guard_install_or_adopt_with_ssh_alias_obligation(
         goto install_done;
     }
 #else
-    /* The prior marker generation is preserved byte-for-byte by the
-     * completion certificate, so its settled slot is inert residue: reclaim
-     * it by identity now instead of leaving one file per install (AR-18 L2;
-     * same transient-arena contract as AR-15 H1). */
-    if (prior_marker_moved) {
-        config_reclaim_settled_slot_at(
-            directory_fd, settled_slot, &prior_settled_identity);
-    }
+    /* Linux/Darwin publish the stage over an exact pair in place (AR-18
+     * M6), so no prior-marker slot is ever consumed here; the AR-18 L2
+     * reclaim of the displaced completion certificate lives in
+     * config_retirement_guard_publish_prepared_at. */
+    (void)prior_marker_moved;
+    (void)prior_settled_identity;
 #endif
     if (config_retirement_guard_make_handle(
             directory_fd, lock_fd, directory, &directory_identity,
