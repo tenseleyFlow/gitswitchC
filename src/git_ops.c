@@ -12050,9 +12050,12 @@ static int git_retirement_reseal_stale_item(
 
     if (!transaction || index >= item_count || !live_generation) return -1;
     publication = &transaction->items[index].publication;
+    /* A benign rewrite leaves a plain single-link regular file. A
+     * hard-linked destination is an alias the retirement machinery refuses
+     * everywhere else; it is not re-sealed either. */
     if (publication->config_path[0] == '\0' ||
         lstat(publication->config_path, &st) != 0 ||
-        !S_ISREG(st.st_mode)) {
+        !S_ISREG(st.st_mode) || st.st_nlink != 1) {
         return -1;
     }
     memset(&live, 0, sizeof(live));
