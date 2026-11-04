@@ -1122,6 +1122,34 @@ static int git_snapshot_key_remove_exact_once(git_snapshot_key_t *key,
     return 0;
 }
 
+/* A `--list -z` record key is section[.subsection].name: the section and the
+ * final name are [A-Za-z0-9-] runs (the name starts with a letter) and a dot
+ * separates them. Subsections may hold almost anything, so only the two
+ * ends are checked; that is enough to reject a glued stderr line ("trace:
+ * built-in: …", "warning: unable to access …"), which has no section-dot
+ * grammar at all. */
+static bool git_snapshot_record_key_is_config_key(const char *key,
+                                                  size_t length) {
+    const char *first_dot;
+    const char *last_dot;
+
+    if (!key || length == 0U) return false;
+    first_dot = memchr(key, '.', length);
+    if (!first_dot || first_dot == key) return false;
+    for (const char *cursor = key; cursor < first_dot; cursor++) {
+        if (!isalnum((unsigned char)*cursor) && *cursor != '-') return false;
+    }
+    last_dot = memrchr(key, '.', length);
+    if (!last_dot || last_dot + 1 >= key + length ||
+        !isalpha((unsigned char)last_dot[1])) {
+        return false;
+    }
+    for (const char *cursor = last_dot + 1; cursor < key + length; cursor++) {
+        if (!isalnum((unsigned char)*cursor) && *cursor != '-') return false;
+    }
+    return true;
+}
+
 /* Parse a complete `git config <scope> --list -z` result. Rollback cannot
  * recreate the spelling of a managed implicit Boolean and therefore rejects
  * it. Retirement edits a copied file in place, so it may retain the occurrence
@@ -1148,6 +1176,17 @@ static int git_parse_snapshot_listing(const char *buf, size_t len,
         record_len = (size_t)(end - record);
         pos += record_len + 1U;
         newline = memchr(record, '\n', record_len);
+        /* AR-18 M13: a record whose key is not a Git config key cannot have
+         * come from `--list -z`. Git writes stderr unbuffered and stdout
+         * block-buffered, so a merged warning or trace line lands glued to
+         * the first record and used to be dropped silently as "unmanaged",
+         * losing the identity key it displaced. Fail closed instead. */
+        if (!git_snapshot_record_key_is_config_key(
+                record, newline ? (size_t)(newline - record) : record_len)) {
+            set_error(ERR_GIT_CONFIG_FAILED,
+                      "Git configuration snapshot contains a record that is not a config key (merged diagnostics or corrupted output)");
+            return -1;
+        }
         if (!newline) {
             key_index = git_managed_key_index_n(record, record_len);
             if (key_index >= 0) {
@@ -1205,6 +1244,18 @@ static int git_snapshot_run_observed(void *context) {
 /* Grow until the complete binary listing fits. A hard cap bounds hostile or
  * corrupt config input; reaching it is a preflight failure, never a partial
  * snapshot followed by mutation (AR-07 M24). */
+/* AR-18 M13: GIT_TRACE and friends make git write to stderr before any
+ * output; several readers here merge stderr to classify diagnostics, so a
+ * debugging environment must never reach a child git. */
+static const char *const g_git_child_unset_env[] = {
+    "GIT_TRACE", "GIT_TRACE_SETUP", "GIT_TRACE_PERFORMANCE",
+    "GIT_TRACE_PACK_ACCESS", "GIT_TRACE_PACKET", "GIT_TRACE_REDACT",
+    "GIT_TRACE_CURL", "GIT_TRACE_CURL_NO_DATA", "GIT_TRACE_SHALLOW",
+    "GIT_TRACE2", "GIT_TRACE2_EVENT", "GIT_TRACE2_PERF",
+    "GIT_TRACE2_BRIEF", "GIT_TRACE2_EVENT_BRIEF", "GIT_TRACE2_PERF_BRIEF",
+    NULL
+};
+
 static int git_read_snapshot_listing(git_scope_t scope, bool includes,
                                      char **out, size_t *out_len) {
     const char *scope_flag = git_scope_to_flag(scope);
@@ -1248,6 +1299,8 @@ static int git_read_snapshot_listing(git_scope_t scope, bool includes,
          * safe here: any stderr on a successful binary listing makes parsing
          * fail closed instead of being silently discarded. */
         opts.merge_stderr = true;
+    opts.unset_env = g_git_child_unset_env;
+        opts.unset_env = g_git_child_unset_env;
         opts.extra_env = diagnostic_env;
         observation.argv = argv;
         observation.opts = &opts;
@@ -1449,6 +1502,7 @@ static int git_add_snapshot_value(git_scope_t scope, const char *key,
     opts.out = output;
     opts.out_size = sizeof(output);
     opts.merge_stderr = true;
+    opts.unset_env = g_git_child_unset_env;
     if (run_argv(argv, &opts, &res) != 0) {
         cfg_cache_store(cfg_scope_index(scope), cfg_key_index(key),
                         CFG_UNKNOWN, true, "");
@@ -1735,6 +1789,7 @@ static int git_query_single_path(const char *const argv[], char *out,
     opts.out = raw;
     opts.out_size = sizeof(raw);
     opts.merge_stderr = true;
+    opts.unset_env = g_git_child_unset_env;
     if (run_argv(argv, &opts, &result) != 0 || result.out_truncated ||
         result.out_len == 0 || result.out_len >= sizeof(raw)) {
         return -1;
@@ -5759,6 +5814,7 @@ static int git_config_file_unset(const char *path, const char *key,
     opts.out = output;
     opts.out_size = sizeof(output);
     opts.merge_stderr = true;
+    opts.unset_env = g_git_child_unset_env;
     (void)run_argv(argv, &opts, &result);
     if (result.spawned && result.term_signal == 0 &&
         (result.exit_code == 0 || result.exit_code == 5)) {
@@ -5798,6 +5854,7 @@ static int git_config_file_unset_exact(const char *path, const char *key,
     opts.out = output;
     opts.out_size = sizeof(output);
     opts.merge_stderr = true;
+    opts.unset_env = g_git_child_unset_env;
     prior_error_generation = error_report_generation();
     run_rc = run_argv(argv, &opts, &result);
     if (run_rc == 0 && result.spawned &&
@@ -5828,6 +5885,7 @@ static int git_config_file_add(const char *path, const char *key,
     opts.out = output;
     opts.out_size = sizeof(output);
     opts.merge_stderr = true;
+    opts.unset_env = g_git_child_unset_env;
     if (run_argv(argv, &opts, &result) == 0) return 0;
     set_error(ERR_GIT_CONFIG_FAILED,
               "Failed to add Git config %s in rollback lock: %s", key,
@@ -9228,6 +9286,7 @@ static void git_set_capture_error(const char *context,
     opts.out = diagnostic;
     opts.out_size = sizeof(diagnostic);
     opts.merge_stderr = true;
+    opts.unset_env = g_git_child_unset_env;
     (void)run_argv(argv, &opts, &retry);
 
     length = retry.out_len;
@@ -15310,6 +15369,8 @@ static int git_unset_config_value_impl(const char *key, git_scope_t scope,
         opts.out = output;
         opts.out_size = sizeof(output);
         opts.merge_stderr = true;
+    opts.unset_env = g_git_child_unset_env;
+        opts.unset_env = g_git_child_unset_env;
         run_argv(argv, &opts, &res);
         {
             int recovery_result = 0;
@@ -15390,6 +15451,8 @@ int git_list_config(git_scope_t scope, char *output, size_t output_size) {
         opts.out = output;
         opts.out_size = output_size;
         opts.merge_stderr = true;
+    opts.unset_env = g_git_child_unset_env;
+        opts.unset_env = g_git_child_unset_env;
         if (run_argv(argv, &opts, &result) != 0) {
             set_error(ERR_GIT_CONFIG_FAILED,
                       "Failed to list git configuration");
@@ -15479,15 +15542,23 @@ int git_ssh_alias_config_path(const account_t *account, char *buf,
                               size_t size) {
     char config_dir[MAX_PATH_LEN];
 
-    if (!account || !buf || size == 0U || account->id == 0U) {
+    if (!account || !buf || size == 0U ||
+        (account->id == 0U && account->ssh_host_alias[0] == '\0')) {
         errno = EINVAL;
         return -1;
     }
     if (get_config_directory(config_dir, sizeof(config_dir)) != 0) {
         return -1;
     }
-    if ((size_t)snprintf(buf, size, "%s/ssh-alias-%" PRIu32 ".conf",
-                         config_dir, account->id) >= size) {
+    /* Persisted accounts always carry an id, which keeps two accounts that
+     * share an alias spelling from sharing (and overwriting) one file. An
+     * in-memory account without an id (library callers, fixtures) is keyed
+     * by its validated alias, whose grammar is filename-safe. */
+    if (account->id != 0U
+            ? (size_t)snprintf(buf, size, "%s/ssh-alias-%" PRIu32 ".conf",
+                               config_dir, account->id) >= size
+            : (size_t)snprintf(buf, size, "%s/ssh-alias-%s.conf",
+                               config_dir, account->ssh_host_alias) >= size) {
         errno = ENAMETOOLONG;
         return -1;
     }
@@ -15980,6 +16051,7 @@ static int git_run(char *output, size_t output_size, ...) {
     opts.out = output;
     opts.out_size = output_size;
     opts.merge_stderr = true;
+    opts.unset_env = g_git_child_unset_env;
 
     log_debug("Executing git command: %s %s", argv[1] ? argv[1] : "", argv[2] ? argv[2] : "");
     return run_argv(argv, &opts, &res);

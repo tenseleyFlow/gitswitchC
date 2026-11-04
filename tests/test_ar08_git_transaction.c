@@ -3141,6 +3141,41 @@ TEST(private_prepare_interruption_cleans_unpublished_certificate) {
     fixture_cleanup(&fixture);
 }
 
+/* AR-18 M13: GIT_TRACE in the user's environment made git write a trace
+ * line before the block-buffered -z listing on the merged pipe, which used
+ * to swallow the first managed record (user.name in a fresh global config).
+ * The trace variables are scrubbed from every child git, so the snapshot
+ * sees the real listing. */
+TEST(git_trace_in_environment_does_not_corrupt_the_snapshot) {
+    git_fixture_t fixture;
+    account_t account;
+    char actual[256];
+
+    if (!fixture_init(&fixture)) {
+        CHECK(false);
+        fixture_cleanup(&fixture);
+        return;
+    }
+    CHECK_EQ_INT(git_set("--global", "user.name", "traced-user"), 0);
+    CHECK_EQ_INT(setenv("GIT_TRACE", "1", 1), 0);
+    CHECK_EQ_INT(setenv("GIT_TRACE2", "1", 1), 0);
+    git_ops_test_reset_caches();
+    clear_error();
+    CHECK_EQ_INT(git_config_snapshot(GIT_SCOPE_GLOBAL), 0);
+    memset(&account, 0, sizeof(account));
+    CHECK_EQ_INT(safe_strncpy(account.name, "traced", sizeof(account.name)), 0);
+    CHECK_EQ_INT(safe_strncpy(account.email, "traced@example.test",
+                              sizeof(account.email)), 0);
+    CHECK_EQ_INT(git_set_config(&account, GIT_SCOPE_GLOBAL), 0);
+    CHECK_EQ_INT(git_config_restore(), 0);
+    CHECK_EQ_INT(unsetenv("GIT_TRACE"), 0);
+    CHECK_EQ_INT(unsetenv("GIT_TRACE2"), 0);
+    CHECK_EQ_INT(git_get_all("--global", "user.name", actual,
+                             sizeof(actual)), 0);
+    CHECK_STR_EQ(actual, "traced-user\n");
+    fixture_cleanup(&fixture);
+}
+
 TEST(finalization_arena_exhaustion_precedes_private_and_canonical_creation) {
     git_fixture_t fixture;
     git_config_finalization_t *finalization = NULL;
@@ -3688,6 +3723,7 @@ TEST_MAIN_BEGIN()
     RUN_TEST(finalization_sigkill_leaves_complete_self_healing_certificate);
     RUN_TEST(private_prepublication_sigkill_is_reconciled_exactly);
     RUN_TEST(private_prepare_interruption_cleans_unpublished_certificate);
+    RUN_TEST(git_trace_in_environment_does_not_corrupt_the_snapshot);
     RUN_TEST(finalization_arena_exhaustion_precedes_private_and_canonical_creation);
     RUN_TEST(finalization_publishes_single_link_under_forced_noreplace_fallback);
     RUN_TEST(finalization_release_failure_consumes_handle_and_self_heals);
