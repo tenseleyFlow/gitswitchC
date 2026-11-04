@@ -551,6 +551,7 @@ static bool prompt_host_alias_valid(const char *alias);
 static int validate_gpg_key_availability(const char *gpg_key_id);
 static int validate_gpg_key_availability_fresh(const char *gpg_key_id);
 static void print_terminal_safe(const char *text);
+static void print_git_identity_environment_overrides(void);
 static int check_ssh_key_local_file(const account_t *account);
 static int check_gpg_key_local_state(
     const account_t *account, gpg_account_key_readiness_t *readiness);
@@ -5351,6 +5352,29 @@ static void print_terminal_safe(const char *text) {
     }
 }
 
+/* AR-18 L34: git lets GIT_AUTHOR_*, GIT_COMMITTER_* and EMAIL in the
+ * environment override user.name/user.email at commit time, so a matching
+ * config can still commit as someone else. Say so beside the match verdict. */
+static void print_git_identity_environment_overrides(void) {
+    static const char *const names[] = {
+        "GIT_AUTHOR_NAME", "GIT_AUTHOR_EMAIL",
+        "GIT_COMMITTER_NAME", "GIT_COMMITTER_EMAIL", "EMAIL"
+    };
+    bool any = false;
+
+    for (size_t i = 0; i < sizeof(names) / sizeof(names[0]); i++) {
+        const char *value = getenv(names[i]);
+
+        if (!value || value[0] == '\0') continue;
+        if (!any) {
+            printf("    [WARN] Environment overrides the configured identity for commits:");
+            any = true;
+        }
+        printf(" %s", names[i]);
+    }
+    if (any) printf("\n");
+}
+
 static void print_git_value_origin(const git_config_effective_value_t *value) {
     if (!value || !value->present) return;
     printf(" (%s scope", git_config_origin_scope_to_string(value->scope));
@@ -7283,8 +7307,10 @@ int accounts_show_status(const gitswitch_ctx_t *ctx) {
                        gpg_programs_match && signing_key_matches &&
                        signing_enabled_matches) {
                 printf("  Match Status: [OK] Git config matches account\n");
+                print_git_identity_environment_overrides();
             } else {
                 printf("  Match Status: [WARN] Git config does not match account\n");
+                print_git_identity_environment_overrides();
                 if (!identity_matches) {
                     printf("    Expected: %s <%s>\n", account->name, account->email);
                     printf("    Current:  ");

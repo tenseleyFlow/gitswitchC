@@ -171,6 +171,26 @@ TEST(formatted_error_keeps_details_without_an_errno) {
     CHECK(strstr(formatted, "Details:") == NULL);
 }
 
+/* AR-18 P37: publishing an accumulation replaces the global context, so
+ * generation observers (observational scopes, freshness checks) must see a
+ * new report rather than the generation of the first error it was built from. */
+TEST(accumulator_publish_advances_the_report_generation) {
+    error_accumulator_t accumulator;
+    error_context_t first;
+    uint64_t before;
+
+    memset(&first, 0, sizeof(first));
+    first.code = ERR_INVALID_ARGS;
+    snprintf(first.message, sizeof(first.message), "%s", "first");
+    error_accumulator_init(&accumulator);
+    CHECK(error_accumulator_add(&accumulator, "initial", &first));
+    clear_error();
+    before = error_report_generation();
+    CHECK(error_accumulator_publish(&accumulator));
+    CHECK(error_report_generation() != before);
+    CHECK_EQ_INT(get_last_error()->code, ERR_INVALID_ARGS);
+}
+
 TEST(system_error_context_copies_mutable_provenance) {
     char file[64] = "system-source.c";
     char function[64] = "system_function";
@@ -967,6 +987,7 @@ TEST_MAIN_BEGIN()
     RUN_TEST(null_observational_callback_publishes_api_misuse);
     RUN_TEST(direct_error_context_copies_mutable_provenance);
     RUN_TEST(formatted_error_keeps_details_without_an_errno);
+    RUN_TEST(accumulator_publish_advances_the_report_generation);
     RUN_TEST(system_error_context_copies_mutable_provenance);
     RUN_TEST(system_error_and_logging_preserve_entry_errno);
     RUN_TEST(error_context_value_copy_has_independent_provenance);

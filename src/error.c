@@ -565,6 +565,9 @@ bool error_accumulator_publish(const error_accumulator_t *accumulator) {
     published.details_truncated = published.details_truncated ||
                                   accumulator->chain_truncated;
     memcpy(&g_last_error, &published, sizeof(g_last_error));
+    /* AR-18 P37: a published accumulation is a new report; observers that
+     * compare generations must see it. */
+    error_advance_report_generation();
     errno = accumulator->first_errno;
     return true;
 }

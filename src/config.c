@@ -2385,6 +2385,17 @@ static int config_require_loaded_source_generation(
         !config_metadata_snapshot_same(&ctx->config.source_generation,
                                        &current)) {
         lookup_errno = ESTALE;
+        if (!config_metadata_file_is_safe(&current, true)) {
+            /* AR-18 L1: a mode or link-count change is a refused shape, not
+             * a stale generation; say so instead of "changed since loaded"
+             * with ESTALE, which reads as a transient race. */
+            errno = EPERM;
+            set_system_error(
+                ERR_FILE_IO,
+                "Configuration file is no longer a regular 0600 file with one link owned by this user; refusing active-state publication: %s",
+                config_path);
+            return -1;
+        }
         if (config_metadata_file_is_safe(&current, true) &&
             config_metadata_ctime_only_change(
                 &ctx->config.source_generation, &current) &&

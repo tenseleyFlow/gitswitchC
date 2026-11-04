@@ -2329,6 +2329,10 @@ cleanup:
      * names-only output is already checked in its handler, making this
      * successful recheck harmless. */
     if (exit_code == EXIT_SUCCESS && finish_stdout_output() != 0) {
+        /* AR-18 P30: a late stdout failure used to become exit 1 with no
+         * word about why. */
+        fprintf(stderr, "gitswitch: failed to write output: %s\n",
+                strerror(errno != 0 ? errno : EIO));
         exit_code = EXIT_FAILURE;
     }
 
@@ -2430,7 +2434,11 @@ static int handle_list_names(gitswitch_ctx_t *ctx) {
     /* A successful printf may only have filled stdio's buffer. Always finish
      * the machine-readable response here so late ENOSPC/EBADF failures become
      * the command status, including the healthy empty-account case. */
-    if (finish_stdout_output() != 0) write_failed = true;
+    if (finish_stdout_output() != 0) {
+        fprintf(stderr, "gitswitch: failed to write output: %s\n",
+                strerror(errno != 0 ? errno : EIO));
+        write_failed = true;
+    }
     return write_failed ? EXIT_FAILURE : EXIT_SUCCESS;
 }
 
@@ -2697,6 +2705,19 @@ static int handle_doctor_command(gitswitch_ctx_t *ctx) {
     } else {
         display_warning("SSH agent not found - SSH key management may not work");
     }
+    /* AR-18 P60: switch loads keys through ssh-add and reset signals the
+     * agent through gpgconf; a doctor that only finds ssh-agent and gpg
+     * passes a machine that cannot switch. */
+    if (command_exists("ssh-add")) {
+        display_success("ssh-add found");
+    } else {
+        display_warning("ssh-add not found - switch cannot load SSH keys");
+    }
+    if (command_exists("gpgconf")) {
+        display_success("gpgconf found");
+    } else {
+        display_warning("gpgconf not found - reset and GPG agent retargeting cannot signal gpg-agent");
+    }
     
     int gpg_probe_ambient_errno = errno;
     if (gpg_manager_resolve_executable(gpg_executable,
@@ -2744,8 +2765,11 @@ static int handle_config_command(gitswitch_ctx_t *ctx) {
          * printf+fgets never observed a broken/redirected stdout, so the
          * question could go unseen while the answer was still consumed. */
         {
-            int confirmed = prompt_confirm_exact_yes_prompt(
-                "Create default configuration? (yes/No): ");
+            /* AR-18 P59: --yes answers this prompt like every other one. */
+            int confirmed = ctx->config.assume_yes
+                                ? 1
+                                : prompt_confirm_exact_yes_prompt(
+                                      "Create default configuration? (yes/No): ");
 
             if (confirmed == PROMPT_LINE_ERROR) {
                 /* AR-13 L18: only a real display/read I/O failure is a command
