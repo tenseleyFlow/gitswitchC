@@ -1473,6 +1473,40 @@ done:
     return rc;
 }
 
+/* AR-18 P7: merged git diagnostics are embedded verbatim in error messages
+ * that reach the user's terminal. A hook, credential helper, or crafted
+ * repository can print anything on git's stderr, so pass the text through
+ * only when every codepoint is terminal safe (newlines and tabs allowed, as
+ * git diagnostics are multi-line); otherwise substitute a fixed note. */
+static bool git_diagnostic_is_terminal_safe(const char *text) {
+    const unsigned char *cursor = (const unsigned char *)text;
+    size_t remaining = strlen(text);
+
+    while (remaining > 0U) {
+        uint32_t codepoint;
+        size_t consumed = utf8_decode(cursor, remaining, &codepoint);
+
+        if (consumed == 0U ||
+            (codepoint != '\n' && codepoint != '\t' &&
+             !tty_safe_codepoint(codepoint))) {
+            return false;
+        }
+        cursor += consumed;
+        remaining -= consumed;
+    }
+    return true;
+}
+
+static const char *git_diagnostic_text(const char *output,
+                                       const char *fallback) {
+    if (!output || output[0] == '\0') return fallback;
+    if (!git_diagnostic_is_terminal_safe(output)) {
+        return "git diagnostic withheld (it contains terminal control bytes "
+               "or malformed UTF-8)";
+    }
+    return output;
+}
+
 static void git_seed_snapshot_cache(git_scope_t scope,
                                     const git_scope_snapshot_t *snapshot) {
     int s = cfg_scope_index(scope);
@@ -1509,7 +1543,7 @@ static int git_add_snapshot_value(git_scope_t scope, const char *key,
                         CFG_UNKNOWN, true, "");
         set_error(ERR_GIT_CONFIG_FAILED,
                   "Failed to restore Git config %s (%s): %s", key,
-                  scope_flag, output[0] ? output : "unknown error");
+                  scope_flag, git_diagnostic_text(output, "unknown error"));
         return -1;
     }
     /* The ordered vector is in-progress until every --add completes. Do not
@@ -5821,7 +5855,7 @@ static int git_config_file_unset(const char *path, const char *key,
     set_error(ERR_GIT_CONFIG_FAILED,
               "Failed to clear Git config %s in %s: %s", key,
               diagnostic_context ? diagnostic_context : "exact file",
-              output[0] ? output : "unknown Git error");
+              git_diagnostic_text(output, "unknown Git error"));
     return -1;
 }
 
@@ -5864,7 +5898,8 @@ static int git_config_file_unset_exact(const char *path, const char *key,
               "Failed to remove exact Git config %s value in %s: %s",
               key,
               diagnostic_context ? diagnostic_context : "staged file",
-              output[0] ? output : "Git did not remove the planned value");
+              git_diagnostic_text(output,
+                                  "Git did not remove the planned value"));
     return -1;
 }
 
@@ -5885,7 +5920,7 @@ static int git_config_file_add(const char *path, const char *key,
     if (run_argv(argv, &opts, &result) == 0) return 0;
     set_error(ERR_GIT_CONFIG_FAILED,
               "Failed to add Git config %s in rollback lock: %s", key,
-              output[0] ? output : "unknown Git error");
+              git_diagnostic_text(output, "unknown Git error"));
     return -1;
 }
 
@@ -15182,9 +15217,8 @@ static int git_set_config_value_impl(const char *key, const char *value,
         }
         set_error(ERR_GIT_CONFIG_FAILED,
                   "Failed to set git config %s: %s", key,
-                  output[0] != '\0'
-                      ? output
-                      : "git produced no diagnostic output");
+                  git_diagnostic_text(
+                      output, "git produced no diagnostic output"));
         return -1;
     }
 }
@@ -15406,7 +15440,7 @@ static int git_unset_config_value_impl(const char *key, git_scope_t scope,
         }
         set_error(ERR_GIT_CONFIG_FAILED,
                   "Failed to unset git config %s (%s): %s", key, scope_flag,
-                  output[0] ? output : "unknown error");
+                  git_diagnostic_text(output, "unknown error"));
         return -1;
     }
 }
