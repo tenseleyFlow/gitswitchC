@@ -1357,9 +1357,16 @@ static int git_read_snapshot_listing(git_scope_t scope, bool includes,
              * Output-bearing Git failures, timeouts, and signals remain
              * immediately fatal. Later exact generation/ownership checks
              * still gate every rollback write. */
+            /* AR-18: the same Darwin rejection also surfaces as the runner
+             * killing the helper itself (SIGKILL, EPERM, no bytes, no
+             * timeout, no recorded runner error) before git ran at all; a
+             * helper that died by any other signal remains fatal. */
             if (empty_failure_retries_remaining > 0U &&
                 res.out_len == 0U && !res.out_truncated &&
-                !res.timed_out && res.term_signal == 0) {
+                !res.timed_out &&
+                (res.term_signal == 0 ||
+                 (res.term_signal == SIGKILL &&
+                  !observation.runner_error_fresh))) {
                 empty_failure_retries_remaining--;
                 continue;
             }
