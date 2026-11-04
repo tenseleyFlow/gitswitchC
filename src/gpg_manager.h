@@ -144,7 +144,9 @@ typedef int (*gpg_reset_retire_hook_fn)(int base_fd,
 typedef int (*gpg_reset_postvalidate_hook_fn)(int base_fd,
                                               const char *quarantine);
 /* Test/provider seam for platforms with a descriptor-bound conditional unlink.
- * Production uses FreeBSD funlinkat(2); NULL is fail-closed elsewhere. */
+ * Production uses FreeBSD funlinkat(2). Elsewhere the seam stays NULL and
+ * reset re-proves the exact link identity under the base lock immediately
+ * before an ordinary unlink (AR-15 M8). */
 typedef int (*gpg_identity_unlink_fn)(int dir_fd, const char *name,
                                       const struct stat *expected);
 /* Deterministic mount-identity and managed-writer durability seams. NULL

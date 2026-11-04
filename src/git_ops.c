@@ -15202,7 +15202,10 @@ static int git_set_config_value_impl(const char *key, const char *value,
 
     /* perf-3: on a GPG switch, user.signingkey and commit.gpgsign are written
      * once by git_configure_gpg and again (same values) by gpg_manager's
-     * gpg_configure_git_signing. Skip a write ONLY when this process already
+     * gpg_configure_git_signing. The switch path resets this cache between
+     * those two writers, so the skip does not fire there; it serves direct
+     * library callers that repeat an identical write (AR-18 L10). Skip a
+     * write ONLY when this process already
      * ran the identical write successfully — re-execing it could only repeat
      * the first result, so the config outcome is provably unchanged. A value
      * merely observed (CFG_OBSERVED) never suppresses a write: e.g. on a
@@ -16153,7 +16156,8 @@ static int validate_git_installation(void) {
 
 /* Validate a git config value.
  *
- * Every value is written via git_run -> run_argv (execvp, no shell), so shell
+ * Every value is written via git_run -> run_argv (a verified-descriptor exec,
+ * never a shell), so shell
  * metacharacters are NOT dangerous here and must be allowed: a user.name like
  * "Jane Doe (Work)" is common and legitimate, and the old blocklist of
  * ";|&`$(){}[]" rejected it, failing the switch. The only value git itself

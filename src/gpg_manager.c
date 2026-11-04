@@ -2989,7 +2989,8 @@ static int gpg_validate_pinned_home(const gpg_pinned_home_t *home) {
 }
 
 /* Read the stable link while the caller holds the verified base's lock.
- * This is the sole GPG readlink boundary: callers separately decide whether
+ * This is the readlink boundary for the stable `current` link (identity
+ * capture and the runtime probe read their own links); callers separately decide whether
  * a raw target must be a managed child or may merely be unlinked by reset.
  * Return 1 when `current` is absent, 0 when target is populated, and -1 for
  * malformed/unknown state. */
