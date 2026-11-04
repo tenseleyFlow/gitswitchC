@@ -5186,6 +5186,9 @@ static int run_argv_real_impl(
 #endif
         {
             exec_child = fork();
+#ifdef GITSWITCH_TESTING
+            runner_trace("after worker fork: self=%ld exec_child=%ld errno=%d\n", (long)getpid(), (long)exec_child, errno);
+#endif
         }
         if (exec_child < 0) {
             int fork_errno = errno;
@@ -5330,10 +5333,16 @@ static int run_argv_real_impl(
             do {
                 waited = waitpid(exec_child, &exec_status, 0);
             } while (waited < 0 && errno == EINTR);
+#ifdef GITSWITCH_TESTING
+            runner_trace("supervisor %ld reaped worker %ld waited=%ld status=0x%x\n", (long)getpid(), (long)exec_child, (long)waited, (unsigned)exec_status);
+#endif
             if (waited != exec_child) _exit(127);
             runner_supervisor_exit_for_status(exec_child, exec_status);
         }
         close(worker_release_pipe[1]);
+#ifdef GITSWITCH_TESTING
+        runner_trace("worker %ld waiting for release\n", (long)getpid());
+#endif
         if (runner_read_byte(worker_release_pipe[0], 0x45U) != 0) {
             child_report_failure(child_status_fd,
                                  CHILD_STAGE_PROCESS_GROUP, errno, 126);
@@ -5489,6 +5498,9 @@ static int run_argv_real_impl(
          * reserve fd 5 only until the interpreter exec, so they sweep from 6.
          * Nothing else is intentionally handed to a child. */
         run_test_fd_close_observation_t fd_close_observation;
+#ifdef GITSWITCH_TESTING
+        runner_trace("worker %ld fd-close stage\n", (long)getpid());
+#endif
         int close_lowfd = script_launch.is_script
                               ? STDERR_FILENO + 4
                               : STDERR_FILENO + 3;
@@ -5513,6 +5525,9 @@ static int run_argv_real_impl(
         /* Apply removals before additions so callers can express a clean
          * baseline and still deliberately replace one of the same names.
          * Neither operation mutates the parent process environment. */
+#ifdef GITSWITCH_TESTING
+        runner_trace("worker %ld env stage\n", (long)getpid());
+#endif
         if (opts->unset_env) {
             for (size_t i = 0; opts->unset_env[i]; i++) {
                 const char *name = opts->unset_env[i];
@@ -5602,6 +5617,9 @@ static int run_argv_real_impl(
         char *const *launch_argv = script_launch.is_script
                                        ? script_launch.script_argv
                                        : (char *const *)argv;
+#ifdef GITSWITCH_TESTING
+        runner_trace("worker %ld exec stage: %s\n", (long)getpid(), exec_path ? exec_path : "?");
+#endif
 
 #if defined(__linux__) || defined(__FreeBSD__)
         /* Scripts never enter the kernel's shebang path. The already-pinned,
