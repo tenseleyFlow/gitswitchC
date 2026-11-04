@@ -2511,8 +2511,17 @@ static ssh_process_outcome_t reap_ssh_agent(
     return SSH_PROCESS_INDETERMINATE;
 }
 
+/* Cleanup authority: the recorded process is conclusively not a live agent
+ * this tool owns. GONE and UNRELATED are the classic cases. REPLACED is
+ * included (AR-18 M9): a generation mismatch proves the recorded process no
+ * longer exists at that PID (one PID holds one process; boot id and start
+ * time are immutable), so it is exactly GONE for cleanup purposes, while the
+ * PID's current occupant must never be signaled (reap_ssh_agent returns
+ * REPLACED before any signal). Every caller still gates the actual unlink on
+ * the pinned dead-socket proof, so a live agent on the socket fails closed. */
 static bool ssh_reap_allows_cleanup(ssh_process_outcome_t outcome) {
-    return outcome == SSH_PROCESS_GONE || outcome == SSH_PROCESS_UNRELATED;
+    return outcome == SSH_PROCESS_GONE || outcome == SSH_PROCESS_UNRELATED ||
+           outcome == SSH_PROCESS_REPLACED;
 }
 
 static const char *ssh_process_outcome_name(ssh_process_outcome_t outcome) {
@@ -5138,7 +5147,8 @@ static int cleanup_stopped_agent_runtime(ssh_config_t *ssh_config) {
         bool retirement_attempted = false;
 
         if (!ssh_reap_allows_cleanup(reap_outcome) &&
-            reap_outcome == SSH_PROCESS_INDETERMINATE && socket_present) {
+            reap_outcome == SSH_PROCESS_INDETERMINATE &&
+            socket_present) {
             retirement_attempted = true;
             if (retire_recorded_agent_endpoint(
                     dir_fd, runtime_dir, socket_name,
