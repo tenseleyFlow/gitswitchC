@@ -1762,17 +1762,19 @@ static int git_absolute_path(const char *path, char *out, size_t out_size) {
     return 0;
 }
 
-/* AR-18 P6: Git selects its --global write target by probing each candidate
- * with access(R_OK) (git_global_config), so an unreadable file or a dangling
- * symlink is skipped. Mirror that exactly instead of lstat presence; the
- * rollback destination otherwise pins a file Git never writes. Any probe
- * failure means "not selected", as it does for Git. */
 static int git_path_presence(const char *path, bool *present) {
-    int saved_errno = errno;
-
-    *present = access(path, R_OK) == 0;
-    errno = saved_errno;
-    return 0;
+    struct stat st;
+    if (lstat(path, &st) == 0) {
+        *present = true;
+        return 0;
+    }
+    if (errno == ENOENT) {
+        *present = false;
+        return 0;
+    }
+    set_system_error(ERR_GIT_CONFIG_FAILED,
+                     "Cannot inspect Git configuration candidate: %s", path);
+    return -1;
 }
 
 /* Match Git's --global write selection: GIT_CONFIG_GLOBAL is authoritative;

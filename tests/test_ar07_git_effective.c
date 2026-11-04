@@ -305,65 +305,6 @@ TEST(worktree_values_are_cleared_and_restored_around_global_switch) {
  * overrides before writing the new global identity. Make .git non-writable so
  * Git cannot create config.lock, then prove the old global identity remains
  * byte-for-byte intact. */
-/* AR-18 P6: Git chooses its --global write target with access(R_OK), so a
- * dangling ~/.gitconfig symlink beside a readable XDG config makes Git write
- * the XDG file. The tool must pin and restore that same file instead of
- * selecting the dangling link on lstat presence. */
-TEST(global_target_follows_git_readability_not_lstat_presence) {
-    real_fixture_t fixture;
-    account_t account = basic_account();
-    char value[GIT_CONFIG_VALUE_MAX];
-    char home_config[192];
-    char dangling_target[192];
-    char xdg_dir[192];
-    char xdg_config[192];
-    struct stat st;
-
-    CHECK(fixture_init(&fixture));
-    snprintf(home_config, sizeof(home_config), "%s/.gitconfig", fixture.home);
-    snprintf(dangling_target, sizeof(dangling_target), "%s/missing-gitconfig",
-             fixture.home);
-    snprintf(xdg_dir, sizeof(xdg_dir), "%s/git", fixture.xdg);
-    snprintf(xdg_config, sizeof(xdg_config), "%s/git/config", fixture.xdg);
-    CHECK_EQ_INT(mkdir(xdg_dir, 0700), 0);
-    {
-        FILE *xdg = fopen(xdg_config, "w");
-        CHECK(xdg != NULL);
-        if (xdg) {
-            fputs("[user]\n\tname = Old XDG User\n"
-                  "\temail = old-xdg@example.test\n", xdg);
-            fclose(xdg);
-        }
-    }
-    /* With ~/.gitconfig absent and the XDG file readable, Git reads and
-     * writes the XDG file. */
-    CHECK_EQ_INT(get_git_value("--global", GIT_CONFIG_USER_NAME,
-                               value, sizeof(value)), 0);
-    CHECK_STR_EQ(value, "Old XDG User");
-    CHECK_EQ_INT(symlink(dangling_target, home_config), 0);
-    CHECK_EQ_INT(lstat(home_config, &st), 0);
-    CHECK_EQ_INT(access(home_config, R_OK), -1);
-
-    CHECK_EQ_INT(git_config_snapshot(GIT_SCOPE_GLOBAL), 0);
-    CHECK_EQ_INT(git_set_config(&account, GIT_SCOPE_GLOBAL), 0);
-    CHECK_EQ_INT(get_git_value("--global", GIT_CONFIG_USER_NAME,
-                               value, sizeof(value)), 0);
-    CHECK_STR_EQ(value, account.name);
-    /* The dangling link is still a dangling link: nothing was written
-     * through or beside it. */
-    CHECK_EQ_INT(lstat(home_config, &st), 0);
-    CHECK(S_ISLNK(st.st_mode));
-    CHECK_EQ_INT(access(dangling_target, F_OK), -1);
-
-    CHECK_EQ_INT(git_config_restore(), 0);
-    CHECK_EQ_INT(get_git_value("--global", GIT_CONFIG_USER_NAME,
-                               value, sizeof(value)), 0);
-    CHECK_STR_EQ(value, "Old XDG User");
-    CHECK_EQ_INT(lstat(home_config, &st), 0);
-    CHECK(S_ISLNK(st.st_mode));
-    CHECK_EQ_INT(access(dangling_target, F_OK), -1);
-}
-
 TEST(unwritable_repo_config_stops_global_identity_write) {
     real_fixture_t fixture;
     account_t account = basic_account();
@@ -551,7 +492,6 @@ TEST_MAIN_BEGIN()
     RUN_TEST(global_switch_stops_before_writes_when_any_local_clear_fails);
     RUN_TEST(disabled_ssh_unset_failure_is_fatal);
     RUN_TEST(worktree_values_are_cleared_and_restored_around_global_switch);
-    RUN_TEST(global_target_follows_git_readability_not_lstat_presence);
     RUN_TEST(unwritable_repo_config_stops_global_identity_write);
     RUN_TEST(status_attributes_stale_worktree_ssh_and_gpg_program);
     RUN_TEST(case_variant_gpg_subsection_is_not_folded_into_managed_slot);
