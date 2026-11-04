@@ -1624,7 +1624,7 @@ TEST(legacy_literal_ssh_host_falls_back_and_is_canonicalized) {
     restore_home_env(saved_home);
 }
 
-TEST(legacy_wildcard_alias_requires_explicit_canonical_hostname) {
+TEST(wildcard_alias_is_skipped_even_with_explicit_canonical_hostname) {
     char dir[128], path[256], key[256], cfg[2048];
     gitswitch_ctx_t ctx;
 
@@ -1651,8 +1651,9 @@ TEST(legacy_wildcard_alias_requires_explicit_canonical_hostname) {
     CHECK_EQ_INT(ctx.accounts_skipped_on_load, 1);
     CHECK_EQ_INT(config_check_rewritable(&ctx), -1);
 
-    /* The pattern itself remains legal when an unambiguous destination is
-     * supplied; only using a wildcard as the HostName fallback is rejected. */
+    /* AR-18 P14: a wildcard alias is never a literal remote host and would
+     * widen the private -F stanza to every destination, so it is skipped
+     * (not bricked) even with an explicit canonical hostname. */
     CHECK(snprintf(cfg, sizeof(cfg),
                    "[settings]\n"
                    "default_scope = \"local\"\n"
@@ -1666,10 +1667,8 @@ TEST(legacy_wildcard_alias_requires_explicit_canonical_hostname) {
     CHECK_EQ_INT(write_config(path, cfg, strlen(cfg)), 0);
     memset(&ctx, 0, sizeof(ctx));
     CHECK_EQ_INT(config_load(&ctx, path), 0);
-    CHECK_EQ_INT(ctx.account_count, 1);
-    if (ctx.account_count == 1) {
-        CHECK_STR_EQ(ctx.accounts[0].ssh_hostname, "github.com");
-    }
+    CHECK_EQ_INT(ctx.account_count, 0);
+    CHECK_EQ_INT(ctx.accounts_skipped_on_load, 1);
 }
 
 /* AR-12 H3: deleting or chmod-ing the ACTIVE account's key file skips that
@@ -1864,7 +1863,12 @@ TEST(ssh_hostname_schema_and_api_reject_unsafe_values) {
     CHECK(toml_validate_ssh_hostname("::ffff:192.0.2.1"));
     CHECK(toml_validate_ssh_hostname("2001:db8::1:2222"));
     CHECK(!toml_validate_ssh_hostname(""));
-    CHECK(toml_validate_ssh_host_alias("github-*"));
+    /* AR-18 P14/P15: OpenSSH patterns and a leading dash are never usable as
+     * a literal remote host and would widen the private -F stanza. */
+    CHECK(toml_validate_ssh_host_alias("github.com-work"));
+    CHECK(!toml_validate_ssh_host_alias("github-*"));
+    CHECK(!toml_validate_ssh_host_alias("gith?b"));
+    CHECK(!toml_validate_ssh_host_alias("-work"));
     for (size_t i = 0; invalid[i]; i++) {
         CHECK(!toml_validate_ssh_hostname(invalid[i]));
         memset(&ctx, 0, sizeof(ctx));
@@ -2892,7 +2896,7 @@ TEST_MAIN_BEGIN()
     RUN_TEST(account_model_admitted_states_roundtrip_exactly);
     RUN_TEST(ssh_hostname_load_save_and_shared_destination_roundtrip);
     RUN_TEST(legacy_literal_ssh_host_falls_back_and_is_canonicalized);
-    RUN_TEST(legacy_wildcard_alias_requires_explicit_canonical_hostname);
+    RUN_TEST(wildcard_alias_is_skipped_even_with_explicit_canonical_hostname);
     RUN_TEST(ssh_hostname_schema_and_api_reject_unsafe_values);
     RUN_TEST(find_account_rejects_out_of_range_and_noncanonical_ids);
     RUN_TEST(load_skips_leading_zero_id_section);
