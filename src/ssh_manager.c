@@ -6464,10 +6464,10 @@ int ssh_capture_host_alias_obligation(
                   "Cannot capture an invalid SSH alias obligation");
         return -1;
     }
-    if (!home || !*home) {
+    if (!home || home[0] != '/') { /* AR-18 L69: relative HOME refused */
         set_error(
             ERR_INVALID_PATH,
-            "HOME is not set for SSH alias retirement");
+            "HOME is unset or not an absolute path for SSH alias retirement");
         return -1;
     }
     if (realpath(home, canonical_home) == NULL) {
@@ -7950,9 +7950,9 @@ int ssh_preflight_host_alias_config(const account_t *account) {
                   account->ssh_host_alias);
         return -1;
     }
-    if (!home || !*home) {
+    if (!home || home[0] != '/') { /* AR-18 L69: relative HOME refused */
         set_error(ERR_INVALID_PATH,
-                  "Cannot preflight ~/.ssh/config: HOME is not set");
+                  "Cannot preflight ~/.ssh/config: HOME is unset or not an absolute path");
         return -1;
     }
 
@@ -8363,8 +8363,8 @@ static int ssh_remove_host_alias_result_internal(
                   "SSH host alias removal requires a non-empty alias");
         return -1;
     }
-    if (!home || !*home) {
-        set_error(ERR_INVALID_PATH, "HOME not set");
+    if (!home || home[0] != '/') { /* AR-18 L69: relative HOME refused */
+        set_error(ERR_INVALID_PATH, "HOME is unset or not an absolute path");
         return -1;
     }
     if (!valid_ssh_host_alias(alias)) {
@@ -8548,8 +8548,8 @@ int ssh_remove_host_alias_obligation_result(
                   "Invalid SSH alias retirement obligation");
         return -1;
     }
-    if (!home || !*home) {
-        set_error(ERR_INVALID_PATH, "HOME not set");
+    if (!home || home[0] != '/') { /* AR-18 L69: relative HOME refused */
+        set_error(ERR_INVALID_PATH, "HOME is unset or not an absolute path");
         return -1;
     }
     if (!obligation->ssh_directory_identity.present) {
@@ -8616,8 +8616,8 @@ int ssh_configure_host_alias_result(
         }
         return 0; /* Nothing to configure */
     }
-    if (!home || !*home) {
-        set_error(ERR_INVALID_PATH, "HOME not set");
+    if (!home || home[0] != '/') { /* AR-18 L69: relative HOME refused */
+        set_error(ERR_INVALID_PATH, "HOME is unset or not an absolute path");
         return -1;
     }
     if (!valid_ssh_host_alias(account->ssh_host_alias)) {

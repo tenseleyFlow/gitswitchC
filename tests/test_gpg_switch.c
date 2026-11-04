@@ -1391,6 +1391,32 @@ TEST(truncated_idempotency_probe_is_not_signing_evidence) {
     unsetenv("GITSWITCH_ALLOW_TMP_GPG");
 }
 
+/* AR-18 L30: MacGPG and other vendor builds print "gpg (GnuPG/MacGPG2)";
+ * the 2.0-contract probe rejected them as unsupported helpers. */
+TEST(version_banner_accepts_vendor_branded_gnupg) {
+    int is_20 = -1;
+
+    CHECK_EQ_INT(gpg_manager_test_parse_listing_contract_version(
+                     "gpg (GnuPG) 2.4.5\nlibgcrypt 1.10.3\n", &is_20), 0);
+    CHECK_EQ_INT(is_20, 0);
+    CHECK_EQ_INT(gpg_manager_test_parse_listing_contract_version(
+                     "gpg (GnuPG/MacGPG2) 2.2.41\n", &is_20), 0);
+    CHECK_EQ_INT(is_20, 0);
+    CHECK_EQ_INT(gpg_manager_test_parse_listing_contract_version(
+                     "gpg (GnuPG) 2.0.22\n", &is_20), 0);
+    CHECK_EQ_INT(is_20, 1);
+    clear_error();
+    CHECK_EQ_INT(gpg_manager_test_parse_listing_contract_version(
+                     "gpg (Something) 2.4.5\n", &is_20), -1);
+    CHECK(strstr(get_last_error()->message, "supported helper") != NULL);
+    clear_error();
+    CHECK_EQ_INT(gpg_manager_test_parse_listing_contract_version(
+                     "gpg (GnuPG/Mac GPG) 2.2.41\n", &is_20), -1);
+    clear_error();
+    CHECK_EQ_INT(gpg_manager_test_parse_listing_contract_version(
+                     "gpg (GnuPG)2.4.5\n", &is_20), -1);
+}
+
 TEST_MAIN_BEGIN()
     static const char *const trusted_commands[] = {
         "gpg", "gpgconf", NULL
@@ -1423,6 +1449,7 @@ TEST_MAIN_BEGIN()
     RUN_TEST(gpg_current_snapshot_and_conditional_restore_are_compare_and_swap);
     RUN_TEST(gpg_current_snapshot_blocks_on_base_lock);
     RUN_TEST(truncated_idempotency_probe_is_not_signing_evidence);
+    RUN_TEST(version_banner_accepts_vendor_branded_gnupg);
     run_set_runner(previous_runner);
     if (ts_trusted_command_fixture_restore(&command_fixture) != 0) {
         fprintf(stderr,

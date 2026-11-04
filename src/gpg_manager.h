@@ -81,6 +81,11 @@ bool gpg_manager_test_generation_tokens_same_process(const char *left,
 int gpg_manager_test_encode_process_generation(
     uint8_t kind, uint64_t boot_hi, uint64_t boot_lo,
     uint64_t start_hi, uint64_t start_lo, char *token, size_t size);
+/* AR-18 L30 test seam: the `gpg --version` banner parser that selects the
+ * secret-listing contract. Returns 0 and reports whether the 2.0 contract
+ * was selected, or -1 with an error for an unsupported banner. */
+int gpg_manager_test_parse_listing_contract_version(const char *output,
+                                                    int *contract_is_20);
 
 /* Narrow dependency seams for deterministic filesystem-race/error tests. The
  * defaults are libc readdir() and no pre-open callback, respectively. */

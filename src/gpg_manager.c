@@ -1665,7 +1665,8 @@ static int gpg_get_base_dir(char *buf, size_t size) {
             display_warning("XDG_RUNTIME_DIR is unset; isolated GPG homes will use "
                             "%s, which is not memory-backed. Exported "
                             "secret keys could remain recoverable on disk after exit. Set "
-                            "XDG_RUNTIME_DIR to a memory-backed dir to avoid this.",
+                            "XDG_RUNTIME_DIR to a memory-backed dir to avoid this, or set "
+                            "GITSWITCH_ALLOW_TMP_GPG=1 to accept on-disk persistence.",
                             buf);
         }
     }
@@ -3980,9 +3981,14 @@ static int gpg_retarget_current_locked(int base_fd, const char *base,
         if (live_rc > 0) {
             set_error(ERR_INVALID_PATH,
                       "Not retargeting GNUPGHOME: home is missing: %s", real_home);
+            log_warning("Not retargeting GNUPGHOME symlink: home is missing: %s",
+                        real_home);
+        } else {
+            /* AR-18 P18: the directory exists but is unsafe or uninspectable;
+             * the probe already set the precise error. */
+            log_warning("Not retargeting GNUPGHOME symlink: home is present but unsafe or uninspectable: %s",
+                        real_home);
         }
-        log_warning("Not retargeting GNUPGHOME symlink: home is missing: %s",
-                    real_home);
         return -1;
     }
     if (gpg_current_path_from_base(base, link_path, sizeof(link_path)) != 0) {
@@ -5203,8 +5209,21 @@ static int gpg_reset_plan_add_residue(
                   "GPG reset recovery name exceeds its bounded grammar");
         return -1;
     }
-    if (gpg_capture_link_at(base_fd, name, &residue->identity) != 0) {
-        return -1;
+    {
+        int captured = gpg_capture_link_at(base_fd, name, &residue->identity);
+
+        if (captured != 0) {
+            if (captured > 0) {
+                /* AR-18 L27: the entry vanished between readdir and capture;
+                 * leave a diagnostic that names it instead of whatever error
+                 * context the last unrelated call left behind. */
+                errno = ESTALE;
+                set_error(ERR_FILE_IO,
+                          "GPG reset residue vanished while it was being planned: %s; rerun reset",
+                          name);
+            }
+            return -1;
+        }
     }
     residue->kind = kind;
     *index = plan->residue_count;
@@ -8034,7 +8053,7 @@ static bool gpg_version_suffix_is_valid(const char *cursor,
 
 static int gpg_parse_listing_contract_version(
     const char *output, gpg_secret_listing_contract_t *contract) {
-    static const char prefix[] = "gpg (GnuPG) ";
+    static const char prefix[] = "gpg (GnuPG";
     const char *cursor;
     const char *end;
     unsigned int major;
@@ -8047,6 +8066,22 @@ static int gpg_parse_listing_contract_version(
         return -1;
     }
     cursor = output + sizeof(prefix) - 1U;
+    /* AR-18 L30: vendor builds brand the banner as "gpg (GnuPG/MacGPG2)";
+     * the variant suffix is still GnuPG and still speaks the same contract. */
+    if (*cursor == '/') {
+        cursor++;
+        while (*cursor && *cursor != ')' && *cursor != '\n' &&
+               (isalnum((unsigned char)*cursor) || *cursor == '.' ||
+                *cursor == '-' || *cursor == '_')) {
+            cursor++;
+        }
+    }
+    if (cursor[0] != ')' || cursor[1] != ' ') {
+        set_error(ERR_GPG_KEY_FAILED,
+                  "GPG version output does not identify a supported helper");
+        return -1;
+    }
+    cursor += 2;
     end = strchr(cursor, '\n');
     if (!end) end = cursor + strlen(cursor);
     if (end > cursor && end[-1] == '\r') end--;
@@ -8068,6 +8103,17 @@ static int gpg_parse_listing_contract_version(
                     ? GPG_SECRET_LISTING_20
                     : GPG_SECRET_LISTING_MODERN;
     return 0;
+}
+
+int gpg_manager_test_parse_listing_contract_version(const char *output,
+                                                    int *contract_is_20) {
+    gpg_secret_listing_contract_t contract = GPG_SECRET_LISTING_MODERN;
+    int rc = gpg_parse_listing_contract_version(output, &contract);
+
+    if (contract_is_20) {
+        *contract_is_20 = rc == 0 && contract == GPG_SECRET_LISTING_20;
+    }
+    return rc;
 }
 
 static int gpg_query_secret_listing_contract(
@@ -8454,8 +8500,11 @@ static int copy_key_from_system_keyring(const gpg_config_t *gpg_config,
                           "GPG secret-key export was terminated by signal %d",
                           res.term_signal);
             } else if (res.exit_code == 2) {
+                /* AR-18 L28: gpg exits 2 for a missing key, a cancelled
+                 * passphrase prompt and an unreachable agent alike, and its
+                 * stderr is not captured here; do not claim the key vanished. */
                 set_error(ERR_GPG_KEY_NOT_FOUND,
-                          "GPG key disappeared from the system keyring before export");
+                          "GPG secret-key export failed (gpg exit status 2): the key is not in the system keyring, the passphrase prompt was cancelled, or gpg-agent could not be reached");
             } else if (res.exit_code == 0) {
                 set_error(ERR_GPG_KEY_FAILED,
                           "GPG secret-key export produced no complete output");
@@ -10386,9 +10435,11 @@ static int gpg_user_source_home(char *buf, size_t size) {
         }
     }
     home = getenv("HOME");
-    if (!home || !*home) {
+    if (!home || home[0] != '/') {
+        /* AR-18 L69: config resolution already refuses a relative HOME; the
+         * keyring must not be anchored at the working directory instead. */
         set_error(ERR_INVALID_PATH,
-                  "HOME is unset; cannot resolve the system GPG keyring");
+                  "HOME is unset or not an absolute path; cannot resolve the system GPG keyring");
         return -1;
     }
     if (safe_snprintf(fallback, sizeof(fallback), "%s/.gnupg", home) != 0) {
@@ -10675,12 +10726,20 @@ static int gpg_source_proof_add_owned(
         set_error(ERR_INVALID_ARGS, "Invalid retained GPG source proof");
         return -1;
     }
-    if (proof->count >= maximum ||
-        proof->count >= proof->retained_limit) {
+    if (proof->count >= maximum) {
         errno = E2BIG;
         set_error(ERR_PERMISSION_DENIED,
-                  "Managed GPG ancestry exceeds the descriptor-budgeted "
-                  "retained proof bound");
+                  "Managed GPG ancestry exceeds the retained proof bound");
+        return -1;
+    }
+    if (proof->count >= proof->retained_limit) {
+        /* AR-18 L29: the set is legitimately sized; the open-file limit is
+         * what ran out. Say so instead of calling the ancestry oversized. */
+        errno = EMFILE;
+        set_error(ERR_PERMISSION_DENIED,
+                  "Cannot retain the managed GPG ancestry proof: the process "
+                  "open-file limit (RLIMIT_NOFILE) is exhausted; raise it or "
+                  "close other descriptors and retry");
         return -1;
     }
     if (proof->count == proof->capacity) {

@@ -246,6 +246,7 @@ TEST(all_retained_public_apis_compile_and_link) {
     REQUIRE_PUBLIC_API(gpg_configure_git_signing);
     REQUIRE_PUBLIC_API(gpg_manager_test_generation_tokens_same_process);
     REQUIRE_PUBLIC_API(gpg_manager_test_encode_process_generation);
+    REQUIRE_PUBLIC_API(gpg_manager_test_parse_listing_contract_version);
     REQUIRE_PUBLIC_API(gpg_create_isolated_home);
     REQUIRE_PUBLIC_API(gpg_manager_cleanup);
     REQUIRE_PUBLIC_API(gpg_manager_current_is_live_for_account);

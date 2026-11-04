@@ -30,6 +30,9 @@
 #include "test.h"
 #include "gitswitch.h"
 #include "ssh_manager.h"
+#define GITSWITCH_INTERNAL_API
+#include "ssh_manager_internal.h"
+#undef GITSWITCH_INTERNAL_API
 #include "utils.h"
 #include "runner_internal.h"
 #include "error.h"
@@ -1742,9 +1745,42 @@ TEST(host_alias_skips_rewrite_when_content_identical) {
     CHECK(strstr(buf, "key2") != NULL);
 }
 
+/* AR-18 L69: configuration and key resolution already treat a relative HOME
+ * as absent; the SSH config namespace used to anchor ~/.ssh/config at the
+ * working directory instead, publishing the alias cwd-relative and making
+ * its removal fail from anywhere else. */
+TEST(relative_home_is_refused_for_the_ssh_config_namespace) {
+    account_t account;
+    char saved_home[4096];
+    const char *home = getenv("HOME");
+
+    snprintf(saved_home, sizeof(saved_home), "%s", home ? home : "");
+    memset(&account, 0, sizeof(account));
+    account.id = 1;
+    account.ssh_enabled = true;
+    CHECK_EQ_INT(safe_strncpy(account.name, "rel", sizeof(account.name)), 0);
+    CHECK_EQ_INT(safe_strncpy(account.ssh_key_path, "/nonexistent/rel-key",
+                              sizeof(account.ssh_key_path)), 0);
+    CHECK_EQ_INT(safe_strncpy(account.ssh_host_alias, "github.com-rel",
+                              sizeof(account.ssh_host_alias)), 0);
+    CHECK_EQ_INT(safe_strncpy(account.ssh_hostname, "github.com",
+                              sizeof(account.ssh_hostname)), 0);
+    CHECK_EQ_INT(setenv("HOME", "relative-home", 1), 0);
+    clear_error();
+    CHECK_EQ_INT(ssh_preflight_host_alias_config(&account), -1);
+    CHECK(strstr(get_last_error()->message, "absolute") != NULL);
+    CHECK(access("relative-home", F_OK) != 0);
+    if (home) {
+        CHECK_EQ_INT(setenv("HOME", saved_home, 1), 0);
+    } else {
+        unsetenv("HOME");
+    }
+}
+
 TEST_MAIN_BEGIN()
     error_init(LOG_LEVEL_ERROR, NULL);
     RUN_TEST(ssh_manager_reset_rejects_empty_selector);
+    RUN_TEST(relative_home_is_refused_for_the_ssh_config_namespace);
     RUN_TEST(agent_spawn_pins_bourne_format_and_reaps_on_parse_failure);
     RUN_TEST(socket_validation_failure_reaps_spawned_agent);
     RUN_TEST(reuse_refuses_contaminated_agent);
