@@ -899,73 +899,6 @@ cleanup:
     return destination_matches ? 0 : -1;
 }
 
-/* AR-18 M14/M15: a pure function of the stored bytes. Two records denote
- * the same stored destination when their scope, lexical config and
- * repository spellings and the captured parent/repository object identities
- * all agree. The ledger integrity checks (parse, serialize, lookup pairwise)
- * use this rather than live physical resolution, so a ledger the tool wrote
- * always re-parses even after the user later aliases one path to another,
- * and no realpath walks run on every load. Physical equivalence is still
- * consulted where it matters: matching a new record on upsert and a query on
- * lookup, with a byte-exact spelling preferred over an alias. */
-bool publication_record_same_stored_destination(
-    const publication_record_t *left, const publication_record_t *right) {
-    char left_config[MAX_PATH_LEN];
-    char right_config[MAX_PATH_LEN];
-    char left_repository[MAX_PATH_LEN];
-    char right_repository[MAX_PATH_LEN];
-
-    if (!left || !right || left->scope != right->scope) return false;
-    if (!publication_path_lexical_key(left->config_path, left_config) ||
-        !publication_path_lexical_key(right->config_path, right_config) ||
-        strcmp(left_config, right_config) != 0 ||
-        !publication_identity_same_object(&left->config_parent,
-                                          &right->config_parent)) {
-        return false;
-    }
-    if (left->repository_path[0] == '\0' ||
-        right->repository_path[0] == '\0') {
-        return left->repository_path[0] == '\0' &&
-               right->repository_path[0] == '\0';
-    }
-    return publication_path_lexical_key(left->repository_path,
-                                        left_repository) &&
-           publication_path_lexical_key(right->repository_path,
-                                        right_repository) &&
-           strcmp(left_repository, right_repository) == 0 &&
-           publication_identity_same_object(&left->repository,
-                                            &right->repository);
-}
-
-/* AR-18 M15: byte-exact (lexically normalized) spelling match, used only to
- * break a tie between several records that resolve to one physical
- * destination. Identity is not consulted: the physical match already proved
- * the same object. */
-static bool publication_record_stored_matches_spelling(
-    const publication_record_t *candidate, publication_scope_t scope,
-    const char *config_path, const char *repository_path) {
-    char candidate_config[MAX_PATH_LEN];
-    char query_config[MAX_PATH_LEN];
-    char candidate_repository[MAX_PATH_LEN];
-    char query_repository[MAX_PATH_LEN];
-    const char *repository = repository_path ? repository_path : "";
-
-    if (!candidate || candidate->scope != scope ||
-        !publication_path_lexical_key(candidate->config_path,
-                                      candidate_config) ||
-        !publication_path_lexical_key(config_path, query_config) ||
-        strcmp(candidate_config, query_config) != 0) {
-        return false;
-    }
-    if (candidate->repository_path[0] == '\0' || repository[0] == '\0') {
-        return candidate->repository_path[0] == '\0' && repository[0] == '\0';
-    }
-    return publication_path_lexical_key(candidate->repository_path,
-                                        candidate_repository) &&
-           publication_path_lexical_key(repository, query_repository) &&
-           strcmp(candidate_repository, query_repository) == 0;
-}
-
 bool publication_record_same_destination(const publication_record_t *left,
                                          const publication_record_t *right) {
     char left_repository[MAX_PATH_LEN];
@@ -1035,33 +968,11 @@ void publication_ledger_clear(publication_ledger_t *ledger) {
     memset(ledger, 0, sizeof(*ledger));
 }
 
-/* Among the records that physically match `physical`, return the index of
- * the single one whose stored spelling equals the given spelling, or SIZE_MAX
- * when none or several do. */
-static size_t publication_ledger_unique_spelling_match(
-    const publication_ledger_t *ledger, const publication_record_t *physical,
-    const char *config_path, const char *repository_path) {
-    size_t found = SIZE_MAX;
-
-    for (size_t i = 0; i < ledger->count; i++) {
-        const publication_record_t *candidate = &ledger->records[i];
-        if (!publication_record_stored_matches_spelling(
-                candidate, physical->scope, config_path, repository_path) ||
-            !publication_record_same_destination(candidate, physical)) {
-            continue;
-        }
-        if (found != SIZE_MAX) return SIZE_MAX;
-        found = i;
-    }
-    return found;
-}
-
 int publication_ledger_upsert(publication_ledger_t *ledger,
                               const publication_record_t *record) {
     publication_record_t canonical;
     publication_record_t *grown;
     size_t matching_index = SIZE_MAX;
-    size_t match_count = 0U;
 
     if (!ledger || publication_record_validate(record) != 0) return -1;
     canonical = *record;
@@ -1080,36 +991,12 @@ int publication_ledger_upsert(publication_ledger_t *ledger,
     for (size_t i = 0; i < ledger->count; i++) {
         if (publication_record_same_destination(&ledger->records[i],
                                                 &canonical)) {
-            if (matching_index == SIZE_MAX) matching_index = i;
-            match_count++;
+            if (matching_index != SIZE_MAX) {
+                return publication_invalid(
+                    "Publication ledger upsert destination is ambiguous");
+            }
+            matching_index = i;
         }
-    }
-    if (match_count > 1U) {
-        /* AR-18 M14/M15: several stored-distinct records now resolve to one
-         * physical destination (the user aliased one recorded path to
-         * another after the records were written). Prefer the record spelled
-         * exactly like the incoming destination, then the one spelled like
-         * its physical resolution; otherwise fail closed as before. The
-         * chosen record keeps its stored spelling so the ledger stays
-         * stored-distinct and every record remains serializable. */
-        matching_index = publication_ledger_unique_spelling_match(
-            ledger, &canonical, record->config_path,
-            record->repository_path);
-        if (matching_index == SIZE_MAX) {
-            matching_index = publication_ledger_unique_spelling_match(
-                ledger, &canonical, canonical.config_path,
-                canonical.repository_path);
-        }
-        if (matching_index == SIZE_MAX) {
-            return publication_invalid(
-                "Publication ledger upsert destination is ambiguous");
-        }
-        memcpy(canonical.config_path, ledger->records[matching_index].config_path,
-               sizeof(canonical.config_path));
-        memcpy(canonical.repository_path,
-               ledger->records[matching_index].repository_path,
-               sizeof(canonical.repository_path));
-        if (publication_record_validate(&canonical) != 0) return -1;
     }
     if (matching_index != SIZE_MAX) {
         ledger->records[matching_index] = canonical;
@@ -1143,11 +1030,6 @@ publication_lookup_status_t publication_ledger_find(
     publication_scope_t scope, const char *config_path,
     const char *repository_path, const publication_record_t **record) {
     const publication_record_t *match = NULL;
-    const publication_record_t *exact = NULL;
-    const publication_record_t *canonical = NULL;
-    size_t match_count = 0U;
-    size_t exact_count = 0U;
-    size_t canonical_count = 0U;
     const char *repository = repository_path ? repository_path : "";
 
     if (record) *record = NULL;
@@ -1192,8 +1074,8 @@ publication_lookup_status_t publication_ledger_find(
             return PUBLICATION_LOOKUP_ERROR;
         }
         for (size_t j = 0; j < i; j++) {
-            if (publication_record_same_stored_destination(
-                    candidate, &ledger->records[j])) {
+            if (publication_record_same_destination(candidate,
+                                                    &ledger->records[j])) {
                 publication_invalid(
                     "Publication ledger contains duplicate destinations");
                 return PUBLICATION_LOOKUP_ERROR;
@@ -1219,36 +1101,13 @@ publication_lookup_status_t publication_ledger_find(
             strcmp(candidate_repository, query_repository) != 0) {
             continue;
         }
-        if (!match) match = candidate;
-        match_count++;
-        if (publication_record_stored_matches_spelling(
-                candidate, scope, config_path, repository)) {
-            if (!exact) exact = candidate;
-            exact_count++;
-        }
-        /* candidate_config/candidate_repository hold the physical keys here;
-         * a record stored under that exact spelling is the canonical one. */
-        if (publication_record_stored_matches_spelling(
-                candidate, scope, candidate_config, candidate_repository)) {
-            if (!canonical) canonical = candidate;
-            canonical_count++;
-        }
-    }
-    if (match_count == 0U) return PUBLICATION_LOOKUP_ABSENT;
-    /* AR-18 M14/M15: when several stored-distinct records resolve to the
-     * queried physical destination, the one spelled exactly like the query
-     * wins, then the one spelled like the physical resolution (mirroring
-     * upsert); anything less determinate fails closed as before. */
-    if (match_count > 1U) {
-        if (exact_count == 1U) {
-            match = exact;
-        } else if (canonical_count == 1U) {
-            match = canonical;
-        } else {
+        if (match) {
             publication_invalid("Publication ledger lookup is ambiguous");
             return PUBLICATION_LOOKUP_ERROR;
         }
+        match = candidate;
     }
+    if (!match) return PUBLICATION_LOOKUP_ABSENT;
     *record = match;
     return PUBLICATION_LOOKUP_FOUND;
 }
@@ -1706,8 +1565,8 @@ int publication_ledger_parse(const unsigned char *data, size_t length,
             return -1;
         }
         for (size_t j = 0; j < i; j++) {
-            if (publication_record_same_stored_destination(
-                    &parsed.records[i], &parsed.records[j])) {
+            if (publication_record_same_destination(&parsed.records[i],
+                                                    &parsed.records[j])) {
                 publication_ledger_clear(&parsed);
                 return publication_invalid(
                     "Publication ledger contains duplicate destinations");
@@ -1942,8 +1801,8 @@ int publication_ledger_serialize(const publication_ledger_t *ledger,
             return -1;
         }
         for (size_t j = 0; j < i; j++) {
-            if (publication_record_same_stored_destination(
-                    &ledger->records[i], &ledger->records[j])) {
+            if (publication_record_same_destination(&ledger->records[i],
+                                                    &ledger->records[j])) {
                 return publication_invalid(
                     "Publication ledger contains duplicate destinations");
             }

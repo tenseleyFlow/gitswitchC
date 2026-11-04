@@ -18,7 +18,6 @@
 
 #define FINGERPRINT_A "AAAABBBBCCCCDDDDEEEEFFFF0000111122223333"
 #define FINGERPRINT_B "9999888877776666555544440000111122223333"
-#define FINGERPRINT_C "1111222233334444555566667777888899990000"
 #define SELECTOR_A "22223333"
 #define SELECTOR_64 \
     "0123456789ABCDEF0123456789ABCDEF0123456789ABCDEF0123456789ABCDEF"
@@ -2169,13 +2168,6 @@ TEST(offline_destination_spellings_round_trip_without_ancestry_rewrite) {
     publication_ledger_clear(&loaded);
 }
 
-/* AR-18 M14/M15: duplicate detection at serialize/parse is a pure function
- * of the stored bytes. Two records whose spellings differ (one through a
- * symlink alias) are stored-distinct and both survive serialization and
- * parsing; the lookup and upsert layers settle the physical overlap. Before
- * AR-18 this test required both layers to fail with "duplicate
- * destinations", which made a tool-written ledger unparseable after the user
- * added a compatibility symlink. */
 TEST(alias_duplicate_destinations_fail_closed_in_serializer_and_parser) {
     char root[MAX_PATH_LEN] = "/tmp/gsw-ar14-publication-duplicate.XXXXXX";
     char repository[MAX_PATH_LEN];
@@ -2257,14 +2249,9 @@ TEST(alias_duplicate_destinations_fail_closed_in_serializer_and_parser) {
     ledger.count = 2U;
     clear_error();
     CHECK_EQ_INT(publication_ledger_serialize(
-                     &ledger, &serialized, &serialized_length), 0);
-    CHECK(serialized != NULL);
-    CHECK(publication_record_same_destination(&records[0], &records[1]));
-    CHECK(!publication_record_same_stored_destination(&records[0],
-                                                      &records[1]));
-    free(serialized);
-    serialized = NULL;
-    serialized_length = 0U;
+                     &ledger, &serialized, &serialized_length), -1);
+    CHECK(serialized == NULL);
+    CHECK(strstr(get_last_error()->message, "duplicate destinations") != NULL);
 
     CHECK_EQ_INT(safe_strncpy(records[1].config_path, distinct_config,
                               sizeof(records[1].config_path)), 0);
@@ -2286,229 +2273,15 @@ TEST(alias_duplicate_destinations_fail_closed_in_serializer_and_parser) {
     clear_error();
     if (alias_bytes) {
         CHECK_EQ_INT(publication_ledger_parse(
-                         alias_bytes, alias_length, &parsed), 0);
+                         alias_bytes, alias_length, &parsed), -1);
     }
-    CHECK(parsed.present);
-    CHECK_EQ_INT((long)parsed.count, 2);
-    if (parsed.count == 2U) {
-        CHECK_STR_EQ(parsed.records[1].config_path, alias_config);
-        CHECK_STR_EQ(parsed.records[1].repository_path, repository_alias);
-    }
-    /* A byte-identical duplicate is still rejected by both layers. */
-    CHECK_EQ_INT(safe_strncpy(records[1].config_path, config_path,
-                              sizeof(records[1].config_path)), 0);
-    CHECK_EQ_INT(safe_strncpy(records[1].repository_path, repository,
-                              sizeof(records[1].repository_path)), 0);
-    free(serialized);
-    serialized = NULL;
-    serialized_length = 0U;
-    clear_error();
-    CHECK_EQ_INT(publication_ledger_serialize(
-                     &ledger, &serialized, &serialized_length), -1);
-    CHECK(serialized == NULL);
+    CHECK(!parsed.present);
     CHECK(strstr(get_last_error()->message, "duplicate destinations") != NULL);
 
 cleanup:
     if (fd >= 0) close(fd);
     free(alias_bytes);
     free(config_replaced);
-    free(serialized);
-    publication_ledger_clear(&parsed);
-    ts_rm_rf(root);
-}
-
-/* AR-18 M14 regression (verifier witness: `mv repoA repoB`, switch in repoB,
- * then `ln -s repoB repoA` made `gitswitch list` fail with "Publication
- * ledger contains duplicate destinations"). A ledger written while the two
- * spellings were distinct must keep parsing after the alias appears, lookups
- * must resolve each spelling to its own record, and upsert must replace the
- * exactly spelled record without collapsing the ledger. */
-TEST(later_alias_keeps_stored_distinct_ledger_parseable_and_resolvable) {
-    char root[MAX_PATH_LEN] = "/tmp/gsw-ar18-publication-alias.XXXXXX";
-    char repository[MAX_PATH_LEN];
-    char config_parent[MAX_PATH_LEN];
-    char config_path[MAX_PATH_LEN];
-    char moved[MAX_PATH_LEN];
-    char moved_config[MAX_PATH_LEN];
-    char third[MAX_PATH_LEN];
-    char third_config[MAX_PATH_LEN];
-    publication_record_t records[2];
-    publication_record_t incoming;
-    publication_ledger_t source;
-    publication_ledger_t parsed;
-    const publication_record_t *found = NULL;
-    unsigned char *serialized = NULL;
-    size_t serialized_length = 0U;
-    int fd = -1;
-    static const char contents[] = "[alias]\n";
-
-    publication_ledger_init(&source);
-    publication_ledger_init(&parsed);
-    CHECK(ts_mkdtemp(root) != NULL);
-    if (!root[0] || ts_canonicalize_dir_path(root, sizeof(root)) != 0 ||
-        snprintf(repository, sizeof(repository), "%s/repoB", root) >=
-            (int)sizeof(repository) ||
-        snprintf(config_parent, sizeof(config_parent), "%s/.git",
-                 repository) >= (int)sizeof(config_parent) ||
-        snprintf(config_path, sizeof(config_path), "%s/config",
-                 config_parent) >= (int)sizeof(config_path) ||
-        snprintf(moved, sizeof(moved), "%s/repoA", root) >=
-            (int)sizeof(moved) ||
-        snprintf(moved_config, sizeof(moved_config), "%s/.git/config",
-                 moved) >= (int)sizeof(moved_config) ||
-        snprintf(third, sizeof(third), "%s/repoC", root) >=
-            (int)sizeof(third) ||
-        snprintf(third_config, sizeof(third_config), "%s/.git/config",
-                 third) >= (int)sizeof(third_config) ||
-        mkdir(repository, 0700) != 0 ||
-        mkdir(config_parent, 0700) != 0) {
-        CHECK(false);
-        goto cleanup;
-    }
-    fd = open(config_path, O_WRONLY | O_CREAT | O_EXCL | O_CLOEXEC, 0600);
-    if (fd < 0 ||
-        write(fd, contents, sizeof(contents) - 1U) !=
-            (ssize_t)(sizeof(contents) - 1U) ||
-        close(fd) != 0) {
-        CHECK(false);
-        fd = -1;
-        goto cleanup;
-    }
-    fd = -1;
-
-    /* repoA was recorded while it existed (same inode: it was later moved to
-     * repoB), repoB was recorded after the move. Both spellings differ. */
-    fill_gpg_record(&records[1], repository, FINGERPRINT_A);
-    CHECK_EQ_INT(bind_live_local_destination(
-                     &records[1], repository, config_parent, config_path), 0);
-    records[0] = records[1];
-    records[0].account_id++;
-    CHECK_EQ_INT(safe_strncpy(records[0].config_path, moved_config,
-                              sizeof(records[0].config_path)), 0);
-    CHECK_EQ_INT(safe_strncpy(records[0].repository_path, moved,
-                              sizeof(records[0].repository_path)), 0);
-    source.present = true;
-    source.version = PUBLICATION_LEDGER_VERSION;
-    source.records = records;
-    source.count = 2U;
-    CHECK_EQ_INT(publication_ledger_serialize(
-                     &source, &serialized, &serialized_length), 0);
-
-    /* The compatibility symlink appears after the ledger was written. */
-    CHECK_EQ_INT(symlink(repository, moved), 0);
-    CHECK(publication_record_same_destination(&records[0], &records[1]));
-    CHECK(!publication_record_same_stored_destination(&records[0],
-                                                      &records[1]));
-
-    clear_error();
-    CHECK_EQ_INT(publication_ledger_parse(
-                     serialized, serialized_length, &parsed), 0);
-    CHECK_EQ_INT((long)parsed.count, 2);
-    if (parsed.count != 2U) goto cleanup;
-
-    /* Each spelling resolves to its own record even though both now denote
-     * one physical destination. */
-    CHECK_LOOKUP_STATUS(publication_ledger_find(
-                     &parsed, records[1].account_id,
-                     records[1].account_incarnation, records[1].scope,
-                     config_path, repository, &found),
-                 PUBLICATION_LOOKUP_FOUND);
-    CHECK(found == &parsed.records[1]);
-    CHECK_LOOKUP_STATUS(publication_ledger_find(
-                     &parsed, records[0].account_id,
-                     records[0].account_incarnation, records[0].scope,
-                     moved_config, moved, &found),
-                 PUBLICATION_LOOKUP_FOUND);
-    CHECK(found == &parsed.records[0]);
-
-    /* A third spelling that physically matches both and is spelled like
-     * neither resolves to the record stored under the physical spelling. */
-    CHECK_EQ_INT(symlink(repository, third), 0);
-    records[0].account_id = records[1].account_id;
-    parsed.records[0].account_id = records[1].account_id;
-    clear_error();
-    CHECK_LOOKUP_STATUS(publication_ledger_find(
-                     &parsed, records[1].account_id,
-                     records[1].account_incarnation, records[1].scope,
-                     third_config, third, &found),
-                 PUBLICATION_LOOKUP_FOUND);
-    CHECK(found == &parsed.records[1]);
-
-    /* Upsert spelled like repoB replaces repoB's record only; the ledger
-     * stays stored-distinct and serializable. */
-    incoming = records[1];
-    CHECK_EQ_INT(safe_strncpy(incoming.gpg_fingerprint, FINGERPRINT_B,
-                              sizeof(incoming.gpg_fingerprint)), 0);
-    clear_error();
-    CHECK_EQ_INT(publication_ledger_upsert(&parsed, &incoming), 0);
-    CHECK_EQ_INT((long)parsed.count, 2);
-    CHECK_STR_EQ(parsed.records[1].gpg_fingerprint, FINGERPRINT_B);
-    CHECK_STR_EQ(parsed.records[1].config_path, config_path);
-    CHECK_STR_EQ(parsed.records[0].gpg_fingerprint, FINGERPRINT_A);
-    CHECK_STR_EQ(parsed.records[0].config_path, moved_config);
-
-    /* Upsert spelled through the alias replaces repoA's record and keeps the
-     * stored spelling instead of collapsing it onto repoB. */
-    CHECK_EQ_INT(safe_strncpy(incoming.config_path, moved_config,
-                              sizeof(incoming.config_path)), 0);
-    CHECK_EQ_INT(safe_strncpy(incoming.repository_path, moved,
-                              sizeof(incoming.repository_path)), 0);
-    CHECK_EQ_INT(safe_strncpy(incoming.gpg_fingerprint, FINGERPRINT_C,
-                              sizeof(incoming.gpg_fingerprint)), 0);
-    clear_error();
-    CHECK_EQ_INT(publication_ledger_upsert(&parsed, &incoming), 0);
-    CHECK_EQ_INT((long)parsed.count, 2);
-    CHECK_STR_EQ(parsed.records[0].gpg_fingerprint, FINGERPRINT_C);
-    CHECK_STR_EQ(parsed.records[0].config_path, moved_config);
-    CHECK_STR_EQ(parsed.records[0].repository_path, moved);
-    CHECK_STR_EQ(parsed.records[1].gpg_fingerprint, FINGERPRINT_B);
-    free(serialized);
-    serialized = NULL;
-    clear_error();
-    CHECK_EQ_INT(publication_ledger_serialize(
-                     &parsed, &serialized, &serialized_length), 0);
-
-    /* A third-spelled upsert matches both physically and neither exactly:
-     * it lands on the record stored under the physical spelling, which keeps
-     * that spelling. */
-    CHECK_EQ_INT(safe_strncpy(incoming.config_path, third_config,
-                              sizeof(incoming.config_path)), 0);
-    CHECK_EQ_INT(safe_strncpy(incoming.repository_path, third,
-                              sizeof(incoming.repository_path)), 0);
-    CHECK_EQ_INT(safe_strncpy(incoming.gpg_fingerprint, FINGERPRINT_A,
-                              sizeof(incoming.gpg_fingerprint)), 0);
-    clear_error();
-    CHECK_EQ_INT(publication_ledger_upsert(&parsed, &incoming), 0);
-    CHECK_EQ_INT((long)parsed.count, 2);
-    CHECK_STR_EQ(parsed.records[1].gpg_fingerprint, FINGERPRINT_A);
-    CHECK_STR_EQ(parsed.records[1].config_path, config_path);
-    CHECK_STR_EQ(parsed.records[0].gpg_fingerprint, FINGERPRINT_C);
-
-    /* Two offline-spelled records that both alias the physical destination
-     * and neither carry the physical spelling stay ambiguous (see
-     * upsert_rejects_offline_aliases_that_converge_without_model_mutation). */
-    CHECK_EQ_INT(safe_strncpy(parsed.records[1].config_path, third_config,
-                              sizeof(parsed.records[1].config_path)), 0);
-    CHECK_EQ_INT(safe_strncpy(parsed.records[1].repository_path, third,
-                              sizeof(parsed.records[1].repository_path)), 0);
-    CHECK_EQ_INT(safe_strncpy(incoming.config_path, config_path,
-                              sizeof(incoming.config_path)), 0);
-    CHECK_EQ_INT(safe_strncpy(incoming.repository_path, repository,
-                              sizeof(incoming.repository_path)), 0);
-    clear_error();
-    CHECK_EQ_INT(publication_ledger_upsert(&parsed, &incoming), -1);
-    CHECK(strstr(get_last_error()->message, "ambiguous") != NULL);
-    CHECK_EQ_INT((long)parsed.count, 2);
-    clear_error();
-    CHECK_LOOKUP_STATUS(publication_ledger_find(
-                     &parsed, records[1].account_id,
-                     records[1].account_incarnation, records[1].scope,
-                     config_path, repository, &found),
-                 PUBLICATION_LOOKUP_ERROR);
-    CHECK(strstr(get_last_error()->message, "ambiguous") != NULL);
-
-cleanup:
-    if (fd >= 0) close(fd);
     free(serialized);
     publication_ledger_clear(&parsed);
     ts_rm_rf(root);
@@ -4186,7 +3959,6 @@ TEST_MAIN_BEGIN()
     RUN_TEST(absent_config_leaf_uses_anchored_parent_but_conflicts_stay_unresolved);
     RUN_TEST(offline_destination_spellings_round_trip_without_ancestry_rewrite);
     RUN_TEST(alias_duplicate_destinations_fail_closed_in_serializer_and_parser);
-    RUN_TEST(later_alias_keeps_stored_distinct_ledger_parseable_and_resolvable);
     RUN_TEST(upsert_rejects_offline_aliases_that_converge_without_model_mutation);
     RUN_TEST(guarded_publication_clears_install_state_before_input_validation);
     RUN_TEST(guarded_publication_requires_the_exact_live_active_incarnation);
