@@ -163,7 +163,8 @@ typedef enum {
     RETIREMENT_GUARD_CLEAR_AFTER_NAMESPACE_COMMIT,
     RETIREMENT_GUARD_CLEAR_AFTER_PREPARED_PUBLISH,
     RETIREMENT_GUARD_INSTALL_BEFORE_PRIOR_RETIRE,
-    RETIREMENT_GUARD_INSTALL_AFTER_STAGE_WRITE
+    RETIREMENT_GUARD_INSTALL_AFTER_STAGE_WRITE,
+    RETIREMENT_GUARD_INSTALL_AFTER_PRIOR_MOVE
 } retirement_guard_clear_test_stage_t;
 typedef int (*retirement_guard_clear_test_hook_fn)(
     retirement_guard_clear_test_stage_t stage, int directory_fd,
@@ -250,7 +251,8 @@ enum {
     RETIREMENT_GUARD_CLEAR_AFTER_NAMESPACE_COMMIT,
     RETIREMENT_GUARD_CLEAR_AFTER_PREPARED_PUBLISH,
     RETIREMENT_GUARD_INSTALL_BEFORE_PRIOR_RETIRE,
-    RETIREMENT_GUARD_INSTALL_AFTER_STAGE_WRITE
+    RETIREMENT_GUARD_INSTALL_AFTER_STAGE_WRITE,
+    RETIREMENT_GUARD_INSTALL_AFTER_PRIOR_MOVE
 };
 #define RETIREMENT_GUARD_CLEAR_TEST_CHECKPOINT(stage, fd, name)             \
     ((void)(stage), (void)(fd), (void)(name), 0)
@@ -5294,6 +5296,54 @@ static int config_retirement_guard_stage_publish_at(
     return 0;
 }
 
+#if !defined(__FreeBSD__)
+/* Publish the fresh stage over an exact prior marker in one atomic
+ * renameat(2). Both sides are re-proved first: the stage must still be the
+ * generation this process wrote, and the destination must still be the
+ * exact prior marker whose bytes the completion certificate preserves. There
+ * is no marker-absent instant, so a crash at any point leaves either the old
+ * pair (stage still present, adoptable) or the new marker (AR-18 M6). */
+static int config_retirement_guard_stage_replace_at(
+    int directory_fd, const char *destination,
+    const struct stat *stage_identity,
+    const struct stat *expected_destination,
+    const unsigned char *expected_data, size_t expected_length,
+    struct stat *published_identity) {
+    struct stat stage_now;
+    struct stat destination_now;
+    struct stat named = {0};
+
+    if (directory_fd < 0 || !destination || !stage_identity ||
+        !expected_destination || !expected_data || expected_length == 0U ||
+        !published_identity) {
+        errno = EINVAL;
+        return -1;
+    }
+    if (fstatat(directory_fd, CONFIG_RETIREMENT_STAGE_NAME, &stage_now,
+                AT_SYMLINK_NOFOLLOW) != 0 ||
+        !config_metadata_snapshot_same(stage_identity, &stage_now) ||
+        config_reprove_published_file_at(
+            directory_fd, destination, expected_destination,
+            expected_data, expected_length, &destination_now) != 0) {
+        errno = errno ? errno : ESTALE;
+        return -1;
+    }
+    if (renameat(directory_fd, CONFIG_RETIREMENT_STAGE_NAME,
+                 directory_fd, destination) != 0) {
+        return -1;
+    }
+    if (fstatat(directory_fd, destination, &named,
+                AT_SYMLINK_NOFOLLOW) != 0 ||
+        !config_metadata_file_is_safe(&named, true) ||
+        !config_metadata_same_file(stage_identity, &named)) {
+        errno = errno ? errno : ESTALE;
+        return -1;
+    }
+    *published_identity = named;
+    return 0;
+}
+#endif
+
 /* AR-15 M2: mirror config_switch_guard_cleanup_owned_stage_at for the
  * retirement guard. A failure after the fresh .retirement-transition stage is
  * written but before a successful stage->marker publication would otherwise
@@ -6292,6 +6342,7 @@ int config_retirement_guard_install_or_adopt_with_ssh_alias_obligation(
         errno = errno ? errno : ESTALE;
         goto install_done;
     }
+#if defined(__FreeBSD__)
     if (config_retirement_guard_pair_exact(&pair)) {
         if (config_retirement_guard_move_noreplace_at(
                 directory_fd, CONFIG_RETIREMENT_GUARD_NAME,
@@ -6304,11 +6355,38 @@ int config_retirement_guard_install_or_adopt_with_ssh_alias_obligation(
             goto install_done;
         }
         prior_marker_moved = true;
+        /* The marker is absent until the stage publishes: the window AR-18
+         * M6 closed on Linux/Darwin still exists here, where funlinkat
+         * retirement needs the pre-move. The checkpoint lets the test suite
+         * prove the portable path never enters it. */
+        if (RETIREMENT_GUARD_CLEAR_TEST_CHECKPOINT(
+                RETIREMENT_GUARD_INSTALL_AFTER_PRIOR_MOVE,
+                directory_fd, settled_slot) != 0) {
+            goto install_done;
+        }
     }
     if (config_retirement_guard_stage_publish_at(
             directory_fd, CONFIG_RETIREMENT_GUARD_NAME,
             &stage_identity, marker_data, marker_length,
             &published_identity) != 0) {
+#else
+    /* Over an exact marker/certificate pair the completion certificate
+     * already preserves the prior marker generation byte-for-byte, so the
+     * old marker is not moved away first: the stage replaces it in one
+     * atomic renameat(2). The old two-rename sequence had a window (marker
+     * absent, certificate + stage present) that no entry point could ever
+     * complete or roll back (AR-18 M6). */
+    if (config_retirement_guard_pair_exact(&pair)
+            ? config_retirement_guard_stage_replace_at(
+                  directory_fd, CONFIG_RETIREMENT_GUARD_NAME,
+                  &stage_identity, &pair.marker_identity,
+                  pair.marker_data, pair.marker_length,
+                  &published_identity) != 0
+            : config_retirement_guard_stage_publish_at(
+                  directory_fd, CONFIG_RETIREMENT_GUARD_NAME,
+                  &stage_identity, marker_data, marker_length,
+                  &published_identity) != 0) {
+#endif
         if (prior_marker_moved) {
             struct stat settled_identity;
 
