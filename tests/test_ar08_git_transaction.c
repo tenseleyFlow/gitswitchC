@@ -1941,7 +1941,12 @@ TEST(direct_worktree_extension_false_ignores_later_included_true) {
     CHECK_EQ_INT(git_config_snapshot(GIT_SCOPE_GLOBAL), 0);
     CHECK_EQ_INT(git_set_config_value(GIT_CONFIG_USER_NAME, "owned-post",
                                       GIT_SCOPE_GLOBAL), 0);
-    CHECK_EQ_INT(git_config_seal(), 0);
+    clear_error();
+    if (git_config_seal() != 0) {
+        fprintf(stderr, "seal failed: %s | %s (errno=%d)\n",
+                get_last_error()->message, get_last_error()->details, errno);
+        CHECK(false);
+    }
     CHECK((size_t)snprintf(local_config, sizeof(local_config),
                            "%s/.git/config", fixture.repo) <
           sizeof(local_config));
