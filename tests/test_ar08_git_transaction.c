@@ -1965,6 +1965,20 @@ TEST(direct_worktree_extension_false_ignores_later_included_true) {
              * external SIGKILL that none of our kill sites recorded. */
             fflush(stderr);
             fprintf(stderr, "ps: self=%ld\n", (long)getpid());
+            {
+                struct rlimit stack_limit = {0, 0};
+                char probe;
+                (void)getrlimit(RLIMIT_STACK, &stack_limit);
+                fprintf(stderr, "stack: rlimit cur=%llu max=%llu local=%p\n",
+                        (unsigned long long)stack_limit.rlim_cur,
+                        (unsigned long long)stack_limit.rlim_max,
+                        (void *)&probe);
+            }
+            /* The crash report of the killed pre-exec child names the
+             * exception (guarded descriptor, stack fault, ...). */
+            (void)!system("sleep 3; f=$(ls -t \"$HOME\"/Library/Logs/DiagnosticReports/test_ar08_git_transaction*.ips 2>/dev/null | head -1); "
+                          "if [ -n \"$f\" ]; then echo \"crash: $f\" 1>&2; "
+                          "head -c 6000 \"$f\" | tr ',' '\\n' | grep -i -E 'exception|termination|signal|guard|faultingThread|\"type\"|codes|reason' | head -40 | sed 's/^/crash: /' 1>&2; fi");
             /* The unified log records kernel-originated kills with their
              * reason (exec policy, resource exception, jetsam, AMFI). */
             (void)!system("log show --last 3m --style compact --predicate "
