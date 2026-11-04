@@ -3511,12 +3511,25 @@ static bool retirement_guard_blocks_activation(const gitswitch_ctx_t *ctx) {
                     "recorded; run `gitswitch remove %s` to complete it",
                     owners, owners);
             } else if (recovery.kind == CONFIG_RETIREMENT_RESET) {
-                set_error(
-                    ERR_CONFIG_INVALID,
-                    "An interrupted reset of account ID%s %s is still "
-                    "recorded; rerun `gitswitch reset%s` to complete it",
-                    recovery.owner_count > 1U ? "s" : "", owners,
-                    recovery.owner_count > 1U ? " --all" : "");
+                /* AR-18 M16: marker adoption needs an identical owner set.
+                 * A bare `reset` builds its set from every account, so it
+                 * is the command that adopts a multi-owner marker; a marker
+                 * left by `reset <id>` holds that one owner and only
+                 * `reset <id>` rebuilds the same set. (`--all` was never an
+                 * option; getopt rejected it before recovery could run.) */
+                if (recovery.owner_count > 1U) {
+                    set_error(
+                        ERR_CONFIG_INVALID,
+                        "An interrupted reset of account IDs %s is still "
+                        "recorded; rerun `gitswitch reset` to complete it",
+                        owners);
+                } else {
+                    set_error(
+                        ERR_CONFIG_INVALID,
+                        "An interrupted reset of account ID %s is still "
+                        "recorded; rerun `gitswitch reset %s` to complete it",
+                        owners, owners);
+                }
             } else {
                 set_error(
                     ERR_CONFIG_INVALID,
