@@ -1964,9 +1964,12 @@ TEST(direct_worktree_extension_false_ignores_later_included_true) {
              * delivering a delayed signal to a recycled PID would explain an
              * external SIGKILL that none of our kill sites recorded. */
             fflush(stderr);
-            (void)!system("ps -axo pid,ppid,pgid,sess,stat,etime,comm 2>&1 | "
-                          "grep -v -e ' (ps)' -e 'launchd' -e 'kernel_task' | "
-                          "sed 's/^/ps: /' | head -120 1>&2");
+            fprintf(stderr, "ps: self=%ld\n", (long)getpid());
+            (void)!system("ps -axo pid,ppid,pgid,sess,stat,etime,comm,args 2>&1 | "
+                          "grep -E 'gitswitch|test_|/git|ssh|gpg|make|yes|sh |bash|zsh|fish|dash|ksh' | "
+                          "grep -v -e ' (ps)' -e 'grep -E' | "
+                          "sed 's/^/ps: /' | head -150 1>&2; "
+                          "ps -axo pid | sort -n | tail -1 | sed 's/^/ps: maxpid=/' 1>&2");
             CHECK(false);
         }
         (void)unsetenv("GITSWITCH_RUNNER_TRACE");
