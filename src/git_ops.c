@@ -12041,6 +12041,7 @@ static int git_retirement_reseal_stale_item(
     git_scope_snapshot_t live;
     struct stat st;
     publication_identity_t resealed;
+    publication_identity_t original;
     const git_snapshot_key_t *key;
     bool attributable = false;
     error_context_t entry_error = *get_last_error();
@@ -12055,6 +12056,22 @@ static int git_retirement_reseal_stale_item(
         return -1;
     }
     memset(&live, 0, sizeof(live));
+    /* Only a pure generation mismatch is a candidate. With the live stat
+     * sealed in, the verifier still rejects a replaced parent directory or
+     * repository, and then no subprocess runs and the original failure
+     * context stands. */
+    original = publication->post_config;
+    publication_identity_from_stat(&resealed, &st);
+    publication->post_config = resealed;
+    if (publication_record_verify_live_destination(
+            publication, transaction->publication_refs, item_count,
+            live_generation) != 0) {
+        goto done;
+    }
+    /* The generation mismatch left its own context behind; the re-read is a
+     * fresh observation, and entry_error is restored if the re-seal fails. */
+    clear_error();
+    errno = 0;
     if (git_capture_file_snapshot(
             publication->config_path,
             "Could not re-read a changed Git retirement destination",
@@ -12084,13 +12101,6 @@ static int git_retirement_reseal_stale_item(
         if (match) attributable = true;
     }
     if (!attributable) goto done;
-    publication_identity_from_stat(&resealed, &st);
-    publication->post_config = resealed;
-    if (publication_record_verify_live_destination(
-            publication, transaction->publication_refs, item_count,
-            live_generation) != 0) {
-        goto done;
-    }
     log_info(
         "Git retirement destination changed since it was sealed; "
         "re-sealed from its exact attributed values: %s",
@@ -12100,6 +12110,8 @@ static int git_retirement_reseal_stale_item(
 done:
     git_scope_snapshot_clear(&live);
     if (result != 0) {
+        publication->post_config = original;
+        *live_generation = NULL;
         g_last_error = entry_error;
         errno = entry_errno;
     }
