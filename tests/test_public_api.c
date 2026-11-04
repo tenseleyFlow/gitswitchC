@@ -217,6 +217,7 @@ TEST(all_retained_public_apis_compile_and_link) {
     REQUIRE_PUBLIC_API(git_configure_openpgp_publication);
     REQUIRE_PUBLIC_API(git_configure_ssh);
     REQUIRE_PUBLIC_API(git_expected_ssh_command);
+    REQUIRE_PUBLIC_API(git_ssh_alias_config_path);
     REQUIRE_PUBLIC_API(git_get_config_value);
     REQUIRE_PUBLIC_API(git_get_current_config);
     REQUIRE_PUBLIC_API(git_get_repo_root);
