@@ -1148,7 +1148,15 @@ static bool git_snapshot_record_key_is_config_key(const char *key,
     for (const char *cursor = key; cursor < first_dot; cursor++) {
         if (!isalnum((unsigned char)*cursor) && *cursor != '-') return false;
     }
-    last_dot = memrchr(key, '.', length);
+    /* memrchr is a GNU extension; scan backwards by hand for Darwin/BSD. */
+    last_dot = NULL;
+    for (const char *cursor = key + length; cursor > key;) {
+        cursor--;
+        if (*cursor == '.') {
+            last_dot = cursor;
+            break;
+        }
+    }
     if (!last_dot || last_dot + 1 >= key + length ||
         !isalpha((unsigned char)last_dot[1])) {
         return false;
