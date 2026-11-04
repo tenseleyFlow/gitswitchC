@@ -1942,13 +1942,28 @@ TEST(direct_worktree_extension_false_ignores_later_included_true) {
     CHECK_EQ_INT(git_set_config_value(GIT_CONFIG_USER_NAME, "owned-post",
                                       GIT_SCOPE_GLOBAL), 0);
     clear_error();
-    (void)setenv("GITSWITCH_RUNNER_TRACE", "1", 1);
-    if (git_config_seal() != 0) {
-        fprintf(stderr, "seal failed: %s | %s (errno=%d)\n",
-                get_last_error()->message, get_last_error()->details, errno);
-        CHECK(false);
+    {
+        char trace_path[MAX_PATH_LEN];
+
+        CHECK((size_t)snprintf(trace_path, sizeof(trace_path),
+                               "%s/runner-trace.log", fixture.base) <
+              sizeof(trace_path));
+        (void)setenv("GITSWITCH_RUNNER_TRACE", trace_path, 1);
+        if (git_config_seal() != 0) {
+            FILE *trace = fopen(trace_path, "r");
+            char line[512];
+
+            fprintf(stderr, "seal failed: %s | %s (errno=%d)\n",
+                    get_last_error()->message, get_last_error()->details,
+                    errno);
+            while (trace && fgets(line, sizeof(line), trace)) {
+                fprintf(stderr, "trace: %s", line);
+            }
+            if (trace) fclose(trace);
+            CHECK(false);
+        }
+        (void)unsetenv("GITSWITCH_RUNNER_TRACE");
     }
-    (void)unsetenv("GITSWITCH_RUNNER_TRACE");
     CHECK((size_t)snprintf(local_config, sizeof(local_config),
                            "%s/.git/config", fixture.repo) <
           sizeof(local_config));
