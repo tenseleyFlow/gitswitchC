@@ -4386,12 +4386,21 @@ int gpg_manager_snapshot_current(char *target, size_t size, bool *present) {
         return -1;
     }
     live_rc = gpg_live_private_home(base_fd, base, target);
+    if (live_rc > 0) {
+        /* The stable link names a managed child whose home is gone (a crash
+         * window in a targeted reset, or a hand-removed isolated home).
+         * There is nothing to restore, so this is "no previous home", not a
+         * failure: the retarget tolerates the dangling link (AR-12 L10) and
+         * refusing here made that tolerance unreachable from every switch and
+         * resume, which then nagged every new shell (AR-18 L25). */
+        log_warning(
+            "Stable GNUPGHOME points at a missing managed home; treating it as no previous home: %s",
+            target);
+        unlock_gpg_dir(base_fd, lock_fd);
+        target[0] = '\0';
+        return 0;
+    }
     if (live_rc != 0) {
-        if (live_rc > 0) {
-            set_error(ERR_FILE_IO,
-                      "Stable GNUPGHOME points at a missing managed home: %s",
-                      target);
-        }
         unlock_gpg_dir(base_fd, lock_fd);
         target[0] = '\0';
         return -1;
@@ -6257,8 +6266,28 @@ static int gpg_kill_and_remove_home(int base_fd, const char *base,
     }
     if (run_rc != 0 || !result.spawned || result.exit_code != 0 ||
         result.term_signal != 0) {
-        set_error(ERR_SYSTEM_COMMAND_FAILED,
-                  "Failed to stop GPG agent for %s; home retained for retry", home);
+        if (!result.spawned) {
+            /* gpgconf could not even be launched (not installed, not in the
+             * trusted PATH). Retrying cannot help until that is fixed, so
+             * keep the launch failure's own cause instead of the generic
+             * "retained for retry" text (AR-18 P20). */
+            char cause[256];
+
+            if (safe_strncpy(cause, get_last_error()->message,
+                             sizeof(cause)) != 0 ||
+                cause[0] == '\0') {
+                (void)safe_strncpy(cause, "gpgconf could not be started",
+                                   sizeof(cause));
+            }
+            set_error(ERR_SYSTEM_COMMAND_FAILED,
+                      "Cannot run gpgconf to stop the GPG agent for %s (%s); "
+                      "install GnuPG or repair PATH, then rerun gitswitch reset",
+                      home, cause);
+        } else {
+            set_error(ERR_SYSTEM_COMMAND_FAILED,
+                      "Failed to stop GPG agent for %s; home retained for retry",
+                      home);
+        }
         close(home_fd);
         return -1;
     }

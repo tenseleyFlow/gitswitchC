@@ -2508,6 +2508,22 @@ static ssh_process_outcome_t reap_ssh_agent(
         return outcome;
     }
     if (open_errno == ESRCH) return SSH_PROCESS_GONE;
+    if (open_errno == ENOSYS || open_errno == EPERM) {
+        /* The fail-closed choice is deliberate (no pidfd means no
+         * race-free signal), but the generic "retained for retry" text
+         * never said why or what to do, and retrying cannot help here
+         * (AR-18 P13). Name the floor and the manual remedy once. */
+        static bool warned;
+
+        if (!warned) {
+            warned = true;
+            log_warning(
+                "pidfd_open is unavailable on this kernel (Linux 5.3+ without "
+                "a seccomp filter is required to stop isolated ssh-agents "
+                "safely); stop ssh-agent PID %ld by hand and rerun",
+                (long)record->pid);
+        }
+    }
     return SSH_PROCESS_INDETERMINATE;
 }
 
@@ -12769,7 +12785,8 @@ int ssh_manager_reset(const char *account) {
         } else if (reachable) {
             set_error(ERR_SSH_AGENT_FAILED,
                       "Reachable SSH agent socket has no safely matched PID; "
-                      "retained for retry: %s", sock_path);
+                      "retained for retry. Stop the ssh-agent listening on this socket "
+                      "(or remove the socket) and rerun: %s", sock_path);
             failed = true;
             can_remove_runtime = false;
         }
@@ -12793,7 +12810,8 @@ int ssh_manager_reset(const char *account) {
         } else if (reachable) {
             set_error(ERR_SSH_AGENT_FAILED,
                       "Reachable SSH agent socket has no safely matched PID; "
-                      "retained for retry: %s", sock_path);
+                      "retained for retry. Stop the ssh-agent listening on this socket "
+                      "(or remove the socket) and rerun: %s", sock_path);
             failed = true;
             can_remove_runtime = false;
         }

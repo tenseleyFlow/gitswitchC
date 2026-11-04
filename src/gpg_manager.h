@@ -427,9 +427,10 @@ int gpg_manager_drop_current(void);
 
 /**
  * Read the stable isolated-GPG target under the manager lock after validating
- * the private base and the exact managed child. Missing base/link is ordinary
- * success with `*present == false`; unsafe, malformed, dangling, or unreadable
- * state fails closed. On success with `*present == true`, `target` contains a
+ * the private base and the exact managed child. A missing base/link, or a
+ * link naming a managed child whose home is gone, is ordinary success with
+ * `*present == false` (AR-18 L25); unsafe, malformed, or unreadable state
+ * fails closed. On success with `*present == true`, `target` contains a
  * live private per-account home.
  */
 int gpg_manager_snapshot_current(char *target, size_t size, bool *present);

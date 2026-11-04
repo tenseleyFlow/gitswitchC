@@ -1244,6 +1244,19 @@ TEST(gpg_current_snapshot_and_conditional_restore_are_compare_and_swap) {
     CHECK_EQ_INT(gpg_manager_restore_current_if(&rollback, two, one,
                                                 &changed), -1);
     CHECK(!changed);
+
+    /* AR-18 L25: a link naming a managed child whose home is gone is "no
+     * previous home", not a hard failure, so switch and resume proceed and
+     * the retarget's dangling-link tolerance (AR-12 L10) is reachable. */
+    CHECK_EQ_INT(unlink(current), 0);
+    CHECK_EQ_INT(symlink(three, current), 0);
+    CHECK_EQ_INT(rmdir(three), 0);
+    present = true;
+    snapshot[0] = 'x';
+    CHECK_EQ_INT(gpg_manager_snapshot_current(snapshot, sizeof(snapshot),
+                                              &present), 0);
+    CHECK(!present);
+    CHECK_EQ_INT(snapshot[0], '\0');
 }
 
 /* The public reader must take the same blocking base lock as switch/reset/CAS,
