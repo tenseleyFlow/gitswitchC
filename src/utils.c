@@ -3838,7 +3838,23 @@ static int child_close_fds_from(
         for (size_t i = 0; i < snapshot->count; i++) {
             if (snapshot->fds[i] >= lowfd) {
                 observation->close_syscalls++;
+#ifdef __APPLE__
+                /* AR-18: Darwin guards some descriptors it opens on the
+                 * process's behalf (libdispatch, libinfo, XPC); close(2) on
+                 * one from this forked child is a fatal EXC_GUARD that the
+                 * kernel reports as an unrecoverable exception and answers
+                 * with SIGKILL. Marking the descriptor close-on-exec is not
+                 * guarded and the exec that follows drops it all the same. */
+                {
+                    int flags = fcntl(snapshot->fds[i], F_GETFD);
+                    if (flags >= 0) {
+                        (void)fcntl(snapshot->fds[i], F_SETFD,
+                                    flags | FD_CLOEXEC);
+                    }
+                }
+#else
                 (void)close(snapshot->fds[i]);
+#endif
             }
         }
         return 0;
@@ -3854,7 +3870,14 @@ static int child_close_fds_from(
     }
     for (long fd = lowfd; fd < maxfd; fd++) {
         observation->close_syscalls++;
+#ifdef __APPLE__
+        {
+            int flags = fcntl((int)fd, F_GETFD);
+            if (flags >= 0) (void)fcntl((int)fd, F_SETFD, flags | FD_CLOEXEC);
+        }
+#else
         (void)close((int)fd);
+#endif
     }
     return 0;
 }
