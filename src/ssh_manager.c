@@ -3700,7 +3700,9 @@ static ssh_key_generation_match_t ssh_agent_has_exact_key_generation(
     char want_fp[256];
     char agent_fp[256];
     char envbuf[MAX_PATH_LEN + 20];
-    char out[2048];
+    /* AR-18 L16: one identity line is a fingerprint plus a free-form comment;
+     * 2 KiB made any key with a long comment unactivatable. */
+    char out[16384];
     const char *env[2] = { NULL, NULL };
     const char *argv[] = { "ssh-add", "-l", NULL };
     run_opts_t opts;
@@ -8898,10 +8900,21 @@ static bool ssh_authentication_was_proven(const char *output,
         "disabled.";
     static const char bitbucket_current_access[] =
         "You can use git to connect to Bitbucket. Shell access is disabled";
+    /* AR-18 L22: Gitea/Forgejo (Codeberg) and sourcehut greet with their
+     * own complete lines; they used to be reported as a failed probe. */
+    static const char gitea_suffix[] =
+        ", but Gitea does not provide shell access.";
+    static const char forgejo_suffix[] =
+        ", but Forgejo does not provide shell access.";
+    static const char sourcehut_suffix[] =
+        "! You've successfully authenticated, but I do not provide an "
+        "interactive shell session.";
+    static const char forge_marker[] = "! You've successfully authenticated";
     bool github = false;
     bool gitlab = false;
     bool bitbucket_identity = false;
     bool bitbucket_access = false;
+    bool forge = false;
     size_t offset = 0U;
 
     if (!output || !result || !result->spawned || result->term_signal != 0 ||
@@ -8923,6 +8936,17 @@ static bool ssh_authentication_was_proven(const char *output,
                                         "Welcome to GitLab, ", "!", true)) {
             gitlab = true;
         }
+        if ((ssh_auth_line_with_identity(line, line_len, "Hi there, ",
+                                         gitea_suffix, false) ||
+             ssh_auth_line_with_identity(line, line_len, "Hi there, ",
+                                         forgejo_suffix, false)) &&
+            memmem(line, line_len, forge_marker, sizeof(forge_marker) - 1U)) {
+            forge = true;
+        }
+        if (ssh_auth_line_with_identity(line, line_len, "Hi ",
+                                        sourcehut_suffix, false)) {
+            forge = true;
+        }
         if (ssh_auth_line_with_identity(line, line_len, "logged in as ",
                                         ".", true) ||
             (line_len == strlen("authenticated via ssh key.") &&
@@ -8939,9 +8963,9 @@ static bool ssh_authentication_was_proven(const char *output,
         offset = (size_t)(newline - output) + 1U;
     }
 
-    if (result->exit_code == 1) return github;
+    if (result->exit_code == 1) return github || forge;
     if (result->exit_code == 0) {
-        return gitlab || (bitbucket_identity && bitbucket_access);
+        return gitlab || forge || (bitbucket_identity && bitbucket_access);
     }
     return false;
 }

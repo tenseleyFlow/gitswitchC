@@ -515,6 +515,72 @@ TEST(empty_line_is_accepted_as_an_empty_answer) {
     fclose(stream);
 }
 
+/* AR-18 L51: after a Ctrl-D-terminated answer the EOF indicator is sticky;
+ * the next question must read what arrives next instead of failing. */
+TEST(next_prompt_reads_after_a_sticky_eof) {
+    char buffer[16] = "dirty";
+    FILE *stream = input_stream("first");
+    redirected_stream_t redirected = { .stream = NULL, .saved_fd = -1 };
+
+    CHECK(stream != NULL);
+    if (!stream) return;
+    CHECK_EQ_INT(begin_input(stream, &redirected), 0);
+    if (redirected.saved_fd >= 0) {
+        CHECK_EQ_INT(prompt_line("", buffer, sizeof(buffer), false),
+                     PROMPT_LINE_OK);
+        CHECK_STR_EQ(buffer, "first");
+        CHECK_EQ_INT(prompt_line("", buffer, sizeof(buffer), false),
+                     PROMPT_LINE_EOF);
+        /* The redirected stdin shares this file's offset; append without
+         * moving it so the next read sees the new line. */
+        CHECK_EQ_INT((int)pwrite(fileno(stream), "second\n", 7,
+                                 lseek(fileno(stream), 0, SEEK_CUR)), 7);
+        CHECK_EQ_INT(prompt_line("", buffer, sizeof(buffer), false),
+                     PROMPT_LINE_OK);
+        CHECK_STR_EQ(buffer, "second");
+        end_input(&redirected);
+    }
+    fclose(stream);
+}
+
+/* AR-18 L50: an inherited non-blocking stdin reports EAGAIN before the user
+ * has typed; the reader must wait for the answer, not fail the command. */
+TEST(nonblocking_stdin_waits_for_the_answer) {
+    char buffer[16] = "dirty";
+    int pipe_fds[2];
+    FILE *stream;
+    redirected_stream_t redirected = { .stream = NULL, .saved_fd = -1 };
+    pid_t writer;
+    int status = 0;
+
+    CHECK_EQ_INT(pipe(pipe_fds), 0);
+    CHECK_EQ_INT(fcntl(pipe_fds[0], F_SETFL,
+                       fcntl(pipe_fds[0], F_GETFL) | O_NONBLOCK), 0);
+    stream = fdopen(pipe_fds[0], "r");
+    CHECK(stream != NULL);
+    if (!stream) return;
+    fflush(NULL);
+    writer = fork();
+    CHECK(writer >= 0);
+    if (writer == 0) {
+        struct timespec delay = { .tv_sec = 0, .tv_nsec = 200000000 };
+
+        nanosleep(&delay, NULL);
+        (void)!write(pipe_fds[1], "yes\n", 4);
+        _exit(0);
+    }
+    close(pipe_fds[1]);
+    CHECK_EQ_INT(begin_input(stream, &redirected), 0);
+    if (redirected.saved_fd >= 0) {
+        CHECK_EQ_INT(prompt_line("", buffer, sizeof(buffer), false),
+                     PROMPT_LINE_OK);
+        CHECK_STR_EQ(buffer, "yes");
+        end_input(&redirected);
+    }
+    if (writer > 0) (void)waitpid(writer, &status, 0);
+    fclose(stream);
+}
+
 TEST(input_error_is_distinct_from_eof) {
     char buffer[8] = "secret";
     FILE *stream = input_stream("");
@@ -1608,4 +1674,6 @@ TEST_MAIN_BEGIN()
     RUN_TEST(
         operational_gpg_validation_errors_abort_without_reprompt_or_mutation);
     RUN_TEST(account_flow_reprompts_without_accepting_any_prefix);
+    RUN_TEST(next_prompt_reads_after_a_sticky_eof);
+    RUN_TEST(nonblocking_stdin_waits_for_the_answer);
 TEST_MAIN_END()

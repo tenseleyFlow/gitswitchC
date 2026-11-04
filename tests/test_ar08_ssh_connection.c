@@ -364,6 +364,37 @@ TEST(provider_greetings_require_exact_lines_and_exit_classes) {
     CHECK_EQ_INT(scripted_probe(&account, "logged in as alice.", 0, 0, true,
                                 false),
                  -1);
+
+    /* AR-18 L22: Gitea/Forgejo and sourcehut greetings are proof too, in
+     * either of the normal exit classes; a mangled line still is not. */
+    CHECK_EQ_INT(scripted_probe(
+                     &account,
+                     "Hi there, alice! You've successfully authenticated with "
+                     "the key named laptop, but Gitea does not provide shell "
+                     "access.",
+                     0, 0, true, false), 0);
+    CHECK_EQ_INT(scripted_probe(
+                     &account,
+                     "Hi there, alice! You've successfully authenticated with "
+                     "the key named laptop, but Forgejo does not provide shell "
+                     "access.",
+                     1, 0, true, false), 0);
+    CHECK_EQ_INT(scripted_probe(
+                     &account,
+                     "Hi alice! You've successfully authenticated, but I do not "
+                     "provide an interactive shell session.",
+                     0, 0, true, false), 0);
+    CHECK_EQ_INT(scripted_probe(
+                     &account,
+                     "Hi there, alice! but Forgejo does not provide shell "
+                     "access.",
+                     0, 0, true, false), -1);
+    CHECK_EQ_INT(scripted_probe(
+                     &account,
+                     "Hi there, alice! You've successfully authenticated with "
+                     "the key named laptop, but Gitea does not provide shell "
+                     "access.",
+                     2, 0, true, false), -1);
     run_set_runner(previous);
 }
 
