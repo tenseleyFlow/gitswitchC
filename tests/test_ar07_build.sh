@@ -26,16 +26,10 @@ fi
 # AR-18 L47: the install recipe must never move the live binary aside while
 # it verifies the staged copy; the backup is a copy and the only mutation of
 # the live path is the verified rename-over.
-if sed -n '/^install:/,/Installation complete/p' "$root/Makefile" |
-    grep -F 'mv -f "$$binary_final" "$$binary_backup"' |
-    grep -v 'if \[ -L "$$binary_final" \]' >/dev/null; then
-    if ! sed -n '/^install:/,/Installation complete/p' "$root/Makefile" |
-        grep -F 'cp -p "$$binary_final" "$$binary_backup"' >/dev/null; then
-        fail "install moves the live binary aside instead of copying it"
-    fi
-fi
+# shellcheck disable=SC2016
+install_backup_copy='cp -p "$$binary_final" "$$binary_backup"'
 sed -n '/^install:/,/Installation complete/p' "$root/Makefile" |
-    grep -F 'cp -p "$$binary_final" "$$binary_backup"' >/dev/null ||
+    grep -F "$install_backup_copy" >/dev/null ||
     fail "install backup is not a copy of the live binary"
 
 tmp=$(mktemp -d "${TMPDIR:-/tmp}/gitswitch-ar07-build.XXXXXX") ||
