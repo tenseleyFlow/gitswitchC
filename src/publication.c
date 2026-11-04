@@ -47,9 +47,11 @@ typedef struct {
     size_t capacity;
 } publication_writer_t;
 
-#define PUBLICATION_SSH_OPTIONS                                              \
-    " -F none -o IdentitiesOnly=yes -o StrictHostKeyChecking=accept-new"    \
+#define PUBLICATION_SSH_FIXED_OPTIONS                                        \
+    " -o IdentitiesOnly=yes -o StrictHostKeyChecking=accept-new"            \
     " -o LogLevel=ERROR"
+#define PUBLICATION_SSH_OPTIONS " -F none" PUBLICATION_SSH_FIXED_OPTIONS
+#define PUBLICATION_SSH_CONFIG_OPTION " -F "
 #define PUBLICATION_SSH_HOSTNAME_OPTION " -o HostName="
 
 static int publication_writer_printf(publication_writer_t *writer,
@@ -498,13 +500,36 @@ int publication_extract_ssh_program(const char *command, char *out,
     if (publication_parse_ssh_quoted_word(
             command, command_length, &cursor, identity,
             sizeof(identity)) != 0 ||
-        identity[0] != '/' || !is_safe_ssh_key_path(identity) ||
-        command_length - cursor < sizeof(PUBLICATION_SSH_OPTIONS) - 1U ||
-        memcmp(command + cursor, PUBLICATION_SSH_OPTIONS,
-               sizeof(PUBLICATION_SSH_OPTIONS) - 1U) != 0) {
+        identity[0] != '/' || !is_safe_ssh_key_path(identity)) {
         goto invalid_grammar;
     }
-    cursor += sizeof(PUBLICATION_SSH_OPTIONS) - 1U;
+    if (command_length - cursor > sizeof(PUBLICATION_SSH_CONFIG_OPTION) - 1U &&
+        memcmp(command + cursor, PUBLICATION_SSH_CONFIG_OPTION,
+               sizeof(PUBLICATION_SSH_CONFIG_OPTION) - 1U) == 0 &&
+        command[cursor + sizeof(PUBLICATION_SSH_CONFIG_OPTION) - 1U] == '\'') {
+        /* AR-18 M12 form: the alias destination lives in a private -F
+         * config; no HostName suffix follows the fixed options. */
+        char alias_config[MAX_PATH_LEN];
+
+        cursor += sizeof(PUBLICATION_SSH_CONFIG_OPTION) - 1U;
+        if (publication_parse_ssh_quoted_word(
+                command, command_length, &cursor, alias_config,
+                sizeof(alias_config)) != 0 ||
+            alias_config[0] != '/' || !is_safe_ssh_key_path(alias_config) ||
+            command_length - cursor !=
+                sizeof(PUBLICATION_SSH_FIXED_OPTIONS) - 1U ||
+            memcmp(command + cursor, PUBLICATION_SSH_FIXED_OPTIONS,
+                   sizeof(PUBLICATION_SSH_FIXED_OPTIONS) - 1U) != 0) {
+            goto invalid_grammar;
+        }
+        cursor = command_length;
+    } else if (command_length - cursor < sizeof(PUBLICATION_SSH_OPTIONS) - 1U ||
+               memcmp(command + cursor, PUBLICATION_SSH_OPTIONS,
+                      sizeof(PUBLICATION_SSH_OPTIONS) - 1U) != 0) {
+        goto invalid_grammar;
+    } else {
+        cursor += sizeof(PUBLICATION_SSH_OPTIONS) - 1U;
+    }
     if (cursor != command_length) {
         if (command_length - cursor <
                 sizeof(PUBLICATION_SSH_HOSTNAME_OPTION) - 1U ||

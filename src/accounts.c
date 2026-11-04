@@ -4190,6 +4190,22 @@ int accounts_remove_finalize(
                 "Could not remove ~/.ssh/config host-alias block for '%s': %s",
                 alias, get_last_error()->message);
         }
+        if (alias[0] != '\0') {
+            /* The private -F alias config that core.sshCommand pointed at
+             * (AR-18 M12) is owned by this account alone; drop it best-effort
+             * once the Git values that referenced it are retired. */
+            char alias_config[MAX_PATH_LEN];
+
+            if (g_pending_remove.removed_valid &&
+                git_ssh_alias_config_path(&g_pending_remove.removed_account,
+                                          alias_config,
+                                          sizeof(alias_config)) == 0 &&
+                unlink(alias_config) != 0 && errno != ENOENT) {
+                log_warning(
+                    "Could not remove the private SSH alias config for '%s': %s",
+                    alias, strerror(errno));
+            }
+        }
     }
 
     if (g_pending_remove.retirement.phase != PENDING_RETIREMENT_NONE &&

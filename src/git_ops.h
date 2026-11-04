@@ -110,6 +110,11 @@ const char *git_config_origin_scope_to_string(git_config_origin_scope_t scope);
  * status uses the publication-backed matcher below so it never substitutes a
  * newly PATH-resolved executable for the one used at switch time.
  */
+/* AR-18 M12: the gitswitch-owned per-account ssh config that core.sshCommand
+ * points -F at when the account has a managed alias: <config_dir>/ssh-alias-<id>.conf. */
+int git_ssh_alias_config_path(const account_t *account, char *buf,
+                              size_t size);
+
 int git_expected_ssh_command(const account_t *account, char *command,
                              size_t command_size);
 
