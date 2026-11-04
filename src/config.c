@@ -1207,6 +1207,37 @@ static int config_reconcile_settled_aliases_at(
                 fixed_suffix_length)) {
             continue;
         }
+        /* Only a temp that is an alias of the published inode is ever
+         * retired below, so only those consume candidate slots. Anything
+         * else is the residue of a writer killed between mkstemp and rename
+         * (or a foreign object the random-alias contract preserves) and must
+         * not count toward the cap, or 64 orphans brick every mutating
+         * command behind a lock error (AR-18 L5). Zero-length residue is
+         * provably an abandoned mkstemp and is deleted; the caller holds the
+         * exclusive publication lock, so no live writer owns it. */
+        {
+            struct stat seen;
+
+            if (fstatat(dir_fd, entry->d_name, &seen,
+                        AT_SYMLINK_NOFOLLOW) != 0) {
+                if (errno == ENOENT) {
+                    errno = 0;
+                    continue;
+                }
+                scan_errno = errno;
+                goto scan_done;
+            }
+            if (!target_exists ||
+                !config_metadata_same_file(&target, &seen)) {
+                if (S_ISREG(seen.st_mode) && seen.st_size == 0 &&
+                    seen.st_nlink == 1 && seen.st_uid == geteuid() &&
+                    unlinkat(dir_fd, entry->d_name, 0) == 0) {
+                    removed_random = true;
+                }
+                errno = 0;
+                continue;
+            }
+        }
         if (candidate_count >=
             CONFIG_ALIAS_SCAN_MAX_CANDIDATES) {
             scan_errno = E2BIG;
@@ -5735,6 +5766,13 @@ freebsd_fail_saved:
         if (!displaced_exact) {
             log_warning(
                 "Retirement completion committed while its prior-certificate slot changed");
+        } else {
+            /* The displaced certificate is the prior completion generation,
+             * already superseded by the one just published; reclaim its slot
+             * by identity so the arena stays transient (AR-18 L2). */
+            config_reclaim_settled_slot_at(
+                guard->directory_fd, guard->prepared_slot_name,
+                &displaced_now);
         }
         *published_identity = published_now;
         return 0;
@@ -6188,6 +6226,15 @@ int config_retirement_guard_install_or_adopt_with_ssh_alias_obligation(
             ERR_FILE_IO,
             "Cannot retire the prior FreeBSD guard generation");
         goto install_done;
+    }
+#else
+    /* The prior marker generation is preserved byte-for-byte by the
+     * completion certificate, so its settled slot is inert residue: reclaim
+     * it by identity now instead of leaving one file per install (AR-18 L2;
+     * same transient-arena contract as AR-15 H1). */
+    if (prior_marker_moved) {
+        config_reclaim_settled_slot_at(
+            directory_fd, settled_slot, &prior_settled_identity);
     }
 #endif
     if (config_retirement_guard_make_handle(

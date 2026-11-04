@@ -1789,8 +1789,10 @@ TEST(prepared_slot_replacement_after_move_is_preserved) {
     CHECK_EQ_INT(config_retirement_guard_clear_with_barrier(
                      &fixture.guard, guard_commit_barrier, NULL), -1);
     (void)gitswitch_test_set_retirement_guard_clear_hook(NULL);
+    /* AR-18 L2: the install in rotate_active reclaimed the prior marker's
+     * slot, so this clear's prepared slot is slot 0, not slot 1. */
     CHECK((size_t)snprintf(
-              slot_path, sizeof(slot_path), "%s/%s1",
+              slot_path, sizeof(slot_path), "%s/%s0",
               fixture.directory, SETTLED_PREFIX) < sizeof(slot_path));
     observed_length = guard_read_file(
         slot_path, observed, sizeof(observed));
@@ -1828,8 +1830,12 @@ TEST(interrupted_slot_move_consumes_slot_and_retry_uses_next) {
     CHECK((size_t)snprintf(
               second_slot, sizeof(second_slot), "%s/%s1",
               fixture.directory, SETTLED_PREFIX) < sizeof(second_slot));
+    /* The interrupted move leaves its stage copy in slot 0 (a straggler
+     * the failed clear cannot prove inert). The retry uses the next slot
+     * and, having exchanged the certificate, reclaims it (AR-18 L2). */
     CHECK_EQ_INT(access(first_slot, F_OK), 0);
-    CHECK_EQ_INT(access(second_slot, F_OK), 0);
+    errno = 0;
+    CHECK(access(second_slot, F_OK) != 0 && errno == ENOENT);
     guard_fixture_cleanup(&fixture);
 }
 #endif
