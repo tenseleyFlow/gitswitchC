@@ -1694,8 +1694,13 @@ check_policy()
     freebsd_version=$(sed -n 's/^freebsd-version=//p' "$work_actions")
     [ -n "$freebsd_version" ] || fail "FreeBSD CI version is not explicit"
 
+    # Reviewed releng branches and their security-support deadlines (the
+    # FreeBSD Security Officer's supported-releases table). 14.4 expires
+    # 2026-12-31; 14.5 (released 2026-09-08) runs to 2027-06-30, so the VM
+    # version in ci.yml and the fixtures that spell it must move before then.
     case $freebsd_version in
         14.4) freebsd_eol=2026-12-31 ;;
+        14.5) freebsd_eol=2027-06-30 ;;
         *) fail "FreeBSD $freebsd_version is unreviewed or no longer supported" ;;
     esac
     printf '%s\n' "$policy_date" | grep -E '^[0-9]{4}-[0-9]{2}-[0-9]{2}$' \

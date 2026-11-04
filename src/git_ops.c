@@ -333,8 +333,9 @@ static git_finalization_test_hook_fn g_finalization_test_hook;
 static size_t g_terminal_namespace_mutation_count;
 static size_t g_terminal_namespace_sync_count;
 
-/* Test seams for deterministic real-Git race coverage. They are deliberately
- * absent from the installed API; tests declare the prototypes locally. */
+/* Test seams for deterministic real-Git race coverage. They are compiled
+ * into the binary but deliberately absent from the installed headers; tests
+ * declare the prototypes locally. */
 void git_ops_test_set_restore_prelock_hook(git_restore_test_hook_fn fn);
 void git_ops_test_set_restore_locked_hook(git_restore_test_hook_fn fn);
 void git_ops_test_set_restore_postpublish_hook(git_restore_test_hook_fn fn);

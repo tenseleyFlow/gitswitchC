@@ -311,6 +311,39 @@ fi
 expect_status 'normal lock cleanup' 0 "$normal_status" "$normal_log"
 assert_absent "$normal_lock" 'normal cleanup'
 
+# AR-18 L55: a lock mkdir can fail for reasons other than EEXIST (here a
+# missing parent). The script used to spin without sleeping and then blame a
+# lock that "changed too often"; it must pace the retries and report mkdir's
+# own diagnostic.
+if [ "$(id -u)" -ne 0 ]; then
+    uncreatable_parent=$tmp/read-only-parent
+    uncreatable_lock=$uncreatable_parent/publish.lock
+    uncreatable_log=$tmp/uncreatable.err
+    "$real_mkdir" "$uncreatable_parent" ||
+        fail 'cannot create the read-only lock parent'
+    "$real_chmod" 0500 "$uncreatable_parent" ||
+        fail 'cannot make the lock parent read-only'
+    uncreatable_started=$(date +%s)
+    if GITSWITCH_RELEASE_LOCK_ATTEMPTS=1 sh "$lock_script" "$uncreatable_lock" \
+        sh "$self" --validate-token "$uncreatable_lock" \
+        >"$tmp/uncreatable.out" 2>"$uncreatable_log"; then
+        uncreatable_status=0
+    else
+        uncreatable_status=$?
+    fi
+    uncreatable_elapsed=$(( $(date +%s) - uncreatable_started ))
+    "$real_chmod" 0700 "$uncreatable_parent" || :
+    [ "$uncreatable_status" -ne 0 ] ||
+        fail 'uncreatable lock directory was reported as acquired'
+    grep -F 'release publisher lock cannot be created' "$uncreatable_log" \
+        >/dev/null ||
+        fail "uncreatable lock was not attributed to mkdir: $(cat "$uncreatable_log")"
+    grep -F 'changed too often' "$uncreatable_log" >/dev/null &&
+        fail 'uncreatable lock was blamed on a changing lock'
+    [ "$uncreatable_elapsed" -ge 1 ] ||
+        fail 'uncreatable lock retry loop did not pace its attempts'
+fi
+
 # POSIX shells may add SIGINT/SIGQUIT ignores when launching an asynchronous
 # list. The supervisor itself needs a background child so it can forward
 # signals, but those shell-added ignores must not prevent the exec'd command

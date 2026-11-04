@@ -228,6 +228,22 @@ TEST(init_snippet_gates_probe_on_hint_content) {
 /* With stdout closed every write fails; before the SIPW-1 fix `init` ignored
  * printf results and still exited 0, handing eval a truncated/empty script
  * with a success status. */
+/* AR-18 L66: a TS_SKIP token that is not registered turns an environment
+ * skip into a suite failure. Every token the tree skips with must resolve. */
+TEST(every_skip_token_used_by_the_suites_is_registered) {
+    static const char *const tokens[] = {
+        "bash", "bulk-fd-close", "coreutils", "dev-full", "exec", "fish",
+        "freebsd-acl", "freebsd-nullfs", "git", "gpg", "high-fd",
+        "mount-namespace", "openssh", "persistent-fs", "pty", "readline",
+        "sh", "source-proof-rlimit", "unix-sockets", "unprivileged", "zsh"
+    };
+
+    for (size_t i = 0; i < sizeof(tokens) / sizeof(tokens[0]); i++) {
+        CHECK(ts_capability_index(tokens[i], strlen(tokens[i])) >= 0);
+    }
+    CHECK(ts_capability_index("not-a-token", strlen("not-a-token")) < 0);
+}
+
 TEST(init_fails_when_stdout_is_closed) {
     char rt[256], cmd[9000];
     int rc;
@@ -1857,6 +1873,7 @@ TEST_MAIN_BEGIN()
     }
     RUN_TEST(init_succeeds_and_emits_full_snippet);
     RUN_TEST(init_snippet_gates_probe_on_hint_content);
+    RUN_TEST(every_skip_token_used_by_the_suites_is_registered);
     RUN_TEST(init_fails_when_stdout_is_closed);
     RUN_TEST(init_fails_on_enospc);
     RUN_TEST(list_names_protocol_is_exact_and_empty_set_succeeds);

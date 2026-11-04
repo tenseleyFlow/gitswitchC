@@ -390,8 +390,9 @@ case $lock_attempt_limit in
 esac
 lock_attempt=0
 disappeared_attempt=0
+mkdir_diagnostic=
 while :; do
-    if mkdir -m 0700 "$lock_dir" 2>/dev/null; then
+    if mkdir_diagnostic=$(mkdir -m 0700 "$lock_dir" 2>&1); then
         lock_owned=1
         abort_if_signalled
         break
@@ -401,10 +402,16 @@ while :; do
         fail "lock path is a symlink: $lock_dir"
     fi
     if [ ! -e "$lock_dir" ] && [ ! -L "$lock_dir" ]; then
+        # AR-18 L55: mkdir failed and nothing is there. Either the lock was
+        # released between the attempt and the probe (retry, paced like the
+        # busy case) or mkdir itself cannot create it (EACCES, ENOENT, EROFS);
+        # report mkdir's own words instead of blaming a changing lock.
         disappeared_attempt=$((disappeared_attempt + 1))
         if [ "$disappeared_attempt" -gt "$lock_attempt_limit" ]; then
-            fail "release publisher lock changed too often: $lock_dir"
+            fail "release publisher lock cannot be created: ${mkdir_diagnostic:-$lock_dir}"
         fi
+        sleep 1
+        abort_if_signalled
         continue
     fi
     [ -d "$lock_dir" ] || {

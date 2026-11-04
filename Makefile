@@ -1507,7 +1507,11 @@ install:
 	fi; \
 	if [ -e "$$binary_final" ] || [ -L "$$binary_final" ]; then \
 		binary_state=inflight; \
-		mv -f "$$binary_final" "$$binary_backup"; binary_state=backed; \
+		if [ -L "$$binary_final" ]; then \
+			mv -f "$$binary_final" "$$binary_backup"; \
+		else \
+			cp -p "$$binary_final" "$$binary_backup"; \
+		fi; binary_state=backed; \
 	else binary_state=absent; rm -f "$$binary_backup"; fi; \
 	if [ -e "$$bash_final" ] || [ -L "$$bash_final" ]; then \
 		bash_state=inflight; \
