@@ -938,6 +938,57 @@ TEST(full_reset_retires_residue_without_descriptor_unlink) {
 }
 #endif
 
+static unsigned g_failing_retire_hook_calls;
+
+static int fail_retirement_once(int base_fd, const char *quarantine) {
+    (void)base_fd;
+    (void)quarantine;
+    if (g_failing_retire_hook_calls++ == 0U) {
+        errno = EIO;
+        return -1;
+    }
+    return 0;
+}
+
+/* AR-18 M10: a planned residue is renamed into a private quarantine name
+ * before its unlink. If a transient failure (sync, hook, pin) hits in that
+ * window, the name must be put back; otherwise the witness keeps the old
+ * stem, the next classification sees two stems and fails "ambiguous", and
+ * every later reset is unsatisfiable. */
+TEST(full_reset_restores_planned_residue_name_after_transient_failure) {
+    char base[256], home[320], marker[384];
+    char quarantine[416], witness[448];
+    gpg_reset_retire_hook_fn old_hook;
+    command_runner_fn previous;
+
+    CHECK_EQ_INT(make_generation_retry(base, sizeof(base), home, sizeof(home),
+                                       marker, sizeof(marker)), 0);
+    snprintf(quarantine, sizeof(quarantine), "%s/%s", base,
+             g_generation_quarantine);
+    snprintf(witness, sizeof(witness), "%s.witness", quarantine);
+    CHECK(lstat(quarantine, &(struct stat){0}) == 0);
+    CHECK(lstat(witness, &(struct stat){0}) == 0);
+
+    g_failing_retire_hook_calls = 0U;
+    old_hook = gpg_manager_set_reset_retire_hook_fn(fail_retirement_once);
+    previous = run_set_runner(recording_null_runner);
+    CHECK_EQ_INT(gpg_manager_reset(NULL), -1);
+    run_set_runner(previous);
+    gpg_manager_set_reset_retire_hook_fn(old_hook);
+    CHECK(g_failing_retire_hook_calls >= 1U);
+    /* The residue is back under its recorded stem beside its witness, so
+     * the retry sees one pair instead of two stems. */
+    CHECK(lstat(quarantine, &(struct stat){0}) == 0);
+    CHECK(lstat(witness, &(struct stat){0}) == 0);
+
+    previous = run_set_runner(recording_null_runner);
+    CHECK_EQ_INT(gpg_manager_reset(NULL), 0);
+    run_set_runner(previous);
+    CHECK(lstat(quarantine, &(struct stat){0}) != 0 && errno == ENOENT);
+    CHECK(lstat(witness, &(struct stat){0}) != 0 && errno == ENOENT);
+    CHECK(!path_exists(marker));
+}
+
 TEST(full_reset_preserves_replaced_retirement_quarantine) {
     char xdg[128], base[256], home[320], marker[384], legacy[416];
     char replacement[416];
@@ -1850,6 +1901,7 @@ TEST_MAIN_BEGIN()
 #if !defined(__FreeBSD__)
     RUN_TEST(full_reset_retires_residue_without_descriptor_unlink);
 #endif
+    RUN_TEST(full_reset_restores_planned_residue_name_after_transient_failure);
     RUN_TEST(full_reset_preserves_replaced_retirement_quarantine);
     RUN_TEST(full_reset_preflight_preserves_every_planned_entry_on_home_blocker);
     RUN_TEST(full_reset_preflight_rejects_mixed_invalid_recovery_without_retirement);

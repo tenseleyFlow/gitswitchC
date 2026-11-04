@@ -5860,6 +5860,29 @@ static unsigned int gpg_reset_plan_residue_priority(
     }
 }
 
+/* After a planned residue was renamed into its private quarantine name, a
+ * failure before the unlink must put the name back: the witness that pairs
+ * with it still carries the old stem, and a second stem makes every later
+ * classification "ambiguous" and every reset unsatisfiable (AR-18 M10). The
+ * restore is identity-checked and best-effort; the caller still fails. */
+static void gpg_restore_planned_residue_name(
+    int base_fd, const char *quarantine, const char *original,
+    const gpg_link_identity_t *expected) {
+    gpg_link_identity_t now;
+
+    if (base_fd < 0 || !quarantine || !original || !expected) return;
+    if (gpg_capture_link_at(base_fd, quarantine, &now) != 0 ||
+        !gpg_same_link(&now, expected)) {
+        return;
+    }
+    if (g_rename_noreplace(base_fd, quarantine, base_fd, original) != 0) {
+        log_warning(
+            "GPG recovery quarantine could not be restored to its recorded name; "
+            "run gitswitch reset after the transient failure clears: %s",
+            original);
+    }
+}
+
 static int gpg_retire_planned_reset_residue_locked(
     int base_fd, const gpg_reset_plan_residue_t *residue) {
     char quarantine[GPG_QUARANTINE_NAME_LEN];
@@ -5917,6 +5940,8 @@ static int gpg_retire_planned_reset_residue_locked(
         set_system_error(ERR_FILE_IO,
                          "Cannot synchronize GPG recovery quarantine: %s",
                          residue->name);
+        gpg_restore_planned_residue_name(base_fd, quarantine, residue->name,
+                                         &residue->identity);
         return -1;
     }
     if (g_reset_retire_hook &&
@@ -5924,6 +5949,8 @@ static int gpg_retire_planned_reset_residue_locked(
         set_error(ERR_FILE_IO,
                   "GPG recovery retirement hook failed: %s",
                   residue->name);
+        gpg_restore_planned_residue_name(base_fd, quarantine, residue->name,
+                                         &residue->identity);
         return -1;
     }
     if (gpg_capture_link_at(base_fd, quarantine, &observed) != 0 ||
@@ -5947,6 +5974,8 @@ static int gpg_retire_planned_reset_residue_locked(
             set_error(ERR_FILE_IO,
                       "Cannot descriptor-pin GPG recovery quarantine: %s",
                       residue->name);
+            gpg_restore_planned_residue_name(base_fd, quarantine, residue->name,
+                                             &residue->identity);
             return -1;
         }
     }
@@ -5959,6 +5988,8 @@ static int gpg_retire_planned_reset_residue_locked(
         set_error(ERR_FILE_IO,
                   "GPG recovery post-validation hook failed: %s",
                   residue->name);
+        gpg_restore_planned_residue_name(base_fd, quarantine, residue->name,
+                                         &residue->identity);
         return -1;
     }
     if (g_identity_unlink) {
@@ -5968,6 +5999,8 @@ static int gpg_retire_planned_reset_residue_locked(
                       "Descriptor-bound GPG recovery retirement rejected a "
                       "changed entry: %s",
                       residue->name);
+            gpg_restore_planned_residue_name(base_fd, quarantine, residue->name,
+                                             &residue->identity);
             return -1;
         }
 #if defined(__FreeBSD__)
@@ -5981,6 +6014,8 @@ static int gpg_retire_planned_reset_residue_locked(
         set_system_error(ERR_FILE_IO,
                          "Cannot descriptor-unlink GPG recovery quarantine: %s",
                          residue->name);
+        gpg_restore_planned_residue_name(base_fd, quarantine, residue->name,
+                                         &residue->identity);
         return -1;
     }
 #else
