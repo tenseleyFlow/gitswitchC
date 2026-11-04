@@ -216,6 +216,10 @@ TEST(init_snippet_gates_probe_on_hint_content) {
     CHECK(strstr(out, "        'ssh gpg')") != NULL);     /* exact combined arm */
     CHECK(strstr(out, "*gpg*)") == NULL);                 /* no overlapping wildcard */
     CHECK(strstr(out, "-d '") != NULL);                   /* builtin symlink test, not ssh-add */
+    /* AR-18 L70: the snippet never spawns ssh-add itself; --resume-check
+     * probes the socket and fingerprints the key once. */
+    CHECK(strstr(out, "ssh-add") == NULL);
+    CHECK(strstr(out, "--resume-check") != NULL);
     remove_tree(rt);
 }
 

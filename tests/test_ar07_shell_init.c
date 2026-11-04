@@ -886,12 +886,17 @@ static void check_generated_syntax_for_shell(size_t index) {
     }
 }
 
+/* AR-18 L70: the snippet no longer runs its own `ssh-add -l`; the exact
+ * runtime check (`--resume-check`, modelled by GS_CHECK_RC) owns the verdict,
+ * so the ssh-add shim's status (GS_SSH_RC) must not influence the outcome in
+ * either direction and the shim must never be invoked by the snippet. */
 static void check_resume_matrix_for_shell(size_t index) {
-    CHECK_EQ_INT(evaluate_resume_case(index, "ssh", 1, 0, false), 1);
+    CHECK_EQ_INT(evaluate_resume_case(index, "ssh", 1, 0, false), 0);
     CHECK_EQ_INT(evaluate_resume_case(index, "ssh", 0, 1, false), 1);
     CHECK_EQ_INT(evaluate_resume_case(index, "ssh", 0, 1, false), 1);
     CHECK_EQ_INT(evaluate_resume_case(index, "ssh", 0, 0, false), 0);
-    CHECK_EQ_INT(evaluate_resume_case(index, "ssh", 2, 0, false), 1);
+    CHECK_EQ_INT(evaluate_resume_case(index, "ssh", 2, 0, false), 0);
+    CHECK_EQ_INT(evaluate_resume_case(index, "ssh", 2, 1, false), 1);
 }
 
 static void check_combined_runtime_misses_for_shell(const char *shell) {
@@ -904,9 +909,11 @@ static void check_combined_runtime_misses_for_shell(const char *shell) {
     CHECK_EQ_INT(evaluate_resume_case((size_t)index, "ssh gpg", 0, 0,
                                       false), 1);
     CHECK_EQ_INT(evaluate_resume_case((size_t)index, "ssh gpg", 1, 0,
-                                      true), 1);
+                                      true), 0);
     CHECK_EQ_INT(evaluate_resume_case((size_t)index, "ssh gpg", 1, 0,
                                       false), 1);
+    CHECK_EQ_INT(evaluate_resume_case((size_t)index, "ssh gpg", 0, 1,
+                                      true), 1);
 }
 
 static void check_invalid_hints_for_shell(const char *shell) {

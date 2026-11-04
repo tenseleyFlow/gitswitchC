@@ -540,11 +540,15 @@ static int prepare_init_fixture(const char *home, const char *runtime,
                    "#!/bin/sh\nexit \"${GS_TEST_SSH_RC:-2}\"\n", 0700) != 0) {
         return -1;
     }
+    /* AR-18 L70: the snippet consults only `--resume-check` for the SSH
+     * verdict (no shell-side ssh-add probe), so the gitswitch shim models
+     * that check's status from the same knob the ssh-add shim reads. */
     snprintf(path, sizeof(path), "%s/gitswitch", shim_dir);
     if (write_text(path,
                    "#!/bin/sh\n"
                    "case ${1-} in\n"
                    "    --resume-hint-probe) exec \"$GS_REAL_BIN\" \"$@\" ;;\n"
+                   "    --resume-check) exit \"${GS_TEST_SSH_RC:-0}\" ;;\n"
                    "    --startup-resume) printf 'startup\\n' >>\"$GS_TEST_RESUME_LOG\" ;;\n"
                    "esac\n"
                    "exit 0\n", 0700) != 0) {
