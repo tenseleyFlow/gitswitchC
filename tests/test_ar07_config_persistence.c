@@ -2203,6 +2203,46 @@ TEST(active_state_registration_failure_is_atomic_and_retryable) {
     CHECK_EQ_INT(count_prefix(dir, ".resume-hint.tmp."), 0);
 }
 
+/* AR-18 L5: temps a killed writer left between mkstemp and rename must not
+ * count toward the 64-candidate reconcile cap (65 of them used to fail every
+ * lock acquisition with E2BIG behind a "check permissions" message).
+ * Non-empty residue is preserved under the random-alias contract; zero-length
+ * residue is provably an abandoned mkstemp and is deleted. */
+TEST(orphaned_resume_hint_temps_do_not_exhaust_the_lock_scan) {
+    char dir[128], path[256], hint[256], orphan[300];
+    gitswitch_ctx_t ctx;
+
+    CHECK_EQ_INT(private_dir(dir, sizeof(dir)), 0);
+    snprintf(path, sizeof(path), "%s/accounts.toml", dir);
+    snprintf(hint, sizeof(hint), "%s/.resume-hint", dir);
+    CHECK_EQ_INT(write_private(path, two_accounts_legacy), 0);
+    CHECK_EQ_INT(write_private(hint, "none\n"), 0);
+    for (int i = 0; i < 65; i++) {
+        snprintf(orphan, sizeof(orphan), "%s/.resume-hint.tmp.AA%04d",
+                 dir, i);
+        CHECK_EQ_INT(write_private(orphan, "foreign-random\n"), 0);
+    }
+    for (int i = 0; i < 3; i++) {
+        int fd;
+
+        snprintf(orphan, sizeof(orphan), "%s/.resume-hint.tmp.ZZ%04d",
+                 dir, i);
+        fd = open(orphan, O_WRONLY | O_CREAT | O_EXCL | O_CLOEXEC, 0600);
+        CHECK(fd >= 0);
+        if (fd >= 0) close(fd);
+    }
+    CHECK_EQ_INT(count_prefix(dir, ".resume-hint.tmp."), 68);
+    memset(&ctx, 0, sizeof(ctx));
+    CHECK_EQ_INT(config_load(&ctx, path), 0);
+    clear_error();
+    errno = 0;
+    /* The save acquires the directory publication lock, whose reconcile
+     * scan used to fail E2BIG here; it must succeed, delete only the three
+     * zero-length temps, and preserve the 65 non-empty ones. */
+    CHECK_EQ_INT(config_save(&ctx, path), 0);
+    CHECK_EQ_INT(count_prefix(dir, ".resume-hint.tmp."), 65);
+}
+
 TEST_MAIN_BEGIN()
     RUN_TEST(schema_rejects_lossy_types_and_dependent_keys);
     RUN_TEST(malformed_gpg_selector_skips_only_its_account_and_blocks_rewrite);
@@ -2210,6 +2250,7 @@ TEST_MAIN_BEGIN()
     RUN_TEST(default_create_signal_death_is_truthful_at_every_boundary);
     RUN_TEST(backups_are_durable_monotonic_and_bounded);
     RUN_TEST(retired_backup_slots_are_reclaimed_not_leaked);
+    RUN_TEST(orphaned_resume_hint_temps_do_not_exhaust_the_lock_scan);
     RUN_TEST(backup_prunes_recognized_legacy_names_in_generation_order);
     RUN_TEST(backup_retains_malformed_legacy_near_misses_while_pruning_valid_names);
     RUN_TEST(backup_pruning_requires_complete_directory_enumeration);
