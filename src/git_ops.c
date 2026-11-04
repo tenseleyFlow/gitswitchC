@@ -351,7 +351,6 @@ size_t git_ops_test_set_retirement_prelock_witness_budget(
     size_t capacity);
 void git_ops_test_terminal_namespace_activity(
     size_t *mutations, size_t *syncs);
-size_t git_ops_test_directory_scan_count(void);
 void git_ops_test_set_restore_prelock_hook(git_restore_test_hook_fn fn) {
     g_restore_prelock_hook = fn;
 }
@@ -386,14 +385,6 @@ git_finalization_test_hook_fn git_ops_test_set_finalization_hook(
     git_finalization_test_hook_fn previous = g_finalization_test_hook;
     g_finalization_test_hook = fn;
     return previous;
-}
-
-/* AR-18 L13 witness: every full readdir() walk of a lock directory by the
- * cleanup arena or the finalization-certificate passes. */
-static size_t g_git_directory_scan_count;
-
-size_t git_ops_test_directory_scan_count(void) {
-    return g_git_directory_scan_count;
 }
 
 void git_ops_test_terminal_namespace_activity(
@@ -3714,7 +3705,6 @@ static int git_cleanup_arena_scan(
         return -1;
     }
     scan_fd = -1;
-    g_git_directory_scan_count++;
     errno = 0;
     while ((entry = readdir(directory)) != NULL) {
         const char *state;
@@ -7617,54 +7607,6 @@ static int git_finalization_cleanup_unpublished_private(
  * unclaimed, no-stage finalization certificate left before canonical
  * publication. Partial files, live claimed files, stage-bearing rollback
  * markers, and foreign replacements remain untouched. */
-/* Admission is deliberately a separate read-only pass. Conservatively count
- * every syntactically private name, including malformed/foreign entries that
- * the proving pass will leave untouched, so the caller can budget one fixed
- * cleanup slot per candidate before any reconciliation mutates the
- * directory and only then discovers that the finite arena is exhausted. */
-static int git_finalization_count_private_leaves(
-    int directory_fd, size_t *candidate_count) {
-    struct dirent *entry;
-    DIR *directory = NULL;
-    int scan_fd = -1;
-    int saved_errno = 0;
-
-    if (directory_fd < 0 || !candidate_count) {
-        errno = EINVAL;
-        return -1;
-    }
-    *candidate_count = 0U;
-    scan_fd = openat(
-        directory_fd, ".",
-        O_RDONLY | O_DIRECTORY | O_CLOEXEC | O_NOFOLLOW);
-    if (scan_fd < 0 || (directory = fdopendir(scan_fd)) == NULL) {
-        saved_errno = errno ? errno : EIO;
-        if (scan_fd >= 0) (void)close(scan_fd);
-        errno = saved_errno;
-        return -1;
-    }
-    g_git_directory_scan_count++;
-    errno = 0;
-    while ((entry = readdir(directory)) != NULL) {
-        if (!git_finalization_private_leaf_valid(entry->d_name)) continue;
-        if (*candidate_count == SIZE_MAX) {
-            saved_errno = EOVERFLOW;
-            break;
-        }
-        (*candidate_count)++;
-    }
-    if (saved_errno == 0 && errno != 0) saved_errno = errno;
-    (void)closedir(directory);
-    if (saved_errno != 0) {
-        errno = saved_errno;
-        return -1;
-    }
-    return 0;
-}
-
-/* The proving pass. The caller has already counted the candidates and
- * reserved arena budget for all of them (AR-18 L13), so this runs only when
- * there is at least one private name to reconcile. */
 static int git_finalization_reconcile_private_orphans(
     int directory_fd, const char *lock_leaf) {
     git_scope_lock_t cleanup_lock;
@@ -7675,9 +7617,48 @@ static int git_finalization_reconcile_private_orphans(
     int scan_fd = -1;
     int marker_fd = -1;
     int saved_errno = 0;
+    size_t candidate_count = 0U;
 
     if (directory_fd < 0 || !lock_leaf) {
         errno = EINVAL;
+        return -1;
+    }
+    /* Admission is deliberately a separate read-only pass. Conservatively
+     * budget one fixed cleanup slot for every syntactically private name,
+     * including malformed/foreign entries that the proving pass will leave
+     * untouched. Therefore no orphan reconciliation can partially mutate the
+     * directory and only then discover that the finite arena is exhausted. */
+    scan_fd = openat(
+        directory_fd, ".",
+        O_RDONLY | O_DIRECTORY | O_CLOEXEC | O_NOFOLLOW);
+    if (scan_fd < 0 || (directory = fdopendir(scan_fd)) == NULL) {
+        saved_errno = errno ? errno : EIO;
+        if (scan_fd >= 0) (void)close(scan_fd);
+        errno = saved_errno;
+        return -1;
+    }
+    scan_fd = -1;
+    errno = 0;
+    while ((entry = readdir(directory)) != NULL) {
+        if (!git_finalization_private_leaf_valid(entry->d_name)) continue;
+        if (candidate_count == SIZE_MAX) {
+            saved_errno = EOVERFLOW;
+            break;
+        }
+        candidate_count++;
+    }
+    if (saved_errno == 0 && errno != 0) saved_errno = errno;
+    (void)closedir(directory);
+    directory = NULL;
+    if (saved_errno != 0 ||
+        candidate_count >
+            SIZE_MAX - GIT_CLEANUP_ARENA_HANDLE_BUDGET) {
+        errno = saved_errno != 0 ? saved_errno : EOVERFLOW;
+        return -1;
+    }
+    if (git_cleanup_arena_require_budget(
+            directory_fd, lock_leaf,
+            candidate_count + GIT_CLEANUP_ARENA_HANDLE_BUDGET) != 0) {
         return -1;
     }
     scan_fd = openat(
@@ -7690,7 +7671,6 @@ static int git_finalization_reconcile_private_orphans(
         return -1;
     }
     scan_fd = -1;
-    g_git_directory_scan_count++;
     errno = 0;
     while ((entry = readdir(directory)) != NULL) {
         unsigned char *marker_data = NULL;
@@ -7783,7 +7763,6 @@ static int git_finalization_lock_acquire(
     git_config_finalization_lock_t *lock;
     git_finalization_publish_result_t publication;
     struct stat pinned_parent;
-    size_t candidate_count = 0U;
 
     if (!finalization || !generation || !generation->valid ||
         finalization->count >=
@@ -7824,26 +7803,9 @@ static int git_finalization_lock_acquire(
         return -1;
     }
     lock->parent_stat = pinned_parent;
-    /* AR-18 L13: one admission walk counts the private certificates, one
-     * arena scan budgets the handle plus every candidate, and the proving
-     * walk runs only when there is something to reconcile. A clean directory
-     * costs four readdir() walks per lock instead of eight, and an exhausted
-     * arena is reported with its own message rather than a stale one. */
-    if (git_finalization_count_private_leaves(
-            lock->parent_fd, &candidate_count) != 0 ||
-        candidate_count > SIZE_MAX - GIT_CLEANUP_ARENA_HANDLE_BUDGET) {
-        if (candidate_count > SIZE_MAX - GIT_CLEANUP_ARENA_HANDLE_BUDGET) {
-            errno = EOVERFLOW;
-        }
-        set_system_error(
-            ERR_GIT_CONFIG_FAILED,
-            "Cannot inspect the Git finalization-lock directory");
-        git_finalization_lock_dispose(lock);
-        return -1;
-    }
     if (git_cleanup_arena_require_budget(
             lock->parent_fd, lock->lock_leaf,
-            candidate_count + GIT_CLEANUP_ARENA_HANDLE_BUDGET) != 0) {
+            GIT_CLEANUP_ARENA_HANDLE_BUDGET) != 0) {
         int arena_errno = errno;
 
         set_system_error(
@@ -7855,9 +7817,8 @@ static int git_finalization_lock_acquire(
         git_finalization_lock_dispose(lock);
         return -1;
     }
-    if ((candidate_count > 0U &&
-         git_finalization_reconcile_private_orphans(
-             lock->parent_fd, lock->lock_leaf) != 0) ||
+    if (git_finalization_reconcile_private_orphans(
+            lock->parent_fd, lock->lock_leaf) != 0 ||
         git_finalization_prepare_private_marker(lock) != 0) {
         error_context_t primary_error = *get_last_error();
         int primary_errno = errno ? errno : EIO;
