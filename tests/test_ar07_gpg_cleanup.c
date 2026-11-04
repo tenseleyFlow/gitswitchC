@@ -1029,6 +1029,13 @@ TEST(stable_current_agent_is_stopped_on_retarget_drop_and_reset) {
 
     CHECK_EQ_INT(make_home(xdg, sizeof(xdg), base, sizeof(base),
                            home, sizeof(home), "work"), 0);
+    /* The manager resolves the runtime base physically (Darwin spells /tmp
+     * as /private/tmp), and a pre-existing `current` link must name a managed
+     * child of that physical base; spell every path canonically. */
+    CHECK(ts_canonicalize_dir_path(xdg, sizeof(xdg)) == 0);
+    CHECK_EQ_INT(setenv("XDG_RUNTIME_DIR", xdg, 1), 0);
+    snprintf(base, sizeof(base), "%s/gitswitch-gpg", xdg);
+    snprintf(home, sizeof(home), "%s/work", base);
     snprintf(marker, sizeof(marker), "%s/private.key", home);
     snprintf(current, sizeof(current), "%s/current", base);
     snprintf(other, sizeof(other), "%s/other", base);
