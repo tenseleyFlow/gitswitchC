@@ -3179,6 +3179,7 @@ TEST(finalization_arena_exhaustion_precedes_private_and_canonical_creation) {
     fixture_cleanup(&fixture);
 }
 
+#if !defined(__FreeBSD__)
 static bool force_global_finalization_noreplace_fallback(
     git_finalization_test_stage_t stage, int directory_fd,
     const char *lock_leaf) {
@@ -3190,6 +3191,7 @@ static bool force_global_finalization_noreplace_fallback(
     }
     return false;
 }
+#endif
 
 /* AR-18 M4: on a filesystem that rejects rename flags the canonical
  * finalization certificate used to be published as a second hard link of
