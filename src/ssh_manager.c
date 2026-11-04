@@ -4355,8 +4355,14 @@ static int ssh_start_isolated_agent_with_key(
             ssh_pid_sidecar_result_t pid_rc = read_ssh_agent_pid_at(
                 dir_fd, pid_name, pid_path, &record, NULL);
             if (pid_rc == SSH_PID_SIDECAR_VALID) {
+                /* AR-15 M6: pass the pinned runtime directory. Production
+                 * launches agents with a provenance-relative "-a" argument
+                 * (.gsp-<dev>-<ino>/../<name>.sock); without the descriptor
+                 * the argv oracle cannot requalify it, so OUR OWN agent was
+                 * classed UNRELATED and reuse adopted it unowned -- no stop
+                 * or switch-away could ever signal it again. */
                 ssh_process_outcome_t identity =
-                    pid_is_our_ssh_agent(&record, socket_path, -1);
+                    pid_is_our_ssh_agent(&record, socket_path, dir_fd);
                 if (identity == SSH_PROCESS_OWNED) {
                     adopted.agent_pid = record.pid;
                     adopted.agent_generation = record.generation;
