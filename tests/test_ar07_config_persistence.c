@@ -21,6 +21,8 @@ static const char one_account[] =
     "email = \"alice@example.com\"\n"
     "description = \"v0\"\n";
 
+bool gitswitch_test_set_config_noreplace_fallback(bool force);
+
 static const char two_accounts_legacy[] =
     "[settings]\n"
     "default_scope = \"local\"\n"
@@ -2243,6 +2245,33 @@ TEST(orphaned_resume_hint_temps_do_not_exhaust_the_lock_scan) {
     CHECK_EQ_INT(count_prefix(dir, ".resume-hint.tmp."), 65);
 }
 
+/* AR-18 M2: a full save (accounts.toml + .resume-hint publication) must
+ * succeed on a filesystem that rejects rename flags, via the portable
+ * linkat-then-identity-unlink no-replace move, leaving no temp residue. */
+TEST(forced_portable_publication_saves_config_and_hint) {
+#if defined(__FreeBSD__)
+    TS_SKIP("persistent-fs",
+            "portable no-replace fallback is exercised off FreeBSD");
+#else
+    char dir[128], path[256], hint[256], text[256];
+    gitswitch_ctx_t ctx;
+    bool previous = gitswitch_test_set_config_noreplace_fallback(true);
+
+    CHECK_EQ_INT(private_dir(dir, sizeof(dir)), 0);
+    snprintf(path, sizeof(path), "%s/accounts.toml", dir);
+    snprintf(hint, sizeof(hint), "%s/.resume-hint", dir);
+    CHECK_EQ_INT(write_private(path, two_accounts_legacy), 0);
+    memset(&ctx, 0, sizeof(ctx));
+    CHECK_EQ_INT(config_load(&ctx, path), 0);
+    clear_error();
+    CHECK_EQ_INT(config_save(&ctx, path), 0);
+    CHECK_EQ_INT(config_save(&ctx, path), 0);
+    CHECK(read_text(hint, text, sizeof(text)) > 0);
+    CHECK_EQ_INT(count_prefix(dir, ".resume-hint.tmp."), 0);
+    (void)gitswitch_test_set_config_noreplace_fallback(previous);
+#endif
+}
+
 TEST_MAIN_BEGIN()
     RUN_TEST(schema_rejects_lossy_types_and_dependent_keys);
     RUN_TEST(malformed_gpg_selector_skips_only_its_account_and_blocks_rewrite);
@@ -2251,6 +2280,7 @@ TEST_MAIN_BEGIN()
     RUN_TEST(backups_are_durable_monotonic_and_bounded);
     RUN_TEST(retired_backup_slots_are_reclaimed_not_leaked);
     RUN_TEST(orphaned_resume_hint_temps_do_not_exhaust_the_lock_scan);
+    RUN_TEST(forced_portable_publication_saves_config_and_hint);
     RUN_TEST(backup_prunes_recognized_legacy_names_in_generation_order);
     RUN_TEST(backup_retains_malformed_legacy_near_misses_while_pruning_valid_names);
     RUN_TEST(backup_pruning_requires_complete_directory_enumeration);

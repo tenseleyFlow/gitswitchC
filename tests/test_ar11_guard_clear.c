@@ -46,6 +46,8 @@ typedef int (*retirement_guard_clear_test_hook_fn)(
 retirement_guard_clear_test_hook_fn
 gitswitch_test_set_retirement_guard_clear_hook(
     retirement_guard_clear_test_hook_fn hook);
+bool gitswitch_test_set_config_noreplace_fallback(bool force);
+bool gitswitch_test_set_config_exchange_fallback(bool force);
 unsigned int gitswitch_test_set_retirement_settled_slot_limit(
     unsigned int limit);
 int gitswitch_test_retirement_guard_directory_fd(
@@ -1840,6 +1842,48 @@ TEST(interrupted_slot_move_consumes_slot_and_retry_uses_next) {
 }
 #endif
 
+/* AR-18 M2/M3: on a filesystem that rejects rename flags the guard's
+ * no-replace publishes take the portable linkat path and the completion
+ * certificate is replaced by plain renameat, so install and clear cycle
+ * repeatedly instead of failing ENOTSUP on the second clear. */
+TEST(forced_portable_publication_cycles_install_and_clear_repeatedly) {
+#if defined(__FreeBSD__)
+    TS_SKIP("persistent-fs",
+            "portable no-replace and exchange fallbacks are exercised off FreeBSD");
+#else
+    guard_fixture_t fixture;
+    bool previous_noreplace =
+        gitswitch_test_set_config_noreplace_fallback(true);
+    bool previous_exchange =
+        gitswitch_test_set_config_exchange_fallback(true);
+
+    CHECK_EQ_INT(guard_fixture_init(&fixture), 0);
+    /* clear + install (over the exact pair) + clear + install + clear. */
+    CHECK_EQ_INT(guard_fixture_rotate_active(&fixture), 0);
+    CHECK_EQ_INT(guard_fixture_rotate_active(&fixture), 0);
+    CHECK_EQ_INT(
+        config_retirement_guard_prepare_clear(fixture.guard), 0);
+    CHECK_EQ_INT(config_retirement_guard_clear(&fixture.guard), 0);
+    CHECK(fixture.guard == NULL);
+    CHECK(access(fixture.stage_path, F_OK) != 0 && errno == ENOENT);
+    CHECK(guard_files_equal(
+        fixture.marker_path, fixture.completion_path));
+    for (unsigned slot = 0U; slot < 4U; slot++) {
+        char slot_path[256];
+
+        CHECK((size_t)snprintf(
+                  slot_path, sizeof(slot_path), "%s/%s%u",
+                  fixture.directory, SETTLED_PREFIX, slot) <
+              sizeof(slot_path));
+        errno = 0;
+        CHECK(access(slot_path, F_OK) != 0 && errno == ENOENT);
+    }
+    (void)gitswitch_test_set_config_noreplace_fallback(previous_noreplace);
+    (void)gitswitch_test_set_config_exchange_fallback(previous_exchange);
+    guard_fixture_cleanup(&fixture);
+#endif
+}
+
 TEST(prepare_clear_sync_failure_retains_blocking_stage_and_retries) {
     guard_fixture_t fixture;
     bool blocked = false;
@@ -3505,6 +3549,7 @@ TEST_MAIN_BEGIN()
     RUN_TEST(prepared_settled_arena_exhaustion_fails_before_stage);
     RUN_TEST(prepared_slot_replacement_after_move_is_preserved);
     RUN_TEST(interrupted_slot_move_consumes_slot_and_retry_uses_next);
+    RUN_TEST(forced_portable_publication_cycles_install_and_clear_repeatedly);
 #endif
     RUN_TEST(
         prepare_clear_sync_failure_retains_blocking_stage_and_retries);

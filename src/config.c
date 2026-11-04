@@ -3402,10 +3402,102 @@ static int config_create_private_temp_at(int dir_fd, const char *target_name,
     return -1;
 }
 
+#if !defined(__FreeBSD__)
+/* Test seams: force the portable fallbacks that production takes only when
+ * the filesystem rejects rename flags (AR-18 M2/M3). */
+static bool g_config_test_force_noreplace_fallback;
+static bool g_config_test_force_exchange_fallback;
+bool gitswitch_test_set_config_noreplace_fallback(bool force);
+bool gitswitch_test_set_config_exchange_fallback(bool force);
+bool gitswitch_test_set_config_noreplace_fallback(bool force) {
+    bool previous = g_config_test_force_noreplace_fallback;
+
+    g_config_test_force_noreplace_fallback = force;
+    return previous;
+}
+bool gitswitch_test_set_config_exchange_fallback(bool force) {
+    bool previous = g_config_test_force_exchange_fallback;
+
+    g_config_test_force_exchange_fallback = force;
+    return previous;
+}
+
+/* Portable no-replace publication for filesystems whose rename rejects flags
+ * (NFS, CIFS, sshfs and other FUSE daemons without rename2, ecryptfs, 9p):
+ * linkat(2) is atomic and no-replace, then the source is unlinked only while
+ * its identity still equals the linked inode. When that unlink fails the
+ * fresh alias is taken back by identity; when even that fails the canonical
+ * destination is committed and the FreeBSD-shaped retained-source outcome is
+ * reported so fixed-name reconciliation can retire the source later
+ * (AR-18 M2). */
+static int config_publish_noreplace_portable_at(
+    int dir_fd, const char *source, const char *destination,
+    const struct stat *pinned, struct stat *retained_source) {
+    struct stat linked;
+    struct stat current;
+    int saved_errno;
+
+    if (linkat(dir_fd, source, dir_fd, destination, 0) != 0) {
+        return -1;
+    }
+    if (fstatat(dir_fd, destination, &linked, AT_SYMLINK_NOFOLLOW) != 0 ||
+        !config_metadata_same_file(pinned, &linked)) {
+        saved_errno = errno ? errno : ESTALE;
+        if (fstatat(dir_fd, destination, &linked,
+                    AT_SYMLINK_NOFOLLOW) == 0 &&
+            config_metadata_same_file(pinned, &linked)) {
+            (void)unlinkat(dir_fd, destination, 0);
+        }
+        errno = saved_errno;
+        return -1;
+    }
+    if (CONFIG_PUBLISH_TEST_CHECKPOINT(
+            CONFIG_PUBLISH_TEST_SOURCE_UNLINK,
+            dir_fd, source, destination) != 0 ||
+        fstatat(dir_fd, source, &current, AT_SYMLINK_NOFOLLOW) != 0 ||
+        !config_metadata_same_file(pinned, &current) ||
+        unlinkat(dir_fd, source, 0) != 0) {
+        bool source_is_retained;
+
+        saved_errno = errno ? errno : EIO;
+        if (CONFIG_PUBLISH_TEST_CHECKPOINT(
+                CONFIG_PUBLISH_TEST_ROLLBACK_UNLINK,
+                dir_fd, source, destination) == 0 &&
+            fstatat(dir_fd, destination, &linked,
+                    AT_SYMLINK_NOFOLLOW) == 0 &&
+            config_metadata_same_file(pinned, &linked) &&
+            unlinkat(dir_fd, destination, 0) == 0) {
+            errno = saved_errno;
+            return -1;
+        }
+        (void)CONFIG_PUBLISH_TEST_CHECKPOINT(
+            CONFIG_PUBLISH_TEST_AFTER_ROLLBACK_FAILURE,
+            dir_fd, source, destination);
+        source_is_retained =
+            fstatat(dir_fd, source, &current, AT_SYMLINK_NOFOLLOW) == 0 &&
+            config_metadata_same_file(pinned, &current);
+        if (source_is_retained && retained_source) {
+            *retained_source = current;
+        }
+        if (source_is_retained &&
+            fstatat(dir_fd, destination, &linked,
+                    AT_SYMLINK_NOFOLLOW) == 0 &&
+            config_metadata_same_file(pinned, &linked)) {
+            errno = 0;
+            return CONFIG_PUBLISH_INSTALLED_SOURCE_RETAINED;
+        }
+        errno = EINPROGRESS;
+        return CONFIG_PUBLISH_OUTCOME_UNCERTAIN;
+    }
+    return 0;
+}
+#endif
+
 /* Atomically publish one proved source generation only if destination is
  * absent. Every supported platform either provides a one-step no-replace move
  * or a descriptor-conditioned way to retire the exact source and rollback
- * alias. Unsupported platforms fail before changing the namespace. */
+ * alias; Linux and Darwin fall back to a portable linkat-based move when the
+ * filesystem rejects rename flags. */
 static int config_publish_noreplace_at(
     int dir_fd, const char *source, const char *destination,
     const struct stat *expected_source,
@@ -3423,17 +3515,30 @@ static int config_publish_noreplace_at(
 #ifndef RENAME_NOREPLACE
 #define RENAME_NOREPLACE (1U << 0)
 #endif
-    if (syscall(SYS_renameat2, dir_fd, source, dir_fd, destination,
-                RENAME_NOREPLACE) == 0) {
-        return 0;
+    if (!g_config_test_force_noreplace_fallback) {
+        if (syscall(SYS_renameat2, dir_fd, source, dir_fd, destination,
+                    RENAME_NOREPLACE) == 0) {
+            return 0;
+        }
+        if (errno != ENOSYS && errno != EINVAL && errno != ENOTSUP &&
+            errno != EOPNOTSUPP) {
+            return -1;
+        }
     }
-    if (errno == ENOSYS || errno == EINVAL || errno == EOPNOTSUPP) {
-        errno = ENOTSUP;
-    }
-    return -1;
+    return config_publish_noreplace_portable_at(
+        dir_fd, source, destination, &source_now, retained_source);
 #elif defined(__APPLE__) && defined(RENAME_EXCL)
-    return renameatx_np(
-        dir_fd, source, dir_fd, destination, RENAME_EXCL);
+    if (!g_config_test_force_noreplace_fallback) {
+        if (renameatx_np(
+                dir_fd, source, dir_fd, destination, RENAME_EXCL) == 0) {
+            return 0;
+        }
+        if (errno != EINVAL && errno != ENOTSUP && errno != EOPNOTSUPP) {
+            return -1;
+        }
+    }
+    return config_publish_noreplace_portable_at(
+        dir_fd, source, destination, &source_now, retained_source);
 #elif defined(__FreeBSD__)
     {
         struct stat pinned;
@@ -3541,6 +3646,10 @@ static config_exchange_result_t config_exchange_names_at(
     int dir_fd, const char *left, const char *right) {
     int result = -1;
 
+    if (g_config_test_force_exchange_fallback) {
+        errno = ENOTSUP;
+        return CONFIG_EXCHANGE_UNSUPPORTED;
+    }
 #if defined(__linux__) && defined(SYS_renameat2)
 #ifndef RENAME_EXCHANGE
 #define RENAME_EXCHANGE (1U << 1)
@@ -5329,19 +5438,51 @@ static int config_retirement_guard_move_noreplace_at(
 #ifndef RENAME_NOREPLACE
 #define RENAME_NOREPLACE (1U)
 #endif
-    if (syscall(
-            SYS_renameat2, directory_fd, source, directory_fd,
-            destination, RENAME_NOREPLACE) != 0) {
-        return -1;
+    {
+        int moved = -1;
+
+        if (!g_config_test_force_noreplace_fallback) {
+            moved = (int)syscall(
+                SYS_renameat2, directory_fd, source, directory_fd,
+                destination, RENAME_NOREPLACE);
+            if (moved != 0 && errno != ENOSYS && errno != EINVAL &&
+                errno != ENOTSUP && errno != EOPNOTSUPP) {
+                return -1;
+            }
+        }
+        /* Flag-less filesystem: portable linkat-then-identity-unlink move.
+         * The destination is committed once linked; a retained source is
+         * reported as a committed move so the caller's reproof decides
+         * (AR-18 M2). */
+        if (moved != 0 &&
+            config_publish_noreplace_portable_at(
+                directory_fd, source, destination, &source_now,
+                NULL) < 0) {
+            return -1;
+        }
+        if (committed) *committed = true;
     }
-    if (committed) *committed = true;
 #elif defined(__APPLE__) && defined(RENAME_EXCL)
-    if (renameatx_np(
-            directory_fd, source, directory_fd, destination,
-            RENAME_EXCL) != 0) {
-        return -1;
+    {
+        int moved = -1;
+
+        if (!g_config_test_force_noreplace_fallback) {
+            moved = renameatx_np(
+                directory_fd, source, directory_fd, destination,
+                RENAME_EXCL);
+            if (moved != 0 && errno != EINVAL && errno != ENOTSUP &&
+                errno != EOPNOTSUPP) {
+                return -1;
+            }
+        }
+        if (moved != 0 &&
+            config_publish_noreplace_portable_at(
+                directory_fd, source, destination, &source_now,
+                NULL) < 0) {
+            return -1;
+        }
+        if (committed) *committed = true;
     }
-    if (committed) *committed = true;
 #elif defined(__FreeBSD__)
     {
         struct stat opened;
@@ -5688,6 +5829,7 @@ freebsd_fail_saved:
         struct stat slot_now;
         bool published_exact;
         bool displaced_exact;
+        bool replaced_in_place = false;
 
         if (guard->prepared_slot_name[0] == '\0') {
             errno = ENOSPC;
@@ -5723,10 +5865,20 @@ freebsd_fail_saved:
         exchanged = config_exchange_names_at(
             guard->directory_fd, guard->prepared_slot_name,
             CONFIG_RETIREMENT_COMPLETE_NAME);
-        if (exchanged != CONFIG_EXCHANGE_OK) {
-            errno = exchanged == CONFIG_EXCHANGE_UNSUPPORTED
-                        ? ENOTSUP
-                        : (errno ? errno : EIO);
+        if (exchanged == CONFIG_EXCHANGE_UNSUPPORTED) {
+            /* Flag-less filesystem: plain renameat(2) is atomic-replace and
+             * portable. The displaced certificate is not preserved in the
+             * slot, but its exact bytes are already pinned in
+             * guard->completion_data for the reverse path (AR-18 M3). */
+            if (renameat(guard->directory_fd, guard->prepared_slot_name,
+                         guard->directory_fd,
+                         CONFIG_RETIREMENT_COMPLETE_NAME) != 0) {
+                errno = errno ? errno : EIO;
+                return -1;
+            }
+            replaced_in_place = true;
+        } else if (exchanged != CONFIG_EXCHANGE_OK) {
+            errno = errno ? errno : EIO;
             return -1;
         }
         *committed = true;
@@ -5751,6 +5903,7 @@ freebsd_fail_saved:
                     guard->marker_length, &published_now) == 0;
         }
         displaced_exact =
+            !replaced_in_place &&
             config_reprove_published_file_at(
                 guard->directory_fd, guard->prepared_slot_name,
                 &guard->completion_identity, guard->completion_data,
@@ -5763,7 +5916,10 @@ freebsd_fail_saved:
             errno = ESTALE;
             return -1;
         }
-        if (!displaced_exact) {
+        if (replaced_in_place) {
+            /* The prior certificate was replaced in place; there is no
+             * displaced slot to reclaim. */
+        } else if (!displaced_exact) {
             log_warning(
                 "Retirement completion committed while its prior-certificate slot changed");
         } else {
