@@ -4386,12 +4386,21 @@ int gpg_manager_snapshot_current(char *target, size_t size, bool *present) {
         return -1;
     }
     live_rc = gpg_live_private_home(base_fd, base, target);
+    if (live_rc > 0) {
+        /* The stable link names a managed child whose home is gone (a crash
+         * window in a targeted reset, or a hand-removed isolated home).
+         * There is nothing to restore, so this is "no previous home", not a
+         * failure: the retarget tolerates the dangling link (AR-12 L10) and
+         * refusing here made that tolerance unreachable from every switch and
+         * resume, which then nagged every new shell (AR-18 L25). */
+        log_warning(
+            "Stable GNUPGHOME points at a missing managed home; treating it as no previous home: %s",
+            target);
+        unlock_gpg_dir(base_fd, lock_fd);
+        target[0] = '\0';
+        return 0;
+    }
     if (live_rc != 0) {
-        if (live_rc > 0) {
-            set_error(ERR_FILE_IO,
-                      "Stable GNUPGHOME points at a missing managed home: %s",
-                      target);
-        }
         unlock_gpg_dir(base_fd, lock_fd);
         target[0] = '\0';
         return -1;
@@ -5860,6 +5869,29 @@ static unsigned int gpg_reset_plan_residue_priority(
     }
 }
 
+/* After a planned residue was renamed into its private quarantine name, a
+ * failure before the unlink must put the name back: the witness that pairs
+ * with it still carries the old stem, and a second stem makes every later
+ * classification "ambiguous" and every reset unsatisfiable (AR-18 M10). The
+ * restore is identity-checked and best-effort; the caller still fails. */
+static void gpg_restore_planned_residue_name(
+    int base_fd, const char *quarantine, const char *original,
+    const gpg_link_identity_t *expected) {
+    gpg_link_identity_t now;
+
+    if (base_fd < 0 || !quarantine || !original || !expected) return;
+    if (gpg_capture_link_at(base_fd, quarantine, &now) != 0 ||
+        !gpg_same_link(&now, expected)) {
+        return;
+    }
+    if (g_rename_noreplace(base_fd, quarantine, base_fd, original) != 0) {
+        log_warning(
+            "GPG recovery quarantine could not be restored to its recorded name; "
+            "run gitswitch reset after the transient failure clears: %s",
+            original);
+    }
+}
+
 static int gpg_retire_planned_reset_residue_locked(
     int base_fd, const gpg_reset_plan_residue_t *residue) {
     char quarantine[GPG_QUARANTINE_NAME_LEN];
@@ -5917,6 +5949,8 @@ static int gpg_retire_planned_reset_residue_locked(
         set_system_error(ERR_FILE_IO,
                          "Cannot synchronize GPG recovery quarantine: %s",
                          residue->name);
+        gpg_restore_planned_residue_name(base_fd, quarantine, residue->name,
+                                         &residue->identity);
         return -1;
     }
     if (g_reset_retire_hook &&
@@ -5924,6 +5958,8 @@ static int gpg_retire_planned_reset_residue_locked(
         set_error(ERR_FILE_IO,
                   "GPG recovery retirement hook failed: %s",
                   residue->name);
+        gpg_restore_planned_residue_name(base_fd, quarantine, residue->name,
+                                         &residue->identity);
         return -1;
     }
     if (gpg_capture_link_at(base_fd, quarantine, &observed) != 0 ||
@@ -5947,6 +5983,8 @@ static int gpg_retire_planned_reset_residue_locked(
             set_error(ERR_FILE_IO,
                       "Cannot descriptor-pin GPG recovery quarantine: %s",
                       residue->name);
+            gpg_restore_planned_residue_name(base_fd, quarantine, residue->name,
+                                             &residue->identity);
             return -1;
         }
     }
@@ -5959,6 +5997,8 @@ static int gpg_retire_planned_reset_residue_locked(
         set_error(ERR_FILE_IO,
                   "GPG recovery post-validation hook failed: %s",
                   residue->name);
+        gpg_restore_planned_residue_name(base_fd, quarantine, residue->name,
+                                         &residue->identity);
         return -1;
     }
     if (g_identity_unlink) {
@@ -5968,6 +6008,8 @@ static int gpg_retire_planned_reset_residue_locked(
                       "Descriptor-bound GPG recovery retirement rejected a "
                       "changed entry: %s",
                       residue->name);
+            gpg_restore_planned_residue_name(base_fd, quarantine, residue->name,
+                                             &residue->identity);
             return -1;
         }
 #if defined(__FreeBSD__)
@@ -5981,6 +6023,8 @@ static int gpg_retire_planned_reset_residue_locked(
         set_system_error(ERR_FILE_IO,
                          "Cannot descriptor-unlink GPG recovery quarantine: %s",
                          residue->name);
+        gpg_restore_planned_residue_name(base_fd, quarantine, residue->name,
+                                         &residue->identity);
         return -1;
     }
 #else
@@ -6222,8 +6266,28 @@ static int gpg_kill_and_remove_home(int base_fd, const char *base,
     }
     if (run_rc != 0 || !result.spawned || result.exit_code != 0 ||
         result.term_signal != 0) {
-        set_error(ERR_SYSTEM_COMMAND_FAILED,
-                  "Failed to stop GPG agent for %s; home retained for retry", home);
+        if (!result.spawned) {
+            /* gpgconf could not even be launched (not installed, not in the
+             * trusted PATH). Retrying cannot help until that is fixed, so
+             * keep the launch failure's own cause instead of the generic
+             * "retained for retry" text (AR-18 P20). */
+            char cause[256];
+
+            if (safe_strncpy(cause, get_last_error()->message,
+                             sizeof(cause)) != 0 ||
+                cause[0] == '\0') {
+                (void)safe_strncpy(cause, "gpgconf could not be started",
+                                   sizeof(cause));
+            }
+            set_error(ERR_SYSTEM_COMMAND_FAILED,
+                      "Cannot run gpgconf to stop the GPG agent for %s (%s); "
+                      "install GnuPG or repair PATH, then rerun gitswitch reset",
+                      home, cause);
+        } else {
+            set_error(ERR_SYSTEM_COMMAND_FAILED,
+                      "Failed to stop GPG agent for %s; home retained for retry",
+                      home);
+        }
         close(home_fd);
         return -1;
     }

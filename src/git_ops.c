@@ -11917,8 +11917,20 @@ static bool git_retirement_transaction_reprove_unchanged(
                     transaction, group)) {
                 goto done;
             }
-        } else if (group->stale_generation ||
-                   !git_retirement_failed_publish_verify_prelock(
+        } else if (group->stale_generation) {
+            /* A stale-generation group whose preparation was refused before
+             * it created a lock or stage mutated nothing by construction;
+             * its destination is re-verified by path so the caller can clear
+             * the guard it just created instead of retaining it forever
+             * (AR-18 M7). Anything that entered the namespace stays
+             * uncertain. */
+            if (group->lock.lock_created || group->lock.stage_created ||
+                group->lock.published || group->lock.cleanup_uncertain ||
+                group->published || group->cleanup_uncertain ||
+                git_retirement_verify_live_namespace(representative) != 0) {
+                goto done;
+            }
+        } else if (!git_retirement_failed_publish_verify_prelock(
                        transaction, group)) {
             goto done;
         }
@@ -12008,6 +12020,107 @@ static void git_retirement_transaction_add_failure(
     transaction->failure_count++;
 }
 
+/* AR-18 M8: mutation authority is bound to the exact sealed post_config
+ * generation, but Git rewrites the config file (lock + rename) on every
+ * ordinary write, so `git config --global pull.rebase true`, `git maintenance
+ * start` or an editor save changes the generation while leaving our exact
+ * values in place. Previously such a destination could only be retired if it
+ * was already clean, so remove and reset refused forever with a retry hint
+ * that could never succeed. When no sealed generation matches the live file,
+ * re-seal the record from content under the same attribution rules the
+ * planner enforces: every owned value this record authorizes must occur
+ * exactly once (the SSH command verbatim; the signing key by fingerprint).
+ * Ambiguity leaves the record stale and fail-closed as before; a destination
+ * holding none of our values is left to the stale-clean path. The re-seal is
+ * in-memory only: the planner then removes exactly those occurrences and the
+ * ledger record is retired as usual. */
+static int git_retirement_reseal_stale_item(
+    git_retirement_transaction_t *transaction, size_t index,
+    size_t item_count, const publication_record_t **live_generation) {
+    publication_record_t *publication;
+    git_scope_snapshot_t live;
+    struct stat st;
+    publication_identity_t resealed;
+    publication_identity_t original;
+    const git_snapshot_key_t *key;
+    bool attributable = false;
+    error_context_t entry_error = *get_last_error();
+    int entry_errno = errno;
+    int result = -1;
+
+    if (!transaction || index >= item_count || !live_generation) return -1;
+    publication = &transaction->items[index].publication;
+    /* A benign rewrite leaves a plain single-link regular file. A
+     * hard-linked destination is an alias the retirement machinery refuses
+     * everywhere else; it is not re-sealed either. */
+    if (publication->config_path[0] == '\0' ||
+        lstat(publication->config_path, &st) != 0 ||
+        !S_ISREG(st.st_mode) || st.st_nlink != 1) {
+        return -1;
+    }
+    memset(&live, 0, sizeof(live));
+    /* Only a pure generation mismatch is a candidate. With the live stat
+     * sealed in, the verifier still rejects a replaced parent directory or
+     * repository, and then no subprocess runs and the original failure
+     * context stands. */
+    original = publication->post_config;
+    publication_identity_from_stat(&resealed, &st);
+    publication->post_config = resealed;
+    if (publication_record_verify_live_destination(
+            publication, transaction->publication_refs, item_count,
+            live_generation) != 0) {
+        goto done;
+    }
+    /* The generation mismatch left its own context behind; the re-read is a
+     * fresh observation, and entry_error is restored if the re-seal fails. */
+    clear_error();
+    errno = 0;
+    if (git_capture_file_snapshot(
+            publication->config_path,
+            "Could not re-read a changed Git retirement destination",
+            &live) != 0) {
+        goto done;
+    }
+    if ((publication->capabilities & PUBLICATION_CAP_SSH_COMMAND) != 0U) {
+        size_t matches;
+
+        key = git_snapshot_key_by_name(&live, GIT_CONFIG_CORE_SSHCOMMAND);
+        matches = key ? git_snapshot_key_exact_count(
+                            key, publication->ssh_command)
+                      : 0U;
+        if (matches > 1U) goto done;
+        if (matches == 1U) attributable = true;
+    }
+    if ((publication->capabilities & PUBLICATION_CAP_GPG_FINGERPRINT) !=
+        0U) {
+        bool ambiguous = false;
+        const char *match;
+
+        key = git_snapshot_key_by_name(&live, GIT_CONFIG_USER_SIGNINGKEY);
+        match = key ? git_retirement_unique_fingerprint_value(
+                          key, publication->gpg_fingerprint, &ambiguous)
+                    : NULL;
+        if (ambiguous) goto done;
+        if (match) attributable = true;
+    }
+    if (!attributable) goto done;
+    log_info(
+        "Git retirement destination changed since it was sealed; "
+        "re-sealed from its exact attributed values: %s",
+        publication->config_path);
+    result = 0;
+
+done:
+    git_scope_snapshot_clear(&live);
+    if (result != 0) {
+        publication->post_config = original;
+        *live_generation = NULL;
+        g_last_error = entry_error;
+        errno = entry_errno;
+    }
+    return result;
+}
+
 static int git_retirement_transaction_prepare_internal(
     const account_t *const accounts[],
     const publication_record_t *const publications[], size_t item_count,
@@ -12092,10 +12205,12 @@ static int git_retirement_transaction_prepare_internal(
         (void)git_scope_from_publication(
             transaction->publication_refs[i]->scope, &scope);
         if (!transaction->recovery_proof_only &&
-            publication_record_verify_live_destination(
-                transaction->publication_refs[i],
-                transaction->publication_refs, item_count,
-                &live_generations[i]) == 0) {
+            (publication_record_verify_live_destination(
+                 transaction->publication_refs[i],
+                 transaction->publication_refs, item_count,
+                 &live_generations[i]) == 0 ||
+             git_retirement_reseal_stale_item(
+                 transaction, i, item_count, &live_generations[i]) == 0)) {
             bool witness_already_captured = false;
 
             for (size_t j = 0U; j < i; j++) {
@@ -12368,7 +12483,11 @@ static int git_retirement_transaction_prepare_internal(
             if (group->absent_destination) continue;
             if (!group->snapshot_ready) continue;
             if (group->attribution_conflict) {
-                git_retirement_group_clear_prelock_witness(group);
+                /* Keep the prelock witness: the conflict was found in the
+                 * immutable snapshot and nothing was mutated, so the caller's
+                 * unchanged re-proof must still be able to compare the live
+                 * destination against it and clear the guard it created
+                 * (AR-18 M7). Release disposes of the witness later. */
                 set_error(
                     ERR_GIT_CONFIG_FAILED,
                     "Git retirement found ambiguous repeated attributed values");

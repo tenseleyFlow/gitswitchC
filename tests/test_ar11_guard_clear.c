@@ -38,7 +38,8 @@ typedef enum {
     RETIREMENT_GUARD_CLEAR_AFTER_NAMESPACE_COMMIT,
     RETIREMENT_GUARD_CLEAR_AFTER_PREPARED_PUBLISH,
     RETIREMENT_GUARD_INSTALL_BEFORE_PRIOR_RETIRE,
-    RETIREMENT_GUARD_INSTALL_AFTER_STAGE_WRITE
+    RETIREMENT_GUARD_INSTALL_AFTER_STAGE_WRITE,
+    RETIREMENT_GUARD_INSTALL_AFTER_PRIOR_MOVE
 } retirement_guard_clear_test_stage_t;
 typedef int (*retirement_guard_clear_test_hook_fn)(
     retirement_guard_clear_test_stage_t stage, int descriptor,
@@ -1884,6 +1885,36 @@ TEST(forced_portable_publication_cycles_install_and_clear_repeatedly) {
 #endif
 }
 
+/* AR-18 M6: installing over an exact marker/certificate pair publishes the
+ * stage in one atomic replace. The old two-rename sequence had a window
+ * (marker absent, certificate + stage present) no entry point could ever
+ * complete or roll back; a failure injected there must be unreachable. */
+TEST(install_over_exact_pair_never_leaves_the_marker_absent) {
+#if defined(__FreeBSD__)
+    TS_SKIP("persistent-fs",
+            "FreeBSD retains the pre-move; the window is covered by its funlinkat path");
+#else
+    guard_fixture_t fixture;
+    bool blocked = false;
+
+    CHECK_EQ_INT(guard_fixture_init(&fixture), 0);
+    CHECK_EQ_INT(guard_fixture_rotate_active(&fixture), 0);
+    CHECK_EQ_INT(config_retirement_guard_clear(&fixture.guard), 0);
+    guard_arm_hook(RETIREMENT_GUARD_INSTALL_AFTER_PRIOR_MOVE, HOOK_FAIL);
+    CHECK_EQ_INT(config_retirement_guard_install_or_adopt(
+                     fixture.config_path, CONFIG_RETIREMENT_RESET,
+                     &fixture.owner, 1U, &fixture.guard), 0);
+    (void)gitswitch_test_set_retirement_guard_clear_hook(NULL);
+    CHECK(!hook_action_observed);
+    CHECK_EQ_INT(access(fixture.marker_path, F_OK), 0);
+    CHECK_EQ_INT(access(fixture.completion_path, F_OK), 0);
+    CHECK(access(fixture.stage_path, F_OK) != 0 && errno == ENOENT);
+    CHECK(guard_probe(&fixture, &blocked));
+    CHECK(blocked);
+    guard_fixture_cleanup(&fixture);
+#endif
+}
+
 TEST(prepare_clear_sync_failure_retains_blocking_stage_and_retries) {
     guard_fixture_t fixture;
     bool blocked = false;
@@ -3551,6 +3582,7 @@ TEST_MAIN_BEGIN()
     RUN_TEST(interrupted_slot_move_consumes_slot_and_retry_uses_next);
 #endif
     RUN_TEST(forced_portable_publication_cycles_install_and_clear_repeatedly);
+    RUN_TEST(install_over_exact_pair_never_leaves_the_marker_absent);
     RUN_TEST(
         prepare_clear_sync_failure_retains_blocking_stage_and_retries);
     RUN_TEST(

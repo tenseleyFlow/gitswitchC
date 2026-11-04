@@ -153,6 +153,14 @@ rewrites Git configuration.
 > requires `GPG_TTY` to be set before the integration line, e.g. in fish:
 > `set -x GPG_TTY (tty)`. You can also run `gitswitch resume` manually anytime.
 
+### Platform notes
+
+On Linux, stopping an isolated `ssh-agent` safely needs `pidfd_open` (kernel
+5.3 or newer, not blocked by a seccomp filter). Without it gitswitch refuses to
+signal a recorded agent and tells you which PID to stop by hand before the next
+switch or reset. macOS and FreeBSD use their own process-identity checks and
+have no such floor.
+
 > **GPG scoping:** when an account uses GPG signing, the snippet points
 > `GNUPGHOME` at a per-account keyring containing only that account's key. That
 > is the isolation — but it means *all* gpg in that shell is scoped to the

@@ -1229,7 +1229,9 @@ TEST(full_reset_forward_quarantine_sync_failure_is_retryable) {
     CHECK_EQ_INT(g_reset_sync_calls, 1);
     CHECK_EQ_INT(lstat(candidate, &st), 0);
     CHECK_EQ_INT(lstat(witness, &st), 0);
-    CHECK(lstat(quarantine, &st) != 0 && errno == ENOENT);
+    /* AR-18 M10: the failed retirement puts the quarantine back under its
+     * recorded name instead of leaving it under a fresh private stem. */
+    CHECK_EQ_INT(lstat(quarantine, &st), 0);
     CHECK(lstat(current, &st) != 0 && errno == ENOENT);
 
     g_fail_reset_sync = false;

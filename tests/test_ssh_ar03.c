@@ -1441,6 +1441,76 @@ TEST(legacy_absolute_socket_arg_matches_through_symlinked_root) {
  * START stays a replacement (that is the PID-reuse signal), and Linux's
  * boot half is the stable kernel boot_id, so any drift there stays a real
  * reboot. */
+/* AR-18 M9: a valid sidecar whose recorded generation no longer matches the
+ * live PID (REPLACED: the PID was recycled by another process) proves the
+ * recorded agent is gone. With a dead socket the endpoint must be retired
+ * like any other dead recorded endpoint instead of wedging reset forever;
+ * with a live socket it must still fail closed and never signal the PID's
+ * current occupant (this process). */
+TEST(replaced_generation_retires_dead_socket_but_keeps_live_socket) {
+    char dir[128], sock[256], pid_path[256];
+    ssh_agent_record_t record;
+    struct sockaddr_un address;
+    int dir_fd;
+    int listener;
+
+    CHECK_EQ_INT(make_xdg_agent_dir(dir, sizeof(dir)), 0);
+    snprintf(sock, sizeof(sock), "%s/ssh-agent.work.sock", dir);
+    snprintf(pid_path, sizeof(pid_path), "%s/ssh-agent.work.pid", dir);
+    memset(&address, 0, sizeof(address));
+    address.sun_family = AF_UNIX;
+    CHECK(strlen(sock) < sizeof(address.sun_path));
+    if (strlen(sock) >= sizeof(address.sun_path)) return;
+    memcpy(address.sun_path, sock, strlen(sock) + 1U);
+    listener = socket(AF_UNIX, SOCK_STREAM, 0);
+    if (listener >= 0) (void)fcntl(listener, F_SETFD, FD_CLOEXEC);
+    CHECK(listener >= 0);
+    CHECK_EQ_INT(bind(listener, (struct sockaddr *)&address,
+                      sizeof(address)), 0);
+    CHECK_EQ_INT(listen(listener, 1), 0);
+
+    /* The sidecar names this process, but with a shifted start time: the
+     * recorded process is provably not the one that holds the PID now. The
+     * socket peer is filled in by hand: the bare listener above never
+     * accepts, and Darwin's peer inspection speaks the agent protocol over
+     * the connection before reading credentials, so it would time out. */
+    memset(&record, 0, sizeof(record));
+    record.pid = getpid();
+    CHECK_EQ_INT(ssh_manager_test_capture_process_generation(
+                     getpid(), &record.generation), 0);
+    record.generation.start_lo++;
+    /* Capture this process's own image rather than letting the seam look up
+     * an ssh-agent launch witness, which is outside the trusted PATH on the
+     * macOS runners. */
+    CHECK_EQ_INT(ssh_manager_test_capture_process_image(getpid(),
+                                                        &record.image), 0);
+    record.image.socket_peer_pid = getpid();
+    record.image.socket_peer_uid = geteuid();
+    dir_fd = open(dir, O_RDONLY | O_DIRECTORY | O_CLOEXEC);
+    CHECK(dir_fd >= 0);
+    CHECK_EQ_INT(ssh_manager_test_write_pid_sidecar(
+                     dir_fd, "ssh-agent.work.pid", &record), 0);
+    CHECK_EQ_INT(close(dir_fd), 0);
+
+#if !defined(__APPLE__)
+    /* Live socket: reset must refuse and leave the names and this process
+     * alone. Darwin classifies liveness through the same protocol probe, so
+     * a listener that never answers is not "live" there; the fail-closed
+     * half is covered by the real-agent suites on that platform. */
+    clear_error();
+    CHECK_EQ_INT(ssh_manager_reset("work"), -1);
+    CHECK(path_exists(pid_path));
+    CHECK(path_exists(sock));
+#endif
+
+    /* Dead socket: the recorded endpoint is retired and reset converges. */
+    CHECK_EQ_INT(close(listener), 0);
+    clear_error();
+    CHECK_EQ_INT(ssh_manager_reset("work"), 0);
+    CHECK(!path_exists(pid_path));
+    CHECK(!path_exists(sock));
+}
+
 TEST(process_generation_tolerates_bsd_boot_step_only) {
     ssh_process_generation_t base = {
         .kind = SSH_PROCESS_GENERATION_DARWIN,
@@ -1710,6 +1780,7 @@ TEST_MAIN_BEGIN()
      * needs is portable, so run it everywhere. */
     RUN_TEST(reset_reaps_real_recorded_agent);
     RUN_TEST(legacy_absolute_socket_arg_matches_through_symlinked_root);
+    RUN_TEST(replaced_generation_retires_dead_socket_but_keeps_live_socket);
     RUN_TEST(process_generation_tolerates_bsd_boot_step_only);
     RUN_TEST(process_image_capture_populates_absolute_path_for_self);
     RUN_TEST(process_image_capture_rejects_invalid_target);

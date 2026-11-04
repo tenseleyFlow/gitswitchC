@@ -2508,11 +2508,36 @@ static ssh_process_outcome_t reap_ssh_agent(
         return outcome;
     }
     if (open_errno == ESRCH) return SSH_PROCESS_GONE;
+    if (open_errno == ENOSYS || open_errno == EPERM) {
+        /* The fail-closed choice is deliberate (no pidfd means no
+         * race-free signal), but the generic "retained for retry" text
+         * never said why or what to do, and retrying cannot help here
+         * (AR-18 P13). Name the floor and the manual remedy once. */
+        static bool warned;
+
+        if (!warned) {
+            warned = true;
+            log_warning(
+                "pidfd_open is unavailable on this kernel (Linux 5.3+ without "
+                "a seccomp filter is required to stop isolated ssh-agents "
+                "safely); stop ssh-agent PID %ld by hand and rerun",
+                (long)record->pid);
+        }
+    }
     return SSH_PROCESS_INDETERMINATE;
 }
 
+/* Cleanup authority: the recorded process is conclusively not a live agent
+ * this tool owns. GONE and UNRELATED are the classic cases. REPLACED is
+ * included (AR-18 M9): a generation mismatch proves the recorded process no
+ * longer exists at that PID (one PID holds one process; boot id and start
+ * time are immutable), so it is exactly GONE for cleanup purposes, while the
+ * PID's current occupant must never be signaled (reap_ssh_agent returns
+ * REPLACED before any signal). Every caller still gates the actual unlink on
+ * the pinned dead-socket proof, so a live agent on the socket fails closed. */
 static bool ssh_reap_allows_cleanup(ssh_process_outcome_t outcome) {
-    return outcome == SSH_PROCESS_GONE || outcome == SSH_PROCESS_UNRELATED;
+    return outcome == SSH_PROCESS_GONE || outcome == SSH_PROCESS_UNRELATED ||
+           outcome == SSH_PROCESS_REPLACED;
 }
 
 static const char *ssh_process_outcome_name(ssh_process_outcome_t outcome) {
@@ -5144,7 +5169,8 @@ static int cleanup_stopped_agent_runtime(ssh_config_t *ssh_config) {
         bool retirement_attempted = false;
 
         if (!ssh_reap_allows_cleanup(reap_outcome) &&
-            reap_outcome == SSH_PROCESS_INDETERMINATE && socket_present) {
+            reap_outcome == SSH_PROCESS_INDETERMINATE &&
+            socket_present) {
             retirement_attempted = true;
             if (retire_recorded_agent_endpoint(
                     dir_fd, runtime_dir, socket_name,
@@ -12765,7 +12791,8 @@ int ssh_manager_reset(const char *account) {
         } else if (reachable) {
             set_error(ERR_SSH_AGENT_FAILED,
                       "Reachable SSH agent socket has no safely matched PID; "
-                      "retained for retry: %s", sock_path);
+                      "retained for retry. Stop the ssh-agent listening on this socket "
+                      "(or remove the socket) and rerun: %s", sock_path);
             failed = true;
             can_remove_runtime = false;
         }
@@ -12789,7 +12816,8 @@ int ssh_manager_reset(const char *account) {
         } else if (reachable) {
             set_error(ERR_SSH_AGENT_FAILED,
                       "Reachable SSH agent socket has no safely matched PID; "
-                      "retained for retry: %s", sock_path);
+                      "retained for retry. Stop the ssh-agent listening on this socket "
+                      "(or remove the socket) and rerun: %s", sock_path);
             failed = true;
             can_remove_runtime = false;
         }

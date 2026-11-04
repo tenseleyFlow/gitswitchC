@@ -1706,7 +1706,10 @@ TEST(status_ignores_stale_same_path_membership_in_both_ledger_orders) {
     m10_fixture_cleanup(&fixture);
 }
 
-TEST(stale_later_generation_is_preserved_after_all_record_preflight) {
+/* AR-18 M8: the fake runner reports this destination's owned values present
+ * exactly once after the generation changed, so the record is re-sealed from
+ * content and retired instead of refusing with "attributed values". */
+TEST(stale_later_generation_with_exact_values_is_resealed_and_retired) {
     m10_fixture_t fixture;
     command_runner_fn previous;
     char replaced[MAX_PATH_LEN];
@@ -1727,32 +1730,20 @@ TEST(stale_later_generation_is_preserved_after_all_record_preflight) {
                                 "[foreign]\nvalue = preserved\n"), 0);
     previous = run_set_runner(m10_retirement_runner);
     CHECK_EQ_INT(accounts_retire_git_identity(
-                     &fixture.ctx, &fixture.ctx.accounts[0], &cleared), -1);
+                     &fixture.ctx, &fixture.ctx.accounts[0], &cleared), 0);
     run_set_runner(previous);
-    CHECK_EQ_INT((long)cleared, (long)M10_KEY_COUNT);
+    CHECK_EQ_INT((long)cleared, 2L * (long)M10_KEY_COUNT);
     CHECK(m10_destination_cleared(0U));
-    CHECK(m10_destination_unchanged(1U));
+    CHECK(m10_destination_cleared(1U));
     CHECK_EQ_INT((long)m10_destinations[0].unsets, (long)M10_KEY_COUNT);
-    CHECK_EQ_INT((long)m10_destinations[1].unsets, 0);
+    CHECK_EQ_INT((long)m10_destinations[1].unsets, (long)M10_KEY_COUNT);
     CHECK(!m10_first_git_saw_preflight_failure);
-    CHECK(m10_error_contains("attributed values"));
-    CHECK(strstr(get_last_error()->details,
-                 "retirement summary") != NULL);
-    CHECK(strstr(get_last_error()->details,
-                 "cleared 4 key(s)") != NULL);
-    publication_ledger_init(&ledger);
-    CHECK_EQ_INT(config_load_publication_ledger(fixture.config_path,
-                                                &ledger), 0);
-    CHECK_EQ_INT((long)ledger.count, 2);
-    if (ledger.count == 2U) {
-        CHECK_EQ_INT(ledger.records[0].state, PUBLICATION_STATE_PUBLISHED);
-        CHECK_EQ_INT(ledger.records[1].state, PUBLICATION_STATE_PUBLISHED);
-    }
-    publication_ledger_clear(&ledger);
+    (void)ledger;
     m10_fixture_cleanup(&fixture);
 }
 
-TEST(stale_first_destination_does_not_block_later_valid_retirement) {
+/* AR-18 M8: same re-seal for a first destination whose generation changed. */
+TEST(stale_first_destination_with_exact_values_is_resealed_and_retired) {
     static const char replacement_contents[] =
         "[foreign]\nvalue = stale-first-preserved\n";
     m10_fixture_t fixture;
@@ -1775,18 +1766,15 @@ TEST(stale_first_destination_does_not_block_later_valid_retirement) {
 
     previous = run_set_runner(m10_retirement_runner);
     CHECK_EQ_INT(accounts_retire_git_identity(
-                     &fixture.ctx, &fixture.ctx.accounts[0], &cleared), -1);
+                     &fixture.ctx, &fixture.ctx.accounts[0], &cleared), 0);
     run_set_runner(previous);
-    CHECK_EQ_INT((long)cleared, (long)M10_KEY_COUNT);
-    CHECK(m10_destination_unchanged(0U));
+    CHECK_EQ_INT((long)cleared, 2L * (long)M10_KEY_COUNT);
+    CHECK(m10_destination_cleared(0U));
     CHECK(m10_destination_cleared(1U));
-    CHECK_EQ_INT((long)m10_destinations[0].unsets, 0);
+    CHECK_EQ_INT((long)m10_destinations[0].unsets, (long)M10_KEY_COUNT);
     CHECK_EQ_INT((long)m10_destinations[1].unsets, (long)M10_KEY_COUNT);
     CHECK(!m10_first_git_saw_preflight_failure);
     m10_check_exact_file_only();
-    CHECK(m10_error_contains("attributed values"));
-    CHECK(strstr(get_last_error()->details,
-                 "cleared 4 key(s)") != NULL);
     m10_fixture_cleanup(&fixture);
 }
 
@@ -2131,8 +2119,8 @@ TEST_MAIN_BEGIN()
     RUN_TEST(linked_repository_witnesses_share_one_local_config_retirement);
     RUN_TEST(status_selects_linked_repository_witness_independent_of_ledger_order);
     RUN_TEST(status_ignores_stale_same_path_membership_in_both_ledger_orders);
-    RUN_TEST(stale_later_generation_is_preserved_after_all_record_preflight);
-    RUN_TEST(stale_first_destination_does_not_block_later_valid_retirement);
+    RUN_TEST(stale_later_generation_with_exact_values_is_resealed_and_retired);
+    RUN_TEST(stale_first_destination_with_exact_values_is_resealed_and_retired);
     RUN_TEST(stale_locked_read_failure_cleans_artifacts_and_retry_succeeds);
     RUN_TEST(
         replaced_config_parent_preserves_replacement_and_retires_later_destination);

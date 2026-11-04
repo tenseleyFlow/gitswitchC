@@ -1767,30 +1767,35 @@ static void exercise_preterm_generation_mismatch(bool reset_all) {
     reset_generation_harness();
     g_observed_generation = replacement_generation();
     previous = ssh_manager_set_reap_test_ops(&ops);
-    CHECK_EQ_INT(ssh_manager_reset(reset_all ? NULL : "work"), -1);
+    /* AR-18 M9: a generation mismatch proves the recorded process is gone,
+     * so with a dead socket the endpoint is retired (never signaled) and
+     * reset converges instead of preserving the tuple forever. */
+    CHECK_EQ_INT(ssh_manager_reset(reset_all ? NULL : "work"), 0);
     ssh_manager_set_reap_test_ops(&previous);
 
     CHECK(g_generation_calls > 0);
     CHECK_EQ_INT(g_term_calls, 0);
     CHECK_EQ_INT(g_kill_calls, 0);
     CHECK_EQ_INT(g_presence_calls, 0);
-    CHECK(artifact_matches_snapshot(fixture.sidecar, &sidecar_before));
-    CHECK(artifact_matches_snapshot(fixture.socket, &socket_before));
-    CHECK(artifact_matches_snapshot(fixture.current, &current_before));
+    (void)sidecar_before;
+    (void)socket_before;
+    (void)current_before;
+    CHECK(!entry_exists(fixture.sidecar));
+    CHECK(!entry_exists(fixture.socket));
 
     if (g_pidfd_keepalive >= 0) {
         CHECK_EQ_INT(close(g_pidfd_keepalive), 0);
         g_pidfd_keepalive = -1;
     }
-    cleanup_retained_fixture(&fixture);
     close(fixture.dir_fd);
+    ts_rm_rf(fixture.xdg);
 }
 
-TEST(targeted_generation_mismatch_before_pidfd_preserves_retry_tuple) {
+TEST(targeted_generation_mismatch_before_pidfd_retires_dead_endpoint_unsignaled) {
     exercise_preterm_generation_mismatch(false);
 }
 
-TEST(reset_all_generation_mismatch_before_pidfd_preserves_retry_tuple) {
+TEST(reset_all_generation_mismatch_before_pidfd_retires_dead_endpoint_unsignaled) {
     exercise_preterm_generation_mismatch(true);
 }
 
@@ -1814,7 +1819,9 @@ TEST(generation_is_verified_before_pidfd_open_and_reverified_afterward) {
 
     reset_generation_harness();
     previous = ssh_manager_set_reap_test_ops(&ops);
-    CHECK_EQ_INT(ssh_manager_reset("work"), -1);
+    /* AR-18 M9: the re-verified generation mismatch is REPLACED, which now
+     * authorizes retiring the sidecar (no socket exists) without signaling. */
+    CHECK_EQ_INT(ssh_manager_reset("work"), 0);
     ssh_manager_set_reap_test_ops(&previous);
 
     CHECK(g_pidfd_open_saw_generation);
@@ -1822,13 +1829,14 @@ TEST(generation_is_verified_before_pidfd_open_and_reverified_afterward) {
     CHECK_EQ_INT(g_presence_calls, 2);
     CHECK_EQ_INT(g_term_calls, 0);
     CHECK_EQ_INT(g_kill_calls, 0);
-    CHECK(artifact_matches_snapshot(fixture.sidecar, &sidecar_before));
+    (void)sidecar_before;
+    CHECK(!entry_exists(fixture.sidecar));
     if (g_pidfd_keepalive >= 0) {
         CHECK_EQ_INT(close(g_pidfd_keepalive), 0);
         g_pidfd_keepalive = -1;
     }
-    cleanup_retained_fixture(&fixture);
     close(fixture.dir_fd);
+    ts_rm_rf(fixture.xdg);
 }
 
 TEST(pidfd_death_during_numeric_inspection_discards_replacement_result) {
@@ -4508,8 +4516,8 @@ TEST_MAIN_BEGIN()
     RUN_TEST(permission_denied_presence_probe_is_indeterminate);
     RUN_TEST(failed_pidfd_signal_retains_retry_sidecar);
     RUN_TEST(interrupted_pidfd_term_retries_and_esrch_cleans);
-    RUN_TEST(targeted_generation_mismatch_before_pidfd_preserves_retry_tuple);
-    RUN_TEST(reset_all_generation_mismatch_before_pidfd_preserves_retry_tuple);
+    RUN_TEST(targeted_generation_mismatch_before_pidfd_retires_dead_endpoint_unsignaled);
+    RUN_TEST(reset_all_generation_mismatch_before_pidfd_retires_dead_endpoint_unsignaled);
     RUN_TEST(generation_is_verified_before_pidfd_open_and_reverified_afterward);
     RUN_TEST(pidfd_death_during_numeric_inspection_discards_replacement_result);
     RUN_TEST(live_pidfd_rejects_contradictory_numeric_generation_gone);

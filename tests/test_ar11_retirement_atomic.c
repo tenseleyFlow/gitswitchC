@@ -5352,6 +5352,108 @@ TEST(forced_fallback_cleanup_failure_persists_marker_and_self_heals) {
 #endif
 }
 
+/* AR-18 M8: an ordinary foreign write after the sealing switch (git rewrites
+ * the file, so the generation changes while our values stay) must not make
+ * the retirement refuse forever; the record is re-sealed from its exact
+ * attributed values and the planner removes exactly those occurrences. */
+TEST(foreign_rewrite_after_seal_still_retires_exact_values) {
+    at_fixture_t fixture;
+    char observed[256];
+    size_t cleared = 99U;
+
+    CHECK_EQ_INT(at_fixture_init(&fixture, PUBLICATION_SCOPE_GLOBAL, true,
+                                 0640), 0);
+    /* A benign unrelated write changes the file generation. */
+    CHECK_EQ_INT(at_git_add(fixture.config_path, "alias.co", "checkout"), 0);
+    clear_error();
+    CHECK_EQ_INT(at_retire(&fixture, &cleared), 0);
+    CHECK_EQ_INT((long)cleared, (long)AT_KEY_COUNT);
+    at_check_foreign_survivors(&fixture);
+    CHECK_EQ_INT(at_git_get_all(fixture.config_path, "alias.co",
+                                observed, sizeof(observed)), 0);
+    CHECK_STR_EQ(observed, "checkout\n");
+    errno = 0;
+    CHECK(access(fixture.lock_path, F_OK) != 0 && errno == ENOENT);
+}
+
+/* AR-18 M8 (negative): a foreign rewrite that duplicates an owned value is
+ * ambiguous and stays refused without mutation. */
+TEST(foreign_duplicate_after_seal_is_still_refused_without_mutation) {
+    at_fixture_t fixture;
+    at_bytes_t before = {0};
+    size_t cleared = 99U;
+
+    CHECK_EQ_INT(at_fixture_init(&fixture, PUBLICATION_SCOPE_GLOBAL, false,
+                                 0640), 0);
+    CHECK_EQ_INT(at_git_add(fixture.config_path, GIT_CONFIG_CORE_SSHCOMMAND,
+                            fixture.ssh_command), 0);
+    CHECK_EQ_INT(at_read_bytes(fixture.config_path, &before), 0);
+    clear_error();
+    CHECK_EQ_INT(at_retire(&fixture, &cleared), -1);
+    CHECK_EQ_INT((long)cleared, 0);
+    CHECK(at_file_equals_bytes(fixture.config_path, &before));
+    errno = 0;
+    CHECK(access(fixture.lock_path, F_OK) != 0 && errno == ENOENT);
+    at_bytes_clear(&before);
+}
+
+/* AR-18 M7: refusals that mutate nothing must be classified UNCHANGED_CLEAN
+ * so the caller clears the retirement guard it just created, instead of
+ * MUTATED_OR_UNCERTAIN, which retained the guard and bricked switch/resume
+ * with a retry hint that failed identically. Two cases: a stale-generation
+ * group refused before it entered the namespace, and an attribution
+ * conflict found in the immutable snapshot. */
+static void at_run_zero_mutation_refusal(bool reseal_after_duplicate) {
+    at_fixture_t fixture;
+    at_bytes_t before = {0};
+    git_retirement_transaction_t *transaction = NULL;
+    git_retirement_failed_publish_outcome_t outcome =
+        GIT_RETIREMENT_FAILED_PUBLISH_MUTATED_OR_UNCERTAIN;
+    const account_t *accounts[1];
+    const publication_record_t *publications[1];
+    size_t cleared = 99U;
+
+    CHECK_EQ_INT(at_fixture_init(&fixture, PUBLICATION_SCOPE_GLOBAL, false,
+                                 0640), 0);
+    CHECK_EQ_INT(at_git_add(fixture.config_path, GIT_CONFIG_CORE_SSHCOMMAND,
+                            fixture.ssh_command), 0);
+    if (reseal_after_duplicate) {
+        /* Sealed with the duplicate: not stale, but an attribution
+         * conflict in the snapshot. */
+        CHECK_EQ_INT(at_refresh_publication(&fixture), 0);
+    }
+    CHECK_EQ_INT(at_read_bytes(fixture.config_path, &before), 0);
+    accounts[0] = &fixture.account;
+    publications[0] = &fixture.publication;
+    clear_error();
+    CHECK_EQ_INT(git_retirement_transaction_prepare(
+                     accounts, publications, 1U, &transaction), 0);
+    CHECK(transaction != NULL);
+    if (transaction) {
+        clear_error();
+        CHECK_EQ_INT(git_retirement_transaction_publish(
+                         transaction, &cleared), -1);
+        CHECK_EQ_INT((long)cleared, 0);
+        CHECK_EQ_INT(git_retirement_transaction_dispose_failed_publish(
+                         &transaction, &outcome), 0);
+        CHECK_EQ_INT(outcome,
+                     GIT_RETIREMENT_FAILED_PUBLISH_UNCHANGED_CLEAN);
+    }
+    CHECK(transaction == NULL);
+    CHECK(at_file_equals_bytes(fixture.config_path, &before));
+    errno = 0;
+    CHECK(access(fixture.lock_path, F_OK) != 0 && errno == ENOENT);
+    at_bytes_clear(&before);
+}
+
+TEST(stale_refusal_before_namespace_entry_is_unchanged_clean) {
+    at_run_zero_mutation_refusal(false);
+}
+
+TEST(attribution_conflict_refusal_is_unchanged_clean) {
+    at_run_zero_mutation_refusal(true);
+}
+
 TEST_MAIN_BEGIN()
     error_init(LOG_LEVEL_WARNING, NULL);
     RUN_TEST(global_exact_retirement_preserves_ordered_foreign_values);
@@ -5359,6 +5461,10 @@ TEST_MAIN_BEGIN()
     RUN_TEST(cleanup_arena_stragglers_are_swept_before_the_next_mutation);
     RUN_TEST(forced_unsupported_noreplace_fallback_retires_cleanly);
     RUN_TEST(forced_fallback_cleanup_failure_persists_marker_and_self_heals);
+    RUN_TEST(foreign_rewrite_after_seal_still_retires_exact_values);
+    RUN_TEST(foreign_duplicate_after_seal_is_still_refused_without_mutation);
+    RUN_TEST(stale_refusal_before_namespace_entry_is_unchanged_clean);
+    RUN_TEST(attribution_conflict_refusal_is_unchanged_clean);
     RUN_TEST(local_exact_retirement_preserves_ordered_foreign_values);
     RUN_TEST(worktree_exact_retirement_preserves_ordered_foreign_values);
     RUN_TEST(duplicate_identical_owned_value_conflicts_without_mutation);
