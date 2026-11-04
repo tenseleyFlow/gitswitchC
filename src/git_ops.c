@@ -1299,7 +1299,6 @@ static int git_read_snapshot_listing(git_scope_t scope, bool includes,
          * safe here: any stderr on a successful binary listing makes parsing
          * fail closed instead of being silently discarded. */
         opts.merge_stderr = true;
-    opts.unset_env = g_git_child_unset_env;
         opts.unset_env = g_git_child_unset_env;
         opts.extra_env = diagnostic_env;
         observation.argv = argv;
@@ -15369,7 +15368,6 @@ static int git_unset_config_value_impl(const char *key, git_scope_t scope,
         opts.out = output;
         opts.out_size = sizeof(output);
         opts.merge_stderr = true;
-    opts.unset_env = g_git_child_unset_env;
         opts.unset_env = g_git_child_unset_env;
         run_argv(argv, &opts, &res);
         {
@@ -15451,7 +15449,6 @@ int git_list_config(git_scope_t scope, char *output, size_t output_size) {
         opts.out = output;
         opts.out_size = output_size;
         opts.merge_stderr = true;
-    opts.unset_env = g_git_child_unset_env;
         opts.unset_env = g_git_child_unset_env;
         if (run_argv(argv, &opts, &result) != 0) {
             set_error(ERR_GIT_CONFIG_FAILED,
