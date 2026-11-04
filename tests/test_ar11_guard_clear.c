@@ -3580,9 +3580,9 @@ TEST_MAIN_BEGIN()
     RUN_TEST(prepared_settled_arena_exhaustion_fails_before_stage);
     RUN_TEST(prepared_slot_replacement_after_move_is_preserved);
     RUN_TEST(interrupted_slot_move_consumes_slot_and_retry_uses_next);
+#endif
     RUN_TEST(forced_portable_publication_cycles_install_and_clear_repeatedly);
     RUN_TEST(install_over_exact_pair_never_leaves_the_marker_absent);
-#endif
     RUN_TEST(
         prepare_clear_sync_failure_retains_blocking_stage_and_retries);
     RUN_TEST(
