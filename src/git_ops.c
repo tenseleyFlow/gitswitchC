@@ -321,7 +321,8 @@ typedef enum {
     GIT_RETIREMENT_TEST_AFTER_PRELOCK_WITNESS,
     GIT_RETIREMENT_TEST_AFTER_STABLE_WITNESS_CLOSE,
     GIT_RETIREMENT_TEST_AFTER_RESTORED_WITNESS_READ,
-    GIT_RETIREMENT_TEST_AFTER_FINAL_RESTORED_WITNESS_READ
+    GIT_RETIREMENT_TEST_AFTER_FINAL_RESTORED_WITNESS_READ,
+    GIT_RETIREMENT_TEST_BEFORE_CLEANUP_RECLAIM
 } git_retirement_test_stage_t;
 typedef bool (*git_retirement_test_hook_fn)(
     git_retirement_test_stage_t stage, const char *path,
@@ -3431,11 +3432,81 @@ static int git_cleanup_arena_slot_names(
 #endif
 
 /* Each canonical lock leaf owns an exact, finite v2 arena. Pending entries
- * fail closed only for that leaf. Settled entries are untrusted inert
- * namespace residue: they are never inspected, deleted, reused, or
- * overwritten automatically. Requiring a complete-handle budget before
- * canonical mutation makes later cleanup bounded while the canonical
+ * fail closed only for that leaf. Settled entries are inert namespace
+ * residue: no recovery path ever reads one, so the arena is transient. The
+ * process that settles an entry reclaims it by identity immediately
+ * (git_cleanup_arena_reclaim_settled_at), and any straggler a crash or a
+ * pre-AR-18 build left behind is swept before the next canonical mutation
+ * (git_cleanup_arena_sweep_settled). Requiring a complete-handle budget
+ * before canonical mutation keeps cleanup bounded while the canonical
  * lock/marker serializes cooperative reservations. */
+#if !defined(__FreeBSD__)
+/* Delete the settled slot this process just created and proved, while its
+ * live identity still equals the witness (AR-18 M1, mirroring AR-15 H1 in
+ * config.c). Deletion failure is non-fatal: the canonical retirement already
+ * committed and the straggler is swept on the next acquisition. */
+static void git_cleanup_arena_reclaim_settled_at(
+    int dir_fd, const char *settled, int witness_fd) {
+    struct stat now;
+    struct stat witness;
+    int fd;
+
+    if (dir_fd < 0 || !settled || witness_fd < 0) return;
+    fd = openat(dir_fd, settled,
+                O_RDONLY | O_CLOEXEC | O_NOFOLLOW | O_NONBLOCK);
+    if (fd < 0) return;
+    if (fstat(fd, &now) == 0 && fstat(witness_fd, &witness) == 0 &&
+        S_ISREG(now.st_mode) && now.st_dev == witness.st_dev &&
+        now.st_ino == witness.st_ino) {
+        (void)unlinkat(dir_fd, settled, 0);
+    }
+    (void)close(fd);
+}
+
+/* Sweep settled slots of this leaf that no live process is reproving: a
+ * crash between settle and reclaim, a reclaim that failed silently, or a
+ * v1.9.x build that never reclaimed at all. A slot is deleted only when it
+ * is a regular file owned by this user with a single link; anything else is
+ * left in place and still counts against the budget. The caller holds the
+ * occupancy bitmap from a fresh scan and never deletes a pending entry. */
+static void git_cleanup_arena_sweep_settled(
+    int dir_fd, const char *leaf,
+    uint64_t occupied[GIT_CLEANUP_ARENA_WORDS],
+    size_t *occupied_count) {
+    char pending[NAME_MAX + 1U];
+    char settled[NAME_MAX + 1U];
+    bool swept = false;
+
+    if (dir_fd < 0 || !leaf || !occupied || !occupied_count) return;
+    for (size_t slot = 0U; slot < g_cleanup_arena_capacity; slot++) {
+        uint64_t mask = UINT64_C(1) <<
+                        (slot % GIT_CLEANUP_ARENA_WORD_BITS);
+        struct stat now;
+        int fd;
+
+        if ((occupied[slot / GIT_CLEANUP_ARENA_WORD_BITS] & mask) == 0U) {
+            continue;
+        }
+        if (git_cleanup_arena_slot_names(
+                leaf, slot, pending, settled) != 0) {
+            return;
+        }
+        fd = openat(dir_fd, settled,
+                    O_RDONLY | O_CLOEXEC | O_NOFOLLOW | O_NONBLOCK);
+        if (fd < 0) continue;
+        if (fstat(fd, &now) == 0 && S_ISREG(now.st_mode) &&
+            now.st_uid == geteuid() && now.st_nlink == 1 &&
+            unlinkat(dir_fd, settled, 0) == 0) {
+            occupied[slot / GIT_CLEANUP_ARENA_WORD_BITS] &= ~mask;
+            if (*occupied_count > 0U) (*occupied_count)--;
+            swept = true;
+        }
+        (void)close(fd);
+    }
+    if (swept) (void)fsync(dir_fd);
+}
+#endif
+
 static int git_cleanup_arena_scan(
     int dir_fd, const char *leaf,
     uint64_t occupied[GIT_CLEANUP_ARENA_WORDS],
@@ -3532,6 +3603,12 @@ static int git_cleanup_arena_require_budget(
             dir_fd, leaf, occupied, &occupied_count) != 0) {
         return -1;
     }
+#if !defined(__FreeBSD__)
+    if (occupied_count > 0U) {
+        git_cleanup_arena_sweep_settled(
+            dir_fd, leaf, occupied, &occupied_count);
+    }
+#endif
     if (g_cleanup_arena_capacity - occupied_count < required) {
         errno = ENOSPC;
         return -1;
@@ -3636,7 +3713,22 @@ static git_cleanup_result_t git_scope_lock_quarantine_name_once(
                 lock->dir_fd, settled, witness_fd, witness_stat,
                 witness_data, witness_length, NULL)) {
             int mismatch_errno = errno ? errno : ESTALE;
+            struct stat gone;
 
+            /* The proven inode was moved onto a slot this process chose
+             * and no-replace renamed. If both the settled and the pending
+             * names are now absent, a cooperating sweep (another gitswitch
+             * acquiring the same leaf) already reclaimed it: the name is
+             * retired exactly as if this process had done so. */
+            if (mismatch_errno == ENOENT &&
+                fstatat(lock->dir_fd, settled, &gone,
+                        AT_SYMLINK_NOFOLLOW) != 0 &&
+                errno == ENOENT &&
+                fstatat(lock->dir_fd, pending, &gone,
+                        AT_SYMLINK_NOFOLLOW) != 0 &&
+                errno == ENOENT) {
+                goto reclaimed;
+            }
             moved = git_rename_noreplace_at(
                 lock->dir_fd, settled, pending);
             if (moved != GIT_NOREPLACE_MOVE_OK) {
@@ -3646,7 +3738,18 @@ static git_cleanup_result_t git_scope_lock_quarantine_name_once(
             errno = mismatch_errno;
             return GIT_CLEANUP_FOREIGN;
         }
+        /* The settled slot is this process's proven inode under a private
+         * name no recovery path reads; delete it now so the arena stays
+         * transient (AR-18 M1). The hook models a crash in this window. */
+        if (!(g_retirement_test_hook &&
+              g_retirement_test_hook(
+                  GIT_RETIREMENT_TEST_BEFORE_CLEANUP_RECLAIM,
+                  lock->path, leaf, settled))) {
+            git_cleanup_arena_reclaim_settled_at(
+                lock->dir_fd, settled, witness_fd);
+        }
     }
+reclaimed:
     if (fsync(lock->dir_fd) != 0) {
         if (saved_errno == EAGAIN) saved_errno = errno ? errno : EIO;
     }

@@ -57,7 +57,8 @@ typedef enum {
     GIT_RETIREMENT_TEST_AFTER_PRELOCK_WITNESS,
     GIT_RETIREMENT_TEST_AFTER_STABLE_WITNESS_CLOSE,
     GIT_RETIREMENT_TEST_AFTER_RESTORED_WITNESS_READ,
-    GIT_RETIREMENT_TEST_AFTER_FINAL_RESTORED_WITNESS_READ
+    GIT_RETIREMENT_TEST_AFTER_FINAL_RESTORED_WITNESS_READ,
+    GIT_RETIREMENT_TEST_BEFORE_CLEANUP_RECLAIM
 } git_retirement_test_stage_t;
 typedef bool (*git_retirement_test_hook_fn)(
     git_retirement_test_stage_t stage, const char *path,
@@ -160,6 +161,7 @@ typedef enum {
     AT_HOOK_FAIL_AFTER_FALLBACK_UNLINK,
     AT_HOOK_FAIL_FALLBACK_LINK,
     AT_HOOK_FAIL_AFTER_FALLBACK_LINK,
+    AT_HOOK_SKIP_CLEANUP_RECLAIM,
     AT_HOOK_FAIL_AFTER_REVERSE_UNLINK,
     AT_HOOK_EXIT_AFTER_TERMINAL_AUTHORITY_SYNC,
     AT_HOOK_EXIT_AFTER_TERMINAL_CANONICAL_SYNC,
@@ -1466,6 +1468,14 @@ static bool at_retirement_hook(git_retirement_test_stage_t stage,
                                const char *value) {
     char lock_path[MAX_PATH_LEN];
 
+    if (at_hook_mode == AT_HOOK_SKIP_CLEANUP_RECLAIM &&
+        stage == GIT_RETIREMENT_TEST_BEFORE_CLEANUP_RECLAIM) {
+        /* Model a crash between settling an arena slot and reclaiming it:
+         * the retirement still succeeds, the slot is left as a straggler. */
+        at_hook_attempts++;
+        at_hook_observed = true;
+        return true;
+    }
     if ((at_hook_mode == AT_HOOK_FAIL_TARGET_PRELOCK ||
          at_hook_mode == AT_HOOK_FAIL_TARGET_PRELOCK_AND_CLEANUP) &&
         stage == GIT_RETIREMENT_TEST_AFTER_PRELOCK_WITNESS && path &&
@@ -4207,11 +4217,7 @@ TEST(terminal_rollback_marker_release_preserves_raced_foreign_bytes) {
 #endif
     CHECK_EQ_INT((long)at_count_stage_artifacts(fixture.root), 0);
     CHECK_EQ_INT((long)at_count_recovery_artifacts(fixture.root), 0);
-#if defined(__FreeBSD__)
     CHECK_EQ_INT((long)at_count_cleanup_artifacts(fixture.root), 0);
-#else
-    CHECK(at_count_cleanup_artifacts(fixture.root) >= 1U);
-#endif
     errno = 0;
     CHECK(access(fixture.replacement_path, F_OK) != 0 &&
           errno == ENOENT);
@@ -4519,7 +4525,6 @@ TEST(postproof_quarantine_replacement_is_preserved_and_blocks_reuse) {
     CHECK(at_file_equals_bytes(fixture.config_path, &original));
     cleanup_before = at_count_cleanup_artifacts(fixture.root);
     CHECK(cleanup_before != SIZE_MAX);
-    CHECK(cleanup_before >= 1U);
 
     CHECK_EQ_INT(at_write_file_bytes(
                      fixture.replacement_path, foreign_quarantine,
@@ -4732,7 +4737,6 @@ TEST(settled_terminal_marker_residue_allows_two_fresh_retirements) {
     CHECK(at_file_equals_bytes(fixture.config_path, &original));
     cleanup_after_finish = at_count_cleanup_artifacts(fixture.root);
     CHECK(cleanup_after_finish != SIZE_MAX);
-    CHECK(cleanup_after_finish >= 1U);
 
     fixture.publication.post_config = exported_identity;
     cleared = 99U;
@@ -4822,11 +4826,7 @@ TEST(terminal_preledger_stage_cleanup_preserves_raced_foreign_bytes) {
 #else
     CHECK_EQ_INT((long)at_count_recovery_artifacts(fixture.root), 0);
 #endif
-#if defined(__FreeBSD__)
     CHECK_EQ_INT((long)at_count_cleanup_artifacts(fixture.root), 0);
-#else
-    CHECK(at_count_cleanup_artifacts(fixture.root) >= 1U);
-#endif
     errno = 0;
     CHECK(access(fixture.replacement_path, F_OK) != 0 &&
           errno == ENOENT);
@@ -4838,11 +4838,7 @@ TEST(terminal_preledger_stage_cleanup_preserves_raced_foreign_bytes) {
     CHECK(at_file_equals_bytes(recovery_path, &retained_marker));
     CHECK(at_file_equals_bytes(fixture.config_path, &original));
     CHECK_EQ_INT((long)at_count_stage_artifacts(fixture.root), 1);
-#if defined(__FreeBSD__)
     CHECK_EQ_INT((long)at_count_cleanup_artifacts(fixture.root), 0);
-#else
-    CHECK(at_count_cleanup_artifacts(fixture.root) >= 1U);
-#endif
 
 cleanup:
     at_clear_hook();
@@ -5032,11 +5028,10 @@ cleanup:
     at_bytes_clear(&neighbor_before);
 }
 
-TEST(finite_cleanup_arena_has_exact_happy_path_residue) {
-#if defined(__FreeBSD__)
-    TS_SKIP("persistent-fs",
-            "FreeBSD removes owned names with descriptor-conditioned funlinkat");
-#else
+/* AR-18 M1: before this fix the happy path left exactly two settled slots
+ * (stage + canonical lock) per retirement forever; the arena is now
+ * transient, so a clean retirement leaves none. */
+TEST(finite_cleanup_arena_is_transient_on_happy_path) {
     at_fixture_t fixture;
     size_t previous_capacity =
         git_ops_test_set_cleanup_arena_capacity(8U);
@@ -5047,9 +5042,8 @@ TEST(finite_cleanup_arena_has_exact_happy_path_residue) {
     CHECK_EQ_INT((long)at_count_cleanup_artifacts(fixture.root), 0);
     CHECK_EQ_INT(at_retire(&fixture, &cleared), 0);
     CHECK_EQ_INT((long)cleared, (long)AT_KEY_COUNT);
-    CHECK_EQ_INT((long)at_count_cleanup_artifacts(fixture.root), 2);
+    CHECK_EQ_INT((long)at_count_cleanup_artifacts(fixture.root), 0);
     git_ops_test_set_cleanup_arena_capacity(previous_capacity);
-#endif
 }
 
 TEST(settled_slot_collision_preserves_both_entries_and_blocks_reuse) {
@@ -5141,6 +5135,11 @@ TEST(cleanup_arena_exhaustion_precedes_canonical_mutation) {
                      fixture.root, lock_leaf, false, 0U,
                      settled_path, sizeof(settled_path)), 0);
     CHECK_EQ_INT(at_write_file(settled_path, occupied, 0600), 0);
+    /* AR-18 M1 sweeps single-link settled slots owned by this user before
+     * mutation. A multi-link slot is not provably inert residue, so it is
+     * preserved and still counts against the budget: give the seeded slot a
+     * second link so the exhaustion contract is exercised, not the sweep. */
+    CHECK_EQ_INT(link(settled_path, fixture.replacement_path), 0);
 
     clear_error();
     errno = 0;
@@ -5182,7 +5181,9 @@ TEST(cleanup_arena_pending_association_isolates_other_lock_leaf) {
     CHECK_EQ_INT(at_retire(&fixture, &cleared), 0);
     CHECK_EQ_INT((long)cleared, (long)AT_KEY_COUNT);
     CHECK(at_file_equals_text(pending_path, other_pending));
-    CHECK_EQ_INT((long)at_count_cleanup_artifacts(fixture.root), 3);
+    /* Only the other leaf's pending residue remains: this leaf's own
+     * settled slots are reclaimed on the happy path (AR-18 M1). */
+    CHECK_EQ_INT((long)at_count_cleanup_artifacts(fixture.root), 1);
 
     git_ops_test_set_cleanup_arena_capacity(previous_capacity);
 #endif
@@ -5205,9 +5206,62 @@ TEST(successful_publication_preserves_nondefault_file_mode) {
     at_check_owned_absent(&fixture);
 }
 
+/* Re-publish the owned values after a retirement so the same fixture can
+ * be retired again. */
+static int at_republish_owned(at_fixture_t *fixture) {
+    for (int key = 0; key < AT_KEY_COUNT; key++) {
+        if (at_git_add(fixture->config_path, at_keys[key],
+                       at_owned_value(fixture, (enum at_key_index)key)) != 0) {
+            return -1;
+        }
+    }
+    return at_refresh_publication(fixture);
+}
+
+/* AR-18 M1: a mixed-value retirement (foreign survivors on both sides of
+ * every owned value) leaves no cleanup arena residue either. */
+TEST(clean_mixed_retirement_leaves_no_cleanup_arena_residue) {
+    at_fixture_t fixture;
+    size_t cleared = 0U;
+
+    CHECK_EQ_INT(at_fixture_init(&fixture, PUBLICATION_SCOPE_GLOBAL, true,
+                                 0640), 0);
+    CHECK_EQ_INT(at_retire(&fixture, &cleared), 0);
+    CHECK_EQ_INT((long)cleared, (long)AT_KEY_COUNT);
+    at_check_foreign_survivors(&fixture);
+    CHECK_EQ_INT((long)at_count_cleanup_artifacts(fixture.root), 0);
+}
+
+/* AR-18 M1: slots a crash left between settle and reclaim (and the slots
+ * every v1.9.x build left) are swept before the next canonical mutation. */
+TEST(cleanup_arena_stragglers_are_swept_before_the_next_mutation) {
+    at_fixture_t fixture;
+    size_t cleared = 0U;
+
+    CHECK_EQ_INT(at_fixture_init(&fixture, PUBLICATION_SCOPE_GLOBAL, false,
+                                 0600), 0);
+    at_install_hook(&fixture, AT_HOOK_SKIP_CLEANUP_RECLAIM, NULL);
+    CHECK_EQ_INT(at_retire(&fixture, &cleared), 0);
+    at_clear_hook();
+    CHECK_EQ_INT((long)cleared, (long)AT_KEY_COUNT);
+#if !defined(__FreeBSD__)
+    /* The modeled crash leaves one settled slot per retired owned name
+     * (the stage and the canonical lock). */
+    CHECK(at_hook_observed);
+    CHECK(at_count_cleanup_artifacts(fixture.root) >= 1U);
+#endif
+    CHECK_EQ_INT(at_republish_owned(&fixture), 0);
+    CHECK_EQ_INT(at_retire(&fixture, &cleared), 0);
+    CHECK_EQ_INT((long)cleared, (long)AT_KEY_COUNT);
+    at_check_owned_absent(&fixture);
+    CHECK_EQ_INT((long)at_count_cleanup_artifacts(fixture.root), 0);
+}
+
 TEST_MAIN_BEGIN()
     error_init(LOG_LEVEL_WARNING, NULL);
     RUN_TEST(global_exact_retirement_preserves_ordered_foreign_values);
+    RUN_TEST(clean_mixed_retirement_leaves_no_cleanup_arena_residue);
+    RUN_TEST(cleanup_arena_stragglers_are_swept_before_the_next_mutation);
     RUN_TEST(local_exact_retirement_preserves_ordered_foreign_values);
     RUN_TEST(worktree_exact_retirement_preserves_ordered_foreign_values);
     RUN_TEST(duplicate_identical_owned_value_conflicts_without_mutation);
@@ -5282,7 +5336,7 @@ TEST_MAIN_BEGIN()
     RUN_TEST(terminal_preledger_stage_cleanup_preserves_raced_foreign_bytes);
     RUN_TEST(partial_terminal_disposal_preserves_settled_recovery_marker);
     RUN_TEST(absent_recorded_destination_retires_without_recreation);
-    RUN_TEST(finite_cleanup_arena_has_exact_happy_path_residue);
+    RUN_TEST(finite_cleanup_arena_is_transient_on_happy_path);
     RUN_TEST(settled_slot_collision_preserves_both_entries_and_blocks_reuse);
     RUN_TEST(cleanup_arena_exhaustion_precedes_canonical_mutation);
     RUN_TEST(cleanup_arena_pending_association_isolates_other_lock_leaf);
