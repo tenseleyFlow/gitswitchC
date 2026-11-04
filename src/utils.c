@@ -5632,7 +5632,7 @@ static int run_argv_real_impl(
                                        ? script_launch.script_argv
                                        : (char *const *)argv;
 #ifdef GITSWITCH_TESTING
-        runner_trace("worker %ld exec stage: %s\n", (long)getpid(), exec_path ? exec_path : "?");
+        runner_trace("worker %ld exec stage: %s\n", (long)getpid(), exec_path);
 #endif
 
 #if defined(__linux__) || defined(__FreeBSD__)
