@@ -15773,11 +15773,14 @@ static int git_configure_ssh_impl(const account_t *account,
     }
 
     /* The command references the private alias config: publish that file
-     * before the Git value that points at it (AR-18 M12). */
+     * before the Git value that points at it (AR-18 M12). Library callers
+     * and fixtures reach this without config_init having created the
+     * configuration directory, so make sure it exists first. */
     if (account->ssh_host_alias[0] != '\0') {
         char alias_config[MAX_PATH_LEN];
 
-        if (git_ssh_alias_config_path(account, alias_config,
+        if (ensure_config_directory_exists() != 0 ||
+            git_ssh_alias_config_path(account, alias_config,
                                       sizeof(alias_config)) != 0 ||
             git_ssh_alias_config_publish(account, alias_config) != 0) {
             set_system_error(ERR_FILE_IO,
