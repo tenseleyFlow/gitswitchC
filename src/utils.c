@@ -3978,6 +3978,11 @@ static void runner_signal_child(pid_t pid, bool group_proven,
 
 static void runner_accept_group_relay(pid_t pid, bool group_proven,
                                       int signal_number) {
+#ifdef GITSWITCH_TESTING
+    if (getenv("GITSWITCH_RUNNER_TRACE")) fprintf(stderr,
+            "runner relayed group signal: signal=%d pid=%ld group_proven=%d\n",
+            signal_number, (long)pid, group_proven ? 1 : 0);
+#endif
     if (signal_number == SIGTSTP) {
         /* A separate foreground pgrp cannot leave both supervisor and worker
          * stopped or the background parent would wait forever. Full shell
