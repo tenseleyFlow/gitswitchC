@@ -1460,8 +1460,10 @@ TEST(replaced_generation_retires_dead_socket_but_keeps_live_socket) {
     memset(&address, 0, sizeof(address));
     address.sun_family = AF_UNIX;
     CHECK(strlen(sock) < sizeof(address.sun_path));
-    (void)snprintf(address.sun_path, sizeof(address.sun_path), "%s", sock);
-    listener = socket(AF_UNIX, SOCK_STREAM | SOCK_CLOEXEC, 0);
+    if (strlen(sock) >= sizeof(address.sun_path)) return;
+    memcpy(address.sun_path, sock, strlen(sock) + 1U);
+    listener = socket(AF_UNIX, SOCK_STREAM, 0);
+    if (listener >= 0) (void)fcntl(listener, F_SETFD, FD_CLOEXEC);
     CHECK(listener >= 0);
     CHECK_EQ_INT(bind(listener, (struct sockaddr *)&address,
                       sizeof(address)), 0);
