@@ -121,6 +121,12 @@ int publication_record_verify_live_destination(
     const publication_record_t **live_generation);
 bool publication_record_same_destination(const publication_record_t *left,
                                          const publication_record_t *right);
+/* Pure function of the stored bytes: scope, lexically normalized spellings
+ * and captured identities agree. Ledger integrity (parse/serialize/lookup
+ * duplicate detection) uses this; physical equivalence is reserved for
+ * upsert replacement matching and lookup queries. */
+bool publication_record_same_stored_destination(
+    const publication_record_t *left, const publication_record_t *right);
 /* Retained for source compatibility with the v1 publication-ledger API.
  * A live filesystem observation cannot prove that a recorded destination was
  * permanently deleted: ENOENT and changed identity are both reproducible by
