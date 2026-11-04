@@ -1,6 +1,6 @@
 # bash completion for gitswitch
 #
-# Completes subcommands, options, and — for the switch/edit/remove positions —
+# Completes subcommands, options, and — for the switch/edit/remove/reset positions —
 # the live account names reported by `gitswitch --names list`.
 #
 # NOTE: account names may contain spaces, parentheses, and other shell

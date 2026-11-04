@@ -96,8 +96,8 @@ complete -c gitswitch -f -n '__gitswitch_state command' -a doctor -d 'Run local 
 complete -c gitswitch -f -n '__gitswitch_state command' -a health -d 'Run local configuration/key readiness checks'
 complete -c gitswitch -f -n '__gitswitch_state command' -a config -d 'Show configuration file information'
 complete -c gitswitch -f -n '__gitswitch_state command' -a init   -d 'Emit shell integration'
-complete -c gitswitch -f -n '__gitswitch_state command' -a resume -d 'Re-activate the last-used account'
-complete -c gitswitch -f -n '__gitswitch_state command' -a reset  -d 'Kill agents and delete isolated state'
+complete -c gitswitch -f -n '__gitswitch_state command' -a resume -d 'Restore saved SSH/GPG state, or reconcile an incomplete switch'
+complete -c gitswitch -f -n '__gitswitch_state command' -a reset  -d 'Retire isolated GPG/SSH state and the Git identity it published'
 complete -c gitswitch -f -n '__gitswitch_state command' -a switch -d 'Switch to an account explicitly'
 
 # Bare account names in the command position and exactly one account operand

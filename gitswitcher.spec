@@ -75,7 +75,7 @@ make test BUILD_TYPE=release READLINE=1 VERSION=%{version} COMMIT=rpm
 %files
 %license LICENSE
 # AR-06 F40: %doc owns the platform-canonical docdir tree it installs README
-# into (commonly %{name} or %{name}-%{version}), so the containing directory is
+# into (commonly %%{name} or %%{name}-%{version}), so the containing directory is
 # no longer unowned (the prior manual install + bare file listing left it out).
 %doc README.md
 %{_bindir}/gitswitch
@@ -145,7 +145,7 @@ make test BUILD_TYPE=release READLINE=1 VERSION=%{version} COMMIT=rpm
 - Fix: replace the interactive signing self-test with a non-interactive capability check (no PIN, no pinentry dependency).
 - Change: isolated GPG homes now persist and are reused rather than deleted, so a shell pointed at the stable GNUPGHOME is never orphaned.
 
-* Thu May 29 2026 mfw <espadonne@outlook.com> - 1.4.0-1
+* Fri May 29 2026 mfw <espadonne@outlook.com> - 1.4.0-1
 - Build: VERSION file is now the single source of truth for the binary version stamp.
 - Build: drop the stale gitswitch.spec; gitswitcher.spec is the sole maintained spec.
 
@@ -158,7 +158,7 @@ make test BUILD_TYPE=release READLINE=1 VERSION=%{version} COMMIT=rpm
 - Feature: `--ssh-agent-info` compat alias auto-detects shell from $SHELL for Python-era rc files
 - Fix: silence spurious "Failed to get terminal size" stderr when stdout is piped/command-substituted
 
-* Tue Jan 07 2026 mfw <espadonne@outlook.com> - 1.1.9-1
+* Wed Jan 07 2026 mfw <espadonne@outlook.com> - 1.1.9-1
 - Fix: Use WARNING log level for release builds (was INFO)
 - Fix: Silence error logs for missing optional config fields
 - Fix: Improve SSH connection testing for git hosting services
