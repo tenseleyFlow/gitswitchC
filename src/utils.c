@@ -6285,6 +6285,13 @@ static int run_argv_real_impl(
                 }
                 if (observed.si_code != CLD_EXITED ||
                     observed.si_status != 0) {
+#ifdef GITSWITCH_TESTING
+                    if (getenv("GITSWITCH_RUNNER_TRACE")) fprintf(stderr,
+                            "runner supervisor ended abnormally: si_code=%d "
+                            "si_status=%d errno=%d\n",
+                            (int)observed.si_code, (int)observed.si_status,
+                            errno);
+#endif
                     runner_signal_child(pid, group_proven, SIGKILL);
                 }
                 if (outfd >= 0) {
@@ -6356,6 +6363,17 @@ static int run_argv_real_impl(
 
     if (deadline_expired || deadline_clock_failed || child_status_rc != 0 ||
         io_failed || input_failed || output_stalled || wait_failed) {
+#ifdef GITSWITCH_TESTING
+        if (getenv("GITSWITCH_RUNNER_TRACE")) fprintf(stderr,
+                "runner kill: deadline=%d clock=%d child_status_rc=%d "
+                "stage=%d child_errno=%d io=%d/%d input=%d stalled=%d "
+                "wait=%d/%d errno=%d\n",
+                deadline_expired ? 1 : 0, deadline_clock_failed ? 1 : 0,
+                child_status_rc, (int)child_status.stage,
+                child_status.system_errno, io_failed ? 1 : 0, io_errno,
+                input_failed ? 1 : 0, output_stalled ? 1 : 0,
+                wait_failed ? 1 : 0, wait_errno, errno);
+#endif
         runner_signal_child(pid, group_proven, SIGKILL);
     }
 
