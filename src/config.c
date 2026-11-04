@@ -536,6 +536,12 @@ typedef enum {
  * completion-specific names form goes one step further: it parses the same
  * account document, but never consults persisted active state or live runtime
  * state. */
+/* AR-18 P58: read-only initializations (names-only, preview, runtime
+ * read-only) validate SSH key files with the descriptor-backed checks alone;
+ * only a normal initialization, add, edit and switch pay for the ssh-keygen
+ * parse. Set for the duration of one load; never consulted elsewhere. */
+static bool g_config_shallow_key_validation;
+
 static int config_init_mode(gitswitch_ctx_t *ctx, config_init_kind_t kind) {
     char config_path[MAX_PATH_LEN];
     char config_dir[MAX_PATH_LEN];
@@ -575,11 +581,16 @@ static int config_init_mode(gitswitch_ctx_t *ctx, config_init_kind_t kind) {
     
     /* Load configuration if it exists */
     if (path_exists(config_path)) {
+        int load_rc;
+
         log_info("Loading configuration from: %s", config_path);
-        return config_load_mode(ctx, config_path,
-                                kind != CONFIG_INIT_NAMES,
-                                kind == CONFIG_INIT_NORMAL ||
-                                    kind == CONFIG_INIT_RUNTIME_READONLY);
+        g_config_shallow_key_validation = kind != CONFIG_INIT_NORMAL;
+        load_rc = config_load_mode(ctx, config_path,
+                                   kind != CONFIG_INIT_NAMES,
+                                   kind == CONFIG_INIT_NORMAL ||
+                                       kind == CONFIG_INIT_RUNTIME_READONLY);
+        g_config_shallow_key_validation = false;
+        return load_rc;
     } else {
         log_info("Configuration file not found: %s", config_path);
         /* File creation remains deferred to a command that actually needs it. */
@@ -17663,8 +17674,13 @@ static int validate_account_security(const account_t *account) {
 
         /* One authoritative descriptor-backed validator owns the admission
          * contract for load/add/edit/switch: regular file, current uid,
-         * owner-only mode, and private-key content from the same open object. */
-        if (ssh_validate_key_file(expanded_path) != 0) return -1;
+         * owner-only mode, and private-key content from the same open object.
+         * Read-only loads skip only its ssh-keygen parse (AR-18 P58). */
+        if ((g_config_shallow_key_validation
+                 ? ssh_validate_key_file_shallow(expanded_path)
+                 : ssh_validate_key_file(expanded_path)) != 0) {
+            return -1;
+        }
     }
     
     /* Validate GPG key if configured */

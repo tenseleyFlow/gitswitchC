@@ -5806,6 +5806,21 @@ int ssh_validate_key_file(const char *key_path) {
     return rc;
 }
 
+int ssh_validate_key_file_shallow(const char *key_path) {
+    ssh_key_snapshot_t snapshot;
+    int rc;
+
+    if (!key_path) {
+        set_error(ERR_INVALID_ARGS,
+                  "NULL key_path to ssh_validate_key_file_shallow");
+        return -1;
+    }
+    memset(&snapshot, 0, sizeof(snapshot));
+    rc = ssh_key_snapshot_capture(key_path, &snapshot);
+    ssh_key_snapshot_clear(&snapshot);
+    return rc;
+}
+
 typedef struct {
     size_t start;
     size_t text_len;
