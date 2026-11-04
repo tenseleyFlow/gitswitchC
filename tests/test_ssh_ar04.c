@@ -1874,7 +1874,10 @@ TEST(targeted_reset_preserves_live_socket_when_sidecar_pid_is_bystander) {
     CHECK_EQ_INT(ssh_manager_reset("work"), -1); /* pre-fix: 0 */
     reset_error = *get_last_error();
     CHECK_EQ_INT(kill(agent_pid, 0), 0);          /* socket owner untouched */
-    CHECK_EQ_INT(kill(bystander_pid, 0), 0);      /* stale PID never signaled */
+    /* AR-18 M18: the bystander is this test's own unreaped child, so a
+     * SIGTERMed bystander would be a zombie and kill(pid, 0) would still
+     * return 0. Only a non-blocking reap proves it is alive. */
+    CHECK_EQ_INT(waitpid(bystander_pid, &status, WNOHANG), 0);
     after_identity_valid =
         lstat(sock, &socket_after) == 0 &&
         lstat(current, &current_after) == 0 &&
@@ -1895,7 +1898,10 @@ TEST(targeted_reset_preserves_live_socket_when_sidecar_pid_is_bystander) {
                  "process identity outcome UNRELATED") != NULL);
 
     (void)kill(bystander_pid, SIGKILL);
-    (void)waitpid(bystander_pid, &status, 0);
+    CHECK_EQ_INT(waitpid(bystander_pid, &status, 0), bystander_pid);
+    /* The only signal the bystander ever received is the test's own. */
+    CHECK(WIFSIGNALED(status));
+    if (WIFSIGNALED(status)) CHECK_EQ_INT(WTERMSIG(status), SIGKILL);
     stop_real_agent(agent_pid, sock, current);
     CHECK_EQ_INT(ssh_manager_reset("work"), 0);
     CHECK(!entry_exists(pidfile));
