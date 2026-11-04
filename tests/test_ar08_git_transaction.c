@@ -1960,6 +1960,13 @@ TEST(direct_worktree_extension_false_ignores_later_included_true) {
                 fprintf(stderr, "trace: %s", line);
             }
             if (trace) fclose(trace);
+            /* Who else is alive? A lingering helper from an earlier suite
+             * delivering a delayed signal to a recycled PID would explain an
+             * external SIGKILL that none of our kill sites recorded. */
+            fflush(stderr);
+            (void)!system("ps -axo pid,ppid,pgid,sess,stat,etime,comm 2>&1 | "
+                          "grep -v -e ' (ps)' -e 'launchd' -e 'kernel_task' | "
+                          "sed 's/^/ps: /' | head -120 1>&2");
             CHECK(false);
         }
         (void)unsetenv("GITSWITCH_RUNNER_TRACE");
