@@ -712,10 +712,19 @@ bool toml_validate_ssh_host_alias(const char *alias) {
     if (len == 0 || len >= MAX_NAME_LEN) {
         return false;
     }
+    /* AR-18 P14/P15: the alias is a literal host name on the remote URL and
+     * the sole `Host` stanza of the private -F config git's ssh reads. An
+     * OpenSSH pattern ('*', '?') would turn that stanza into `Host *` and
+     * reroute every destination; a leading '-' is refused by OpenSSH as an
+     * option on `git@-alias`. Neither can ever be used, so neither is admitted
+     * (a pre-existing section carrying one is skipped with a warning, not
+     * bricked, per the grammar-narrowing rule). */
+    if (alias[0] == '-') {
+        return false;
+    }
     for (const unsigned char *p = (const unsigned char *)alias; *p; p++) {
         if (!(ascii_alphanumeric(*p) || *p == (unsigned char)'.' ||
-              *p == (unsigned char)'-' || *p == (unsigned char)'_' ||
-              *p == (unsigned char)'*' || *p == (unsigned char)'?')) {
+              *p == (unsigned char)'-' || *p == (unsigned char)'_')) {
             return false;
         }
     }

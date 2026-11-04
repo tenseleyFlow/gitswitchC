@@ -989,6 +989,83 @@ TEST(full_reset_restores_planned_residue_name_after_transient_failure) {
     CHECK(!path_exists(marker));
 }
 
+static char g_stable_agent_log[2048];
+
+static int stable_agent_recording_runner(const char *const argv[],
+                                         const run_opts_t *opts,
+                                         run_result_t *result) {
+    size_t used = strlen(g_stable_agent_log);
+
+    g_runner_calls++;
+    if (argv && argv[0] && argv[1] && used + 256U < sizeof(g_stable_agent_log)) {
+        const char *home = "";
+
+        if (opts && opts->extra_env) {
+            for (size_t i = 0U; opts->extra_env[i]; i++) {
+                if (strncmp(opts->extra_env[i], "GNUPGHOME=", 10U) == 0) {
+                    home = opts->extra_env[i] + 10U;
+                }
+            }
+        }
+        snprintf(g_stable_agent_log + used, sizeof(g_stable_agent_log) - used,
+                 "%s %s %s|", argv[1], argv[2] ? argv[2] : "", home);
+    }
+    if (opts && opts->out && opts->out_size > 0) opts->out[0] = '\0';
+    if (result) {
+        memset(result, 0, sizeof(*result));
+        result->spawned = true;
+    }
+    return 0;
+}
+
+/* AR-18 M11: GnuPG keys the agent by the homedir string, and the shell
+ * exports <base>/current. Retargeting, dropping and resetting must stop the
+ * agent under that spelling, or git keeps talking to an agent carrying the
+ * previous account's config and passphrase cache. */
+TEST(stable_current_agent_is_stopped_on_retarget_drop_and_reset) {
+    char xdg[128], base[256], home[320], marker[384], current[320];
+    char other[320], expected[400];
+    command_runner_fn previous;
+
+    CHECK_EQ_INT(make_home(xdg, sizeof(xdg), base, sizeof(base),
+                           home, sizeof(home), "work"), 0);
+    /* The manager resolves the runtime base physically (Darwin spells /tmp
+     * as /private/tmp), and a pre-existing `current` link must name a managed
+     * child of that physical base; spell every path canonically. */
+    CHECK(ts_canonicalize_dir_path(xdg, sizeof(xdg)) == 0);
+    CHECK_EQ_INT(setenv("XDG_RUNTIME_DIR", xdg, 1), 0);
+    snprintf(base, sizeof(base), "%s/gitswitch-gpg", xdg);
+    snprintf(home, sizeof(home), "%s/work", base);
+    snprintf(marker, sizeof(marker), "%s/private.key", home);
+    snprintf(current, sizeof(current), "%s/current", base);
+    snprintf(other, sizeof(other), "%s/other", base);
+    snprintf(expected, sizeof(expected), "--kill gpg-agent %s|", current);
+    CHECK_EQ_INT(make_file(marker, "secret\n"), 0);
+    CHECK_EQ_INT(mkdir(other, 0700), 0);
+    CHECK_EQ_INT(symlink(home, current), 0);
+
+    g_stable_agent_log[0] = '\0';
+    previous = run_set_runner(stable_agent_recording_runner);
+    CHECK_EQ_INT(gpg_manager_retarget_current(other), 0);
+    run_set_runner(previous);
+    CHECK(strstr(g_stable_agent_log, expected) != NULL);
+
+    g_stable_agent_log[0] = '\0';
+    previous = run_set_runner(stable_agent_recording_runner);
+    CHECK_EQ_INT(gpg_manager_drop_current(), 0);
+    run_set_runner(previous);
+    CHECK(strstr(g_stable_agent_log, expected) != NULL);
+    CHECK(lstat(current, &(struct stat){0}) != 0 && errno == ENOENT);
+
+    CHECK_EQ_INT(symlink(home, current), 0);
+    g_stable_agent_log[0] = '\0';
+    previous = run_set_runner(stable_agent_recording_runner);
+    CHECK_EQ_INT(gpg_manager_reset(NULL), 0);
+    run_set_runner(previous);
+    CHECK(strstr(g_stable_agent_log, expected) != NULL);
+    CHECK(!path_exists(marker));
+}
+
 TEST(full_reset_preserves_replaced_retirement_quarantine) {
     char xdg[128], base[256], home[320], marker[384], legacy[416];
     char replacement[416];
@@ -1209,7 +1286,8 @@ TEST(full_reset_applies_valid_full_and_recovery_only_plans) {
     g_runner_calls = 0;
     previous = run_set_runner(recording_null_runner);
     CHECK_EQ_INT(gpg_manager_reset(NULL), 0);
-    CHECK_EQ_INT(g_runner_calls, 1);
+    /* One kill for the planned home plus the stable-spelling kill (AR-18 M11). */
+    CHECK_EQ_INT(g_runner_calls, 2);
     CHECK(base_contains_only_lock(base));
 
     /* Recovery-only reductions are also planned and retired without launching
@@ -1229,7 +1307,8 @@ TEST(full_reset_applies_valid_full_and_recovery_only_plans) {
     CHECK_EQ_INT(symlink("retired-forward-candidate", forward_p), 0);
     CHECK_EQ_INT(gpg_manager_reset(NULL), 0);
     run_set_runner(previous);
-    CHECK_EQ_INT(g_runner_calls, 1);
+    /* One kill for the planned home plus the stable-spelling kill (AR-18 M11). */
+    CHECK_EQ_INT(g_runner_calls, 2);
     CHECK(base_contains_only_lock(base));
 }
 
@@ -1902,6 +1981,7 @@ TEST_MAIN_BEGIN()
     RUN_TEST(full_reset_retires_residue_without_descriptor_unlink);
 #endif
     RUN_TEST(full_reset_restores_planned_residue_name_after_transient_failure);
+    RUN_TEST(stable_current_agent_is_stopped_on_retarget_drop_and_reset);
     RUN_TEST(full_reset_preserves_replaced_retirement_quarantine);
     RUN_TEST(full_reset_preflight_preserves_every_planned_entry_on_home_blocker);
     RUN_TEST(full_reset_preflight_rejects_mixed_invalid_recovery_without_retirement);

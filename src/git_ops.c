@@ -1122,6 +1122,42 @@ static int git_snapshot_key_remove_exact_once(git_snapshot_key_t *key,
     return 0;
 }
 
+/* A `--list -z` record key is section[.subsection].name: the section and the
+ * final name are [A-Za-z0-9-] runs (the name starts with a letter) and a dot
+ * separates them. Subsections may hold almost anything, so only the two
+ * ends are checked; that is enough to reject a glued stderr line ("trace:
+ * built-in: …", "warning: unable to access …"), which has no section-dot
+ * grammar at all. */
+static bool git_snapshot_record_key_is_config_key(const char *key,
+                                                  size_t length) {
+    const char *first_dot;
+    const char *last_dot;
+
+    if (!key || length == 0U) return false;
+    first_dot = memchr(key, '.', length);
+    if (!first_dot || first_dot == key) return false;
+    for (const char *cursor = key; cursor < first_dot; cursor++) {
+        if (!isalnum((unsigned char)*cursor) && *cursor != '-') return false;
+    }
+    /* memrchr is a GNU extension; scan backwards by hand for Darwin/BSD. */
+    last_dot = NULL;
+    for (const char *cursor = key + length; cursor > key;) {
+        cursor--;
+        if (*cursor == '.') {
+            last_dot = cursor;
+            break;
+        }
+    }
+    if (!last_dot || last_dot + 1 >= key + length ||
+        !isalpha((unsigned char)last_dot[1])) {
+        return false;
+    }
+    for (const char *cursor = last_dot + 1; cursor < key + length; cursor++) {
+        if (!isalnum((unsigned char)*cursor) && *cursor != '-') return false;
+    }
+    return true;
+}
+
 /* Parse a complete `git config <scope> --list -z` result. Rollback cannot
  * recreate the spelling of a managed implicit Boolean and therefore rejects
  * it. Retirement edits a copied file in place, so it may retain the occurrence
@@ -1148,6 +1184,17 @@ static int git_parse_snapshot_listing(const char *buf, size_t len,
         record_len = (size_t)(end - record);
         pos += record_len + 1U;
         newline = memchr(record, '\n', record_len);
+        /* AR-18 M13: a record whose key is not a Git config key cannot have
+         * come from `--list -z`. Git writes stderr unbuffered and stdout
+         * block-buffered, so a merged warning or trace line lands glued to
+         * the first record and used to be dropped silently as "unmanaged",
+         * losing the identity key it displaced. Fail closed instead. */
+        if (!git_snapshot_record_key_is_config_key(
+                record, newline ? (size_t)(newline - record) : record_len)) {
+            set_error(ERR_GIT_CONFIG_FAILED,
+                      "Git configuration snapshot contains a record that is not a config key (merged diagnostics or corrupted output)");
+            return -1;
+        }
         if (!newline) {
             key_index = git_managed_key_index_n(record, record_len);
             if (key_index >= 0) {
@@ -1205,6 +1252,21 @@ static int git_snapshot_run_observed(void *context) {
 /* Grow until the complete binary listing fits. A hard cap bounds hostile or
  * corrupt config input; reaching it is a preflight failure, never a partial
  * snapshot followed by mutation (AR-07 M24). */
+/* AR-18 M13: GIT_TRACE and friends make git write to stderr before any
+ * output, and the readers that parse a merged capture (the -z snapshot
+ * listing, single-path queries, the raw listing) must never see a debugging
+ * environment. Message-only captures keep the user's environment: a trace
+ * line in a failure diagnostic is what GIT_TRACE asks for, and the
+ * retirement regressions observe git's own trace of `--unset`. */
+static const char *const g_git_child_unset_env[] = {
+    "GIT_TRACE", "GIT_TRACE_SETUP", "GIT_TRACE_PERFORMANCE",
+    "GIT_TRACE_PACK_ACCESS", "GIT_TRACE_PACKET", "GIT_TRACE_REDACT",
+    "GIT_TRACE_CURL", "GIT_TRACE_CURL_NO_DATA", "GIT_TRACE_SHALLOW",
+    "GIT_TRACE2", "GIT_TRACE2_EVENT", "GIT_TRACE2_PERF",
+    "GIT_TRACE2_BRIEF", "GIT_TRACE2_EVENT_BRIEF", "GIT_TRACE2_PERF_BRIEF",
+    NULL
+};
+
 static int git_read_snapshot_listing(git_scope_t scope, bool includes,
                                      char **out, size_t *out_len) {
     const char *scope_flag = git_scope_to_flag(scope);
@@ -1248,6 +1310,7 @@ static int git_read_snapshot_listing(git_scope_t scope, bool includes,
          * safe here: any stderr on a successful binary listing makes parsing
          * fail closed instead of being silently discarded. */
         opts.merge_stderr = true;
+        opts.unset_env = g_git_child_unset_env;
         opts.extra_env = diagnostic_env;
         observation.argv = argv;
         observation.opts = &opts;
@@ -1735,6 +1798,7 @@ static int git_query_single_path(const char *const argv[], char *out,
     opts.out = raw;
     opts.out_size = sizeof(raw);
     opts.merge_stderr = true;
+    opts.unset_env = g_git_child_unset_env;
     if (run_argv(argv, &opts, &result) != 0 || result.out_truncated ||
         result.out_len == 0 || result.out_len >= sizeof(raw)) {
         return -1;
@@ -15390,6 +15454,7 @@ int git_list_config(git_scope_t scope, char *output, size_t output_size) {
         opts.out = output;
         opts.out_size = output_size;
         opts.merge_stderr = true;
+        opts.unset_env = g_git_child_unset_env;
         if (run_argv(argv, &opts, &result) != 0) {
             set_error(ERR_GIT_CONFIG_FAILED,
                       "Failed to list git configuration");
@@ -15448,18 +15513,127 @@ static int ssh_command_append_quoted(char *command, size_t command_size,
     return ssh_command_append(command, command_size, used, "'");
 }
 
-#define SSH_COMMAND_OPTIONS                                                   \
-    " -F none -o IdentitiesOnly=yes -o StrictHostKeyChecking=accept-new"     \
+#define SSH_COMMAND_FIXED_OPTIONS                                             \
+    " -o IdentitiesOnly=yes -o StrictHostKeyChecking=accept-new"             \
     " -o LogLevel=ERROR"
+#define SSH_COMMAND_OPTIONS " -F none" SSH_COMMAND_FIXED_OPTIONS
+#define SSH_COMMAND_CONFIG_OPTION " -F "
 #define SSH_COMMAND_HOSTNAME_OPTION " -o HostName="
 
-/* GIT_CONFIG_VALUE_MAX reserves 256 bytes beyond the serialized path and
- * hostname payloads. Prove at compile time that the exact fixed spelling, six
- * quote delimiters, and terminating NUL fit inside that reserve. */
+/* GIT_CONFIG_VALUE_MAX reserves 256 bytes beyond the serialized path,
+ * private-config path and hostname payloads. Prove at compile time that the
+ * exact fixed spelling, eight quote delimiters, and terminating NUL fit
+ * inside that reserve. */
 _Static_assert((sizeof(" -i ") - 1U) + (sizeof(SSH_COMMAND_OPTIONS) - 1U) +
-                       (sizeof(SSH_COMMAND_HOSTNAME_OPTION) - 1U) + 6U + 1U <=
+                       (sizeof(SSH_COMMAND_CONFIG_OPTION) - 1U) +
+                       (sizeof(SSH_COMMAND_HOSTNAME_OPTION) - 1U) + 8U + 1U <=
                    256U,
                "GIT_CONFIG_VALUE_MAX fixed SSH command reserve is too small");
+
+/* AR-18 M12: `-o HostName=` on the ssh command line is global to the
+ * invocation, so persisting it in core.sshCommand rerouted every SSH remote
+ * git touched (gitlab.com, an internal host) to the alias destination while
+ * the account was active. The destination now lives in a gitswitch-owned
+ * per-account ssh config holding only the alias stanza, and core.sshCommand
+ * points -F at it: the alias resolves exactly as before and is still immune
+ * to the user's ~/.ssh/config precedence, other hosts keep their own names.
+ * The file is keyed by the stable account id, so renames and alias edits
+ * rewrite the same file, and it lives in the config directory so it
+ * survives reboots like the Git config that references it. */
+int git_ssh_alias_config_path(const account_t *account, char *buf,
+                              size_t size) {
+    char config_dir[MAX_PATH_LEN];
+
+    if (!account || !buf || size == 0U ||
+        (account->id == 0U && account->ssh_host_alias[0] == '\0')) {
+        errno = EINVAL;
+        return -1;
+    }
+    if (get_config_directory(config_dir, sizeof(config_dir)) != 0) {
+        return -1;
+    }
+    /* Persisted accounts always carry an id, which keeps two accounts that
+     * share an alias spelling from sharing (and overwriting) one file. An
+     * in-memory account without an id (library callers, fixtures) is keyed
+     * by its validated alias, whose grammar is filename-safe. */
+    if (account->id != 0U
+            ? (size_t)snprintf(buf, size, "%s/ssh-alias-%" PRIu32 ".conf",
+                               config_dir, account->id) >= size
+            : (size_t)snprintf(buf, size, "%s/ssh-alias-%s.conf",
+                               config_dir, account->ssh_host_alias) >= size) {
+        errno = ENAMETOOLONG;
+        return -1;
+    }
+    return 0;
+}
+
+/* Write the private alias config atomically (mkstemp in the config
+ * directory, 0600, fsync, rename) and prove the published bytes. */
+static int git_ssh_alias_config_publish(const account_t *account,
+                                        const char *path) {
+    char temp[MAX_PATH_LEN];
+    char content[MAX_NAME_LEN * 2U + 128U];
+    int fd = -1;
+    int written;
+    size_t length;
+    int dir_fd = -1;
+    const char *slash;
+
+    if (!account || !path || !path[0]) {
+        errno = EINVAL;
+        return -1;
+    }
+    written = snprintf(content, sizeof(content),
+                       "# Written by gitswitch for account '%s'; do not edit.\n"
+                       "Host %s\n  HostName %s\n",
+                       account->name, account->ssh_host_alias,
+                       account->ssh_hostname);
+    if (written < 0 || (size_t)written >= sizeof(content)) {
+        errno = ENAMETOOLONG;
+        return -1;
+    }
+    length = (size_t)written;
+    if ((size_t)snprintf(temp, sizeof(temp), "%s.tmp.XXXXXX", path) >=
+        sizeof(temp)) {
+        errno = ENAMETOOLONG;
+        return -1;
+    }
+    fd = mkstemp(temp);
+    if (fd < 0) return -1;
+    if (fchmod(fd, 0600) != 0 ||
+        git_write_all(fd, (const unsigned char *)content, length) != 0 ||
+        fsync(fd) != 0 || close(fd) != 0) {
+        int saved_errno = errno ? errno : EIO;
+
+        if (fd >= 0) (void)close(fd);
+        (void)unlink(temp);
+        errno = saved_errno;
+        return -1;
+    }
+    if (rename(temp, path) != 0) {
+        int saved_errno = errno ? errno : EIO;
+
+        (void)unlink(temp);
+        errno = saved_errno;
+        return -1;
+    }
+    slash = strrchr(path, '/');
+    if (slash && slash != path) {
+        char directory[MAX_PATH_LEN];
+        size_t directory_length = (size_t)(slash - path);
+
+        if (directory_length < sizeof(directory)) {
+            memcpy(directory, path, directory_length);
+            directory[directory_length] = '\0';
+            dir_fd = open(directory, O_RDONLY | O_DIRECTORY | O_CLOEXEC);
+            if (dir_fd >= 0) {
+                (void)fsync(dir_fd);
+                (void)close(dir_fd);
+            }
+        }
+    }
+    return 0;
+}
 
 static int build_expected_ssh_command(const account_t *account,
                                       char *command, size_t command_size,
@@ -15539,16 +15713,38 @@ static int build_expected_ssh_command_with_program(
     if (ssh_command_append_quoted(command, command_size, &used, ssh_path) != 0 ||
         ssh_command_append(command, command_size, &used, " -i ") != 0 ||
         ssh_command_append_quoted(command, command_size, &used,
-                                  expanded_path) != 0 ||
-        ssh_command_append(command, command_size, &used,
-                           SSH_COMMAND_OPTIONS) != 0) {
+                                  expanded_path) != 0) {
         return -1;
     }
-    if (has_alias &&
-        (ssh_command_append(command, command_size, &used,
-                            SSH_COMMAND_HOSTNAME_OPTION) != 0 ||
-         ssh_command_append_quoted(command, command_size, &used,
-                                   account->ssh_hostname) != 0)) {
+    if (has_alias) {
+        /* The alias destination is scoped through a private -F config
+         * (AR-18 M12) rather than a global -o HostName= override. */
+        char alias_config[MAX_PATH_LEN];
+
+        if (git_ssh_alias_config_path(account, alias_config,
+                                      sizeof(alias_config)) != 0) {
+            set_system_error(ERR_INVALID_PATH,
+                             "Cannot derive the private SSH alias config path");
+            return -1;
+        }
+        if (!is_safe_ssh_key_path(alias_config)) {
+            set_error(ERR_INVALID_PATH,
+                      "Private SSH alias config path contains an illegal character (quote/control): %s",
+                      alias_config);
+            return -1;
+        }
+        if (ssh_command_append(command, command_size, &used,
+                               SSH_COMMAND_CONFIG_OPTION) != 0 ||
+            ssh_command_append_quoted(command, command_size, &used,
+                                      alias_config) != 0 ||
+            ssh_command_append(command, command_size, &used,
+                               SSH_COMMAND_FIXED_OPTIONS) != 0) {
+            return -1;
+        }
+        return 0;
+    }
+    if (ssh_command_append(command, command_size, &used,
+                           SSH_COMMAND_OPTIONS) != 0) {
         return -1;
     }
     return 0;
@@ -15582,6 +15778,23 @@ static int git_configure_ssh_impl(const account_t *account,
     if (!path_exists(expanded_key_path)) {
         set_error(ERR_SSH_KEY_NOT_FOUND, "SSH key file not found: %s", expanded_key_path);
         return -1;
+    }
+
+    /* The command references the private alias config: publish that file
+     * before the Git value that points at it (AR-18 M12). Library callers
+     * and fixtures reach this without config_init having created the
+     * configuration directory, so make sure it exists first. */
+    if (account->ssh_host_alias[0] != '\0') {
+        char alias_config[MAX_PATH_LEN];
+
+        if (ensure_config_directory_exists() != 0 ||
+            git_ssh_alias_config_path(account, alias_config,
+                                      sizeof(alias_config)) != 0 ||
+            git_ssh_alias_config_publish(account, alias_config) != 0) {
+            set_system_error(ERR_FILE_IO,
+                             "Cannot publish the private SSH alias config");
+            return -1;
+        }
     }
 
     log_debug("Configuring SSH command: %s", ssh_command);

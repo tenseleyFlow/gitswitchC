@@ -148,8 +148,11 @@ static int connection_runner(const char *const argv[],
     return spawned && term_signal == 0 && exit_code == 0 ? 0 : -1;
 }
 
+void git_ops_test_reset_caches(void);
+
 static void make_account(account_t *account, bool with_alias) {
     memset(account, 0, sizeof(*account));
+    account->id = 7U;
     account->ssh_enabled = true;
     CHECK_EQ_INT(safe_strncpy(account->name, "work",
                               sizeof(account->name)), 0);
@@ -476,10 +479,102 @@ TEST(managed_git_command_ignores_shared_config_and_pins_destination) {
     make_account(&account, true);
     CHECK_EQ_INT(git_expected_ssh_command(&account, command,
                                           sizeof(command)), 0);
-    CHECK(strstr(command, " -F none ") != NULL);
+    /* AR-18 M12: the destination is scoped through a private -F config
+     * instead of a global -o HostName= override, and the user's shared
+     * ~/.ssh/config still never applies. */
+    CHECK(strstr(command, " -F '") != NULL);
+    CHECK(strstr(command, "/ssh-alias-7.conf'") != NULL);
+    CHECK(strstr(command, " -F none") == NULL);
     CHECK(strstr(command, " -i '/tmp/intended-account-key'") != NULL);
     CHECK(strstr(command, " -o IdentitiesOnly=yes") != NULL);
-    CHECK(strstr(command, " -o HostName='github.com'") != NULL);
+    CHECK(strstr(command, " -o HostName=") == NULL);
+}
+
+static int read_small_file(const char *path, char *out, size_t size) {
+    FILE *file = fopen(path, "r");
+    size_t got;
+
+    if (!file) return -1;
+    got = fread(out, 1U, size - 1U, file);
+    out[got] = '\0';
+    (void)fclose(file);
+    return 0;
+}
+
+/* AR-18 M12: the published private config scopes the destination to the
+ * alias. Resolved through the real ssh, the alias reaches ssh_hostname while
+ * an unrelated host keeps its own name instead of being rerouted. */
+TEST(private_alias_config_scopes_destination_to_the_alias_only) {
+    account_t account;
+    char home[256], config_dir[512], key[512], global_config[512];
+    char alias_config[MAX_PATH_LEN], stanza[512], resolved[4096];
+    const char *old_home = getenv("HOME");
+    const char *old_global = getenv("GIT_CONFIG_GLOBAL");
+    char saved_home[512] = "";
+    char saved_global[512] = "";
+    run_opts_t opts;
+    run_result_t result;
+
+    if (!command_exists("ssh") || !command_exists("git")) {
+        TS_SKIP("openssh", "ssh/git unavailable in trusted PATH");
+    }
+    if (old_home) (void)safe_strncpy(saved_home, old_home, sizeof(saved_home));
+    if (old_global) {
+        (void)safe_strncpy(saved_global, old_global, sizeof(saved_global));
+    }
+    snprintf(home, sizeof(home), "/tmp/gswm12home.XXXXXX");
+    CHECK(ts_mkdtemp(home));
+    snprintf(config_dir, sizeof(config_dir), "%s/.config", home);
+    CHECK_EQ_INT(mkdir(config_dir, 0700), 0);
+    snprintf(config_dir, sizeof(config_dir), "%s/.config/gitswitch", home);
+    CHECK_EQ_INT(mkdir(config_dir, 0700), 0);
+    snprintf(key, sizeof(key), "%s/id_key", home);
+    CHECK_EQ_INT(write_string_to_file(key, "fixture-key\n", 0600), 0);
+    snprintf(global_config, sizeof(global_config), "%s/global.gitconfig",
+             home);
+    CHECK_EQ_INT(write_string_to_file(global_config, "[fixture]\n", 0600), 0);
+    CHECK_EQ_INT(setenv("HOME", home, 1), 0);
+    CHECK_EQ_INT(setenv("GIT_CONFIG_GLOBAL", global_config, 1), 0);
+
+    make_account(&account, true);
+    CHECK_EQ_INT(safe_strncpy(account.ssh_key_path, key,
+                              sizeof(account.ssh_key_path)), 0);
+    git_ops_test_reset_caches();
+    clear_error();
+    CHECK_EQ_INT(git_configure_ssh(&account, GIT_SCOPE_GLOBAL), 0);
+    git_config_commit();
+    CHECK_EQ_INT(git_ssh_alias_config_path(&account, alias_config,
+                                           sizeof(alias_config)), 0);
+    CHECK_EQ_INT(read_small_file(alias_config, stanza, sizeof(stanza)), 0);
+    CHECK(strstr(stanza, "Host work-github\n  HostName github.com\n") != NULL);
+    CHECK(strstr(stanza, "Host *") == NULL);
+
+    {
+        const char *alias_argv[] = {"ssh", "-F", alias_config, "-G",
+                                    "git@work-github", NULL};
+        const char *other_argv[] = {"ssh", "-F", alias_config, "-G",
+                                    "git@gitlab.example.test", NULL};
+
+        memset(&opts, 0, sizeof(opts));
+        memset(&result, 0, sizeof(result));
+        opts.out = resolved;
+        opts.out_size = sizeof(resolved);
+        opts.stderr_to_devnull = true;
+        CHECK_EQ_INT(run_argv(alias_argv, &opts, &result), 0);
+        CHECK(strstr(resolved, "hostname github.com\n") != NULL);
+
+        memset(&result, 0, sizeof(result));
+        resolved[0] = '\0';
+        CHECK_EQ_INT(run_argv(other_argv, &opts, &result), 0);
+        CHECK(strstr(resolved, "hostname gitlab.example.test\n") != NULL);
+        CHECK(strstr(resolved, "hostname github.com") == NULL);
+    }
+
+    if (old_home) (void)setenv("HOME", saved_home, 1); else (void)unsetenv("HOME");
+    if (old_global) (void)setenv("GIT_CONFIG_GLOBAL", saved_global, 1);
+    else (void)unsetenv("GIT_CONFIG_GLOBAL");
+    git_ops_test_reset_caches();
+    ts_rm_rf(home);
 }
 
 TEST(managed_git_command_rejects_host_port_destination) {
@@ -535,7 +630,10 @@ TEST(managed_ipv6_destination_is_preserved_in_git_command) {
                               sizeof(account.ssh_hostname)), 0);
     CHECK_EQ_INT(git_expected_ssh_command(&account, command,
                                           sizeof(command)), 0);
-    CHECK(strstr(command, " -o HostName='2001:db8::1'") != NULL);
+    /* AR-18 M12: the IPv6 destination now lives in the private -F config
+     * stanza (verified end to end by the scoping test), never on argv. */
+    CHECK(strstr(command, " -F '") != NULL);
+    CHECK(strstr(command, " -o HostName=") == NULL);
 }
 
 static bool output_has_identity_file(const char *output, const char *path) {
@@ -729,6 +827,7 @@ TEST_MAIN_BEGIN()
     RUN_TEST(managed_git_command_rejects_host_port_destination);
     RUN_TEST(managed_ipv6_destination_is_preserved_in_probe);
     RUN_TEST(managed_ipv6_destination_is_preserved_in_git_command);
+    RUN_TEST(private_alias_config_scopes_destination_to_the_alias_only);
     RUN_TEST(openssh_effective_config_confirms_direct_probe_isolation);
     RUN_TEST(openssh_effective_config_confirms_managed_alias_isolation);
 TEST_MAIN_END()

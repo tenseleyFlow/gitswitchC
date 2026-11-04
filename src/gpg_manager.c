@@ -81,6 +81,7 @@ typedef struct {
 static int gpg_retarget_current_locked(int base_fd, const char *base,
                                        const char *real_home,
                                        gpg_retarget_result_t *result);
+static void gpg_signal_stable_agent(const char *base, const char *operation);
 typedef struct {
     int base_fd;
     int home_fd;
@@ -4281,6 +4282,10 @@ int gpg_manager_retarget_current(const char *real_home) {
         }
         return -1;
     }
+    /* The shell's agent is keyed by the `current` spelling and would keep
+     * the previous account's config and passphrase cache across the
+     * retarget; stop it so the next git call starts a fresh one. */
+    gpg_signal_stable_agent(base, "--kill");
     rc = gpg_retarget_current_locked(base_fd, base, real_home, NULL);
     unlock_gpg_dir(base_fd, lock_fd);
     return rc;
@@ -4315,6 +4320,8 @@ int gpg_manager_drop_current(void) {
         unlock_gpg_dir(base_fd, lock_fd);
         return -1;
     }
+    /* The link is going away: stop the agent the shell keyed on it. */
+    gpg_signal_stable_agent(base, "--kill");
     if (fstatat(base_fd, "current", &link_st, AT_SYMLINK_NOFOLLOW) != 0) {
         if (errno != ENOENT) {
             set_system_error(ERR_FILE_IO, "Cannot inspect stable GNUPGHOME link: %s",
@@ -6166,6 +6173,52 @@ static int gpg_verify_reset_all_final_locked(int base_fd, int lock_fd,
     return 0;
 }
 
+/* AR-18 M11: GnuPG keys the agent socket directory by hashing the homedir
+ * *string*, not its realpath. The shell integration exports
+ * GNUPGHOME=<base>/current, so the agent git actually talks to is a separate
+ * instance from the one every pinned helper here reaches through
+ * GNUPGHOME=. inside the physical <base>/<account> home. That instance kept
+ * the gpg-agent.conf and passphrase cache of whichever account `current`
+ * pointed at when the shell first autostarted it, was never reloaded, and
+ * survived reset. Address it under the same spelling the shell uses: stop it
+ * whenever `current` is about to change or go away (the next git call
+ * autostarts a fresh agent reading the new home's config), and send reloads
+ * to it as well. Best-effort: a missing agent or an absent link is fine. */
+static void gpg_signal_stable_agent(const char *base, const char *operation) {
+    const char *argv[] = {"gpgconf", NULL, "gpg-agent", NULL};
+    char link_path[MAX_PATH_LEN];
+    char env_home[MAX_PATH_LEN + sizeof("GNUPGHOME=")];
+    const char *env[2] = {env_home, NULL};
+    run_opts_t opts;
+    run_result_t result;
+    struct stat link_st;
+    error_context_t entry_error = *get_last_error();
+    int entry_errno = errno;
+
+    if (!base || !operation ||
+        gpg_current_path_from_base(base, link_path, sizeof(link_path)) != 0 ||
+        lstat(link_path, &link_st) != 0 || !S_ISLNK(link_st.st_mode) ||
+        (size_t)snprintf(env_home, sizeof(env_home), "GNUPGHOME=%s",
+                         link_path) >= sizeof(env_home)) {
+        g_last_error = entry_error;
+        errno = entry_errno;
+        return;
+    }
+    argv[1] = operation;
+    memset(&opts, 0, sizeof(opts));
+    memset(&result, 0, sizeof(result));
+    opts.unset_env = g_gpg_child_unset_env;
+    opts.extra_env = env;
+    opts.stderr_to_devnull = true;
+    if (run_argv(argv, &opts, &result) != 0 || !result.spawned ||
+        result.exit_code != 0) {
+        log_debug("gpgconf %s for the stable GNUPGHOME spelling did not complete: %s",
+                  operation, link_path);
+    }
+    g_last_error = entry_error;
+    errno = entry_errno;
+}
+
 /* Stop the gpg-agent and only then delete its isolated home. The home is the
  * retry handle for both the agent and its secret-key material, so an
  * unconfirmed stop must retain it rather than erase the only targeting state. */
@@ -6642,6 +6695,11 @@ int gpg_manager_reset(const char *account) {
             return -1;
         }
     }
+
+    /* Preflight passed and the recovery plan is applied: reset now stops
+     * agents. The one the shell actually uses is keyed by the `current`
+     * spelling and is not reached by the per-home kills below (AR-18 M11). */
+    gpg_signal_stable_agent(base, "--kill");
 
     if (account) {
         struct stat hst;
@@ -10015,6 +10073,10 @@ static int gpg_reload_agent_config(const gpg_pinned_home_t *home,
         return -1;
     }
     log_debug("Reloaded GPG agent configuration for %s", home->path);
+    /* The pinned reload reached the agent keyed by the physical home; the
+     * shell's git talks to the one keyed by <base>/current. Reload it too so
+     * edited gpg-agent.conf bytes reach the agent that matters. */
+    gpg_signal_stable_agent(home->base, "--reload");
     return 0;
 }
 

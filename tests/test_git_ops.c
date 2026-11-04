@@ -168,12 +168,24 @@ static int fk_emit_effective_listing(const run_opts_t *opts,
     return fk_ret(result, 0);
 }
 
+static bool fk_glue_stderr_line;
+
 static int fk_emit_scope_listing(const char *scope, const run_opts_t *opts,
                                  run_result_t *result) {
     size_t used = 0;
 
     if (!scope || !opts || !opts->out || opts->out_size == 0) {
         return fk_ret(result, 1);
+    }
+    /* AR-18 M13: model git's unbuffered stderr landing in front of the
+     * block-buffered listing on a merged pipe. */
+    if (fk_glue_stderr_line) {
+        static const char glued[] =
+            "trace: built-in: git config --global --list -z --no-includes\n";
+        if (sizeof(glued) - 1U < opts->out_size) {
+            memcpy(opts->out, glued, sizeof(glued) - 1U);
+            used = sizeof(glued) - 1U;
+        }
     }
     for (int i = 0; i < FK_MAX; i++) {
         size_t key_len;
@@ -730,6 +742,31 @@ static account_t fk_publication_account(void) {
                  sizeof(account.email));
     account.preferred_scope = GIT_SCOPE_GLOBAL;
     return account;
+}
+
+static void fk_seed(const char *scope, const char *key, const char *value);
+
+/* AR-18 M13: a stderr line glued in front of the first -z record used to
+ * be dropped as an unmanaged key, silently losing user.name from the
+ * before-image. The parser now fails closed on a record that is not a Git
+ * config key. */
+TEST(glued_stderr_line_in_listing_fails_closed) {
+    command_runner_fn previous;
+
+    git_ops_test_reset_caches();
+    fk_reset();
+    fk_seed("--global", GIT_CONFIG_USER_NAME, "original");
+    fk_seed("--global", GIT_CONFIG_USER_EMAIL, "original@example.test");
+    previous = run_set_runner(fake_git_runner);
+    fk_glue_stderr_line = true;
+    clear_error();
+    CHECK_EQ_INT(git_config_snapshot(GIT_SCOPE_GLOBAL), -1);
+    CHECK(strstr(get_last_error()->message, "not a config key") != NULL);
+    fk_glue_stderr_line = false;
+    git_ops_test_reset_caches();
+    CHECK_EQ_INT(git_config_snapshot(GIT_SCOPE_GLOBAL), 0);
+    git_config_commit();
+    run_set_runner(previous);
 }
 
 TEST(partial_account_writer_failure_invalidates_prior_complete_publication) {
@@ -2866,6 +2903,7 @@ TEST_MAIN_BEGIN()
     RUN_TEST(git_get_repo_root_requires_complete_exact_output);
     RUN_TEST(effective_config_capture_enforces_maximum);
     RUN_TEST(git_set_config_value_skips_duplicate_managed_write);
+    RUN_TEST(glued_stderr_line_in_listing_fails_closed);
     RUN_TEST(partial_account_writer_failure_invalidates_prior_complete_publication);
     RUN_TEST(fake_runner_zero_output_failure_has_stable_diagnostic);
     RUN_TEST(rollback_z_parser_survives_embedded_newline);

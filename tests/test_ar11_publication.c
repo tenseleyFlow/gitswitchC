@@ -853,6 +853,30 @@ TEST(ssh_program_extraction_accepts_only_the_managed_first_word) {
     static const char alias_command[] =
         "'/usr/bin/ssh' -i '/tmp/key' " SSH_COMMAND_OPTIONS
         " -o HostName='2001:db8::1'";
+    /* AR-18 M12 form: the alias destination lives in a private -F config
+     * and no HostName suffix follows the fixed options. */
+    static const char private_config_command[] =
+        "'/usr/bin/ssh' -i '/tmp/key' "
+        "-F '/home/user/.config/gitswitch/ssh-alias-7.conf' "
+        "-o IdentitiesOnly=yes -o StrictHostKeyChecking=accept-new "
+        "-o LogLevel=ERROR";
+    static const char *const private_malformed[] = {
+        "'/usr/bin/ssh' -i '/tmp/key' "
+            "-F '/home/user/.config/gitswitch/ssh-alias-7.conf' "
+            "-o IdentitiesOnly=yes -o StrictHostKeyChecking=accept-new "
+            "-o LogLevel=ERROR -o HostName='github.com'",
+        "'/usr/bin/ssh' -i '/tmp/key' "
+            "-F 'relative/ssh-alias-7.conf' "
+            "-o IdentitiesOnly=yes -o StrictHostKeyChecking=accept-new "
+            "-o LogLevel=ERROR",
+        "'/usr/bin/ssh' -i '/tmp/key' "
+            "-F '/home/user/.config/gitswitch/ssh-alias-7.conf' "
+            "-o StrictHostKeyChecking=accept-new -o LogLevel=ERROR",
+        "'/usr/bin/ssh' -i '/tmp/key' "
+            "-F '/home/user/.config/gitswitch/ssh-alias-7.conf' "
+            "-o IdentitiesOnly=yes -o StrictHostKeyChecking=accept-new "
+            "-o LogLevel=ERROR trailing",
+    };
     static const char *const malformed[] = {
         "/usr/bin/ssh -i '/tmp/key' " SSH_COMMAND_OPTIONS,
         "'ssh' -i '/tmp/key' " SSH_COMMAND_OPTIONS,
@@ -894,6 +918,15 @@ TEST(ssh_program_extraction_accepts_only_the_managed_first_word) {
     CHECK_EQ_INT(publication_extract_ssh_program(
                      alias_command, program, sizeof(program)), 0);
     CHECK_STR_EQ(program, SSH_PROGRAM_A);
+    CHECK_EQ_INT(publication_extract_ssh_program(
+                     private_config_command, program, sizeof(program)), 0);
+    CHECK_STR_EQ(program, SSH_PROGRAM_A);
+    for (i = 0U; i < sizeof(private_malformed) / sizeof(private_malformed[0]);
+         i++) {
+        CHECK_EQ_INT(publication_extract_ssh_program(
+                         private_malformed[i], program, sizeof(program)), -1);
+        CHECK_EQ_INT(program[0], '\0');
+    }
     for (i = 0U; i < sizeof(malformed) / sizeof(malformed[0]); i++) {
         CHECK_EQ_INT(publication_extract_ssh_program(
                          malformed[i], program, sizeof(program)), -1);

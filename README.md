@@ -62,6 +62,14 @@ An account with an SSH key can carry two host fields in `accounts.toml`:
   (`HostName`, e.g. `github.com`). If unset, the alias itself is used as the
   destination, which only works when the alias is a real DNS name.
 
+The published `core.sshCommand` points `-F` at a gitswitch-owned per-account
+config (`~/.config/gitswitch/ssh-alias-<id>.conf`) that holds only the alias
+stanza, so the destination applies to the alias alone: other SSH remotes keep
+their own host names. That private config replaces your `~/.ssh/config` for
+git's ssh while the account is active (the account key and `IdentitiesOnly`
+still apply to every host), so per-host settings such as `ProxyJump` are not
+in effect for git.
+
 `add`/`edit` prompt for both; suffix-style aliases like `github.com-work`
 need an explicit `ssh_hostname` to be reachable.
 
