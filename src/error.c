@@ -683,7 +683,9 @@ void format_error_message(char *buffer, size_t buffer_size,
     complete = append_display_field(buffer, buffer_size, &used,
                                     error->message,
                                     sizeof(error->message)) && complete;
-    if (error->system_errno != 0) {
+    /* AR-18 L52: the accumulated causal chain lives in details whether or
+     * not the first error carried an errno; never hide it. */
+    if (error->system_errno != 0 || error->details[0] != '\0') {
         complete = append_display_span(buffer, buffer_size, &used,
                                        "\nDetails: ",
                                        sizeof("\nDetails: ") - 1U) && complete;
