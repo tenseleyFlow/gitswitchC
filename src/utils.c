@@ -3913,6 +3913,33 @@ static int runner_tcsetpgrp_masked(int fd, pid_t pgid) {
     return 0;
 }
 
+#ifdef GITSWITCH_TESTING
+/* AR-18 diagnostics: append one line to the file named by
+ * GITSWITCH_RUNNER_TRACE (when it is an absolute path). Works from the
+ * supervisor too, whose stderr is already the capture pipe or /dev/null. */
+static void runner_trace(const char *format, ...) {
+    const char *path = getenv("GITSWITCH_RUNNER_TRACE");
+    char line[512];
+    va_list args;
+    int length;
+    int fd;
+    int saved_errno = errno;
+
+    if (!path || path[0] != '/') { errno = saved_errno; return; }
+    va_start(args, format);
+    length = vsnprintf(line, sizeof(line), format, args);
+    va_end(args);
+    if (length <= 0) { errno = saved_errno; return; }
+    if ((size_t)length >= sizeof(line)) length = (int)sizeof(line) - 1;
+    fd = open(path, O_WRONLY | O_APPEND | O_CREAT | O_CLOEXEC, 0600);
+    if (fd >= 0) {
+        (void)!write(fd, line, (size_t)length);
+        close(fd);
+    }
+    errno = saved_errno;
+}
+#endif
+
 static int runner_tty_prepare(runner_tty_state_t *state) {
     pid_t foreground;
 
@@ -3974,7 +4001,7 @@ static void runner_signal_child_at(pid_t pid, bool group_proven,
                                    int signal_number, int line) {
     if (pid <= 0) return;
 #ifdef GITSWITCH_TESTING
-    if (getenv("GITSWITCH_RUNNER_TRACE")) fprintf(stderr,
+    runner_trace(
             "runner signal: sig=%d pid=%ld group=%d from utils.c:%d errno=%d\n",
             signal_number, (long)pid, group_proven ? 1 : 0, line, errno);
 #else
@@ -3988,7 +4015,7 @@ static void runner_signal_child_at(pid_t pid, bool group_proven,
 static void runner_accept_group_relay(pid_t pid, bool group_proven,
                                       int signal_number) {
 #ifdef GITSWITCH_TESTING
-    if (getenv("GITSWITCH_RUNNER_TRACE")) fprintf(stderr,
+    runner_trace(
             "runner relayed group signal: signal=%d pid=%ld group_proven=%d\n",
             signal_number, (long)pid, group_proven ? 1 : 0);
 #endif
@@ -4156,7 +4183,7 @@ static int runner_replay_pending_group_signals(
             }
             (void)kill(worker, SIGCONT);
 #ifdef GITSWITCH_TESTING
-    if (getenv("GITSWITCH_RUNNER_TRACE")) fprintf(stderr, "supervisor kill at utils.c:%d errno=%d\n", __LINE__, errno);
+    runner_trace( "supervisor kill at utils.c:%d errno=%d\n", __LINE__, errno);
 #endif
             if (kill(worker, SIGKILL) != 0) return -1;
             *worker_killed = true;
@@ -4180,10 +4207,10 @@ static void runner_kill_and_reap_worker(pid_t worker,
     if (!relay_set ||
         sigprocmask(SIG_BLOCK, relay_set, &previous_mask) != 0) {
 #ifdef GITSWITCH_TESTING
-    if (getenv("GITSWITCH_RUNNER_TRACE")) fprintf(stderr, "supervisor kill at utils.c:%d errno=%d\n", __LINE__, errno);
+    runner_trace( "supervisor kill at utils.c:%d errno=%d\n", __LINE__, errno);
 #endif
     #ifdef GITSWITCH_TESTING
-    if (getenv("GITSWITCH_RUNNER_TRACE")) fprintf(stderr, "supervisor kill at utils.c:%d errno=%d\n", __LINE__, errno);
+    runner_trace( "supervisor kill at utils.c:%d errno=%d\n", __LINE__, errno);
 #endif
     (void)kill(worker, SIGKILL);
         do {
@@ -4192,7 +4219,7 @@ static void runner_kill_and_reap_worker(pid_t worker,
         return;
     }
 #ifdef GITSWITCH_TESTING
-    if (getenv("GITSWITCH_RUNNER_TRACE")) fprintf(stderr, "supervisor kill at utils.c:%d errno=%d\n", __LINE__, errno);
+    runner_trace( "supervisor kill at utils.c:%d errno=%d\n", __LINE__, errno);
 #endif
     (void)kill(worker, SIGKILL);
     do {
@@ -4215,7 +4242,7 @@ static void runner_supervisor_exit_for_status(pid_t child, int status) {
         (void)raise(signal_number);
     }
 #ifdef GITSWITCH_TESTING
-    if (getenv("GITSWITCH_RUNNER_TRACE")) fprintf(stderr, "supervisor kill at utils.c:%d errno=%d\n", __LINE__, errno);
+    runner_trace( "supervisor kill at utils.c:%d errno=%d\n", __LINE__, errno);
 #endif
     (void)kill(child, SIGKILL);
     _exit(127);
@@ -5728,7 +5755,7 @@ static int run_argv_real_impl(
 #ifdef GITSWITCH_TESTING
         /* AR-18: name the exact pre-exec failure for a suite that opts in;
          * the production runner reports it through the result and errno. */
-        if (getenv("GITSWITCH_RUNNER_TRACE")) fprintf(stderr,
+        runner_trace(
                 "runner early failure: group_proven=%d ready_rc=%d "
                 "ready_errno=%d early_rc=%d early_stage=%d early_errno=%d "
                 "tty_prepare=%d/%d tty_transfer=%d/%d\n",
@@ -6315,7 +6342,7 @@ static int run_argv_real_impl(
                 if (observed.si_code != CLD_EXITED ||
                     observed.si_status != 0) {
 #ifdef GITSWITCH_TESTING
-                    if (getenv("GITSWITCH_RUNNER_TRACE")) fprintf(stderr,
+                    runner_trace(
                             "runner supervisor ended abnormally: si_code=%d "
                             "si_status=%d errno=%d\n",
                             (int)observed.si_code, (int)observed.si_status,
@@ -6393,7 +6420,7 @@ static int run_argv_real_impl(
     if (deadline_expired || deadline_clock_failed || child_status_rc != 0 ||
         io_failed || input_failed || output_stalled || wait_failed) {
 #ifdef GITSWITCH_TESTING
-        if (getenv("GITSWITCH_RUNNER_TRACE")) fprintf(stderr,
+        runner_trace(
                 "runner kill: deadline=%d clock=%d child_status_rc=%d "
                 "stage=%d child_errno=%d io=%d/%d input=%d stalled=%d "
                 "wait=%d/%d errno=%d\n",
