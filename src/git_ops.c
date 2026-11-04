@@ -1245,8 +1245,11 @@ static int git_snapshot_run_observed(void *context) {
  * corrupt config input; reaching it is a preflight failure, never a partial
  * snapshot followed by mutation (AR-07 M24). */
 /* AR-18 M13: GIT_TRACE and friends make git write to stderr before any
- * output; several readers here merge stderr to classify diagnostics, so a
- * debugging environment must never reach a child git. */
+ * output, and the readers that parse a merged capture (the -z snapshot
+ * listing, single-path queries, the raw listing) must never see a debugging
+ * environment. Message-only captures keep the user's environment: a trace
+ * line in a failure diagnostic is what GIT_TRACE asks for, and the
+ * retirement regressions observe git's own trace of `--unset`. */
 static const char *const g_git_child_unset_env[] = {
     "GIT_TRACE", "GIT_TRACE_SETUP", "GIT_TRACE_PERFORMANCE",
     "GIT_TRACE_PACK_ACCESS", "GIT_TRACE_PACKET", "GIT_TRACE_REDACT",
@@ -1501,7 +1504,6 @@ static int git_add_snapshot_value(git_scope_t scope, const char *key,
     opts.out = output;
     opts.out_size = sizeof(output);
     opts.merge_stderr = true;
-    opts.unset_env = g_git_child_unset_env;
     if (run_argv(argv, &opts, &res) != 0) {
         cfg_cache_store(cfg_scope_index(scope), cfg_key_index(key),
                         CFG_UNKNOWN, true, "");
@@ -5813,7 +5815,6 @@ static int git_config_file_unset(const char *path, const char *key,
     opts.out = output;
     opts.out_size = sizeof(output);
     opts.merge_stderr = true;
-    opts.unset_env = g_git_child_unset_env;
     (void)run_argv(argv, &opts, &result);
     if (result.spawned && result.term_signal == 0 &&
         (result.exit_code == 0 || result.exit_code == 5)) {
@@ -5853,7 +5854,6 @@ static int git_config_file_unset_exact(const char *path, const char *key,
     opts.out = output;
     opts.out_size = sizeof(output);
     opts.merge_stderr = true;
-    opts.unset_env = g_git_child_unset_env;
     prior_error_generation = error_report_generation();
     run_rc = run_argv(argv, &opts, &result);
     if (run_rc == 0 && result.spawned &&
@@ -5884,7 +5884,6 @@ static int git_config_file_add(const char *path, const char *key,
     opts.out = output;
     opts.out_size = sizeof(output);
     opts.merge_stderr = true;
-    opts.unset_env = g_git_child_unset_env;
     if (run_argv(argv, &opts, &result) == 0) return 0;
     set_error(ERR_GIT_CONFIG_FAILED,
               "Failed to add Git config %s in rollback lock: %s", key,
@@ -9285,7 +9284,6 @@ static void git_set_capture_error(const char *context,
     opts.out = diagnostic;
     opts.out_size = sizeof(diagnostic);
     opts.merge_stderr = true;
-    opts.unset_env = g_git_child_unset_env;
     (void)run_argv(argv, &opts, &retry);
 
     length = retry.out_len;
@@ -15368,7 +15366,6 @@ static int git_unset_config_value_impl(const char *key, git_scope_t scope,
         opts.out = output;
         opts.out_size = sizeof(output);
         opts.merge_stderr = true;
-        opts.unset_env = g_git_child_unset_env;
         run_argv(argv, &opts, &res);
         {
             int recovery_result = 0;
@@ -16048,7 +16045,6 @@ static int git_run(char *output, size_t output_size, ...) {
     opts.out = output;
     opts.out_size = output_size;
     opts.merge_stderr = true;
-    opts.unset_env = g_git_child_unset_env;
 
     log_debug("Executing git command: %s %s", argv[1] ? argv[1] : "", argv[2] ? argv[2] : "");
     return run_argv(argv, &opts, &res);
