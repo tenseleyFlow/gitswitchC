@@ -1965,6 +1965,16 @@ TEST(direct_worktree_extension_false_ignores_later_included_true) {
              * external SIGKILL that none of our kill sites recorded. */
             fflush(stderr);
             fprintf(stderr, "ps: self=%ld\n", (long)getpid());
+            /* The unified log records kernel-originated kills with their
+             * reason (exec policy, resource exception, jetsam, AMFI). */
+            (void)!system("log show --last 3m --style compact --predicate "
+                          "'(process == \"kernel\" OR process == \"git\" OR "
+                          "process CONTAINS \"test_ar08\" OR "
+                          "eventMessage CONTAINS \"git\" OR "
+                          "eventMessage CONTAINS \"SIGKILL\" OR "
+                          "eventMessage CONTAINS \"killed\")' 2>&1 | "
+                          "grep -v -i -e 'com.apple.' -e 'nehelper' | "
+                          "sed 's/^/log: /' | tail -80 1>&2");
             (void)!system("ps -axo pid,ppid,pgid,sess,stat,etime,comm,args 2>&1 | "
                           "grep -E 'gitswitch|test_|/git|ssh|gpg|make|yes|sh |bash|zsh|fish|dash|ksh' | "
                           "grep -v -e ' (ps)' -e 'grep -E' | "
