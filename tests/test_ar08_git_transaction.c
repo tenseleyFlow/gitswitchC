@@ -3179,6 +3179,66 @@ TEST(finalization_arena_exhaustion_precedes_private_and_canonical_creation) {
     fixture_cleanup(&fixture);
 }
 
+static bool force_global_finalization_noreplace_fallback(
+    git_finalization_test_stage_t stage, int directory_fd,
+    const char *lock_leaf) {
+    (void)directory_fd;
+    if (stage == GIT_FINALIZATION_TEST_FORCE_NOREPLACE_FALLBACK &&
+        finalization_hook_targets_global(lock_leaf)) {
+        g_finalization_hook_calls++;
+        return true;
+    }
+    return false;
+}
+
+/* AR-18 M4: on a filesystem that rejects rename flags the canonical
+ * finalization certificate used to be published as a second hard link of
+ * the private alias, which no non-FreeBSD cleanup could ever bring back to
+ * one link. It is now published through the portable single-link move, so
+ * begin/end complete and leave neither a lock nor a private alias. */
+TEST(finalization_publishes_single_link_under_forced_noreplace_fallback) {
+#if defined(__FreeBSD__)
+    TS_SKIP("persistent-fs",
+            "FreeBSD retires the linked alias with funlinkat");
+#else
+    git_fixture_t fixture;
+    git_config_finalization_t *finalization = NULL;
+    struct stat named;
+
+    if (!fixture_init(&fixture)) {
+        CHECK(false);
+        fixture_cleanup(&fixture);
+        return;
+    }
+    CHECK_EQ_INT(git_set("--global", "user.name",
+                         "before-portable-finalization"), 0);
+    CHECK((size_t)snprintf(
+              g_finalization_lock_path,
+              sizeof(g_finalization_lock_path), "%s.lock",
+              fixture.global_config) < sizeof(g_finalization_lock_path));
+    CHECK_EQ_INT(prepare_finalization_transaction(
+                     "portable-finalization-postimage"), 0);
+    g_finalization_hook_calls = 0;
+    (void)git_ops_test_set_finalization_hook(
+        force_global_finalization_noreplace_fallback);
+    CHECK_EQ_INT(git_config_finalization_begin(&finalization), 0);
+    CHECK(finalization != NULL);
+    CHECK_EQ_INT(git_config_finalization_end(&finalization), 0);
+    CHECK(finalization == NULL);
+    (void)git_ops_test_set_finalization_hook(NULL);
+    CHECK(g_finalization_hook_calls >= 1);
+    errno = 0;
+    CHECK(lstat(g_finalization_lock_path, &named) != 0 &&
+          errno == ENOENT);
+    CHECK_EQ_INT((long)count_finalization_private_aliases(fixture.base), 0);
+    CHECK_EQ_INT(lstat(fixture.global_config, &named), 0);
+    CHECK_EQ_INT((long)named.st_nlink, 1L);
+    git_config_commit();
+
+    fixture_cleanup(&fixture);
+#endif
+}
+
 TEST(finalization_release_failure_consumes_handle_and_self_heals) {
     static const char marker_magic[] = "gitswitch-recovery-v1 ";
     git_fixture_t fixture;
@@ -3627,6 +3687,7 @@ TEST_MAIN_BEGIN()
     RUN_TEST(private_prepublication_sigkill_is_reconciled_exactly);
     RUN_TEST(private_prepare_interruption_cleans_unpublished_certificate);
     RUN_TEST(finalization_arena_exhaustion_precedes_private_and_canonical_creation);
+    RUN_TEST(finalization_publishes_single_link_under_forced_noreplace_fallback);
     RUN_TEST(finalization_release_failure_consumes_handle_and_self_heals);
     RUN_TEST(forked_child_finalization_end_is_descriptor_only);
     RUN_TEST(finalization_release_preserves_foreign_replacement);

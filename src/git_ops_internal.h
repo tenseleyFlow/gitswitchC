@@ -157,7 +157,11 @@ typedef enum {
     GIT_FINALIZATION_TEST_AFTER_PRIVATE_PREPARE = 1,
     GIT_FINALIZATION_TEST_AFTER_CANONICAL_PUBLISH,
     GIT_FINALIZATION_TEST_BEFORE_RELEASE,
-    GIT_FINALIZATION_TEST_BEFORE_RELEASE_DIRECTORY_SYNC
+    GIT_FINALIZATION_TEST_BEFORE_RELEASE_DIRECTORY_SYNC,
+    /* Return true to model a filesystem that rejects rename flags: the
+     * canonical certificate is published through the portable no-replace
+     * move (AR-18 M4). */
+    GIT_FINALIZATION_TEST_FORCE_NOREPLACE_FALLBACK
 } git_finalization_test_stage_t;
 
 typedef bool (*git_finalization_test_hook_fn)(
