@@ -1976,9 +1976,12 @@ TEST(direct_worktree_extension_false_ignores_later_included_true) {
             }
             /* The crash report of the killed pre-exec child names the
              * exception (guarded descriptor, stack fault, ...). */
-            (void)!system("sleep 3; f=$(ls -t \"$HOME\"/Library/Logs/DiagnosticReports/test_ar08_git_transaction*.ips 2>/dev/null | head -1); "
+            (void)!system("sleep 12; for d in \"$HOME\"/Library/Logs/DiagnosticReports /Library/Logs/DiagnosticReports; do "
+                          "ls -t \"$d\" 2>/dev/null | head -5 | sed \"s|^|reports: $d/|\" 1>&2; done; "
+                          "f=$(ls -t \"$HOME\"/Library/Logs/DiagnosticReports/test_ar08* /Library/Logs/DiagnosticReports/test_ar08* 2>/dev/null | head -1); "
                           "if [ -n \"$f\" ]; then echo \"crash: $f\" 1>&2; "
-                          "head -c 6000 \"$f\" | tr ',' '\\n' | grep -i -E 'exception|termination|signal|guard|faultingThread|\"type\"|codes|reason' | head -40 | sed 's/^/crash: /' 1>&2; fi");
+                          "head -c 12000 \"$f\" | tr ',' '\\n' | grep -i -E 'exception|termination|signal|guard|faultingThread|\"type\"|codes|reason|symbol|imageOffset' | head -60 | sed 's/^/crash: /' 1>&2; fi; "
+                          "log show --last 3m --style compact --predicate 'process == \"ReportCrash\" OR eventMessage CONTAINS \"EXC_\" OR eventMessage CONTAINS \"guard\"' 2>/dev/null | grep -v 'com.apple.' | tail -30 | sed 's/^/rc: /' 1>&2");
             /* The unified log records kernel-originated kills with their
              * reason (exec policy, resource exception, jetsam, AMFI). */
             (void)!system("log show --last 3m --style compact --predicate "
