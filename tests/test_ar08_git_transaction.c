@@ -163,17 +163,6 @@ static int write_binary_file(const char *path, const unsigned char *contents,
     return chmod(path, mode);
 }
 
-#if defined(__APPLE__) && defined(__has_feature)
-#if __has_feature(address_sanitizer)
-/* AR-18 Darwin diagnostics: the pre-exec child has no stderr, so route the
- * sanitizer's report of a fault in it to a file the failing test can dump. */
-const char *__asan_default_options(void);
-const char *__asan_default_options(void) {
-    return "log_path=/tmp/gsw-asan-ar08,abort_on_error=0,handle_segv=1,handle_sigbus=1";
-}
-#endif
-#endif
-
 static int run_command(const char *const argv[], char *output,
                        size_t output_size, bool merge_stderr,
                        run_result_t *result) {
@@ -1952,106 +1941,13 @@ TEST(direct_worktree_extension_false_ignores_later_included_true) {
     CHECK_EQ_INT(git_config_snapshot(GIT_SCOPE_GLOBAL), 0);
     CHECK_EQ_INT(git_set_config_value(GIT_CONFIG_USER_NAME, "owned-post",
                                       GIT_SCOPE_GLOBAL), 0);
-    clear_error();
-    {
-        char trace_path[MAX_PATH_LEN];
-
-        CHECK((size_t)snprintf(trace_path, sizeof(trace_path),
-                               "%s/runner-trace.log", fixture.base) <
-              sizeof(trace_path));
-        (void)setenv("GITSWITCH_RUNNER_TRACE", trace_path, 1);
-        /* Darwin diagnostics: which descriptors does the parent hold here? */
-        (void)!system("ls -l /dev/fd/ 2>/dev/null | sed 's/^/fds-before: /' 1>&2; "
-                      "for fd in /dev/fd/*; do n=${fd##*/}; [ \"$n\" -gt 2 ] 2>/dev/null || continue; "
-                      "echo \"fdinfo-before: $n $(lsof -p $PPID -a -d $n -Fn 2>/dev/null | tail -1)\" 1>&2; done");
-        if (git_config_seal() != 0) {
-            FILE *trace = fopen(trace_path, "r");
-            char line[512];
-
-            fprintf(stderr, "seal failed: %s | %s (errno=%d)\n",
-                    get_last_error()->message, get_last_error()->details,
-                    errno);
-            while (trace && fgets(line, sizeof(line), trace)) {
-                fprintf(stderr, "trace: %s", line);
-            }
-            if (trace) fclose(trace);
-            /* Who else is alive? A lingering helper from an earlier suite
-             * delivering a delayed signal to a recycled PID would explain an
-             * external SIGKILL that none of our kill sites recorded. */
-            fflush(stderr);
-            fprintf(stderr, "ps: self=%ld\n", (long)getpid());
-            {
-                struct rlimit stack_limit = {0, 0};
-                char probe;
-                (void)getrlimit(RLIMIT_STACK, &stack_limit);
-                fprintf(stderr, "stack: rlimit cur=%llu max=%llu local=%p\n",
-                        (unsigned long long)stack_limit.rlim_cur,
-                        (unsigned long long)stack_limit.rlim_max,
-                        (void *)&probe);
-            }
-            /* The crash report of the killed pre-exec child names the
-             * exception (guarded descriptor, stack fault, ...). */
-            (void)!system("for f in /tmp/gsw-asan-ar08.*; do [ -e \"$f\" ] || continue; "
-                          "echo \"asan: $f\" 1>&2; head -60 \"$f\" | sed 's/^/asan: /' 1>&2; done");
-            (void)!system(
-                /* The suite points HOME at a fixture; ReportCrash writes under
-                 * the account's real home (and names corpse reports with a
-                 * .000 sequence suffix on macOS 26). */
-                "h=$(eval echo \"~$(id -un)\"); d=\"$h/Library/Logs/DiagnosticReports\"; f=; "
-                "for i in $(seq 1 30); do "
-                "f=$(ls -t \"$d\"/test_ar08_git_transaction-*.ips 2>/dev/null | head -1); "
-                "[ -n \"$f\" ] && break; sleep 2; done; "
-                "if [ -z \"$f\" ]; then echo 'crash: no report' 1>&2; exit 0; fi; "
-                "echo \"crash: $f\" 1>&2; "
-                "python3 - \"$f\" 1>&2 <<'PY'\n"
-                "import json,sys\n"
-                "raw=open(sys.argv[1]).read().split('\\n',1)\n"
-                "body=json.loads(raw[1])\n"
-                "for k in ('exception','termination','asi','vmRegionInfo','faultingThread','isCorpse','procName','parentProc','parentPid'):\n"
-                "    if k in body: print('crash:',k,'=',json.dumps(body[k])[:400])\n"
-                "imgs=body.get('usedImages',[])\n"
-                "ft=body.get('faultingThread',0)\n"
-                "th=body.get('threads',[])\n"
-                "if th:\n"
-                "    t=th[ft] if ft < len(th) else th[0]\n"
-                "    for fr in t.get('frames',[])[:14]:\n"
-                "        idx=fr.get('imageIndex',-1); name=imgs[idx].get('name','?') if 0<=idx<len(imgs) else '?'\n"
-                "        print('crash: frame', name, fr.get('symbol','?'), '+', fr.get('symbolLocation','?'), 'off', fr.get('imageOffset','?'))\n"
-                "PY\n");
-            /* The unified log records kernel-originated kills with their
-             * reason (exec policy, resource exception, jetsam, AMFI). */
-            (void)!system("log show --last 3m --style compact --predicate "
-                          "'(process == \"kernel\" OR process == \"git\" OR "
-                          "process CONTAINS \"test_ar08\" OR "
-                          "eventMessage CONTAINS \"git\" OR "
-                          "eventMessage CONTAINS \"SIGKILL\" OR "
-                          "eventMessage CONTAINS \"killed\")' 2>&1 | "
-                          "grep -v -i -e 'com.apple.' -e 'nehelper' | "
-                          "sed 's/^/log: /' | tail -80 1>&2");
-            (void)!system("ps -axo pid,ppid,pgid,sess,stat,etime,comm,args 2>&1 | "
-                          "grep -E 'gitswitch|test_|/git|ssh|gpg|make|yes|sh |bash|zsh|fish|dash|ksh' | "
-                          "grep -v -e ' (ps)' -e 'grep -E' | "
-                          "sed 's/^/ps: /' | head -150 1>&2; "
-                          "ps -axo pid | sort -n | tail -1 | sed 's/^/ps: maxpid=/' 1>&2");
-            /* Darwin diagnostics: the kernel kills a forked child that hits a
-             * system-library hard trap (brk 0xB000-0xBFFF) without any
-             * handler, so the only witnesses are the parent's own state
-             * (threads, loaded images, descriptors) and ReportCrash. */
-            (void)!system("log show --last 4m --style compact --predicate "
-                          "'process == \"ReportCrash\" OR eventMessage CONTAINS \"unrecoverable\" "
-                          "OR eventMessage CONTAINS \"corpse\"' 2>/dev/null | "
-                          "sed 's/^/rc: /' | tail -40 1>&2");
-            /* Is the rejection a transient window or a sticky state? */
-            sleep(3);
-            {
-                int again = git_config_seal();
-                fprintf(stderr, "seal-retry-after-3s: rc=%d msg=%s | %s\n", again,
-                        get_last_error()->message, get_last_error()->details);
-            }
-            CHECK(false);
-        }
-        (void)unsetenv("GITSWITCH_RUNNER_TRACE");
-    }
+    /* AR-18: on macOS 26 this seal read was the deterministic victim of
+     * Apple's compiler-rt fork bug (a forked child dies in libSystem's own
+     * atfork handler whenever ASan's stack depot needs a new block there).
+     * The Makefile keeps allocation stacks out of the depot on Darwin debug
+     * runs; GITSWITCH_RUNNER_TRACE=/abs/file traces the runner's stages if
+     * it ever recurs. */
+    CHECK_EQ_INT(git_config_seal(), 0);
     CHECK((size_t)snprintf(local_config, sizeof(local_config),
                            "%s/.git/config", fixture.repo) <
           sizeof(local_config));
