@@ -684,6 +684,66 @@ TEST(config_init_rejects_symlinked_final_directory_without_mutation) {
     check_symlinked_config_directory_refused(0700);
 }
 
+/* AR-18 P58: read-only initializations admit an account on the
+ * descriptor-backed key checks alone, so completion's `list --names` and the
+ * per-shell `--resume-check` never spawn ssh-keygen per account. A key file
+ * whose envelope is right but whose body ssh-keygen rejects therefore loads
+ * read-only and is skipped only by the normal (mutating) initialization. */
+TEST(readonly_loads_skip_the_ssh_keygen_parse_per_account) {
+    char home[128], saved_home[512], dotconfig[256], final[256];
+    char accounts[512], key[512], cfg[1024];
+    gitswitch_ctx_t ctx;
+    static const char envelope_only[] =
+        "-----BEGIN OPENSSH PRIVATE KEY-----\n"
+        "bm90IGEgcmVhbCBrZXk=\n"
+        "-----END OPENSSH PRIVATE KEY-----\n";
+
+    save_home_env(saved_home, sizeof(saved_home));
+    CHECK_EQ_INT(make_scratch_dir(home, sizeof(home)), 0);
+    snprintf(dotconfig, sizeof(dotconfig), "%s/.config", home);
+    CHECK_EQ_INT(test_join_path(final, sizeof(final), dotconfig, "/gitswitch"), 0);
+    CHECK_EQ_INT(mkdir(dotconfig, 0700), 0);
+    CHECK_EQ_INT(mkdir(final, 0700), 0);
+    snprintf(accounts, sizeof(accounts), "%s/accounts.toml", final);
+    snprintf(key, sizeof(key), "%s/envelope_only", home);
+    CHECK_EQ_INT(write_config(key, envelope_only, sizeof(envelope_only) - 1U), 0);
+    CHECK(snprintf(cfg, sizeof(cfg),
+                   "[settings]\n"
+                   "default_scope = \"local\"\n"
+                   "[accounts.1]\n"
+                   "name = \"work\"\n"
+                   "email = \"work@example.com\"\n"
+                   "ssh_key = \"%s\"\n", key) < (int)sizeof(cfg));
+    CHECK_EQ_INT(write_config(accounts, cfg, strlen(cfg)), 0);
+    CHECK_EQ_INT(setenv("HOME", home, 1), 0);
+
+    memset(&ctx, 0, sizeof(ctx));
+    CHECK_EQ_INT(config_init_names(&ctx), 0);
+    CHECK_EQ_INT(ctx.account_count, 1);
+    CHECK_EQ_INT((int)ctx.accounts_skipped_on_load, 0);
+    memset(&ctx, 0, sizeof(ctx));
+    CHECK_EQ_INT(config_init_readonly(&ctx), 0);
+    CHECK_EQ_INT(ctx.account_count, 1);
+    memset(&ctx, 0, sizeof(ctx));
+    CHECK_EQ_INT(config_init_runtime_readonly(&ctx), 0);
+    CHECK_EQ_INT(ctx.account_count, 1);
+
+    /* The mutating initialization still runs the OpenSSH parse. */
+    memset(&ctx, 0, sizeof(ctx));
+    CHECK_EQ_INT(config_init(&ctx), 0);
+    CHECK_EQ_INT(ctx.account_count, 0);
+    CHECK_EQ_INT((int)ctx.accounts_skipped_on_load, 1);
+
+    /* The shallow check is not a bypass of the descriptor-backed gate. */
+    CHECK_EQ_INT(chmod(key, 0644), 0);
+    memset(&ctx, 0, sizeof(ctx));
+    CHECK_EQ_INT(config_init_names(&ctx), 0);
+    CHECK_EQ_INT(ctx.account_count, 0);
+    CHECK_EQ_INT((int)ctx.accounts_skipped_on_load, 1);
+
+    restore_home_env(saved_home);
+}
+
 TEST(config_init_rejects_nondirectory_final_components) {
     char home[128], saved_home[512], dotconfig[256], final[256];
     char before[64], after[64];
@@ -2879,6 +2939,7 @@ TEST_MAIN_BEGIN()
     RUN_TEST(reload_reconciles_current_account_from_runtime_or_saved_state);
     RUN_TEST(load_rejects_symlinked_config);
     RUN_TEST(config_init_rejects_symlinked_final_directory_without_mutation);
+    RUN_TEST(readonly_loads_skip_the_ssh_keygen_parse_per_account);
     RUN_TEST(config_init_rejects_nondirectory_final_components);
     RUN_TEST(config_init_secures_real_or_absent_final_directory);
     RUN_TEST(config_get_path_uses_home_or_passwd_without_filesystem_mutation);

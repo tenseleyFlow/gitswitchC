@@ -3127,19 +3127,15 @@ static int handle_init_command(const char *shell) {
         printf("# gitswitch shell integration (fish)\n");
         printf("set -l __gitswitch_auth_sock '%s'\n", sock_path);
         printf("function __gitswitch_ssh_needs_resume\n");
-        printf("    env SSH_AUTH_SOCK='%s' ssh-add -l >/dev/null 2>&1\n",
-               sock_path);
-        printf("    if test $status -ne 0\n");
-        printf("        return 0\n");
-        printf("    end\n");
         printf("    command gitswitch --resume-check >/dev/null 2>&1\n");
         printf("    test $status -ne 0\n");
         printf("end\n");
-        /* First interactive shell after a boot: a nonzero `ssh-add -l` result
-         * (including status 1 for an empty agent) resumes directly. Status 0 is
-         * followed by the read-only exact-runtime check, which rejects the
-         * wrong key or any extra identity. Interactive-gated so pinentry has a
-         * user. The "restoring your
+        /* First interactive shell after a boot: the read-only exact-runtime
+         * check owns the whole verdict. It probes the stable socket itself
+         * and rejects a dead agent, an empty one, the wrong key or any extra
+         * identity, so a separate `ssh-add -l` pre-probe in the shell only
+         * duplicated its first subprocess on every prompt (AR-18 L70).
+         * Interactive-gated so pinentry has a user. The "restoring your
          * account" notice is printed by startup resume itself (on stderr, past the
          * stdout suppression) only when it actually has an account to restore —
          * echoing it here would nag on every shell when there is nothing saved,
@@ -3203,17 +3199,15 @@ static int handle_init_command(const char *shell) {
         printf("# gitswitch shell integration (%s)\n", shell);
         printf("__gitswitch_auth_sock='%s'\n", sock_path);
         printf("__gitswitch_ssh_needs_resume() {\n");
-        printf("    SSH_AUTH_SOCK='%s' ssh-add -l >/dev/null 2>&1\n",
-               sock_path);
-        printf("    [ $? -ne 0 ] && return 0\n");
         printf("    command gitswitch --resume-check >/dev/null 2>&1\n");
         printf("    [ $? -ne 0 ]\n");
         printf("}\n");
-        /* First interactive shell after a boot: nonzero/empty agent results
-         * resume directly, while status 0 is verified against the saved
-         * account's exact single fingerprint by --resume-check. A stale socket
-         * or a reachable wrong/extra-key agent therefore cannot suppress the
-         * restore. Interactive-gated so pinentry has a user. The notice comes
+        /* First interactive shell after a boot: --resume-check verifies the
+         * stable socket against the saved account's exact single fingerprint,
+         * so a stale socket, an empty agent, or a reachable wrong/extra-key
+         * agent all force the restore without a separate `ssh-add -l`
+         * pre-probe (AR-18 L70). Interactive-gated so pinentry has a user.
+         * The notice comes
          * from startup resume itself (stderr) only when there is an account to
          * restore — see the fish branch above for why. */
         printf("case $- in *i*)\n");

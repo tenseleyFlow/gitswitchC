@@ -327,6 +327,7 @@ TEST(all_retained_public_apis_compile_and_link) {
     REQUIRE_PUBLIC_API(publication_record_init);
     REQUIRE_PUBLIC_API(publication_record_same_config_destination);
     REQUIRE_PUBLIC_API(publication_record_same_destination);
+    REQUIRE_PUBLIC_API(publication_record_same_stored_destination);
     REQUIRE_PUBLIC_API(publication_record_validate);
     REQUIRE_PUBLIC_API(publication_record_verify_live_destination);
     REQUIRE_PUBLIC_API(prompt_confirm_exact_yes);
@@ -476,6 +477,7 @@ TEST(all_retained_public_apis_compile_and_link) {
     REQUIRE_PUBLIC_API(ssh_switch_account);
     REQUIRE_PUBLIC_API(ssh_test_connection);
     REQUIRE_PUBLIC_API(ssh_validate_key_file);
+    REQUIRE_PUBLIC_API(ssh_validate_key_file_shallow);
     REQUIRE_PUBLIC_API(string_ascii_case_equal);
     REQUIRE_PUBLIC_API(string_empty);
     REQUIRE_PUBLIC_API(string_ends_with);

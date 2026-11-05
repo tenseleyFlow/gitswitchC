@@ -12,6 +12,8 @@
 #define _POSIX_C_SOURCE 200809L
 #endif
 
+#include <stdio.h>
+#include <stdlib.h>
 #include <errno.h>
 #include <fcntl.h>
 #include <limits.h>
@@ -130,6 +132,22 @@ void signals_record_relayed_group_signal(int signal_number) {
             } else if ((pid_t)g_child_pgid == (pid_t)g_child_pid &&
                        g_child_pid > 0 &&
                        (pid_t)g_child_signaled == (pid_t)g_child_pid) {
+#ifdef GITSWITCH_TESTING
+                {
+                    const char *trace = getenv("GITSWITCH_RUNNER_TRACE");
+                    if (trace && trace[0] == '/') {
+                        char line[160];
+                        int n = snprintf(line, sizeof(line),
+                                         "signal guard: second relayed signal %d "
+                                         "while %d pending; killing group %ld\n",
+                                         signal_number, (int)g_pending_signal,
+                                         (long)g_child_pgid);
+                        int fd = open(trace, O_WRONLY | O_APPEND | O_CREAT, 0600);
+                        if (fd >= 0 && n > 0) { (void)!write(fd, line, (size_t)n); }
+                        if (fd >= 0) close(fd);
+                    }
+                }
+#endif
                 (void)kill(-(pid_t)g_child_pgid, SIGKILL);
             } else if ((pid_t)g_child_pgid == (pid_t)g_child_pid &&
                        g_child_pid > 0) {

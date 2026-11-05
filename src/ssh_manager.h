@@ -301,6 +301,13 @@ int ssh_list_keys(ssh_config_t *ssh_config, char *output, size_t output_size);
  */
 int ssh_validate_key_file(const char *key_path);
 
+/* AR-18 P58: the descriptor-backed admission checks only (regular file,
+ * current uid, owner-only mode, private-key header read from the same open
+ * object) without the ssh-keygen parse. Read-only configuration loads use it
+ * so `list --names` and `--resume-check` never spawn ssh-keygen once per
+ * account; every mutating path still runs ssh_validate_key_file. */
+int ssh_validate_key_file_shallow(const char *key_path);
+
 /**
  * Inspect one key through one O_NOFOLLOW descriptor. A missing path is a
  * successful inspection with exists=false; unsafe/unreadable namespace state

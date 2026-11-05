@@ -1941,6 +1941,12 @@ TEST(direct_worktree_extension_false_ignores_later_included_true) {
     CHECK_EQ_INT(git_config_snapshot(GIT_SCOPE_GLOBAL), 0);
     CHECK_EQ_INT(git_set_config_value(GIT_CONFIG_USER_NAME, "owned-post",
                                       GIT_SCOPE_GLOBAL), 0);
+    /* AR-18: on macOS 26 this seal read was the deterministic victim of
+     * Apple's compiler-rt fork bug (a forked child dies in libSystem's own
+     * atfork handler whenever ASan's stack depot needs a new block there).
+     * The Makefile keeps allocation stacks out of the depot on Darwin debug
+     * runs; GITSWITCH_RUNNER_TRACE=/abs/file traces the runner's stages if
+     * it ever recurs. */
     CHECK_EQ_INT(git_config_seal(), 0);
     CHECK((size_t)snprintf(local_config, sizeof(local_config),
                            "%s/.git/config", fixture.repo) <
@@ -2539,6 +2545,38 @@ static int prepare_finalization_transaction(const char *post_name) {
 }
 
 static int install_git_fd_sentinel(int stale_fd, int minimum);
+
+size_t git_ops_test_directory_scan_count(void);
+
+/* AR-18 L13: acquiring and publishing a finalization lock on a clean
+ * directory walks it four times: the admission count, one arena budget scan,
+ * and the two walks owned by the private-alias quarantine move. Before AR-18
+ * the same operation cost eight full readdir() passes of $HOME or .git: a
+ * handle-only arena scan, the admission count, a second arena scan and the
+ * proving pass even when nothing was there to prove, on top of the move. */
+TEST(clean_finalization_lock_walks_its_directory_four_times) {
+    git_fixture_t fixture;
+    git_config_finalization_t *finalization = NULL;
+    size_t before;
+    size_t after;
+
+    if (!fixture_init(&fixture)) {
+        CHECK(false);
+        fixture_cleanup(&fixture);
+        return;
+    }
+    CHECK_EQ_INT(git_set("--global", "user.name", "before-scan-count"), 0);
+    git_ops_test_reset_caches();
+    CHECK_EQ_INT(prepare_finalization_transaction("scan-count"), 0);
+    before = git_ops_test_directory_scan_count();
+    CHECK_EQ_INT(git_config_finalization_begin(&finalization), 0);
+    after = git_ops_test_directory_scan_count();
+    CHECK_EQ_INT((long)(after - before), 4);
+    CHECK_EQ_INT(git_config_finalization_end(&finalization), 0);
+    git_config_commit();
+    fixture_cleanup(&fixture);
+}
+
 
 static void fork_coverage_child_return(void) {
     /* The child must reach normal process exit for gcov to flush, but it must
@@ -3685,6 +3723,7 @@ TEST_MAIN_BEGIN()
     if (g_fork_coverage_child) return ts_test_finish();
     RUN_TEST(fork_child_identity_gate_preserves_parent_reused_snapshot_descriptor);
     if (g_fork_coverage_child) return ts_test_finish();
+    RUN_TEST(clean_finalization_lock_walks_its_directory_four_times);
     RUN_TEST(fork_child_closes_active_snapshot_finalizer_and_retirement_descriptors);
     if (g_fork_coverage_child) return ts_test_finish();
     RUN_TEST(real_git_proves_narrow_ssh_environment_precedence_and_api_rejects_it);

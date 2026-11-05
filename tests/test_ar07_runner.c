@@ -735,6 +735,33 @@ TEST(repeated_silent_pre_ready_supervisor_death_is_bounded_and_truthful) {
         repeated_silent_pre_ready_supervisor_death_worker, 5000));
 }
 
+/* AR-18: a worker the kernel kills before it can read the release byte must
+ * surface as that worker's own death. Before the fix the supervisor's release
+ * write raised SIGPIPE in the supervisor itself, so the parent reported
+ * signal 13 for a child that died of SIGKILL. */
+TEST(worker_death_before_release_surfaces_as_the_worker_signal) {
+    const char *argv[] = {"true", NULL};
+    run_result_t result;
+    int unreaped;
+    int unreaped_errno;
+
+    run_test_set_worker_death_before_release(1);
+    clear_error();
+    errno = 0;
+    int rc = run_argv(argv, NULL, &result);
+    run_test_set_worker_death_before_release(0);
+    unreaped = waitpid(-1, NULL, WNOHANG);
+    unreaped_errno = errno;
+
+    CHECK_EQ_INT(rc, -1);
+    CHECK(result.spawned);
+    CHECK(!result.timed_out);
+    CHECK_EQ_INT(result.exit_code, -1);
+    CHECK_EQ_INT(result.term_signal, SIGKILL);
+    CHECK_EQ_INT(unreaped, -1);
+    CHECK_EQ_INT(unreaped_errno, ECHILD);
+}
+
 TEST(supervisor_stage_failures_are_truthful_reaped_and_one_shot) {
     static const struct {
         run_test_supervisor_failure_stage_t stage;
@@ -2862,6 +2889,7 @@ int main(int argc, char **argv) {
     RUN_TEST(process_group_supervisor_setup_failure_is_truthful_and_reaped);
     RUN_TEST(one_silent_pre_ready_supervisor_death_retries_before_execution);
     RUN_TEST(repeated_silent_pre_ready_supervisor_death_is_bounded_and_truthful);
+    RUN_TEST(worker_death_before_release_surfaces_as_the_worker_signal);
     RUN_TEST(supervisor_stage_failures_are_truthful_reaped_and_one_shot);
     RUN_TEST(pre_release_group_death_cannot_sigpipe_parent);
     RUN_TEST(early_stdin_close_is_a_runner_failure);

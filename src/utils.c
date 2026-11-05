@@ -45,6 +45,13 @@
 #include "runner_internal.h"
 #define GITSWITCH_SIGNALS_RUNNER_INTERNAL
 #include "signals.h"
+
+/* AR-18 diagnostics: the runner trace is compiled into every debug object,
+ * not only the GITSWITCH_TESTING copies, because the git transaction suite
+ * links the plain utils object. Release builds (NDEBUG) drop it entirely. */
+#if defined(GITSWITCH_TESTING) || !defined(NDEBUG)
+#define GITSWITCH_RUNNER_TRACE 1
+#endif
 #undef GITSWITCH_SIGNALS_RUNNER_INTERNAL
 
 #ifdef GITSWITCH_TESTING
@@ -53,6 +60,7 @@ void run_test_set_supervisor_pending_signal(int signal_number);
 void run_test_set_post_replay_signal(int signal_number);
 void run_test_set_supervisor_failure(
     run_test_supervisor_failure_stage_t stage, int system_errno);
+void run_test_set_worker_death_before_release(int enabled);
 #endif
 
 /* POSIX exposes the process environment through this external object, but
@@ -3488,6 +3496,7 @@ static int g_test_fork_failure_errno;
 static int g_test_child_process_group_failure_errno;
 static int g_test_supervisor_pending_signal;
 static int g_test_post_replay_signal;
+static bool g_test_worker_dies_before_release;
 static run_test_supervisor_failure_stage_t
     g_test_supervisor_failure_stage;
 static int g_test_supervisor_failure_errno;
@@ -3737,6 +3746,10 @@ void run_test_set_post_replay_signal(int signal_number) {
     }
 }
 
+void run_test_set_worker_death_before_release(int enabled) {
+    g_test_worker_dies_before_release = enabled != 0;
+}
+
 void run_test_set_supervisor_failure(
     run_test_supervisor_failure_stage_t stage, int system_errno) {
     if (stage < RUN_TEST_SUPERVISOR_FAILURE_WORKER_RELEASE_PIPE ||
@@ -3838,7 +3851,23 @@ static int child_close_fds_from(
         for (size_t i = 0; i < snapshot->count; i++) {
             if (snapshot->fds[i] >= lowfd) {
                 observation->close_syscalls++;
+#ifdef __APPLE__
+                /* AR-18: Darwin guards some descriptors it opens on the
+                 * process's behalf (libdispatch, libinfo, XPC); close(2) on
+                 * one from this forked child is a fatal EXC_GUARD that the
+                 * kernel reports as an unrecoverable exception and answers
+                 * with SIGKILL. Marking the descriptor close-on-exec is not
+                 * guarded and the exec that follows drops it all the same. */
+                {
+                    int flags = fcntl(snapshot->fds[i], F_GETFD);
+                    if (flags >= 0) {
+                        (void)fcntl(snapshot->fds[i], F_SETFD,
+                                    flags | FD_CLOEXEC);
+                    }
+                }
+#else
                 (void)close(snapshot->fds[i]);
+#endif
             }
         }
         return 0;
@@ -3854,7 +3883,14 @@ static int child_close_fds_from(
     }
     for (long fd = lowfd; fd < maxfd; fd++) {
         observation->close_syscalls++;
+#ifdef __APPLE__
+        {
+            int flags = fcntl((int)fd, F_GETFD);
+            if (flags >= 0) (void)fcntl((int)fd, F_SETFD, flags | FD_CLOEXEC);
+        }
+#else
         (void)close((int)fd);
+#endif
     }
     return 0;
 }
@@ -3913,6 +3949,35 @@ static int runner_tcsetpgrp_masked(int fd, pid_t pgid) {
     return 0;
 }
 
+#ifdef GITSWITCH_RUNNER_TRACE
+/* AR-18 diagnostics: append one line to the file named by
+ * GITSWITCH_RUNNER_TRACE (when it is an absolute path). Works from the
+ * supervisor too, whose stderr is already the capture pipe or /dev/null. */
+static void runner_trace(const char *format, ...) {
+    const char *path = getenv("GITSWITCH_RUNNER_TRACE");
+    char line[512];
+    va_list args;
+    int length;
+    int fd;
+    int saved_errno = errno;
+
+    if (!path || path[0] != '/') { errno = saved_errno; return; }
+    va_start(args, format);
+    length = vsnprintf(line, sizeof(line), format, args); /* Flawfinder: ignore
+                                       -- bounded; every format is a literal in
+                                       this translation unit; debug-only. */
+    va_end(args);
+    if (length <= 0) { errno = saved_errno; return; }
+    if ((size_t)length >= sizeof(line)) length = (int)sizeof(line) - 1;
+    fd = open(path, O_WRONLY | O_APPEND | O_CREAT | O_CLOEXEC, 0600);
+    if (fd >= 0) {
+        (void)!write(fd, line, (size_t)length);
+        close(fd);
+    }
+    errno = saved_errno;
+}
+#endif
+
 static int runner_tty_prepare(runner_tty_state_t *state) {
     pid_t foreground;
 
@@ -3970,14 +4035,28 @@ static int runner_tty_restore(runner_tty_state_t *state) {
     return 0;
 }
 
-static void runner_signal_child(pid_t pid, bool group_proven,
-                                int signal_number) {
+static void runner_signal_child_at(pid_t pid, bool group_proven,
+                                   int signal_number, int line) {
     if (pid <= 0) return;
+#ifdef GITSWITCH_RUNNER_TRACE
+    runner_trace(
+            "runner signal: sig=%d pid=%ld group=%d from utils.c:%d errno=%d\n",
+            signal_number, (long)pid, group_proven ? 1 : 0, line, errno);
+#else
+    (void)line;
+#endif
     (void)kill(group_proven ? -pid : pid, signal_number);
 }
+#define runner_signal_child(pid, group_proven, signal_number) \
+    runner_signal_child_at((pid), (group_proven), (signal_number), __LINE__)
 
 static void runner_accept_group_relay(pid_t pid, bool group_proven,
                                       int signal_number) {
+#ifdef GITSWITCH_RUNNER_TRACE
+    runner_trace(
+            "runner relayed group signal: signal=%d pid=%ld group_proven=%d\n",
+            signal_number, (long)pid, group_proven ? 1 : 0);
+#endif
     if (signal_number == SIGTSTP) {
         /* A separate foreground pgrp cannot leave both supervisor and worker
          * stopped or the background parent would wait forever. Full shell
@@ -4141,6 +4220,9 @@ static int runner_replay_pending_group_signals(
                 return -1;
             }
             (void)kill(worker, SIGCONT);
+#ifdef GITSWITCH_RUNNER_TRACE
+    runner_trace( "supervisor kill at utils.c:%d errno=%d\n", __LINE__, errno);
+#endif
             if (kill(worker, SIGKILL) != 0) return -1;
             *worker_killed = true;
             continue;
@@ -4162,12 +4244,18 @@ static void runner_kill_and_reap_worker(pid_t worker,
 
     if (!relay_set ||
         sigprocmask(SIG_BLOCK, relay_set, &previous_mask) != 0) {
-        (void)kill(worker, SIGKILL);
+#ifdef GITSWITCH_RUNNER_TRACE
+    runner_trace( "supervisor kill at utils.c:%d errno=%d\n", __LINE__, errno);
+#endif
+    (void)kill(worker, SIGKILL);
         do {
             waited = waitpid(worker, NULL, 0);
         } while (waited < 0 && errno == EINTR);
         return;
     }
+#ifdef GITSWITCH_RUNNER_TRACE
+    runner_trace( "supervisor kill at utils.c:%d errno=%d\n", __LINE__, errno);
+#endif
     (void)kill(worker, SIGKILL);
     do {
         waited = waitpid(worker, NULL, 0);
@@ -4188,6 +4276,9 @@ static void runner_supervisor_exit_for_status(pid_t child, int status) {
         }
         (void)raise(signal_number);
     }
+#ifdef GITSWITCH_RUNNER_TRACE
+    runner_trace( "supervisor kill at utils.c:%d errno=%d\n", __LINE__, errno);
+#endif
     (void)kill(child, SIGKILL);
     _exit(127);
 }
@@ -4970,6 +5061,10 @@ static int run_argv_real_impl(
     }
 
     pid_t pid;
+#ifdef GITSWITCH_TESTING
+    bool worker_dies_before_release = g_test_worker_dies_before_release;
+    g_test_worker_dies_before_release = false;
+#endif
     int pre_fork_deadline_rc = run_deadline_observe(&deadline, NULL);
     if (pre_fork_deadline_rc != 0) {
         pid = -1;
@@ -5107,6 +5202,9 @@ static int run_argv_real_impl(
 #endif
         {
             exec_child = fork();
+#ifdef GITSWITCH_RUNNER_TRACE
+            runner_trace("after worker fork: self=%ld exec_child=%ld errno=%d\n", (long)getpid(), (long)exec_child, errno);
+#endif
         }
         if (exec_child < 0) {
             int fork_errno = errno;
@@ -5189,15 +5287,63 @@ static int run_argv_real_impl(
                     injected_errno, 126);
             }
 #endif
-            if (!worker_killed &&
-                runner_write_byte(worker_release_pipe[1], 0x45U) != 0) {
-                int setup_errno = errno;
-                close(worker_release_pipe[1]);
-                runner_kill_and_reap_worker(
-                    exec_child, &relay_block_set);
-                child_report_failure(
-                    child_status_fd, CHILD_STAGE_PROCESS_GROUP,
-                    setup_errno, 126);
+#ifdef GITSWITCH_TESTING
+            if (worker_dies_before_release) {
+                /* Hold the release until the worker's death is visible so
+                 * the dead-worker release path runs deterministically. */
+                siginfo_t gone;
+                do {
+                    memset(&gone, 0, sizeof(gone));
+                    if (waitid(P_PID, (id_t)exec_child, &gone,
+                               WEXITED | WNOWAIT | WNOHANG) != 0 &&
+                        errno != EINTR) {
+                        break;
+                    }
+                } while (gone.si_pid != exec_child);
+            }
+#endif
+            if (!worker_killed) {
+                run_sigpipe_state_t release_guard;
+                int release_errno = 0;
+                bool worker_gone = false;
+
+                /* The worker gives up its read end only by exiting (exec
+                 * happens after it has read the byte), so EPIPE here proves
+                 * the worker is already dead. Its real fate must reach the
+                 * parent through the wait below, not as this supervisor's
+                 * own SIGPIPE death: AR-18 found a kernel-killed pre-exec
+                 * child reported as signal 13, which hid the SIGKILL from
+                 * the callers that key their one-shot retry on it. */
+                if (run_sigpipe_begin(&release_guard) != 0) {
+                    release_errno = errno;
+                } else {
+                    if (runner_write_byte(worker_release_pipe[1], 0x45U) !=
+                        0) {
+                        release_errno = errno;
+                        release_guard.saw_epipe = release_errno == EPIPE;
+                    }
+                    if (run_sigpipe_end(&release_guard) != 0 &&
+                        release_errno == 0) {
+                        release_errno = errno;
+                    }
+                }
+                if (release_errno == EPIPE) {
+                    siginfo_t gone;
+
+                    memset(&gone, 0, sizeof(gone));
+                    worker_gone =
+                        waitid(P_PID, (id_t)exec_child, &gone,
+                               WEXITED | WNOWAIT | WNOHANG) == 0 &&
+                        gone.si_pid == exec_child;
+                }
+                if (release_errno != 0 && !worker_gone) {
+                    close(worker_release_pipe[1]);
+                    runner_kill_and_reap_worker(
+                        exec_child, &relay_block_set);
+                    child_report_failure(
+                        child_status_fd, CHILD_STAGE_PROCESS_GROUP,
+                        release_errno, 126);
+                }
             }
             close(worker_release_pipe[1]);
 #ifdef GITSWITCH_TESTING
@@ -5251,10 +5397,19 @@ static int run_argv_real_impl(
             do {
                 waited = waitpid(exec_child, &exec_status, 0);
             } while (waited < 0 && errno == EINTR);
+#ifdef GITSWITCH_RUNNER_TRACE
+            runner_trace("supervisor %ld reaped worker %ld waited=%ld status=0x%x\n", (long)getpid(), (long)exec_child, (long)waited, (unsigned)exec_status);
+#endif
             if (waited != exec_child) _exit(127);
             runner_supervisor_exit_for_status(exec_child, exec_status);
         }
         close(worker_release_pipe[1]);
+#ifdef GITSWITCH_TESTING
+        if (worker_dies_before_release) (void)raise(SIGKILL);
+#endif
+#ifdef GITSWITCH_RUNNER_TRACE
+        runner_trace("worker %ld waiting for release\n", (long)getpid());
+#endif
         if (runner_read_byte(worker_release_pipe[0], 0x45U) != 0) {
             child_report_failure(child_status_fd,
                                  CHILD_STAGE_PROCESS_GROUP, errno, 126);
@@ -5410,6 +5565,9 @@ static int run_argv_real_impl(
          * reserve fd 5 only until the interpreter exec, so they sweep from 6.
          * Nothing else is intentionally handed to a child. */
         run_test_fd_close_observation_t fd_close_observation;
+#ifdef GITSWITCH_RUNNER_TRACE
+        runner_trace("worker %ld fd-close stage\n", (long)getpid());
+#endif
         int close_lowfd = script_launch.is_script
                               ? STDERR_FILENO + 4
                               : STDERR_FILENO + 3;
@@ -5434,6 +5592,9 @@ static int run_argv_real_impl(
         /* Apply removals before additions so callers can express a clean
          * baseline and still deliberately replace one of the same names.
          * Neither operation mutates the parent process environment. */
+#ifdef GITSWITCH_RUNNER_TRACE
+        runner_trace("worker %ld env stage\n", (long)getpid());
+#endif
         if (opts->unset_env) {
             for (size_t i = 0; opts->unset_env[i]; i++) {
                 const char *name = opts->unset_env[i];
@@ -5523,6 +5684,9 @@ static int run_argv_real_impl(
         char *const *launch_argv = script_launch.is_script
                                        ? script_launch.script_argv
                                        : (char *const *)argv;
+#ifdef GITSWITCH_RUNNER_TRACE
+        runner_trace("worker %ld exec stage: %s\n", (long)getpid(), exec_path);
+#endif
 
 #if defined(__linux__) || defined(__FreeBSD__)
         /* Scripts never enter the kernel's shebang path. The already-pinned,
@@ -5681,8 +5845,33 @@ static int run_argv_real_impl(
         group_proven = true;
     }
     close(group_ready_pipe[0]);
-    if (!group_proven || runner_tty_prepare(&tty_state) != 0 ||
-        runner_tty_transfer(&tty_state, pid) != 0) {
+    int tty_prepare_rc = 0;
+    int tty_prepare_errno = 0;
+    int tty_transfer_rc = 0;
+    int tty_transfer_errno = 0;
+    if (group_proven) {
+        tty_prepare_rc = runner_tty_prepare(&tty_state);
+        if (tty_prepare_rc != 0) tty_prepare_errno = errno;
+        if (tty_prepare_rc == 0) {
+            tty_transfer_rc = runner_tty_transfer(&tty_state, pid);
+            if (tty_transfer_rc != 0) tty_transfer_errno = errno;
+        }
+    }
+    (void)tty_prepare_errno;
+    (void)tty_transfer_errno;
+    if (!group_proven || tty_prepare_rc != 0 || tty_transfer_rc != 0) {
+#ifdef GITSWITCH_RUNNER_TRACE
+        /* AR-18: name the exact pre-exec failure for a suite that opts in;
+         * the production runner reports it through the result and errno. */
+        runner_trace(
+                "runner early failure: group_proven=%d ready_rc=%d "
+                "ready_errno=%d early_rc=%d early_stage=%d early_errno=%d "
+                "tty_prepare=%d/%d tty_transfer=%d/%d\n",
+                group_proven ? 1 : 0, group_ready_rc, group_ready_errno,
+                early_group_failure_rc, (int)early_group_failure.stage,
+                early_group_failure.system_errno, tty_prepare_rc,
+                tty_prepare_errno, tty_transfer_rc, tty_transfer_errno);
+#endif
         bool silent_pre_ready_failure =
             group_ready_rc != 0 && group_ready_errno == EPIPE &&
             early_group_failure_rc == 0;
@@ -6260,6 +6449,13 @@ static int run_argv_real_impl(
                 }
                 if (observed.si_code != CLD_EXITED ||
                     observed.si_status != 0) {
+#ifdef GITSWITCH_RUNNER_TRACE
+                    runner_trace(
+                            "runner supervisor ended abnormally: si_code=%d "
+                            "si_status=%d errno=%d\n",
+                            (int)observed.si_code, (int)observed.si_status,
+                            errno);
+#endif
                     runner_signal_child(pid, group_proven, SIGKILL);
                 }
                 if (outfd >= 0) {
@@ -6331,6 +6527,17 @@ static int run_argv_real_impl(
 
     if (deadline_expired || deadline_clock_failed || child_status_rc != 0 ||
         io_failed || input_failed || output_stalled || wait_failed) {
+#ifdef GITSWITCH_RUNNER_TRACE
+        runner_trace(
+                "runner kill: deadline=%d clock=%d child_status_rc=%d "
+                "stage=%d child_errno=%d io=%d/%d input=%d stalled=%d "
+                "wait=%d/%d errno=%d\n",
+                deadline_expired ? 1 : 0, deadline_clock_failed ? 1 : 0,
+                child_status_rc, (int)child_status.stage,
+                child_status.system_errno, io_failed ? 1 : 0, io_errno,
+                input_failed ? 1 : 0, output_stalled ? 1 : 0,
+                wait_failed ? 1 : 0, wait_errno, errno);
+#endif
         runner_signal_child(pid, group_proven, SIGKILL);
     }
 

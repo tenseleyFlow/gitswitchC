@@ -351,6 +351,7 @@ size_t git_ops_test_set_retirement_prelock_witness_budget(
     size_t capacity);
 void git_ops_test_terminal_namespace_activity(
     size_t *mutations, size_t *syncs);
+size_t git_ops_test_directory_scan_count(void);
 void git_ops_test_set_restore_prelock_hook(git_restore_test_hook_fn fn) {
     g_restore_prelock_hook = fn;
 }
@@ -385,6 +386,14 @@ git_finalization_test_hook_fn git_ops_test_set_finalization_hook(
     git_finalization_test_hook_fn previous = g_finalization_test_hook;
     g_finalization_test_hook = fn;
     return previous;
+}
+
+/* AR-18 L13 witness: every full readdir() walk of a lock directory by the
+ * cleanup arena or the finalization-certificate passes. */
+static size_t g_git_directory_scan_count;
+
+size_t git_ops_test_directory_scan_count(void) {
+    return g_git_directory_scan_count;
 }
 
 void git_ops_test_terminal_namespace_activity(
@@ -1343,14 +1352,22 @@ static int git_read_snapshot_listing(git_scope_t scope, bool includes,
                 return 0;
             }
             /* The listing is side-effect-free. Retry one empty boundary
-             * failure: Darwin runners have intermittently rejected a
-             * short-lived helper without Git producing any diagnostic bytes.
-             * Output-bearing Git failures, timeouts, and signals remain
+             * failure: the helper died with no bytes, no timeout, and no
+             * recorded runner error, either by a clean non-zero exit or by
+             * SIGKILL before exec. AR-18 traced the Darwin instance to Apple's
+             * compiler-rt: a forked child dies in libSystem's own atfork
+             * handler whenever ASan's stack depot needs a new block there,
+             * an ASan-build artefact the Makefile now prevents
+             * (malloc_context_size=0); the retry stays as a cheap guard.
+             * Output-bearing Git failures, timeouts, and other signals remain
              * immediately fatal. Later exact generation/ownership checks
              * still gate every rollback write. */
             if (empty_failure_retries_remaining > 0U &&
                 res.out_len == 0U && !res.out_truncated &&
-                !res.timed_out && res.term_signal == 0) {
+                !res.timed_out &&
+                (res.term_signal == 0 ||
+                 (res.term_signal == SIGKILL &&
+                  !observation.runner_error_fresh))) {
                 empty_failure_retries_remaining--;
                 continue;
             }
@@ -1481,6 +1498,40 @@ done:
     return rc;
 }
 
+/* AR-18 P7: merged git diagnostics are embedded verbatim in error messages
+ * that reach the user's terminal. A hook, credential helper, or crafted
+ * repository can print anything on git's stderr, so pass the text through
+ * only when every codepoint is terminal safe (newlines and tabs allowed, as
+ * git diagnostics are multi-line); otherwise substitute a fixed note. */
+static bool git_diagnostic_is_terminal_safe(const char *text) {
+    const unsigned char *cursor = (const unsigned char *)text;
+    size_t remaining = strlen(text);
+
+    while (remaining > 0U) {
+        uint32_t codepoint;
+        size_t consumed = utf8_decode(cursor, remaining, &codepoint);
+
+        if (consumed == 0U ||
+            (codepoint != '\n' && codepoint != '\t' &&
+             !tty_safe_codepoint(codepoint))) {
+            return false;
+        }
+        cursor += consumed;
+        remaining -= consumed;
+    }
+    return true;
+}
+
+static const char *git_diagnostic_text(const char *output,
+                                       const char *fallback) {
+    if (!output || output[0] == '\0') return fallback;
+    if (!git_diagnostic_is_terminal_safe(output)) {
+        return "git diagnostic withheld (it contains terminal control bytes "
+               "or malformed UTF-8)";
+    }
+    return output;
+}
+
 static void git_seed_snapshot_cache(git_scope_t scope,
                                     const git_scope_snapshot_t *snapshot) {
     int s = cfg_scope_index(scope);
@@ -1517,7 +1568,7 @@ static int git_add_snapshot_value(git_scope_t scope, const char *key,
                         CFG_UNKNOWN, true, "");
         set_error(ERR_GIT_CONFIG_FAILED,
                   "Failed to restore Git config %s (%s): %s", key,
-                  scope_flag, output[0] ? output : "unknown error");
+                  scope_flag, git_diagnostic_text(output, "unknown error"));
         return -1;
     }
     /* The ordered vector is in-progress until every --add completes. Do not
@@ -1712,19 +1763,20 @@ static int git_absolute_path(const char *path, char *out, size_t out_size) {
     return 0;
 }
 
+/* AR-18 P6: Git selects its --global write target by probing each candidate
+ * with access(R_OK) (git_global_config), so an unreadable file or a dangling
+ * symlink is skipped. Mirror that exactly instead of lstat presence; the
+ * rollback destination otherwise pins a file Git never writes. Any probe
+ * failure means "not selected", as it does for Git. */
 static int git_path_presence(const char *path, bool *present) {
-    struct stat st;
-    if (lstat(path, &st) == 0) {
-        *present = true;
-        return 0;
-    }
-    if (errno == ENOENT) {
-        *present = false;
-        return 0;
-    }
-    set_system_error(ERR_GIT_CONFIG_FAILED,
-                     "Cannot inspect Git configuration candidate: %s", path);
-    return -1;
+    int saved_errno = errno;
+
+    *present = access(path, R_OK) == 0; /* Flawfinder: ignore -- a presence
+                                         * probe that mirrors Git's own
+                                         * selection; the later read, not
+                                         * this probe, is authoritative. */
+    errno = saved_errno;
+    return 0;
 }
 
 /* Match Git's --global write selection: GIT_CONFIG_GLOBAL is authoritative;
@@ -3666,6 +3718,7 @@ static int git_cleanup_arena_scan(
         return -1;
     }
     scan_fd = -1;
+    g_git_directory_scan_count++;
     errno = 0;
     while ((entry = readdir(directory)) != NULL) {
         const char *state;
@@ -5831,7 +5884,7 @@ static int git_config_file_unset(const char *path, const char *key,
     set_error(ERR_GIT_CONFIG_FAILED,
               "Failed to clear Git config %s in %s: %s", key,
               diagnostic_context ? diagnostic_context : "exact file",
-              output[0] ? output : "unknown Git error");
+              git_diagnostic_text(output, "unknown Git error"));
     return -1;
 }
 
@@ -5874,7 +5927,8 @@ static int git_config_file_unset_exact(const char *path, const char *key,
               "Failed to remove exact Git config %s value in %s: %s",
               key,
               diagnostic_context ? diagnostic_context : "staged file",
-              output[0] ? output : "Git did not remove the planned value");
+              git_diagnostic_text(output,
+                                  "Git did not remove the planned value"));
     return -1;
 }
 
@@ -5895,7 +5949,7 @@ static int git_config_file_add(const char *path, const char *key,
     if (run_argv(argv, &opts, &result) == 0) return 0;
     set_error(ERR_GIT_CONFIG_FAILED,
               "Failed to add Git config %s in rollback lock: %s", key,
-              output[0] ? output : "unknown Git error");
+              git_diagnostic_text(output, "unknown Git error"));
     return -1;
 }
 
@@ -7567,6 +7621,54 @@ static int git_finalization_cleanup_unpublished_private(
  * unclaimed, no-stage finalization certificate left before canonical
  * publication. Partial files, live claimed files, stage-bearing rollback
  * markers, and foreign replacements remain untouched. */
+/* Admission is deliberately a separate read-only pass. Conservatively count
+ * every syntactically private name, including malformed/foreign entries that
+ * the proving pass will leave untouched, so the caller can budget one fixed
+ * cleanup slot per candidate before any reconciliation mutates the
+ * directory and only then discovers that the finite arena is exhausted. */
+static int git_finalization_count_private_leaves(
+    int directory_fd, size_t *candidate_count) {
+    struct dirent *entry;
+    DIR *directory = NULL;
+    int scan_fd = -1;
+    int saved_errno = 0;
+
+    if (directory_fd < 0 || !candidate_count) {
+        errno = EINVAL;
+        return -1;
+    }
+    *candidate_count = 0U;
+    scan_fd = openat(
+        directory_fd, ".",
+        O_RDONLY | O_DIRECTORY | O_CLOEXEC | O_NOFOLLOW);
+    if (scan_fd < 0 || (directory = fdopendir(scan_fd)) == NULL) {
+        saved_errno = errno ? errno : EIO;
+        if (scan_fd >= 0) (void)close(scan_fd);
+        errno = saved_errno;
+        return -1;
+    }
+    g_git_directory_scan_count++;
+    errno = 0;
+    while ((entry = readdir(directory)) != NULL) {
+        if (!git_finalization_private_leaf_valid(entry->d_name)) continue;
+        if (*candidate_count == SIZE_MAX) {
+            saved_errno = EOVERFLOW;
+            break;
+        }
+        (*candidate_count)++;
+    }
+    if (saved_errno == 0 && errno != 0) saved_errno = errno;
+    (void)closedir(directory);
+    if (saved_errno != 0) {
+        errno = saved_errno;
+        return -1;
+    }
+    return 0;
+}
+
+/* The proving pass. The caller has already counted the candidates and
+ * reserved arena budget for all of them (AR-18 L13), so this runs only when
+ * there is at least one private name to reconcile. */
 static int git_finalization_reconcile_private_orphans(
     int directory_fd, const char *lock_leaf) {
     git_scope_lock_t cleanup_lock;
@@ -7577,17 +7679,11 @@ static int git_finalization_reconcile_private_orphans(
     int scan_fd = -1;
     int marker_fd = -1;
     int saved_errno = 0;
-    size_t candidate_count = 0U;
 
     if (directory_fd < 0 || !lock_leaf) {
         errno = EINVAL;
         return -1;
     }
-    /* Admission is deliberately a separate read-only pass. Conservatively
-     * budget one fixed cleanup slot for every syntactically private name,
-     * including malformed/foreign entries that the proving pass will leave
-     * untouched. Therefore no orphan reconciliation can partially mutate the
-     * directory and only then discover that the finite arena is exhausted. */
     scan_fd = openat(
         directory_fd, ".",
         O_RDONLY | O_DIRECTORY | O_CLOEXEC | O_NOFOLLOW);
@@ -7598,39 +7694,7 @@ static int git_finalization_reconcile_private_orphans(
         return -1;
     }
     scan_fd = -1;
-    errno = 0;
-    while ((entry = readdir(directory)) != NULL) {
-        if (!git_finalization_private_leaf_valid(entry->d_name)) continue;
-        if (candidate_count == SIZE_MAX) {
-            saved_errno = EOVERFLOW;
-            break;
-        }
-        candidate_count++;
-    }
-    if (saved_errno == 0 && errno != 0) saved_errno = errno;
-    (void)closedir(directory);
-    directory = NULL;
-    if (saved_errno != 0 ||
-        candidate_count >
-            SIZE_MAX - GIT_CLEANUP_ARENA_HANDLE_BUDGET) {
-        errno = saved_errno != 0 ? saved_errno : EOVERFLOW;
-        return -1;
-    }
-    if (git_cleanup_arena_require_budget(
-            directory_fd, lock_leaf,
-            candidate_count + GIT_CLEANUP_ARENA_HANDLE_BUDGET) != 0) {
-        return -1;
-    }
-    scan_fd = openat(
-        directory_fd, ".",
-        O_RDONLY | O_DIRECTORY | O_CLOEXEC | O_NOFOLLOW);
-    if (scan_fd < 0 || (directory = fdopendir(scan_fd)) == NULL) {
-        saved_errno = errno ? errno : EIO;
-        if (scan_fd >= 0) (void)close(scan_fd);
-        errno = saved_errno;
-        return -1;
-    }
-    scan_fd = -1;
+    g_git_directory_scan_count++;
     errno = 0;
     while ((entry = readdir(directory)) != NULL) {
         unsigned char *marker_data = NULL;
@@ -7723,6 +7787,7 @@ static int git_finalization_lock_acquire(
     git_config_finalization_lock_t *lock;
     git_finalization_publish_result_t publication;
     struct stat pinned_parent;
+    size_t candidate_count = 0U;
 
     if (!finalization || !generation || !generation->valid ||
         finalization->count >=
@@ -7763,9 +7828,26 @@ static int git_finalization_lock_acquire(
         return -1;
     }
     lock->parent_stat = pinned_parent;
+    /* AR-18 L13: one admission walk counts the private certificates, one
+     * arena scan budgets the handle plus every candidate, and the proving
+     * walk runs only when there is something to reconcile. A clean directory
+     * costs four readdir() walks per lock instead of eight, and an exhausted
+     * arena is reported with its own message rather than a stale one. */
+    if (git_finalization_count_private_leaves(
+            lock->parent_fd, &candidate_count) != 0 ||
+        candidate_count > SIZE_MAX - GIT_CLEANUP_ARENA_HANDLE_BUDGET) {
+        if (candidate_count > SIZE_MAX - GIT_CLEANUP_ARENA_HANDLE_BUDGET) {
+            errno = EOVERFLOW;
+        }
+        set_system_error(
+            ERR_GIT_CONFIG_FAILED,
+            "Cannot inspect the Git finalization-lock directory");
+        git_finalization_lock_dispose(lock);
+        return -1;
+    }
     if (git_cleanup_arena_require_budget(
             lock->parent_fd, lock->lock_leaf,
-            GIT_CLEANUP_ARENA_HANDLE_BUDGET) != 0) {
+            candidate_count + GIT_CLEANUP_ARENA_HANDLE_BUDGET) != 0) {
         int arena_errno = errno;
 
         set_system_error(
@@ -7777,8 +7859,9 @@ static int git_finalization_lock_acquire(
         git_finalization_lock_dispose(lock);
         return -1;
     }
-    if (git_finalization_reconcile_private_orphans(
-            lock->parent_fd, lock->lock_leaf) != 0 ||
+    if ((candidate_count > 0U &&
+         git_finalization_reconcile_private_orphans(
+             lock->parent_fd, lock->lock_leaf) != 0) ||
         git_finalization_prepare_private_marker(lock) != 0) {
         error_context_t primary_error = *get_last_error();
         int primary_errno = errno ? errno : EIO;
@@ -15192,9 +15275,8 @@ static int git_set_config_value_impl(const char *key, const char *value,
         }
         set_error(ERR_GIT_CONFIG_FAILED,
                   "Failed to set git config %s: %s", key,
-                  output[0] != '\0'
-                      ? output
-                      : "git produced no diagnostic output");
+                  git_diagnostic_text(
+                      output, "git produced no diagnostic output"));
         return -1;
     }
 }
@@ -15416,7 +15498,7 @@ static int git_unset_config_value_impl(const char *key, git_scope_t scope,
         }
         set_error(ERR_GIT_CONFIG_FAILED,
                   "Failed to unset git config %s (%s): %s", key, scope_flag,
-                  output[0] ? output : "unknown error");
+                  git_diagnostic_text(output, "unknown error"));
         return -1;
     }
 }

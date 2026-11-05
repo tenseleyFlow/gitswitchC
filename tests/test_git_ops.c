@@ -912,6 +912,39 @@ TEST(fake_runner_zero_output_failure_has_stable_diagnostic) {
                  "Failed to set git config commit.gpgsign: "
                  "synthetic git failure detail");
 
+    /* AR-18 P7: multi-line diagnostics pass through, but a diagnostic that
+     * carries terminal control bytes (here an OSC title-set sequence, as a
+     * hook or crafted repository could print) is withheld rather than
+     * embedded in the tool's own error channel. */
+    fk_write_attempts = 0U;
+    fk_fail_write_output = "error: could not lock config file\n"
+                           "fatal: second line\n";
+    clear_error();
+    CHECK_EQ_INT(git_set_config_value(
+                     "commit.gpgsign", "true", GIT_SCOPE_GLOBAL), -1);
+    CHECK_STR_EQ(get_last_error()->message,
+                 "Failed to set git config commit.gpgsign: "
+                 "error: could not lock config file\nfatal: second line\n");
+
+    fk_write_attempts = 0U;
+    fk_fail_write_output = "fatal: \x1b]0;owned\x07 boom\n";
+    clear_error();
+    CHECK_EQ_INT(git_set_config_value(
+                     "commit.gpgsign", "true", GIT_SCOPE_GLOBAL), -1);
+    CHECK(strchr(get_last_error()->message, '\x1b') == NULL);
+    CHECK(strstr(get_last_error()->message, "owned") == NULL);
+    CHECK(strstr(get_last_error()->message,
+                 "git diagnostic withheld") != NULL);
+
+    fk_write_attempts = 0U;
+    fk_fail_write_output = "fatal: overlong \xe0\x80\x9b CSI\n";
+    clear_error();
+    CHECK_EQ_INT(git_set_config_value(
+                     "commit.gpgsign", "true", GIT_SCOPE_GLOBAL), -1);
+    CHECK(strstr(get_last_error()->message, "\xe0\x80\x9b") == NULL);
+    CHECK(strstr(get_last_error()->message,
+                 "git diagnostic withheld") != NULL);
+
     fk_fail_write_ordinal = 0U;
     fk_fail_write_output = NULL;
     run_set_runner(previous);

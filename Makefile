@@ -1923,6 +1923,17 @@ test:
 	@echo "ERROR: no C tests discovered under $(TESTDIR)/ (expected test_*.c)" >&2
 	@exit 1
 else
+# AR-18: Apple's compiler-rt is not fork-safe against libSystem's own child
+# handlers. ASan's fork-prepare handler locks every stack-depot block, then
+# libSystem_atfork_child runs _notify_fork_child, whose calloc records an
+# allocation stack; when the current depot block is full that recording
+# must create a new block under the still-held lock, os_unfair_lock reports a
+# recursive lock, and macOS 26 kills the child with an uncatchable SIGKILL
+# before exec. The boundary is positional (it moves with every code change)
+# and transient (the parent creates the block itself moments later), which
+# is the "intermittently rejected helper" Darwin runners showed for months.
+# malloc_context_size=0 keeps allocation stacks out of the depot entirely, so
+# no fork child can need a new block. A later explicit value still wins.
 test: $(BINDIR)/$(TARGET) $(TEST_TARGETS)
 	@sh $(TESTDIR)/test_runner_mode_policy.sh "$(CURDIR)"
 	@echo "Running tests..."
@@ -1930,6 +1941,10 @@ test: $(BINDIR)/$(TARGET) $(TEST_TARGETS)
 	export GITSWITCH_BIN; \
 	GITSWITCH_SOURCE_ROOT="$(CURDIR)"; \
 	export GITSWITCH_SOURCE_ROOT; \
+	if [ "$(UNAME_S)" = "Darwin" ] && [ "$(BUILD_TYPE)" = "debug" ]; then \
+		ASAN_OPTIONS="malloc_context_size=0$${ASAN_OPTIONS:+:$$ASAN_OPTIONS}"; \
+		export ASAN_OPTIONS; \
+	fi; \
 	for test in $(TEST_TARGETS); do \
 		echo "Running $$test..."; \
 		"$$test" || exit 1; \
