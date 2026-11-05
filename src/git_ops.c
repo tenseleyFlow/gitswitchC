@@ -1353,15 +1353,16 @@ static int git_read_snapshot_listing(git_scope_t scope, bool includes,
                 return 0;
             }
             /* The listing is side-effect-free. Retry one empty boundary
-             * failure: Darwin runners have intermittently rejected a
-             * short-lived helper without Git producing any diagnostic bytes.
-             * Output-bearing Git failures, timeouts, and signals remain
+             * failure: the helper died with no bytes, no timeout, and no
+             * recorded runner error, either by a clean non-zero exit or by
+             * SIGKILL before exec. AR-18 traced the Darwin instance to Apple's
+             * compiler-rt: a forked child dies in libSystem's own atfork
+             * handler whenever ASan's stack depot needs a new block there,
+             * an ASan-build artefact the Makefile now prevents
+             * (malloc_context_size=0); the retry stays as a cheap guard.
+             * Output-bearing Git failures, timeouts, and other signals remain
              * immediately fatal. Later exact generation/ownership checks
              * still gate every rollback write. */
-            /* AR-18: the same Darwin rejection also surfaces as the runner
-             * killing the helper itself (SIGKILL, EPERM, no bytes, no
-             * timeout, no recorded runner error) before git ran at all; a
-             * helper that died by any other signal remains fatal. */
             if (empty_failure_retries_remaining > 0U &&
                 res.out_len == 0U && !res.out_truncated &&
                 !res.timed_out &&

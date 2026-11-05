@@ -32,6 +32,22 @@ sed -n '/^install:/,/Installation complete/p' "$root/Makefile" |
     grep -F "$install_backup_copy" >/dev/null ||
     fail "install backup is not a copy of the live binary"
 
+# AR-18: Darwin debug test runs must keep ASan allocation stacks out of the
+# stack depot, or a fork child can be SIGKILLed by macOS 26 inside
+# libSystem's own atfork handler whenever the depot block happens to be full.
+# shellcheck disable=SC2016
+darwin_asan_guard='ASAN_OPTIONS="malloc_context_size=0$${ASAN_OPTIONS:+:$$ASAN_OPTIONS}"'
+# shellcheck disable=SC2016
+darwin_asan_condition='if [ "$(UNAME_S)" = "Darwin" ] && [ "$(BUILD_TYPE)" = "debug" ]'
+# shellcheck disable=SC2016
+test_target_range='/^test: \$(BINDIR)/,/All tests passed/p'
+sed -n "$test_target_range" "$root/Makefile" |
+    grep -F "$darwin_asan_guard" >/dev/null ||
+    fail "Darwin debug test run does not disable ASan malloc stack contexts"
+sed -n "$test_target_range" "$root/Makefile" |
+    grep -F "$darwin_asan_condition" >/dev/null ||
+    fail "ASan malloc stack context guard is not limited to Darwin debug runs"
+
 tmp=$(mktemp -d "${TMPDIR:-/tmp}/gitswitch-ar07-build.XXXXXX") ||
     fail "cannot create temporary directory"
 host_build_pid=
