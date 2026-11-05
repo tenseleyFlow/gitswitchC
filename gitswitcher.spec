@@ -1,5 +1,5 @@
 Name:           gitswitcher
-Version:        1.9.1
+Version:        1.10.0
 Release:        1%{?dist}
 Summary:        Secure Git identity and SSH/GPG key management tool for seamless account switching
 
@@ -84,6 +84,12 @@ make test BUILD_TYPE=release READLINE=1 VERSION=%{version} COMMIT=rpm
 %{_datadir}/fish/vendor_completions.d/gitswitch.fish
 
 %changelog
+* Thu Nov 05 2026 mfw <espadonne@outlook.com> - 1.10.0-1
+- Ship the AR-18 remediation campaign: 18 mediums and about seventy lows across configuration, Git publication, SSH, GPG, runner, CLI and CI, each with a revert-proven regression.
+- Add config create --yes, doctor checks for ssh-add and gpgconf, status reporting of GIT_AUTHOR_*/GIT_COMMITTER_* overrides, Gitea/Forgejo/sourcehut SSH greetings, and a private -F ssh-alias config per account.
+- Reclaim cleanup arenas on Linux/macOS; make no-replace publication, marker/certificate install and retirement re-proof atomic and fail-closed; prove ssh-agent ownership before reuse; retire GPG reset residue correctly.
+- Fix the months-old macOS CI flake: Apple compiler-rt ASan is not fork-safe against libSystem's atfork child handlers; Darwin debug test runs now set malloc_context_size=0.
+
 * Sun Aug 02 2026 mfw <espadonne@outlook.com> - 1.9.1-1
 - Repair Linux migration of live pre-1.9.0 PID-only ssh-agent records while preserving fail-closed ownership and process-identity checks.
 - Coalesce concurrent shell-startup resume attempts so ordinary terminal fan-out stays quiet while explicit and unsafe-lock failures remain diagnostic.
