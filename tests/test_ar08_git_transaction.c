@@ -1964,8 +1964,6 @@ TEST(direct_worktree_extension_false_ignores_later_included_true) {
         (void)!system("ls -l /dev/fd/ 2>/dev/null | sed 's/^/fds-before: /' 1>&2; "
                       "for fd in /dev/fd/*; do n=${fd##*/}; [ \"$n\" -gt 2 ] 2>/dev/null || continue; "
                       "echo \"fdinfo-before: $n $(lsof -p $PPID -a -d $n -Fn 2>/dev/null | tail -1)\" 1>&2; done");
-        /* Darwin diagnostics: is the parent still single-threaded here? */
-        (void)!system("ps -M -p $PPID 2>/dev/null | sed 's/^/threads-before: /' 1>&2");
         if (git_config_seal() != 0) {
             FILE *trace = fopen(trace_path, "r");
             char line[512];
@@ -1996,8 +1994,11 @@ TEST(direct_worktree_extension_false_ignores_later_included_true) {
             (void)!system("for f in /tmp/gsw-asan-ar08.*; do [ -e \"$f\" ] || continue; "
                           "echo \"asan: $f\" 1>&2; head -60 \"$f\" | sed 's/^/asan: /' 1>&2; done");
             (void)!system(
-                "d=\"$HOME/Library/Logs/DiagnosticReports\"; f=; "
-                "for i in $(seq 1 45); do "
+                /* The suite points HOME at a fixture; ReportCrash writes under
+                 * the account's real home (and names corpse reports with a
+                 * .000 sequence suffix on macOS 26). */
+                "h=$(eval echo \"~$(id -un)\"); d=\"$h/Library/Logs/DiagnosticReports\"; f=; "
+                "for i in $(seq 1 30); do "
                 "f=$(ls -t \"$d\"/test_ar08_git_transaction-*.ips 2>/dev/null | head -1); "
                 "[ -n \"$f\" ] && break; sleep 2; done; "
                 "if [ -z \"$f\" ]; then echo 'crash: no report' 1>&2; exit 0; fi; "
@@ -2036,17 +2037,7 @@ TEST(direct_worktree_extension_false_ignores_later_included_true) {
              * system-library hard trap (brk 0xB000-0xBFFF) without any
              * handler, so the only witnesses are the parent's own state
              * (threads, loaded images, descriptors) and ReportCrash. */
-            (void)!system("ps -M -p $PPID 2>/dev/null | sed 's/^/threads: /' 1>&2; "
-                          "lsof -p $PPID 2>/dev/null | awk '{print $4, $5, $NF}' | "
-                          "sed 's/^/lsof: /' | head -120 1>&2; "
-                          "vmmap $PPID 2>/dev/null | grep '__TEXT' | awk '{print $NF}' | "
-                          "sort -u | sed 's/^/img: /' | head -120 1>&2; "
-                          "sample $PPID 1 -mayDie 2>&1 | sed -n '1,160p' | "
-                          "sed 's/^/sample: /' 1>&2");
-            (void)!system("find \"$HOME/Library/Logs/DiagnosticReports\" /Library/Logs/DiagnosticReports "
-                          "-name '*.ips' -newer \"$GITSWITCH_RUNNER_TRACE\" 2>/dev/null | "
-                          "sed 's/^/ips: /' 1>&2; "
-                          "log show --last 4m --style compact --predicate "
+            (void)!system("log show --last 4m --style compact --predicate "
                           "'process == \"ReportCrash\" OR eventMessage CONTAINS \"unrecoverable\" "
                           "OR eventMessage CONTAINS \"corpse\"' 2>/dev/null | "
                           "sed 's/^/rc: /' | tail -40 1>&2");
