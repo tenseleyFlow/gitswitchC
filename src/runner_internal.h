@@ -57,6 +57,10 @@ void run_test_set_supervisor_pending_signal(int signal_number);
  * its inherited mask. Normal signals target the complete process group;
  * SIGTSTP targets the supervisor to exercise its local fail-closed handler. */
 void run_test_set_post_replay_signal(int signal_number);
+/* One-shot: SIGKILL the worker right after its fork, before it reads the
+ * release byte, and have the supervisor wait for that death to be visible
+ * before releasing, so the dead-worker release path runs deterministically. */
+void run_test_set_worker_death_before_release(int enabled);
 /* One-shot supervisor-stage failure with exact errno propagation. */
 void run_test_set_supervisor_failure(
     run_test_supervisor_failure_stage_t stage, int system_errno);

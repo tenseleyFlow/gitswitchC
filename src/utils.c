@@ -61,6 +61,7 @@ void run_test_set_supervisor_pending_signal(int signal_number);
 void run_test_set_post_replay_signal(int signal_number);
 void run_test_set_supervisor_failure(
     run_test_supervisor_failure_stage_t stage, int system_errno);
+void run_test_set_worker_death_before_release(int enabled);
 #endif
 
 /* POSIX exposes the process environment through this external object, but
@@ -3496,6 +3497,7 @@ static int g_test_fork_failure_errno;
 static int g_test_child_process_group_failure_errno;
 static int g_test_supervisor_pending_signal;
 static int g_test_post_replay_signal;
+static bool g_test_worker_dies_before_release;
 static run_test_supervisor_failure_stage_t
     g_test_supervisor_failure_stage;
 static int g_test_supervisor_failure_errno;
@@ -3743,6 +3745,10 @@ void run_test_set_post_replay_signal(int signal_number) {
             g_test_post_replay_signal = 0;
             break;
     }
+}
+
+void run_test_set_worker_death_before_release(int enabled) {
+    g_test_worker_dies_before_release = enabled != 0;
 }
 
 void run_test_set_supervisor_failure(
@@ -5067,6 +5073,10 @@ static int run_argv_real_impl(
     }
 
     pid_t pid;
+#ifdef GITSWITCH_TESTING
+    bool worker_dies_before_release = g_test_worker_dies_before_release;
+    g_test_worker_dies_before_release = false;
+#endif
     int pre_fork_deadline_rc = run_deadline_observe(&deadline, NULL);
     if (pre_fork_deadline_rc != 0) {
         pid = -1;
@@ -5289,15 +5299,63 @@ static int run_argv_real_impl(
                     injected_errno, 126);
             }
 #endif
-            if (!worker_killed &&
-                runner_write_byte(worker_release_pipe[1], 0x45U) != 0) {
-                int setup_errno = errno;
-                close(worker_release_pipe[1]);
-                runner_kill_and_reap_worker(
-                    exec_child, &relay_block_set);
-                child_report_failure(
-                    child_status_fd, CHILD_STAGE_PROCESS_GROUP,
-                    setup_errno, 126);
+#ifdef GITSWITCH_TESTING
+            if (worker_dies_before_release) {
+                /* Hold the release until the worker's death is visible so
+                 * the dead-worker release path runs deterministically. */
+                siginfo_t gone;
+                do {
+                    memset(&gone, 0, sizeof(gone));
+                    if (waitid(P_PID, (id_t)exec_child, &gone,
+                               WEXITED | WNOWAIT | WNOHANG) != 0 &&
+                        errno != EINTR) {
+                        break;
+                    }
+                } while (gone.si_pid != exec_child);
+            }
+#endif
+            if (!worker_killed) {
+                run_sigpipe_state_t release_guard;
+                int release_errno = 0;
+                bool worker_gone = false;
+
+                /* The worker gives up its read end only by exiting (exec
+                 * happens after it has read the byte), so EPIPE here proves
+                 * the worker is already dead. Its real fate must reach the
+                 * parent through the wait below, not as this supervisor's
+                 * own SIGPIPE death: AR-18 found a kernel-killed pre-exec
+                 * child reported as signal 13, which hid the SIGKILL from
+                 * the callers that key their one-shot retry on it. */
+                if (run_sigpipe_begin(&release_guard) != 0) {
+                    release_errno = errno;
+                } else {
+                    if (runner_write_byte(worker_release_pipe[1], 0x45U) !=
+                        0) {
+                        release_errno = errno;
+                        release_guard.saw_epipe = release_errno == EPIPE;
+                    }
+                    if (run_sigpipe_end(&release_guard) != 0 &&
+                        release_errno == 0) {
+                        release_errno = errno;
+                    }
+                }
+                if (release_errno == EPIPE) {
+                    siginfo_t gone;
+
+                    memset(&gone, 0, sizeof(gone));
+                    worker_gone =
+                        waitid(P_PID, (id_t)exec_child, &gone,
+                               WEXITED | WNOWAIT | WNOHANG) == 0 &&
+                        gone.si_pid == exec_child;
+                }
+                if (release_errno != 0 && !worker_gone) {
+                    close(worker_release_pipe[1]);
+                    runner_kill_and_reap_worker(
+                        exec_child, &relay_block_set);
+                    child_report_failure(
+                        child_status_fd, CHILD_STAGE_PROCESS_GROUP,
+                        release_errno, 126);
+                }
             }
             close(worker_release_pipe[1]);
 #ifdef GITSWITCH_TESTING
@@ -5358,6 +5416,9 @@ static int run_argv_real_impl(
             runner_supervisor_exit_for_status(exec_child, exec_status);
         }
         close(worker_release_pipe[1]);
+#ifdef GITSWITCH_TESTING
+        if (worker_dies_before_release) (void)raise(SIGKILL);
+#endif
 #ifdef GITSWITCH_RUNNER_TRACE
         runner_trace("worker %ld waiting for release\n", (long)getpid());
 #endif
