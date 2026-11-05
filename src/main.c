@@ -3755,9 +3755,10 @@ static int handle_resume_command(gitswitch_ctx_t *ctx) {
         bool resuming_gpg = resuming && resuming->gpg_enabled &&
                             resuming->gpg_key_id[0] != '\0';
 
-        fprintf(stderr, resuming_gpg
-                            ? "gitswitch: restoring your last account (you may be prompted for your GPG PIN)...\n"
-                            : "gitswitch: restoring your last account...\n");
+        fputs(resuming_gpg
+                  ? "gitswitch: restoring your last account (you may be prompted for your GPG PIN)...\n"
+                  : "gitswitch: restoring your last account...\n",
+              stderr);
     }
 
     if (accounts_switch(ctx, ctx->config.active_account) != 0) {
