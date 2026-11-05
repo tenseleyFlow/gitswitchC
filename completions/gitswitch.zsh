@@ -71,8 +71,8 @@ _gitswitch() {
         'health:Run local configuration/key readiness checks'
         'config:Show configuration file information'
         'init:Emit shell integration'
-        'resume:Re-activate the last-used account'
-        'reset:Kill agents and delete isolated GPG/SSH state'
+        'resume:Restore saved SSH/GPG state, or reconcile an incomplete switch'
+        'reset:Retire isolated GPG/SSH state and the Git identity it published'
         'switch:Switch to an account explicitly'
     )
 

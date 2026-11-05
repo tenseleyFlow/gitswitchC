@@ -16,6 +16,7 @@
 #include <fcntl.h>
 #include <dirent.h>
 #include <poll.h>
+#include <sys/resource.h>
 #include <pthread.h>
 #include <errno.h>
 #include <pwd.h>
@@ -3985,8 +3986,10 @@ static int runner_tty_prepare(runner_tty_state_t *state) {
     state->fd = -1;
     state->fd = open("/dev/tty", O_RDWR | O_NOCTTY);
     if (state->fd < 0) {
+        /* AR-18 L45: a container or chroot without /dev/tty has no
+         * controlling terminal to hand over, exactly like ENXIO. */
         if (errno == ENXIO || errno == ENODEV || errno == ENOTTY ||
-            errno == EACCES) {
+            errno == EACCES || errno == ENOENT) {
             state->fd = -1;
             return 0;
         }
@@ -4269,6 +4272,17 @@ static void runner_supervisor_exit_for_status(pid_t child, int status) {
     if (WIFSIGNALED(status)) {
         int signal_number = WTERMSIG(status);
         sigset_t unblock;
+        /* AR-18 L43: re-raising a core-dumping signal reports the worker's
+         * death faithfully, but the supervisor's own image is not evidence of
+         * anything; keep it off the disk. */
+        if (WCOREDUMP(status) || signal_number == SIGQUIT ||
+            signal_number == SIGABRT || signal_number == SIGSEGV ||
+            signal_number == SIGBUS || signal_number == SIGFPE ||
+            signal_number == SIGILL || signal_number == SIGTRAP ||
+            signal_number == SIGSYS) {
+            struct rlimit no_core = {0, 0};
+            (void)setrlimit(RLIMIT_CORE, &no_core);
+        }
         (void)signal(signal_number, SIG_DFL);
         if (sigemptyset(&unblock) == 0 &&
             sigaddset(&unblock, signal_number) == 0) {
@@ -7778,10 +7792,28 @@ bool validate_name(const char *name) {
         return false;
     }
 
-    /* Name should contain at least one non-whitespace character */
-    for (const char *p = name; *p; p++) {
-        if (!isspace((unsigned char)*p)) {
-            return true;
+    /* Name should contain at least one non-whitespace character. AR-18 L49:
+     * Unicode space separators (NBSP, ideographic space, the U+2000 block)
+     * are whitespace too; a name made only of them rendered as blank. */
+    {
+        const unsigned char *cursor = (const unsigned char *)name;
+        size_t remaining = strlen(name);
+
+        while (remaining > 0U) {
+            uint32_t codepoint = 0;
+            size_t consumed = utf8_decode(cursor, remaining, &codepoint);
+            bool space;
+
+            if (consumed == 0U) return false;
+            space = (codepoint < 0x80U && isspace((int)codepoint)) ||
+                    codepoint == 0x00A0U || codepoint == 0x1680U ||
+                    (codepoint >= 0x2000U && codepoint <= 0x200AU) ||
+                    codepoint == 0x2028U || codepoint == 0x2029U ||
+                    codepoint == 0x202FU || codepoint == 0x205FU ||
+                    codepoint == 0x3000U;
+            if (!space) return true;
+            cursor += consumed;
+            remaining -= consumed;
         }
     }
 

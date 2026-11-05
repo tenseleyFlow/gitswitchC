@@ -551,6 +551,7 @@ static bool prompt_host_alias_valid(const char *alias);
 static int validate_gpg_key_availability(const char *gpg_key_id);
 static int validate_gpg_key_availability_fresh(const char *gpg_key_id);
 static void print_terminal_safe(const char *text);
+static void print_git_identity_environment_overrides(void);
 static int check_ssh_key_local_file(const account_t *account);
 static int check_gpg_key_local_state(
     const account_t *account, gpg_account_key_readiness_t *readiness);
@@ -1241,7 +1242,10 @@ static void finish_switch_success(gitswitch_ctx_t *ctx, account_t *account,
         }
     }
 
-    if (full_success) {
+    if (ctx->config.dry_run) {
+        log_info("Dry run: no switch to account %s was performed",
+                 account->name);
+    } else if (full_success) {
         log_info("Successfully switched to account: %s (%s)", account->name,
                  account->description);
     } else {
@@ -4581,9 +4585,10 @@ int accounts_remove_recover_incomplete(gitswitch_ctx_t *ctx,
             "Its account is already gone and this marker blocks add/edit "
             "until it is cleared. To finish by hand: check ~/.ssh/config "
             "for a leftover gitswitch-managed alias block and remove it, "
-            "then delete %s and rerun `gitswitch remove %u` to settle the "
-            "Git destinations",
-            requested_id, ctx->config.config_path, requested_id);
+            "then delete the .retirement-incomplete marker beside the "
+            "gitswitch configuration file and rerun `gitswitch remove %u` "
+            "to settle the Git destinations",
+            requested_id, requested_id);
         matching_absent_owner = true;
         goto done;
     }
@@ -5307,23 +5312,67 @@ int accounts_list(const gitswitch_ctx_t *ctx) {
 static void print_terminal_safe(const char *text) {
     const unsigned char *cursor = (const unsigned char *)text;
     size_t consumed = 0;
+    size_t remaining;
 
     if (!cursor) return;
-    for (; consumed < STATUS_RENDER_BYTE_LIMIT && cursor[consumed] != '\0';
-         consumed++) {
+    remaining = strlen(text);
+    while (consumed < STATUS_RENDER_BYTE_LIMIT && cursor[consumed] != '\0') {
         unsigned char byte = cursor[consumed];
+        uint32_t codepoint = 0;
+        size_t width = 0;
 
         if (byte >= 0x20 && byte <= 0x7e && byte != '\\') {
             putchar((int)byte);
-        } else if (byte == '\\') {
-            fputs("\\\\", stdout);
-        } else {
-            printf("\\x%02X", (unsigned int)byte);
+            consumed++;
+            continue;
         }
+        if (byte == '\\') {
+            fputs("\\\\", stdout);
+            consumed++;
+            continue;
+        }
+        /* AR-18 L35: a complete, terminal-safe multibyte sequence is text
+         * the tool itself admitted; print it as is. Control bytes, malformed
+         * or truncated sequences and unsafe codepoints are still escaped. */
+        if (byte >= 0x80) {
+            width = utf8_decode(cursor + consumed, remaining - consumed,
+                                &codepoint);
+        }
+        if (width > 1U && tty_safe_codepoint(codepoint) &&
+            consumed + width <= STATUS_RENDER_BYTE_LIMIT) {
+            fwrite(cursor + consumed, 1U, width, stdout);
+            consumed += width;
+            continue;
+        }
+        printf("\\x%02X", (unsigned int)byte);
+        consumed++;
     }
     if (consumed == STATUS_RENDER_BYTE_LIMIT && cursor[consumed] != '\0') {
         fputs(STATUS_RENDER_TRUNCATION, stdout);
     }
+}
+
+/* AR-18 L34: git lets GIT_AUTHOR_*, GIT_COMMITTER_* and EMAIL in the
+ * environment override user.name/user.email at commit time, so a matching
+ * config can still commit as someone else. Say so beside the match verdict. */
+static void print_git_identity_environment_overrides(void) {
+    static const char *const names[] = {
+        "GIT_AUTHOR_NAME", "GIT_AUTHOR_EMAIL",
+        "GIT_COMMITTER_NAME", "GIT_COMMITTER_EMAIL", "EMAIL"
+    };
+    bool any = false;
+
+    for (size_t i = 0; i < sizeof(names) / sizeof(names[0]); i++) {
+        const char *value = getenv(names[i]);
+
+        if (!value || value[0] == '\0') continue;
+        if (!any) {
+            printf("    [WARN] Environment overrides the configured identity for commits:");
+            any = true;
+        }
+        printf(" %s", names[i]);
+    }
+    if (any) printf("\n");
 }
 
 static void print_git_value_origin(const git_config_effective_value_t *value) {
@@ -7258,8 +7307,10 @@ int accounts_show_status(const gitswitch_ctx_t *ctx) {
                        gpg_programs_match && signing_key_matches &&
                        signing_enabled_matches) {
                 printf("  Match Status: [OK] Git config matches account\n");
+                print_git_identity_environment_overrides();
             } else {
                 printf("  Match Status: [WARN] Git config does not match account\n");
+                print_git_identity_environment_overrides();
                 if (!identity_matches) {
                     printf("    Expected: %s <%s>\n", account->name, account->email);
                     printf("    Current:  ");

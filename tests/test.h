@@ -532,7 +532,12 @@ static inline const char *ts_capability_name(int index) {
         "coreutils",
         "persistent-fs",
         "dev-full",
-        "unix-sockets"
+        "unix-sockets",
+        /* AR-18 L66: three tokens were skipped with but never registered, so
+         * the environment skip failed the suite on a host lacking them. */
+        "exec",
+        "git",
+        "source-proof-rlimit"
     };
     size_t count = sizeof(names) / sizeof(names[0]);
     return index >= 0 && (size_t)index < count ? names[index] : NULL;

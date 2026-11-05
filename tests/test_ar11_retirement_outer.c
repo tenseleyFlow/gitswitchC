@@ -147,6 +147,7 @@ typedef enum {
     M18_COMMAND_REMOVE_NUMERIC,
     M18_COMMAND_RESET,
     M18_COMMAND_RESET_ALL,
+    M18_COMMAND_RESET_NUMERIC,
     M18_COMMAND_RESUME,
     M18_COMMAND_SWITCH
 } m18_command_t;
@@ -2240,6 +2241,9 @@ static int m18_run_cli_after_matches(
         char *reset_all_argv[] = {
             program, no_color, assume_yes, reset, NULL
         };
+        char *reset_numeric_argv[] = {
+            program, no_color, assume_yes, reset, one, NULL
+        };
         char *resume_argv[] = {program, no_color, resume, NULL};
         char *switch_argv[] = {
             program, no_color, assume_yes, switch_command, work, NULL
@@ -2287,6 +2291,10 @@ static int m18_run_cli_after_matches(
             case M18_COMMAND_RESET_ALL:
                 argv = reset_all_argv;
                 argc = 4;
+                break;
+            case M18_COMMAND_RESET_NUMERIC:
+                argv = reset_numeric_argv;
+                argc = 5;
                 break;
             case M18_COMMAND_RESUME:
                 argv = resume_argv;
@@ -5687,6 +5695,151 @@ TEST(absent_destination_recreation_stays_guarded_until_clean_retry) {
     m18_fixture_cleanup(&fixture);
 }
 
+/* Install a fresh RESET marker owned by the first `owner_count` loaded
+ * accounts, exactly as an interrupted reset would leave it, in a child so
+ * the parent's process-global state stays untouched. */
+static int m18_install_reset_marker(const m18_fixture_t *fixture,
+                                    size_t owner_count) {
+    pid_t child;
+    int status = 0;
+
+    if (!fixture || owner_count == 0U || owner_count > MAX_ACCOUNTS) {
+        return -1;
+    }
+    child = fork();
+    if (child < 0) return -1;
+    if (child == 0) {
+        gitswitch_ctx_t ctx;
+        config_retirement_guard_t *installed = NULL;
+        config_retirement_owner_t owners[MAX_ACCOUNTS];
+        char trusted_path[2U * MAX_PATH_LEN];
+
+        if (safe_strncpy(trusted_path, M18_TRUSTED_SYSTEM_PATH,
+                         sizeof(trusted_path)) != 0 ||
+            setenv("PATH", trusted_path, 1) != 0 ||
+            setenv("HOME", fixture->home, 1) != 0 ||
+            setenv("XDG_RUNTIME_DIR", fixture->runtime, 1) != 0 ||
+            setenv("GITSWITCH_ALLOW_TMP_GPG", "1", 1) != 0 ||
+            setenv("GIT_CONFIG_GLOBAL", fixture->git_path, 1) != 0 ||
+            setenv("GIT_CONFIG_NOSYSTEM", "1", 1) != 0 ||
+            unsetenv("GIT_CONFIG_COUNT") != 0 ||
+            config_init_readonly(&ctx) != 0 ||
+            ctx.account_count < owner_count) {
+            _exit(101);
+        }
+        memset(owners, 0, sizeof(owners));
+        for (size_t i = 0U; i < owner_count; i++) {
+            owners[i].account_id = ctx.accounts[i].id;
+            if (safe_strncpy(owners[i].account_incarnation,
+                             ctx.accounts[i].incarnation,
+                             sizeof(owners[i].account_incarnation)) != 0) {
+                _exit(102);
+            }
+        }
+        if (config_retirement_guard_install_or_adopt(
+                fixture->accounts_path, CONFIG_RETIREMENT_RESET,
+                owners, owner_count, &installed) != 0 ||
+            !config_retirement_guard_was_created(installed)) {
+            _exit(103);
+        }
+        config_retirement_guard_abandon(&installed);
+        _exit(installed ? 104 : 0);
+    }
+    if (waitpid(child, &status, 0) != child || !WIFEXITED(status)) {
+        return -1;
+    }
+    return WEXITSTATUS(status) == 0 ? 0 : -1;
+}
+
+static int m18_run_blocked_switch(const m18_fixture_t *fixture,
+                                  m18_bytes_t *output) {
+    int status = m18_run_cli(fixture, M18_COMMAND_SWITCH, M18_FAULT_NONE,
+                             CONFIG_IO_DEFAULT_AFTER_TEMP, NULL);
+
+    if (!WIFEXITED(status) || WEXITSTATUS(status) != EXIT_FAILURE) {
+        return -1;
+    }
+    return m18_read_bytes(fixture->output_path, output);
+}
+
+/* AR-18 M16 (AR-15 L2/L3 follow-up): the lockout names the command that
+ * settles the marker, and that command has to be the one whose owner set
+ * adopts it. A reset's owner set is every ledger-recorded target, so a
+ * bare `reset` adopts the marker it left behind when both recorded accounts
+ * were targets. The old text suggested `reset --all`, which getopt rejects
+ * before recovery can run. The suggested command runs verbatim. */
+TEST(blocked_switch_names_bare_reset_for_a_multi_owner_marker) {
+    m18_fixture_t fixture;
+    m18_bytes_t output = {0};
+    bool blocked = false;
+    int status;
+
+    CHECK_EQ_INT(m18_fixture_setup(&fixture), 0);
+    CHECK_EQ_INT(m18_fixture_add_shared_and_no_op_destinations(&fixture), 0);
+    CHECK_EQ_INT(m18_install_reset_marker(&fixture, 2U), 0);
+    CHECK_EQ_INT(config_retirement_guard_probe(fixture.accounts_path,
+                                               &blocked), 0);
+    CHECK(blocked);
+    CHECK_EQ_INT(m18_run_blocked_switch(&fixture, &output), 0);
+    CHECK(m18_output_contains(
+        &output,
+        "An interrupted reset of account IDs 1, 2 is still recorded; "
+        "rerun `gitswitch reset` to complete it"));
+    CHECK(!m18_output_contains(&output, "--all"));
+
+    status = m18_run_cli(&fixture, M18_COMMAND_RESET_ALL, M18_FAULT_NONE,
+                         CONFIG_IO_DEFAULT_AFTER_TEMP, NULL);
+    CHECK(WIFEXITED(status));
+    if (WIFEXITED(status)) CHECK_EQ_INT(WEXITSTATUS(status), EXIT_SUCCESS);
+    CHECK_EQ_INT(config_retirement_guard_probe(fixture.accounts_path,
+                                               &blocked), 0);
+    CHECK(!blocked);
+
+    m18_bytes_clear(&output);
+    m18_fixture_cleanup(&fixture);
+}
+
+/* The single-owner half: `reset <id>` left the marker, and beside a second
+ * recorded account a bare `reset` builds {1, 2}, which adoption refuses.
+ * The old text suggested exactly that bare `reset`. */
+TEST(blocked_switch_names_reset_id_for_a_single_owner_marker) {
+    m18_fixture_t fixture;
+    m18_bytes_t output = {0};
+    bool blocked = false;
+    int status;
+
+    CHECK_EQ_INT(m18_fixture_setup(&fixture), 0);
+    CHECK_EQ_INT(m18_fixture_add_shared_and_no_op_destinations(&fixture), 0);
+    CHECK_EQ_INT(m18_install_reset_marker(&fixture, 1U), 0);
+    CHECK_EQ_INT(config_retirement_guard_probe(fixture.accounts_path,
+                                               &blocked), 0);
+    CHECK(blocked);
+    CHECK_EQ_INT(m18_run_blocked_switch(&fixture, &output), 0);
+    CHECK(m18_output_contains(
+        &output,
+        "An interrupted reset of account ID 1 is still recorded; "
+        "rerun `gitswitch reset 1` to complete it"));
+
+    status = m18_run_cli(&fixture, M18_COMMAND_RESET_ALL, M18_FAULT_NONE,
+                         CONFIG_IO_DEFAULT_AFTER_TEMP, NULL);
+    CHECK(WIFEXITED(status));
+    if (WIFEXITED(status)) CHECK_EQ_INT(WEXITSTATUS(status), EXIT_FAILURE);
+    CHECK_EQ_INT(config_retirement_guard_probe(fixture.accounts_path,
+                                               &blocked), 0);
+    CHECK(blocked);
+
+    status = m18_run_cli(&fixture, M18_COMMAND_RESET_NUMERIC, M18_FAULT_NONE,
+                         CONFIG_IO_DEFAULT_AFTER_TEMP, NULL);
+    CHECK(WIFEXITED(status));
+    if (WIFEXITED(status)) CHECK_EQ_INT(WEXITSTATUS(status), EXIT_SUCCESS);
+    CHECK_EQ_INT(config_retirement_guard_probe(fixture.accounts_path,
+                                               &blocked), 0);
+    CHECK(!blocked);
+
+    m18_bytes_clear(&output);
+    m18_fixture_cleanup(&fixture);
+}
+
 TEST(same_filesystem_repository_move_retains_guard_and_retry_authority) {
     m18_fixture_t fixture;
     m18_bytes_t accounts_before = {0};
@@ -7726,6 +7879,8 @@ TEST_MAIN_BEGIN()
     RUN_TEST(remove_recovery_rejects_reintroduced_git_identity);
     RUN_TEST(remove_recovery_rejects_reused_id_incarnation);
     RUN_TEST(absent_destination_recreation_stays_guarded_until_clean_retry);
+    RUN_TEST(blocked_switch_names_bare_reset_for_a_multi_owner_marker);
+    RUN_TEST(blocked_switch_names_reset_id_for_a_single_owner_marker);
     RUN_TEST(same_filesystem_repository_move_retains_guard_and_retry_authority);
     RUN_TEST(remove_backup_verification_fault_restores_exact_outer_state);
     RUN_TEST(restored_witness_retries_multiple_delayed_ctime_steps);

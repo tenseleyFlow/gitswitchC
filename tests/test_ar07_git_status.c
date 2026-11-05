@@ -1484,8 +1484,25 @@ TEST(active_ssh_status_uses_saved_program_and_exact_destination) {
     run_set_runner(previous);
     CHECK(strstr(status, "Match Status: [OK]") != NULL);
     CHECK(strstr(status, "Effective SSH Command: [MATCH]") != NULL);
+    CHECK(strstr(status, "Environment overrides the configured identity") ==
+          NULL);
     CHECK(fake_git_calls > 0);
     CHECK_EQ_INT(fake_non_git_calls, 0);
+
+    /* AR-18 L34: a matching config still commits as someone else while the
+     * GIT_AUTHOR, GIT_COMMITTER or EMAIL variables are exported; status
+     * says so. */
+    CHECK_EQ_INT(setenv("GIT_AUTHOR_EMAIL", "someone-else@example.test", 1),
+                 0);
+    previous = run_set_runner(status_fake_runner);
+    CHECK_EQ_INT(capture_status_output_for(&context, status,
+                                           sizeof(status)), 0);
+    run_set_runner(previous);
+    CHECK_EQ_INT(unsetenv("GIT_AUTHOR_EMAIL"), 0);
+    CHECK(strstr(status, "Match Status: [OK]") != NULL);
+    CHECK(strstr(status,
+                 "[WARN] Environment overrides the configured identity for "
+                 "commits: GIT_AUTHOR_EMAIL") != NULL);
 
     /* The account model changed after publication. Rebuild it with the saved
      * program, not PATH, and report the exact old Git value as drift. */

@@ -1423,14 +1423,14 @@ install:
 		fi; \
 		case "$$rollback_state" in \
 		backed) \
-			if [ "$$rollback_published" -eq 1 ] || \
-			   { [ ! -e "$$rollback_stage" ] && [ ! -L "$$rollback_stage" ]; }; then \
+			if [ "$$rollback_published" -eq 1 ]; then \
 				rm -f "$$rollback_final" || { transaction_status=1; return; }; \
 			fi; \
 			if [ -e "$$rollback_final" ] || [ -L "$$rollback_final" ]; then \
-				transaction_status=1; return; \
+				rm -f "$$rollback_backup" || transaction_status=1; \
+			else \
+				mv -f "$$rollback_backup" "$$rollback_final" || transaction_status=1; \
 			fi; \
-			mv -f "$$rollback_backup" "$$rollback_final" || transaction_status=1; \
 			;; \
 		absent) \
 			if [ "$$rollback_published" -eq 1 ] || \
@@ -1507,7 +1507,11 @@ install:
 	fi; \
 	if [ -e "$$binary_final" ] || [ -L "$$binary_final" ]; then \
 		binary_state=inflight; \
-		mv -f "$$binary_final" "$$binary_backup"; binary_state=backed; \
+		if [ -L "$$binary_final" ]; then \
+			mv -f "$$binary_final" "$$binary_backup"; \
+		else \
+			cp -p "$$binary_final" "$$binary_backup"; \
+		fi; binary_state=backed; \
 	else binary_state=absent; rm -f "$$binary_backup"; fi; \
 	if [ -e "$$bash_final" ] || [ -L "$$bash_final" ]; then \
 		bash_state=inflight; \

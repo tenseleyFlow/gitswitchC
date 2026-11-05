@@ -8,13 +8,36 @@
 #include "prompt.h"
 #include "utils.h"
 #include "error.h"
+#include <poll.h>
+#include <unistd.h>
 
 static int prompt_getchar_retry(void) {
     for (;;) {
         errno = 0;
         int byte = fgetc(stdin);
-        if (byte != EOF || !ferror(stdin) || errno != EINTR) return byte;
-        clearerr(stdin);
+        if (byte != EOF || !ferror(stdin)) return byte;
+        if (errno == EINTR) {
+            clearerr(stdin);
+            continue;
+        }
+        /* AR-18 L50: an inherited non-blocking stdin reports EAGAIN when the
+         * user has not typed yet; wait for input instead of failing the
+         * whole command. */
+        if (errno == EAGAIN
+#if EAGAIN != EWOULDBLOCK
+            || errno == EWOULDBLOCK
+#endif
+        ) {
+            struct pollfd waiter;
+
+            waiter.fd = STDIN_FILENO;
+            waiter.events = POLLIN;
+            waiter.revents = 0;
+            if (poll(&waiter, 1, -1) < 0 && errno != EINTR) return EOF;
+            clearerr(stdin);
+            continue;
+        }
+        return byte;
     }
 }
 
@@ -81,6 +104,12 @@ static int prompt_line_stdio(const char *prompt, char *buf, size_t size) {
 
     if (!buf || size == 0) return PROMPT_LINE_ERROR;
     buf[0] = '\0';
+
+    /* AR-18 L51: a Ctrl-D that ended the previous answer leaves stdio's EOF
+     * indicator sticky, so the next question would fail before reading
+     * anything the user types. Only the EOF flag is cleared; a real input
+     * error stays visible. */
+    if (feof(stdin) && !ferror(stdin)) clearerr(stdin);
 
     if (prompt_emit_checked(prompt) != PROMPT_LINE_OK) {
         return PROMPT_LINE_ERROR;

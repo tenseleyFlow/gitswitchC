@@ -23,6 +23,15 @@ if sed -n '/^TOOLCHAIN_FILE_FINGERPRINT := /,/^CC_VERSION_ID := /p' \
     fail "toolchain fingerprint uses a GNU make 3.81-incompatible shell count"
 fi
 
+# AR-18 L47: the install recipe must never move the live binary aside while
+# it verifies the staged copy; the backup is a copy and the only mutation of
+# the live path is the verified rename-over.
+# shellcheck disable=SC2016
+install_backup_copy='cp -p "$$binary_final" "$$binary_backup"'
+sed -n '/^install:/,/Installation complete/p' "$root/Makefile" |
+    grep -F "$install_backup_copy" >/dev/null ||
+    fail "install backup is not a copy of the live binary"
+
 # AR-18: Darwin debug test runs must keep ASan allocation stacks out of the
 # stack depot, or a fork child can be SIGKILLed by macOS 26 inside
 # libSystem's own atfork handler whenever the depot block happens to be full.

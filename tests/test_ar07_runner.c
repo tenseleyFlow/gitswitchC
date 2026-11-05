@@ -2381,6 +2381,14 @@ TEST(global_deadline_survives_continuous_descendant_output) {
     CHECK_EQ_INT(returned_errno, ETIMEDOUT);
     CHECK(result.spawned);
     CHECK(result.timed_out);
+    if (!result.out_truncated || result.exit_code != 0) {
+        fprintf(stderr,
+                "deadline/output: truncated=%d exit=%d signal=%d out_len=%zu "
+                "elapsed=%lld err=%s\n",
+                (int)result.out_truncated, result.exit_code,
+                result.term_signal, result.out_len, (long long)elapsed,
+                get_last_error()->message);
+    }
     CHECK(result.out_truncated);
     CHECK_EQ_INT(result.exit_code, 0);
     CHECK(elapsed >= 0 && elapsed < 750);

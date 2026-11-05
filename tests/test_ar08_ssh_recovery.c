@@ -3308,14 +3308,22 @@ TEST(portable_restore_retirement_substitution_is_preserved) {
     close(fixture.dir_fd);
 }
 
+/* AR-18 M18: the bystander serves the managed socket so the legacy record
+ * reaches the identity code instead of returning early on a dead endpoint.
+ * It is this test's own child, so only a non-blocking reap proves it is
+ * alive (a SIGTERMed child is a zombie that kill(pid, 0) still accepts), and
+ * the final reap proves the only signal it received was the test's SIGKILL. */
 TEST(unrelated_live_pid_is_not_signaled) {
     ssh_fixture_t fixture;
     char legacy_pid[64];
+    int ready_pipe[2];
+    char ready = '\0';
     pid_t child;
     int status = 0;
 
     CHECK_EQ_INT(make_fixture(&fixture, "gsar08other"), 0);
     if (fixture.dir_fd < 0) return;
+    CHECK_EQ_INT(pipe(ready_pipe), 0);
     child = fork();
     CHECK(child >= 0);
     if (child < 0) {
@@ -3323,20 +3331,39 @@ TEST(unrelated_live_pid_is_not_signaled) {
         return;
     }
     if (child == 0) {
+        close(ready_pipe[0]);
+        if (bind_live_socket(fixture.socket) < 0 ||
+            write(ready_pipe[1], "R", 1) != 1) {
+            _exit(2);
+        }
+        close(ready_pipe[1]);
         for (;;) pause();
     }
+    close(ready_pipe[1]);
+    CHECK_EQ_INT((int)read(ready_pipe[0], &ready, 1), 1);
+    close(ready_pipe[0]);
+    CHECK_EQ_INT(ready, 'R');
 
     CHECK(snprintf(legacy_pid, sizeof(legacy_pid), "%ld\n",
                    (long)child) > 0);
     CHECK_EQ_INT(write_sidecar_bytes(
                      &fixture, legacy_pid, strlen(legacy_pid), 0600), 0);
-    CHECK_EQ_INT(ssh_manager_reset("work"), 0);
-    CHECK_EQ_INT(kill(child, 0), 0);
-    CHECK(!path_exists(fixture.sidecar));
+    CHECK_EQ_INT(ssh_manager_reset("work"), -1);
+    /* The H2 migration leg proves the record's PID serves the socket and
+     * then refuses it on image evidence: not an ssh-agent, so no signal. */
+    CHECK(strstr(get_last_error()->message,
+                 "legacy pre-upgrade PID-only record") != NULL);
+    CHECK_EQ_INT(waitpid(child, &status, WNOHANG), 0); /* alive, not a zombie */
+    CHECK(path_exists(fixture.sidecar));
+    CHECK(path_exists(fixture.socket));
 
-    (void)kill(child, SIGKILL);
+    CHECK_EQ_INT(kill(child, SIGKILL), 0);
     CHECK_EQ_INT(waitpid(child, &status, 0), child);
     CHECK(WIFSIGNALED(status));
+    if (WIFSIGNALED(status)) CHECK_EQ_INT(WTERMSIG(status), SIGKILL);
+    CHECK_EQ_INT(ssh_manager_reset("work"), 0);
+    CHECK(!path_exists(fixture.sidecar));
+    CHECK(!path_exists(fixture.socket));
     close(fixture.dir_fd);
 }
 

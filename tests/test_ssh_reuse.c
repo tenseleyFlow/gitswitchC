@@ -1797,12 +1797,21 @@ TEST(host_alias_handles_config_larger_than_64k) {
 /* AR-02 test menu (ranks 19/20): a sidecar PID that now belongs to a NON-agent
  * same-uid process — the classic PID-recycle scenario — must never be
  * signaled by the teardown path. reap_ssh_agent's identity check (comm +
- * exact socket in argv, /proc-based, hence Linux-only) must refuse it, keep
- * the bystander alive, and drop the sidecar as garbage. */
+ * exact socket in argv, /proc-based, hence Linux-only) must refuse it and
+ * keep the bystander alive.
+ *
+ * AR-18 M18: the bystander serves the managed socket, so the record reaches
+ * the identity code instead of returning early on a dead endpoint, and its
+ * liveness is proven with a non-blocking reap: it is this test's own child,
+ * so a SIGTERMed bystander would be a zombie that kill(pid, 0) still
+ * reports as alive. The final reap proves the only signal it ever received
+ * was the test's own SIGKILL. */
 TEST(reset_never_signals_bystander_pid_in_sidecar) {
     char dir[128], pid_path[256], sock_path[256];
     char legacy_pid[64];
     struct timespec ts = { .tv_sec = 0, .tv_nsec = 100000000 }; /* 100ms */
+    int ready_pipe[2];
+    char ready = '\0';
     pid_t pid;
     int status = 0;
 
@@ -1810,31 +1819,60 @@ TEST(reset_never_signals_bystander_pid_in_sidecar) {
     setenv("XDG_RUNTIME_DIR", g_xdg, 1);
     snprintf(dir, sizeof(dir), "%s/gitswitch-ssh", g_xdg);
     CHECK_EQ_INT(mkdir(dir, 0700), 0);
+    snprintf(pid_path, sizeof(pid_path), "%s/ssh-agent.work.pid", dir);
+    snprintf(sock_path, sizeof(sock_path), "%s/ssh-agent.work.sock", dir);
+    CHECK_EQ_INT(pipe(ready_pipe), 0);
 
-    /* The bystander: our own forked child, parked on pause(). Its comm is
-     * this test binary, not "ssh-agent", so the identity check must refuse. */
     fflush(NULL);
     pid = fork();
     CHECK(pid >= 0);
     if (pid == 0) {
+        struct sockaddr_un addr;
+        int listener = socket(AF_UNIX, SOCK_STREAM, 0);
+
+        close(ready_pipe[0]);
+        memset(&addr, 0, sizeof(addr));
+        addr.sun_family = AF_UNIX;
+        if (listener < 0 || strlen(sock_path) >= sizeof(addr.sun_path)) {
+            _exit(2);
+        }
+        strcpy(addr.sun_path, sock_path);
+        if (bind(listener, (struct sockaddr *)&addr, sizeof(addr)) != 0 ||
+            chmod(sock_path, 0600) != 0 || listen(listener, 4) != 0 ||
+            write(ready_pipe[1], "R", 1) != 1) {
+            _exit(2);
+        }
+        close(ready_pipe[1]);
         for (;;) pause();
     }
+    close(ready_pipe[1]);
+    CHECK_EQ_INT((int)read(ready_pipe[0], &ready, 1), 1);
+    close(ready_pipe[0]);
+    CHECK_EQ_INT(ready, 'R');
 
-    snprintf(pid_path, sizeof(pid_path), "%s/ssh-agent.work.pid", dir);
-    snprintf(sock_path, sizeof(sock_path), "%s/ssh-agent.work.sock", dir);
     CHECK(snprintf(legacy_pid, sizeof(legacy_pid), "%ld\n",
                    (long)pid) > 0);
     CHECK_EQ_INT(write_string_to_file(pid_path, legacy_pid, 0600), 0);
 
-    CHECK_EQ_INT(ssh_manager_reset("work"), 0);
+    CHECK_EQ_INT(ssh_manager_reset("work"), -1);
+    /* The H2 migration leg proves the record's PID serves the socket and
+     * then refuses it on image evidence: not an ssh-agent, so no signal. */
+    CHECK(strstr(get_last_error()->message,
+                 "legacy pre-upgrade PID-only record") != NULL);
     nanosleep(&ts, NULL); /* let any (wrongly) sent signal land */
 
-    CHECK_EQ_INT(kill(pid, 0), 0);          /* bystander untouched */
-    CHECK(!path_exists(pid_path));          /* garbage record dropped */
-    CHECK(!path_exists(sock_path));
+    CHECK_EQ_INT(waitpid(pid, &status, WNOHANG), 0); /* alive, not a zombie */
+    CHECK(path_exists(pid_path));           /* retry evidence retained */
+    CHECK(path_exists(sock_path));
 
-    kill(pid, SIGKILL);
-    waitpid(pid, &status, 0);
+    CHECK_EQ_INT(kill(pid, SIGKILL), 0);
+    CHECK_EQ_INT(waitpid(pid, &status, 0), pid);
+    CHECK(WIFSIGNALED(status));
+    if (WIFSIGNALED(status)) CHECK_EQ_INT(WTERMSIG(status), SIGKILL);
+    /* With the bystander gone the record is garbage and reset converges. */
+    CHECK_EQ_INT(ssh_manager_reset("work"), 0);
+    CHECK(!path_exists(pid_path));
+    CHECK(!path_exists(sock_path));
 }
 #endif
 

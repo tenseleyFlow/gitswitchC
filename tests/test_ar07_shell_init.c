@@ -1177,6 +1177,45 @@ TEST(fish_wrapper_preserves_manual_overrides_status_argv_and_neuter_paths) {
                  "arg=<switch>\narg=<two words>\narg=<--local>\n");
 }
 
+/* AR-18 L40: zsh's warn_create_global reported every global the snippet's
+ * helper functions assign (seven per shell start through the README
+ * loader). The functions keep that state on purpose, so they declare the
+ * intent for zsh alone; the other shells never see a setopt. */
+TEST(zsh_snippet_helpers_create_no_globals_under_warncreateglobal) {
+    char zsh_path[PATH_MAX];
+    char err_path[PATH_MAX];
+    char command[4096];
+    char contents[4096];
+    int index = shell_index("zsh");
+    int written;
+
+    CHECK(index >= 0);
+    if (index < 0) return;
+    if (resolve_executable("zsh", zsh_path, sizeof(zsh_path)) != 0) {
+        TS_SKIP("zsh", "native zsh executable is unavailable");
+    }
+    CHECK_EQ_INT(join_path(err_path, sizeof(err_path), g_fixture.root,
+                           "/zsh-warn.err"), 0);
+    written = snprintf(
+        command, sizeof(command),
+        "env HOME='%s' XDG_RUNTIME_DIR='%s' PATH='%s:/usr/bin:/bin' "
+        "GS_SSH_RC=1 GS_CHECK_RC=1 GS_RESUME_LOG='%s' GS_REAL_BIN='%s' "
+        "'%s' -f -c 'setopt warncreateglobal; . \"$1\"; "
+        "__gitswitch_command_updates_runtime switch work; "
+        "__gitswitch_refresh; gitswitch --vers >/dev/null' zsh '%s' "
+        ">/dev/null 2>'%s'",
+        g_fixture.home, g_fixture.runtime, g_fixture.shims,
+        g_fixture.resume_log, g_bin, zsh_path, g_fixture.snippets[index],
+        err_path);
+    CHECK(written >= 0 && (size_t)written < sizeof(command));
+    if (written < 0 || (size_t)written >= sizeof(command)) return;
+    CHECK_EQ_INT(run_shell(command), 0);
+    contents[0] = '\0';
+    (void)read_text(err_path, contents, sizeof(contents));
+    CHECK(strstr(contents, "created global") == NULL);
+    CHECK(strstr(contents, "warning") == NULL);
+}
+
 TEST(real_ssh_liveness_requires_current_account_and_exactly_one_key) {
     static const char certificate_suffix[] = "(ED25519-CERT)\n";
     char root[PATH_MAX] = "/tmp/gitswitch-ar07-live.XXXXXX";
@@ -1496,6 +1535,7 @@ int main(int argc, char **argv) {
     RUN_TEST(fish_source_before_runtime_refreshes_then_restores_prior_ownership);
     RUN_TEST(posix_wrapper_preserves_manual_overrides_status_argv_and_neuter_paths);
     RUN_TEST(fish_wrapper_preserves_manual_overrides_status_argv_and_neuter_paths);
+    RUN_TEST(zsh_snippet_helpers_create_no_globals_under_warncreateglobal);
     RUN_TEST(real_ssh_liveness_requires_current_account_and_exactly_one_key);
     RUN_TEST(real_resume_leaves_external_git_configuration_byte_identical);
 

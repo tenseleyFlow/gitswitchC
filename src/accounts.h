@@ -290,6 +290,8 @@ int accounts_session_cleanup(void);
  * - Reads the current.sock symlink in gitswitch-ssh directory
  * - Parses account name from socket filename
  * - Sets ctx->current_account if a match is found
+ * - Otherwise falls back to the persisted active_account; a malformed or
+ *   stale runtime hint never suppresses that fallback
  * Call this after accounts are loaded from config
  */
 int accounts_detect_current(gitswitch_ctx_t *ctx);

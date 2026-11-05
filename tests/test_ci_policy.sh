@@ -394,6 +394,62 @@ check_policy()
         function is_linux_gcovr_version_probe(command) {
             return command == "test \"$(\"$gcovr_path\" --version | /usr/bin/sed -n " single_quote "1p" single_quote ")\" = " single_quote "gcovr 8.6" single_quote
         }
+        # AR-18 M17: the FreeBSD gates live in one shared VM script, so every
+        # dangerous construct has to be judged per simple command, not per
+        # line start. Split a line on ;, &&, ||, | and & (quotes are kept in
+        # the text; a false split inside a quoted argument can only add a
+        # harmless segment), strip the grouping and prefix words a bypass can
+        # hide behind, and apply the rules to each piece at every control
+        # depth. A command that exits, returns, execs, redefines or aliases
+        # gmake, rewrites the make environment, plants a makefile, or touches
+        # the pinned capability export a second time makes the gates not
+        # provably reachable.
+        function normalize_shell_segment(segment) {
+            segment = trim(segment)
+            while (segment ~ /^[{(!][[:space:]]*/ ||
+                   segment ~ /^(command|builtin|time|nohup|then|else|elif|do|if|while|until)([[:space:]]+|$)/) {
+                if (segment ~ /^[{(!]/) segment = substr(segment, 2)
+                else sub(/^(command|builtin|time|nohup|then|else|elif|do|if|while|until)([[:space:]]+|$)/, "",
+                         segment)
+                segment = trim(segment)
+            }
+            return segment
+        }
+        function freebsd_segment_unsafe(segment) {
+            return segment ~ /^(alias|eval|source|trap|unalias)([[:space:]]|$)/ ||
+                segment ~ /^\.[[:space:]]/ ||
+                segment ~ /^(export[[:space:]]+|readonly[[:space:]]+)?(PATH|MAKEFLAGS|MFLAGS|GNUMAKEFLAGS|MAKEFILES|MAKE|BASH_ENV|ENV|SHELLOPTS|BASHOPTS)=/ ||
+                segment ~ /^(function[[:space:]]+)?g?make[[:space:]]*(\(\)|\{)/ ||
+                segment ~ /^hash[[:space:]].*g?make/ ||
+                segment ~ /^set[[:space:]]+\+e([[:space:]]|$)/ ||
+                segment ~ /^set[[:space:]]+\+o[[:space:]]+errexit([[:space:]]|$)/ ||
+                segment ~ /^shopt[[:space:]].*expand_aliases/ ||
+                segment ~ /^unset[[:space:]].*GITSWITCH_TEST_REQUIRED_CAPS/ ||
+                segment ~ /^(export[[:space:]]+)?(GITSWITCH_TEST_REQUIRED_CAPS)=.*[[:space:]]/ ||
+                (segment ~ /(^|[[:space:]])(tee|cp|mv|ln|install|touch|cat)([[:space:]]|$)|>/ &&
+                 segment ~ /(^|[[:space:]>\/])(GNUmakefile|[Mm]akefile)([[:space:]]|$)/)
+        }
+        function segment_terminates_early(segment) {
+            return segment ~ /^(exit|return)([[:space:]]|$)/ ||
+                segment ~ /^exec[[:space:]]+[^0-9<]/
+        }
+        function freebsd_caps_mutation(segment, whole) {
+            return (segment ~ /^(export[[:space:]]+)?GITSWITCH_TEST_REQUIRED_CAPS=/ ||
+                    segment ~ /^unset[[:space:]]/ && segment ~ /GITSWITCH_TEST_REQUIRED_CAPS/) &&
+                whole != "export GITSWITCH_TEST_REQUIRED_CAPS=pty,readline,bash,zsh,fish,sh,dash,openssh,gpg,unix-sockets,freebsd-nullfs"
+        }
+        function scan_freebsd_segments(code, parts, count, k, segment) {
+            count = split(code, parts, /[;&|]+/)
+            for (k = 1; k <= count; k++) {
+                segment = normalize_shell_segment(parts[k])
+                if (segment == "") continue
+                if (freebsd_segment_unsafe(segment) ||
+                    freebsd_caps_mutation(segment, code))
+                    step_unsafe_script = 1
+                if (segment_terminates_early(segment))
+                    step_terminates_early = 1
+            }
+        }
         function record_block_command(raw_line, source, line, i, c, escaped,
                                       quote_at_start, continued_at_start,
                                       depth_at_start, eligible) {
@@ -441,6 +497,8 @@ check_policy()
                  shell_code ~ /^set[[:space:]]+\+o[[:space:]]+errexit([[:space:]]|$)/ ||
                  shell_code ~ /^shopt[[:space:]].*expand_aliases/))
                 step_unsafe_script = 1
+            if (source == "direct" && current_job == "freebsd")
+                scan_freebsd_segments(shell_code)
             if (source == "direct" && required_release_job(current_job) &&
                 mutates_executable_resolution(shell_code) &&
                 !(current_job == "linux" &&
@@ -465,8 +523,14 @@ check_policy()
                 !shell_trailing_continuation(shell_code) &&
                 shell_control_depth == 0
             add_step_command(shell_code, source, eligible)
-            if (shell_code ~ /^(if|for|while|until|case|select)[[:space:]]/ ||
-                shell_code ~ /^[A-Za-z_][A-Za-z0-9_]*[[:space:]]*\(\)[[:space:]]*\{/) {
+            # AR-18 M17: a one-line construct that closes itself on the same
+            # line (`if :; then :; fi`, `f() { :; }`) opens no depth; it used
+            # to leave every later command ineligible, so the verdict was a
+            # missing gate instead of the construct itself.
+            if ((shell_code ~ /^(if|for|while|until|case|select)[[:space:]]/ &&
+                 shell_code !~ /(^|[;&|][[:space:]]*)(fi|done|esac)[[:space:]]*$/) ||
+                (shell_code ~ /^[A-Za-z_][A-Za-z0-9_]*[[:space:]]*\(\)[[:space:]]*\{/ &&
+                 shell_code !~ /\}[[:space:]]*$/)) {
                 shell_control_depth++
             }
             shell_continued = shell_trailing_continuation(shell_code)
@@ -1630,8 +1694,13 @@ check_policy()
     freebsd_version=$(sed -n 's/^freebsd-version=//p' "$work_actions")
     [ -n "$freebsd_version" ] || fail "FreeBSD CI version is not explicit"
 
+    # Reviewed releng branches and their security-support deadlines (the
+    # FreeBSD Security Officer's supported-releases table). 14.4 expires
+    # 2026-12-31; 14.5 (released 2026-09-08) runs to 2027-06-30, so the VM
+    # version in ci.yml and the fixtures that spell it must move before then.
     case $freebsd_version in
         14.4) freebsd_eol=2026-12-31 ;;
+        14.5) freebsd_eol=2027-06-30 ;;
         *) fail "FreeBSD $freebsd_version is unreviewed or no longer supported" ;;
     esac
     printf '%s\n' "$policy_date" | grep -E '^[0-9]{4}-[0-9]{2}-[0-9]{2}$' \
@@ -3417,19 +3486,79 @@ expect_structural_rejected_for "FreeBSD release gates without errexit" \
     "$tmp/freebsd-no-errexit.yml" "$today" \
     "FreeBSD release gates require an earlier set -eu"
 
+# AR-18 L57: inject into the FreeBSD VM script (the first `set -eu` in the
+# file belongs to the Linux gcovr step, whose shape check rejected these
+# fixtures for an unrelated reason) and require the reachability verdict.
 for unsafe_line in "alias gmake=true" "gmake() { true; }" \
     "export MAKEFLAGS=-i" "hash -p /usr/bin/true gmake"; do
     unsafe_id=$(printf '%s\n' "$unsafe_line" | cksum | awk '{print $1}')
     awk -v injected="$unsafe_line" '
+        /^  freebsd:[[:space:]]*$/ { in_freebsd = 1 }
         { print }
-        !changed && $0 == "          set -eu" {
+        in_freebsd && !changed && $0 == "          set -eu" {
             print "          " injected
             changed = 1
         }
         END { if (!changed) exit 1 }
     ' "$workflow" >"$tmp/freebsd-command-override-$unsafe_id.yml"
-    expect_structural_rejected "FreeBSD gmake override: $unsafe_line" \
-        "$tmp/freebsd-command-override-$unsafe_id.yml" "$today"
+    expect_structural_rejected_for "FreeBSD gmake override: $unsafe_line" \
+        "$tmp/freebsd-command-override-$unsafe_id.yml" "$today" \
+        "required release gate command is not provably reachable"
+done
+
+# AR-18 M17: the same constructs hidden behind a grouping, a prefix word, a
+# same-line separator, a nested control block, make's wider environment, a
+# planted makefile, or a second touch of the pinned capability export. Each
+# one used to pass --check while making the FreeBSD gates unreachable.
+for unsafe_line in ":; gmake() { :; }" ":; alias gmake=true" \
+    "export GNUMAKEFLAGS=-i" "export MAKEFILES=/tmp/evil.mk" \
+    "{ exit 0; }" "command exec true" ": > GNUmakefile" \
+    "true || exit 0" "( exit 0 )"; do
+    unsafe_id=$(printf '%s\n' "$unsafe_line" | cksum | awk '{print $1}')
+    awk -v injected="$unsafe_line" '
+        /^  freebsd:[[:space:]]*$/ { in_freebsd = 1 }
+        { print }
+        in_freebsd && !changed && $0 == "          set -eu" {
+            print "          " injected
+            changed = 1
+        }
+        END { if (!changed) exit 1 }
+    ' "$workflow" >"$tmp/freebsd-segment-bypass-$unsafe_id.yml"
+    expect_structural_rejected_for "FreeBSD segment bypass: $unsafe_line" \
+        "$tmp/freebsd-segment-bypass-$unsafe_id.yml" "$today" \
+        "required release gate command is not provably reachable"
+done
+
+awk '
+    /^  freebsd:[[:space:]]*$/ { in_freebsd = 1 }
+    { print }
+    in_freebsd && !changed && $0 == "          set -eu" {
+        print "          if :; then"
+        print "            if :; then exit 0; fi"
+        print "          fi"
+        changed = 1
+    }
+    END { if (!changed) exit 1 }
+' "$workflow" >"$tmp/freebsd-nested-exit.yml"
+expect_structural_rejected_for "FreeBSD nested conditional exit" \
+    "$tmp/freebsd-nested-exit.yml" "$today" \
+    "required release gate command is not provably reachable"
+
+for caps_line in "unset GITSWITCH_TEST_REQUIRED_CAPS" \
+    "GITSWITCH_TEST_REQUIRED_CAPS=pty" \
+    "{ export GITSWITCH_TEST_REQUIRED_CAPS=pty; }"; do
+    caps_id=$(printf '%s\n' "$caps_line" | cksum | awk '{print $1}')
+    awk -v injected="$caps_line" '
+        { print }
+        !changed && $0 == "          export GITSWITCH_TEST_REQUIRED_CAPS=pty,readline,bash,zsh,fish,sh,dash,openssh,gpg,unix-sockets,freebsd-nullfs" {
+            print "          " injected
+            changed = 1
+        }
+        END { if (!changed) exit 1 }
+    ' "$workflow" >"$tmp/freebsd-caps-mutation-$caps_id.yml"
+    expect_structural_rejected_for "FreeBSD capability mutation: $caps_line" \
+        "$tmp/freebsd-caps-mutation-$caps_id.yml" "$today" \
+        "required release gate command is not provably reachable"
 done
 
 awk '

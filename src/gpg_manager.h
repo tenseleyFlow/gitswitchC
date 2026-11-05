@@ -81,6 +81,11 @@ bool gpg_manager_test_generation_tokens_same_process(const char *left,
 int gpg_manager_test_encode_process_generation(
     uint8_t kind, uint64_t boot_hi, uint64_t boot_lo,
     uint64_t start_hi, uint64_t start_lo, char *token, size_t size);
+/* AR-18 L30 test seam: the `gpg --version` banner parser that selects the
+ * secret-listing contract. Returns 0 and reports whether the 2.0 contract
+ * was selected, or -1 with an error for an unsupported banner. */
+int gpg_manager_test_parse_listing_contract_version(const char *output,
+                                                    int *contract_is_20);
 
 /* Narrow dependency seams for deterministic filesystem-race/error tests. The
  * defaults are libc readdir() and no pre-open callback, respectively. */
@@ -144,7 +149,9 @@ typedef int (*gpg_reset_retire_hook_fn)(int base_fd,
 typedef int (*gpg_reset_postvalidate_hook_fn)(int base_fd,
                                               const char *quarantine);
 /* Test/provider seam for platforms with a descriptor-bound conditional unlink.
- * Production uses FreeBSD funlinkat(2); NULL is fail-closed elsewhere. */
+ * Production uses FreeBSD funlinkat(2). Elsewhere the seam stays NULL and
+ * reset re-proves the exact link identity under the base lock immediately
+ * before an ordinary unlink (AR-15 M8). */
 typedef int (*gpg_identity_unlink_fn)(int dir_fd, const char *name,
                                       const struct stat *expected);
 /* Deterministic mount-identity and managed-writer durability seams. NULL

@@ -144,6 +144,53 @@ TEST(direct_error_context_copies_mutable_provenance) {
           NULL);
 }
 
+/* AR-18 L52: the accumulated causal chain lives in details; it used to be
+ * printed only when the first error also carried an errno, so a chain
+ * rooted in a plain validation failure lost every later cause. */
+TEST(formatted_error_keeps_details_without_an_errno) {
+    char formatted[2048];
+    error_context_t error;
+
+    memset(&error, 0, sizeof(error));
+    error.code = ERR_INVALID_ARGS;
+    error.system_errno = 0;
+    error.line = 7;
+    snprintf(error.message, sizeof(error.message), "%s", "first failure");
+    snprintf(error.details, sizeof(error.details), "%s",
+             "then: retry material retained");
+    snprintf(error.file, sizeof(error.file), "%s", "chain.c");
+    snprintf(error.function, sizeof(error.function), "%s", "chain");
+    memset(formatted, 0, sizeof(formatted));
+    format_error_message(formatted, sizeof(formatted), &error);
+    CHECK(strstr(formatted, "Error: first failure") != NULL);
+    CHECK(strstr(formatted, "Details: then: retry material retained") != NULL);
+
+    error.details[0] = '\0';
+    memset(formatted, 0, sizeof(formatted));
+    format_error_message(formatted, sizeof(formatted), &error);
+    CHECK(strstr(formatted, "Details:") == NULL);
+}
+
+/* AR-18 P37: publishing an accumulation replaces the global context, so
+ * generation observers (observational scopes, freshness checks) must see a
+ * new report rather than the generation of the first error it was built from. */
+TEST(accumulator_publish_advances_the_report_generation) {
+    error_accumulator_t accumulator;
+    error_context_t first;
+    uint64_t before;
+
+    memset(&first, 0, sizeof(first));
+    first.code = ERR_INVALID_ARGS;
+    snprintf(first.message, sizeof(first.message), "%s", "first");
+    error_accumulator_init(&accumulator);
+    CHECK(error_accumulator_add(&accumulator, "initial", &first));
+    clear_error();
+    before = error_report_generation();
+    CHECK(error_accumulator_publish(&accumulator));
+    CHECK(error_report_generation() != before);
+    CHECK_EQ_INT(get_last_error()->code, ERR_INVALID_ARGS);
+}
+
 TEST(system_error_context_copies_mutable_provenance) {
     char file[64] = "system-source.c";
     char function[64] = "system_function";
@@ -939,6 +986,8 @@ TEST_MAIN_BEGIN()
     RUN_TEST(nested_observational_scopes_restore_in_lifo_order);
     RUN_TEST(null_observational_callback_publishes_api_misuse);
     RUN_TEST(direct_error_context_copies_mutable_provenance);
+    RUN_TEST(formatted_error_keeps_details_without_an_errno);
+    RUN_TEST(accumulator_publish_advances_the_report_generation);
     RUN_TEST(system_error_context_copies_mutable_provenance);
     RUN_TEST(system_error_and_logging_preserve_entry_errno);
     RUN_TEST(error_context_value_copy_has_independent_provenance);

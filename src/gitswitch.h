@@ -58,9 +58,6 @@
 #define EXIT_SUCCESS 0
 #define EXIT_FAILURE 1
 #define EXIT_CONFIG_ERROR 2
-#define EXIT_VALIDATION_ERROR 3
-#define EXIT_SSH_ERROR 4
-#define EXIT_GPG_ERROR 5
 
 /* Git scopes */
 typedef enum {

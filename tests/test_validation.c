@@ -74,6 +74,15 @@ TEST(validate_name_accepts_ordinary_display_names) {
  * exactly-320-char address that the downstream safe_strncpy then refused —
  * add aborted with a misleading error, edit silently kept the old email. The
  * validator must reject at >=, matching validate_name's bound. */
+/* AR-18 L49: a name made only of Unicode space separators renders blank. */
+TEST(validate_name_rejects_unicode_whitespace_only_names) {
+    CHECK(!validate_name("\xE3\x80\x80"));             /* U+3000 */
+    CHECK(!validate_name("\xC2\xA0 \xC2\xA0"));         /* NBSP, space */
+    CHECK(!validate_name("\xE2\x80\x83\xE2\x80\x83")); /* U+2003 x2 */
+    CHECK(validate_name("a\xC2\xA0" "b"));
+    CHECK(validate_name("Jos\xC3\xA9"));
+}
+
 TEST(validate_email_enforces_storable_bound) {
     char email[MAX_EMAIL_LEN + 2];
     const char *domain = "@example.com";
@@ -146,4 +155,5 @@ TEST_MAIN_BEGIN()
     RUN_TEST(validate_name_accepts_ordinary_display_names);
     RUN_TEST(validate_email_enforces_storable_bound);
     RUN_TEST(validate_key_id_is_hex_only);
+    RUN_TEST(validate_name_rejects_unicode_whitespace_only_names);
 TEST_MAIN_END()

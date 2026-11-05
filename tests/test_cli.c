@@ -192,7 +192,9 @@ TEST(init_succeeds_and_emits_full_snippet) {
      * probe (esac) and the SSH_AUTH_SOCK wiring must be present. */
     slurp(out_path, out, sizeof(out));
     CHECK(strstr(out, "esac") != NULL);
-    CHECK(strstr(out, "unset __gitswitch_auth_sock") != NULL);
+    CHECK(strstr(out, "__gitswitch_refresh\n") != NULL);
+    /* AR-18 L41: the snippet no longer assigns a variable nothing reads. */
+    CHECK(strstr(out, "__gitswitch_auth_sock") == NULL);
     remove_tree(rt);
 }
 
@@ -226,6 +228,22 @@ TEST(init_snippet_gates_probe_on_hint_content) {
 /* With stdout closed every write fails; before the SIPW-1 fix `init` ignored
  * printf results and still exited 0, handing eval a truncated/empty script
  * with a success status. */
+/* AR-18 L66: a TS_SKIP token that is not registered turns an environment
+ * skip into a suite failure. Every token the tree skips with must resolve. */
+TEST(every_skip_token_used_by_the_suites_is_registered) {
+    static const char *const tokens[] = {
+        "bash", "bulk-fd-close", "coreutils", "dev-full", "exec", "fish",
+        "freebsd-acl", "freebsd-nullfs", "git", "gpg", "high-fd",
+        "mount-namespace", "openssh", "persistent-fs", "pty", "readline",
+        "sh", "source-proof-rlimit", "unix-sockets", "unprivileged", "zsh"
+    };
+
+    for (size_t i = 0; i < sizeof(tokens) / sizeof(tokens[0]); i++) {
+        CHECK(ts_capability_index(tokens[i], strlen(tokens[i])) >= 0);
+    }
+    CHECK(ts_capability_index("not-a-token", strlen("not-a-token")) < 0);
+}
+
 TEST(init_fails_when_stdout_is_closed) {
     char rt[256], cmd[9000];
     int rc;
@@ -1105,7 +1123,9 @@ TEST(startup_resume_metadata_failure_remains_visible) {
     CHECK(rc > 0 && rc < 126);
     CHECK(strstr(slurp(out_path, out, sizeof(out)),
                  "Could not coordinate shell startup resume") != NULL);
-    CHECK(strstr(out, "startup lock is unavailable") != NULL);
+    /* AR-18 L39: a lock that cannot be created is a permissions problem; a
+     * held lock (contention) is reported as another gitswitch starting up. */
+    CHECK(strstr(out, "startup lock could not be created") != NULL);
 
     remove_tree(home);
     remove_tree(rt);
@@ -1853,6 +1873,7 @@ TEST_MAIN_BEGIN()
     }
     RUN_TEST(init_succeeds_and_emits_full_snippet);
     RUN_TEST(init_snippet_gates_probe_on_hint_content);
+    RUN_TEST(every_skip_token_used_by_the_suites_is_registered);
     RUN_TEST(init_fails_when_stdout_is_closed);
     RUN_TEST(init_fails_on_enospc);
     RUN_TEST(list_names_protocol_is_exact_and_empty_set_succeeds);
