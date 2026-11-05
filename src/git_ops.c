@@ -1772,7 +1772,10 @@ static int git_absolute_path(const char *path, char *out, size_t out_size) {
 static int git_path_presence(const char *path, bool *present) {
     int saved_errno = errno;
 
-    *present = access(path, R_OK) == 0;
+    *present = access(path, R_OK) == 0; /* Flawfinder: ignore -- a presence
+                                         * probe that mirrors Git's own
+                                         * selection; the later read, not
+                                         * this probe, is authoritative. */
     errno = saved_errno;
     return 0;
 }

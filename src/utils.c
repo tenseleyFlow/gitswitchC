@@ -3964,7 +3964,9 @@ static void runner_trace(const char *format, ...) {
 
     if (!path || path[0] != '/') { errno = saved_errno; return; }
     va_start(args, format);
-    length = vsnprintf(line, sizeof(line), format, args);
+    length = vsnprintf(line, sizeof(line), format, args); /* Flawfinder: ignore
+                                       -- bounded; every format is a literal in
+                                       this translation unit; debug-only. */
     va_end(args);
     if (length <= 0) { errno = saved_errno; return; }
     if ((size_t)length >= sizeof(line)) length = (int)sizeof(line) - 1;
