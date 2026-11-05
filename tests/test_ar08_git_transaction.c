@@ -1964,6 +1964,8 @@ TEST(direct_worktree_extension_false_ignores_later_included_true) {
         (void)!system("ls -l /dev/fd/ 2>/dev/null | sed 's/^/fds-before: /' 1>&2; "
                       "for fd in /dev/fd/*; do n=${fd##*/}; [ \"$n\" -gt 2 ] 2>/dev/null || continue; "
                       "echo \"fdinfo-before: $n $(lsof -p $PPID -a -d $n -Fn 2>/dev/null | tail -1)\" 1>&2; done");
+        /* Darwin diagnostics: is the parent still single-threaded here? */
+        (void)!system("ps -M -p $PPID 2>/dev/null | sed 's/^/threads-before: /' 1>&2");
         if (git_config_seal() != 0) {
             FILE *trace = fopen(trace_path, "r");
             char line[512];
@@ -2030,6 +2032,31 @@ TEST(direct_worktree_extension_false_ignores_later_included_true) {
                           "grep -v -e ' (ps)' -e 'grep -E' | "
                           "sed 's/^/ps: /' | head -150 1>&2; "
                           "ps -axo pid | sort -n | tail -1 | sed 's/^/ps: maxpid=/' 1>&2");
+            /* Darwin diagnostics: the kernel kills a forked child that hits a
+             * system-library hard trap (brk 0xB000-0xBFFF) without any
+             * handler, so the only witnesses are the parent's own state
+             * (threads, loaded images, descriptors) and ReportCrash. */
+            (void)!system("ps -M -p $PPID 2>/dev/null | sed 's/^/threads: /' 1>&2; "
+                          "lsof -p $PPID 2>/dev/null | awk '{print $4, $5, $NF}' | "
+                          "sed 's/^/lsof: /' | head -120 1>&2; "
+                          "vmmap $PPID 2>/dev/null | grep '__TEXT' | awk '{print $NF}' | "
+                          "sort -u | sed 's/^/img: /' | head -120 1>&2; "
+                          "sample $PPID 1 -mayDie 2>&1 | sed -n '1,160p' | "
+                          "sed 's/^/sample: /' 1>&2");
+            (void)!system("find \"$HOME/Library/Logs/DiagnosticReports\" /Library/Logs/DiagnosticReports "
+                          "-name '*.ips' -newer \"$GITSWITCH_RUNNER_TRACE\" 2>/dev/null | "
+                          "sed 's/^/ips: /' 1>&2; "
+                          "log show --last 4m --style compact --predicate "
+                          "'process == \"ReportCrash\" OR eventMessage CONTAINS \"unrecoverable\" "
+                          "OR eventMessage CONTAINS \"corpse\"' 2>/dev/null | "
+                          "sed 's/^/rc: /' | tail -40 1>&2");
+            /* Is the rejection a transient window or a sticky state? */
+            sleep(3);
+            {
+                int again = git_config_seal();
+                fprintf(stderr, "seal-retry-after-3s: rc=%d msg=%s | %s\n", again,
+                        get_last_error()->message, get_last_error()->details);
+            }
             CHECK(false);
         }
         (void)unsetenv("GITSWITCH_RUNNER_TRACE");
